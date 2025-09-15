@@ -29,7 +29,7 @@
   <!-- Keep these links. Translations will automatically update with the README. -->
   <a href="https://zdoc.app/de/shiyu-coder/Kronos">Deutsch</a> | 
   <a href="https://zdoc.app/es/shiyu-coder/Kronos">Español</a> | 
-  <a href="https://zdoc.app/fr/shiyu-coder/Kronos">français</a> | 
+  <a href="https://zdoc.app/fr/shiyu-coder/Kronos">Français</a> | 
   <a href="https://zdoc.app/ja/shiyu-coder/Kronos">日本語</a> | 
   <a href="https://zdoc.app/ko/shiyu-coder/Kronos">한국어</a> | 
   <a href="https://zdoc.app/pt/shiyu-coder/Kronos">Português</a> | 
@@ -73,7 +73,7 @@ We have set up a live demo to visualize Kronos's forecasting results. The webpag
 ## 📦 Model Zoo 
 We release a family of pre-trained models with varying capacities to suit different computational and application needs. All models are readily accessible from the Hugging Face Hub.
 
-| Model        | Tokenizer                                                                       | Context length | Param  | Open-source                                                               |
+| Model        | Tokenizer                                                                       | Context length | Params  | Open-source                                                               |
 |--------------|---------------------------------------------------------------------------------| -------------- | ------ |---------------------------------------------------------------------------|
 | Kronos-mini  | [Kronos-Tokenizer-2k](https://huggingface.co/NeoQuasar/Kronos-Tokenizer-2k)     | 2048           | 4.1M   | ✅ [NeoQuasar/Kronos-mini](https://huggingface.co/NeoQuasar/Kronos-mini)  |
 | Kronos-small | [Kronos-Tokenizer-base](https://huggingface.co/NeoQuasar/Kronos-Tokenizer-base) | 512            | 24.7M  | ✅ [NeoQuasar/Kronos-small](https://huggingface.co/NeoQuasar/Kronos-small) |
@@ -210,7 +210,7 @@ Running this script will generate a plot comparing the ground truth data against
     <img src="figures/prediction_example.png" alt="Forecast Example" align="center" width="600px" />
 </p>
 
-Additionally, we also provide a script that makes predictions without Volume and Amount data, which can be found in [`examples/prediction_wo_vol_example.py`](examples/prediction_wo_vol_example.py).
+Additionally, we provide a script that makes predictions without Volume and Amount data, which can be found in [`examples/prediction_wo_vol_example.py`](examples/prediction_wo_vol_example.py).
 
 
 ## 🔧 Finetuning on Your Own Data (A-Share Market Example)
@@ -324,6 +324,7 @@ If you use Kronos in your research, we would appreciate a citation to our [paper
 
 ## 📜 License 
 This project is licensed under the [MIT License](./LICENSE).
+
 
 
 
