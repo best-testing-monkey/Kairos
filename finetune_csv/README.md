@@ -2,9 +2,9 @@
 
 Supports fine-tuning training with custom CSV data using configuration files
 
-## Quick Start
+## 1. Quick Start
 
-### 1. Configuration Setup
+### Configuration Setup
 
 First edit the `config.yaml` file to set the correct paths and parameters:
 
@@ -24,7 +24,7 @@ model_paths:
   # ... other paths
 ```
 
-### 2. Run Training
+### Run Training
 
 Using train_sequential
 
@@ -58,44 +58,16 @@ DDP Training
 DIST_BACKEND=nccl \
 torchrun --standalone --nproc_per_node=8 train_sequential.py --config configs/config_ali09988_candle-5min.yaml
 ```
+## 2. Training Results
 
-## Configuration Description
+![HK_ali_09988_kline_5min_all_historical_20250919_073929](examples/HK_ali_09988_kline_5min_all_historical_20250919_073929.png)
 
-### Main Configuration Items
+![HK_ali_09988_kline_5min_all_historical_20250919_073944](examples/HK_ali_09988_kline_5min_all_historical_20250919_073944.png)
 
-- **data**: Data-related configuration
-  - `data_path`: CSV data file path
-  - `lookback_window`: Lookback window size
-  - `predict_window`: Prediction window size
-  - `train_ratio/val_ratio/test_ratio`: Dataset split ratios
+![HK_ali_09988_kline_5min_all_historical_20250919_074012](examples/HK_ali_09988_kline_5min_all_historical_20250919_074012.png)
 
-- **training**: Training-related configuration
-  - `epochs`: Number of training epochs
-  - `batch_size`: Batch size
-  - `tokenizer_learning_rate`: Tokenizer learning rate
-  - `predictor_learning_rate`: Predictor learning rate
+![HK_ali_09988_kline_5min_all_historical_20250919_074042](examples/HK_ali_09988_kline_5min_all_historical_20250919_074042.png)
 
-- **model_paths**: Model path configuration
-  - `pretrained_tokenizer`: Pre-trained tokenizer path
-  - `pretrained_predictor`: Pre-trained predictor path
-  - `base_save_path`: Model save root directory
-  - `finetuned_tokenizer`: Fine-tuned tokenizer path (for basemodel training)
-
-- **experiment**: Experiment control
-  - `train_tokenizer`: Whether to train tokenizer
-  - `train_basemodel`: Whether to train basemodel
-  - `skip_existing`: Whether to skip existing models
-
-## Training Process
-
-1. **Tokenizer Fine-tuning Stage**
-   - Load pre-trained tokenizer
-   - Fine-tune on custom data
-   - Save fine-tuned tokenizer to `{base_save_path}/tokenizer/best_model/`
-
-2. **Basemodel Fine-tuning Stage**
-   - Load fine-tuned tokenizer and pre-trained predictor
-   - Fine-tune on custom data
-   - Save fine-tuned basemodel to `{base_save_path}/basemodel/best_model/`
+![HK_ali_09988_kline_5min_all_historical_20250919_074251](examples/HK_ali_09988_kline_5min_all_historical_20250919_074251.png)
 
 **Data Format**: Ensure CSV file contains the following columns: `timestamps`, `open`, `high`, `low`, `close`, `volume`, `amount`
