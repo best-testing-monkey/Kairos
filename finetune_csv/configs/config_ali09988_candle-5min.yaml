@@ -2,7 +2,7 @@
 #这是一份模板config，用于kronos的csv自定义数据微调
 
 data:
-  data_path: "/xxxx/Kronos/finetune_csv2/data/HK_ali_09988_kline_5min_all.csv"
+  data_path: "/xxxx/Kronos/finetune_csv/data/HK_ali_09988_kline_5min_all.csv"
   lookback_window: 512
   predict_window: 48
   max_context: 512
@@ -34,21 +34,21 @@ training:
 # model path configuration
 model_paths:
   # pretrained model path
-  pretrained_tokenizer: "/mnt/DigitalHuman2D/boyuzhang/quant/Kronos/pretrained/Kronos-Tokenizer-base"
-  pretrained_predictor: "/mnt/DigitalHuman2D/boyuzhang/quant/Kronos/pretrained/Kronos-base"
+  pretrained_tokenizer: "/xxx/Kronos/pretrained/Kronos-Tokenizer-base"
+  pretrained_predictor: "/xxx/Kronos/pretrained/Kronos-base"
   
   # experiment name - other paths will be generated based on this
   exp_name: "HK_ali_09988_kline_5min_all"
-  base_path: "/mnt/DigitalHuman2D/boyuzhang/quant/Kronos/finetune_csv/finetuned/"
+  base_path: "/xxx/Kronos/finetune_csv/finetuned/"
 
   # the following paths will be generated based on exp_name, no need to modify manually
   # way 1: leave empty string, the system will generate the full path
   base_save_path: ""  #  /xxxx/Kronos/finetune_csv/finetuned/{exp_name}
-  finetuned_tokenizer: ""  # /xxxx/quant/Kronos/finetune_csv/finetuned/{exp_name}/tokenizer/best_model
+  finetuned_tokenizer: ""  # /xxxx/Kronos/finetune_csv/finetuned/{exp_name}/tokenizer/best_model
   
   # way 2: use template string, {exp_name} will be replaced with the actual experiment name
   # base_save_path: "/xxxx/Kronos/finetune_csv/finetuned/{exp_name}"
-  # finetuned_tokenizer: "/xxxx/quant/Kronos/finetune_csv/finetuned/{exp_name}/tokenizer/best_model"
+  # finetuned_tokenizer: "/xxxx/Kronos/finetune_csv/finetuned/{exp_name}/tokenizer/best_model"
   
   tokenizer_save_name: "tokenizer"
   basemodel_save_name: "basemodel"

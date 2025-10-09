@@ -32,7 +32,7 @@ Your CSV file must contain the following columns:
 ## 2. Config Preparation
 
 
-Please edit the correct data path and set your training parameters.
+Please edit the correct data path & pretrained model path and set your training parameters.
 
 ```yaml
 # Data configuration
