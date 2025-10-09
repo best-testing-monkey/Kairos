@@ -2,7 +2,22 @@
 
 Supports fine-tuning training with custom CSV data using configuration files
 
-## 1. Quick Start
+## 1. Prepare Your Data
+
+**Data Format**: Ensure CSV file contains the following columns: `timestamps`, `open`, `high`, `low`, `close`, `volume`, `amount`
+
+A good csv data should be like:
+
+| timestamps | open | close | high | low | volume | amount |
+|------------|------|-------|------|-----|--------|--------|
+| 2019/11/26 9:35 | 182.45215 | 184.45215 | 184.95215 | 182.45215 | 15136000 | 0 |
+| 2019/11/26 9:40 | 184.35215 | 183.85215 | 184.55215 | 183.45215 | 4433300 | 0 |
+| ... | ... | ... | ... | ... | ... | ... |
+| ... | ... | ... | ... | ... | ... | ... |
+
+You can check "data/HK_ali_09988_kline_5min_all.csv" to find out the proper format.
+
+## 2. Training
 
 ### Configuration Setup
 
@@ -70,4 +85,4 @@ torchrun --standalone --nproc_per_node=8 train_sequential.py --config configs/co
 
 ![HK_ali_09988_kline_5min_all_historical_20250919_074251](examples/HK_ali_09988_kline_5min_all_historical_20250919_074251.png)
 
-**Data Format**: Ensure CSV file contains the following columns: `timestamps`, `open`, `high`, `low`, `close`, `volume`, `amount`
+
