@@ -1,4 +1,4 @@
-# Kronos Fine-tuning Training with Custom Dataset
+# Kronos Finetuning on Your Custom csv Dataset
 
 Supports fine-tuning training with custom CSV data using configuration files
 
