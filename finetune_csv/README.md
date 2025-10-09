@@ -1,50 +1,60 @@
-# Kronos Finetuning on Your Custom csv Dataset
+# Kronos Fine-tuning on Custom CSV Datasets
 
-Supports fine-tuning training with custom CSV data using configuration files
+This module provides a comprehensive pipeline for fine-tuning Kronos models on your own CSV-formatted financial data. It supports both sequential training (tokenizer followed by predictor) and individual component training, with full distributed training capabilities.
 
-## 1. Prepare Your Data
 
-**Data Format**: Ensure CSV file contains the following columns: `timestamps`, `open`, `high`, `low`, `close`, `volume`, `amount`
+## 1. Data Preparation
 
-A good csv data should be like:
+### Required Data Format
+
+Your CSV file must contain the following columns in this exact order:
+- `timestamps`: DateTime stamps for each data point
+- `open`: Opening price
+- `high`: Highest price
+- `low`: Lowest price  
+- `close`: Closing price
+- `volume`: Trading volume
+- `amount`: Trading amount
+
+(volume and amount can be 0 if not available)
+
+### Sample Data Format
 
 | timestamps | open | close | high | low | volume | amount |
 |------------|------|-------|------|-----|--------|--------|
 | 2019/11/26 9:35 | 182.45215 | 184.45215 | 184.95215 | 182.45215 | 15136000 | 0 |
 | 2019/11/26 9:40 | 184.35215 | 183.85215 | 184.55215 | 183.45215 | 4433300 | 0 |
-| ... | ... | ... | ... | ... | ... | ... |
-| ... | ... | ... | ... | ... | ... | ... |
+| 2019/11/26 9:45 | 183.85215 | 183.35215 | 183.95215 | 182.95215 | 3070900 | 0 |
 
-You can check "data/HK_ali_09988_kline_5min_all.csv" to find out the proper format.
+> **Reference**: Check `data/HK_ali_09988_kline_5min_all.csv` for a complete example of the proper data format.
 
-## 2. Training
 
-### Configuration Setup
+## 2. Config Preparation
 
-First edit the `config.yaml` file to set the correct paths and parameters:
+
+Please edit the correct data path and set your training parameters.
 
 ```yaml
 # Data configuration
 data:
   data_path: "/path/to/your/data.csv"
-  lookback_window: 512
-  predict_window: 48
-  # ... other parameters
+  lookback_window: 512        # Historical data points to use
+  predict_window: 48           # Future points to predict
+  max_context: 512            # Maximum context length
 
-# Model path configuration
-model_paths:
-  pretrained_tokenizer: "/path/to/pretrained/tokenizer"
-  pretrained_predictor: "/path/to/pretrained/predictor"
-  base_save_path: "/path/to/save/models"
-  # ... other paths
+...
+
 ```
+There are some other settings here, please see `configs/config_ali09988_candle-5min.yaml` for more comments.
 
-### Run Training
+## 3. Training
 
-Using train_sequential
+### Method 1: Sequential Training (Recommended)
+
+The `train_sequential.py` script handles the complete training pipeline automatically:
 
 ```bash
-# Complete training
+# Complete training (tokenizer + predictor)
 python train_sequential.py --config configs/config_ali09988_candle-5min.yaml
 
 # Skip existing models
@@ -53,36 +63,58 @@ python train_sequential.py --config configs/config_ali09988_candle-5min.yaml --s
 # Only train tokenizer
 python train_sequential.py --config configs/config_ali09988_candle-5min.yaml --skip-basemodel
 
-# Only train basemodel
+# Only train predictor
 python train_sequential.py --config configs/config_ali09988_candle-5min.yaml --skip-tokenizer
 ```
 
-Run each stage separately
+### Method 2: Individual Component Training
+
+Train each component separately for more control:
 
 ```bash
-# Only train tokenizer
-python finetune_tokenizer.py --config configs/config_ali09988_candle-5min.yaml 
+# Step 1: Train tokenizer
+python finetune_tokenizer.py --config configs/config_ali09988_candle-5min.yaml
 
-# Only train basemodel (requires fine-tuned tokenizer first)
-python finetune_base_model.py --config configs/config_ali09988_candle-5min.yaml 
+# Step 2: Train predictor (requires fine-tuned tokenizer)
+python finetune_base_model.py --config configs/config_ali09988_candle-5min.yaml
 ```
 
-DDP Training
+### DDP Training
+
+For faster training on multiple GPUs:
+
 ```bash
-# Choose communication protocol yourself, nccl can be replaced with gloo
+# Set communication backend (nccl for NVIDIA GPUs, gloo for CPU/mixed)
 DIST_BACKEND=nccl \
 torchrun --standalone --nproc_per_node=8 train_sequential.py --config configs/config_ali09988_candle-5min.yaml
 ```
-## 2. Training Results
 
-![HK_ali_09988_kline_5min_all_historical_20250919_073929](examples/HK_ali_09988_kline_5min_all_historical_20250919_073929.png)
+## 4. Training Results
 
-![HK_ali_09988_kline_5min_all_historical_20250919_073944](examples/HK_ali_09988_kline_5min_all_historical_20250919_073944.png)
+The training process generates several outputs:
 
-![HK_ali_09988_kline_5min_all_historical_20250919_074012](examples/HK_ali_09988_kline_5min_all_historical_20250919_074012.png)
+### Model Checkpoints
+- **Tokenizer**: Saved to `{base_save_path}/{exp_name}/tokenizer/best_model/`
+- **Predictor**: Saved to `{base_save_path}/{exp_name}/basemodel/best_model/`
 
-![HK_ali_09988_kline_5min_all_historical_20250919_074042](examples/HK_ali_09988_kline_5min_all_historical_20250919_074042.png)
+### Training Logs
+- **Console output**: Real-time training progress and metrics
+- **Log files**: Detailed logs saved to `{base_save_path}/logs/`
+- **Validation tracking**: Best models are saved based on validation loss
 
-![HK_ali_09988_kline_5min_all_historical_20250919_074251](examples/HK_ali_09988_kline_5min_all_historical_20250919_074251.png)
+## 5. Prediction Vis
+
+The following images show example training results on alibaba (HK stock) data:
+
+![Training Result 1](examples/HK_ali_09988_kline_5min_all_historical_20250919_073929.png)
+
+![Training Result 2](examples/HK_ali_09988_kline_5min_all_historical_20250919_073944.png)
+
+![Training Result 3](examples/HK_ali_09988_kline_5min_all_historical_20250919_074012.png)
+
+![Training Result 4](examples/HK_ali_09988_kline_5min_all_historical_20250919_074042.png)
+
+![Training Result 5](examples/HK_ali_09988_kline_5min_all_historical_20250919_074251.png)
+
 
 

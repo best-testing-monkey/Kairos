@@ -1,36 +1,58 @@
-# 自定义数据集的Kronos微调训练
+# Kronos微调-支持自定义CSV数据集
 
-支持使用配置文件进行自定义csv数据的微调训练
+这是一个在自定义的CSV格式数据上微调Kronos模型的完整流程。包含顺序训练（先训练tokenizer再训练predictor）和单独模块训练，同时支持分布式训练。
 
-## 快速开始
 
-### 1. 配置设置
+## 1. 准备数据
 
-首先编辑 `config.yaml` 文件，设置正确的路径和参数：
+### 数据格式
+
+您的CSV文件必须按以下确切顺序包含以下列：
+- `timestamps`: 每个数据点的时间戳
+- `open`: 开盘价
+- `high`: 最高价
+- `low`: 最低价  
+- `close`: 收盘价
+- `volume`: 交易量
+- `amount`: 交易金额
+
+(volume和amount可以全0如果没有这部分的数据)
+
+### 示例数据格式
+
+| timestamps | open | close | high | low | volume | amount |
+|------------|------|-------|------|-----|--------|--------|
+| 2019/11/26 9:35 | 182.45215 | 184.45215 | 184.95215 | 182.45215 | 15136000 | 0 |
+| 2019/11/26 9:40 | 184.35215 | 183.85215 | 184.55215 | 183.45215 | 4433300 | 0 |
+| 2019/11/26 9:45 | 183.85215 | 183.35215 | 183.95215 | 182.95215 | 3070900 | 0 |
+
+> **标准数据样例**:  `data/HK_ali_09988_kline_5min_all.csv` 
+
+## 2. 准备config文件
+
+data_path需要改成正确的数据路径，训练参数可以自己调节
 
 ```yaml
 # 数据配置
 data:
-  data_path: "/path/to/your/data.csv"  
-  lookback_window: 512
-  predict_window: 48
-  # ... 其他参数
+  data_path: "/path/to/your/data.csv"
+  lookback_window: 512        # 要使用的历史数据点
+  predict_window: 48           # 要预测的未来点数
+  max_context: 512            # 最大上下文长度
 
-# 模型路径配置
-model_paths:
-  pretrained_tokenizer: "/path/to/pretrained/tokenizer"
-  pretrained_predictor: "/path/to/pretrained/predictor"
-  base_save_path: "/path/to/save/models"
-  # ... 其他路径
+...
+
 ```
+这里还有其他一些设置， `configs/config_ali09988_candle-5min.yaml` 有更详细的注释。
 
-### 2. 运行训练
+## 3. 训练
 
+### 方法1: 直接顺序训练
 
-使用train_sequential
+`train_sequential.py` 脚本自动处理完整的训练流程：
 
 ```bash
-# 完整训练
+# 完整训练（tokenizer + predictor）
 python train_sequential.py --config configs/config_ali09988_candle-5min.yaml
 
 # 跳过已存在的模型
@@ -39,67 +61,58 @@ python train_sequential.py --config configs/config_ali09988_candle-5min.yaml --s
 # 只训练tokenizer
 python train_sequential.py --config configs/config_ali09988_candle-5min.yaml --skip-basemodel
 
-# 只训练basemodel
+# 只训练predictor
 python train_sequential.py --config configs/config_ali09988_candle-5min.yaml --skip-tokenizer
 ```
 
-单独运行各个阶段
+### 方法2: 单独组件训练
+
+可以单独训练每个组件：
 
 ```bash
-# 只训练tokenizer
-python finetune_tokenizer.py --config configs/config_ali09988_candle-5min.yaml 
+# 步骤1: 训练tokenizer
+python finetune_tokenizer.py --config configs/config_ali09988_candle-5min.yaml
 
-# 只训练basemodel（需要先有微调后的tokenizer）
-python finetune_base_model.py --config configs/config_ali09988_candle-5min.yaml 
+# 步骤2: 训练predictor（需要微调后的tokenizer）
+python finetune_base_model.py --config configs/config_ali09988_candle-5min.yaml
 ```
 
-DDP训练
+### DDP训练
+
+如果有多卡，可以开启ddp加速训练：
+
 ```bash
-# 通信协议自行选择，nccl可替换gloo
+# 设置通信后端（NVIDIA GPU用nccl，CPU/混合用gloo）
 DIST_BACKEND=nccl \
 torchrun --standalone --nproc_per_node=8 train_sequential.py --config configs/config_ali09988_candle-5min.yaml
 ```
 
-## 配置说明
+## 4. 训练结果
 
-### 主要配置项
+训练过程生成以下输出：
 
-- **data**: 数据相关配置
-  - `data_path`: CSV数据文件路径
-  - `lookback_window`: 回望窗口大小
-  - `predict_window`: 预测窗口大小
-  - `train_ratio/val_ratio/test_ratio`: 数据集分割比例
+### 模型检查点
+- **Tokenizer**: 保存到 `{base_save_path}/{exp_name}/tokenizer/best_model/`
+- **Predictor**: 保存到 `{base_save_path}/{exp_name}/basemodel/best_model/`
 
-- **training**: 训练相关配置
-  - `epochs`: 训练轮数
-  - `batch_size`: 批次大小
-  - `tokenizer_learning_rate`: Tokenizer学习率
-  - `predictor_learning_rate`: Predictor学习率
+### 训练日志
+- **控制台输出**: 实时训练进度和指标
+- **日志文件**: 详细日志保存到 `{base_save_path}/logs/`
+- **验证跟踪**: 基于验证损失保存最佳模型
 
-- **model_paths**: 模型路径配置
-  - `pretrained_tokenizer`: 预训练tokenizer路径
-  - `pretrained_predictor`: 预训练predictor路径
-  - `base_save_path`: 模型保存根目录
-  - `finetuned_tokenizer`: 微调后tokenizer路径（用于basemodel训练）
+## 5. 预测可视化
 
-- **experiment**: 实验控制
-  - `train_tokenizer`: 是否训练tokenizer
-  - `train_basemodel`: 是否训练basemodel
-  - `skip_existing`: 是否跳过已存在的模型
+以下图像显示了kronos在阿里巴巴股票数据上微调后的示例训练结果：
 
-## 训练流程
+![训练结果 1](examples/HK_ali_09988_kline_5min_all_historical_20250919_073929.png)
 
-1. **Tokenizer微调阶段**
-   - 加载预训练tokenizer
-   - 在自定义数据上微调
-   - 保存微调后的tokenizer到 `{base_save_path}/tokenizer/best_model/`
+![训练结果 2](examples/HK_ali_09988_kline_5min_all_historical_20250919_073944.png)
 
-2. **Basemodel微调阶段**
-   - 加载微调后的tokenizer和预训练predictor
-   - 在自定义数据上微调
-   - 保存微调后的basemodel到 `{base_save_path}/basemodel/best_model/`
+![训练结果 3](examples/HK_ali_09988_kline_5min_all_historical_20250919_074012.png)
 
+![训练结果 4](examples/HK_ali_09988_kline_5min_all_historical_20250919_074042.png)
 
- **数据格式**: 确保CSV文件包含以下列：`timestamps`, `open`, `high`, `low`, `close`, `volume`, `amount`
+![训练结果 5](examples/HK_ali_09988_kline_5min_all_historical_20250919_074251.png)
+
 
 
