@@ -45,7 +45,6 @@ Desktop.ini
 
 # Data files (large files)
 *.feather
-*.csv
 *.parquet
 *.h5
 *.hdf5
