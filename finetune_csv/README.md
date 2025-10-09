@@ -7,7 +7,7 @@ This module provides a comprehensive pipeline for fine-tuning Kronos models on y
 
 ### Required Data Format
 
-Your CSV file must contain the following columns in this exact order:
+Your CSV file must contain the following columns:
 - `timestamps`: DateTime stamps for each data point
 - `open`: Opening price
 - `high`: Highest price
