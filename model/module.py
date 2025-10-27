@@ -87,10 +87,17 @@ class BinarySphericalQuantizer(nn.Module):
                            torch.tensor(-1, dtype=z.dtype, device=z.device))
         return z + (zhat - z).detach()
 
-    def forward(self, z):
+    def forward(self, z, collect_metrics=True):
         # if self.input_format == 'bchw':
         #     z = rearrange(z, 'b c h w -> b h w c')
         zq = self.quantize(z)
+
+        q_scale = 1. / (self.embed_dim ** 0.5) if self.l2_norm else 1.
+
+        zq = zq * q_scale
+
+        if not collect_metrics:
+            return zq, zq.new_zeros(()), {}
 
         indices = self.codes_to_indexes(zq.detach())
         group_indices = self.codes_to_group_indexes(zq.detach())
@@ -98,8 +105,6 @@ class BinarySphericalQuantizer(nn.Module):
             used_codes = torch.unique(indices, return_counts=False)
         else:
             used_codes = None
-
-        q_scale = 1. / (self.embed_dim ** 0.5) if self.l2_norm else 1.
 
         if self.soft_entropy:
             persample_entropy, cb_entropy, avg_prob = self.soft_entropy_loss(z)
@@ -109,8 +114,6 @@ class BinarySphericalQuantizer(nn.Module):
             persample_entropy = self.get_hard_per_sample_entropy(zb_by_sample)
             cb_entropy = codebook_entropy(zq, self.basis, self.embed_dim)
             entropy_penalty = self.gamma0 * persample_entropy - self.gamma * cb_entropy
-
-        zq = zq * q_scale
 
         # commit loss
         commit_loss = self.beta * torch.mean(((zq.detach() - z) ** 2).sum(dim=-1))
@@ -239,9 +242,9 @@ class BSQuantizer(nn.Module):
         )
         return (bits * indices).sum(-1)
 
-    def forward(self, z, half=False):
+    def forward(self, z, half=False, collect_metrics=True):
         z = F.normalize(z, dim=-1)
-        quantized, bsq_loss, metrics = self.bsq(z)
+        quantized, bsq_loss, metrics = self.bsq(z, collect_metrics=collect_metrics)
         if half:
             q_pre = quantized[:, :, :self.s1_bits]
             q_post = quantized[:, :, self.s1_bits:]
