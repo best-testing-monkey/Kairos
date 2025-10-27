@@ -309,33 +309,6 @@ class RotaryPositionalEmbedding(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
 
-def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, training=True) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_bias = torch.zeros(L, S, dtype=query.dtype).to(query.device)
-
-    if is_causal:
-        assert attn_mask is None
-        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0).to(query.device)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-        attn_bias.to(query.dtype)
-
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-
-    if attn_mask is not None:
-        attn_mask_bias = torch.zeros_like(attn_weight)
-        if attn_mask.dtype == torch.bool:
-            attn_mask_bias.masked_fill_(attn_mask, float("-inf"))
-        else:
-            attn_mask_bias += attn_mask
-        attn_weight += attn_mask_bias
-
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=training)
-    return attn_weight @ value
-
-
 class MultiHeadAttentionWithRoPE(nn.Module):
     def __init__(self, d_model, n_heads, attn_dropout_p=0.0, resid_dropout_p=0.0):
         super().__init__()
@@ -366,12 +339,11 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         else:
             attn_mask = None
 
-        attn_output = scaled_dot_product_attention(
+        attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
-            dropout_p=self.attn_dropout_p,
-            is_causal=True,
-            training=self.training
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=True
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
@@ -411,12 +383,11 @@ class MultiHeadCrossAttentionWithRoPE(nn.Module):
 
         is_causal_flag = self.training
 
-        attn_output = scaled_dot_product_attention(
+        attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
-            dropout_p=self.attn_dropout_p,
-            is_causal=is_causal_flag,
-            training=self.training
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=is_causal_flag
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
