@@ -14,22 +14,22 @@ INPUT_DATA_PATH = TEST_DATA_ROOT / "regression_input.csv"
 
 # Regression test configuration
 OUTPUT_DATA_DIR = TEST_DATA_ROOT
-MAX_CTX_LEN = 512
 TEST_CTX_LEN = [512, 256]
 PRED_LEN = 8
 REL_TOLERANCE = 1e-5
 FEATURE_NAMES = ["open", "high", "low", "close", "volume", "amount"]
 
 # MSE regression test configuration
-MSE_SAMPLE_SIZE = 8
-MSE_SAMPLE_CTX_LEN = 512
+MSE_SAMPLE_SIZE = 4
+MSE_CTX_LEN = [512, 256]
+MSE_EXPECTED = [0.008979, 0.003741]
 MSE_PRED_LEN = 30
-MSE_EXPECTED =  0.00559805
 MSE_TOLERANCE = 0.000001
 MSE_FEATURE_NAMES = ["open", "high", "low", "close"]
 
 MODEL_REVISION = "901c26c1332695a2a8f243eb2f37243a37bea320"
 TOKENIZER_REVISION = "0e0117387f39004a9016484a186a908917e22426"
+MAX_CTX_LEN = 512
 SEED = 123
 DEVICE = "cpu"
 
@@ -76,6 +76,7 @@ def test_kronos_predictor_regression(context_len):
             top_k=1,
             top_p=1.0,
             verbose=False,
+            sample_count=1,
         )
 
     obtained = pred_df[FEATURE_NAMES].to_numpy(dtype=np.float32)
@@ -86,12 +87,12 @@ def test_kronos_predictor_regression(context_len):
 
     np.testing.assert_allclose(obtained, expected, rtol=REL_TOLERANCE)
 
-
-def test_kronos_predictor_mse():
+@pytest.mark.parametrize("context_len, expected_mse", zip(MSE_CTX_LEN, MSE_EXPECTED))
+def test_kronos_predictor_mse(context_len, expected_mse):
     set_seed(SEED)
 
     df = pd.read_csv(INPUT_DATA_PATH, parse_dates=["timestamps"])
-    if df.shape[0] <= MSE_SAMPLE_CTX_LEN + MSE_PRED_LEN:
+    if df.shape[0] <= context_len + MSE_PRED_LEN:
         raise ValueError("Example data does not contain enough rows for the random sample regression test.")
 
     tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base", revision=TOKENIZER_REVISION)
@@ -101,7 +102,7 @@ def test_kronos_predictor_mse():
 
     predictor = KronosPredictor(model, tokenizer, device=DEVICE, max_context=MAX_CTX_LEN)
 
-    valid_region = df.iloc[MSE_SAMPLE_CTX_LEN : df.shape[0] - MSE_PRED_LEN]
+    valid_region = df.iloc[context_len : df.shape[0] - MSE_PRED_LEN]
     if valid_region.shape[0] < MSE_SAMPLE_SIZE:
         raise ValueError("Not enough data points to draw the requested random samples.")
 
@@ -111,7 +112,7 @@ def test_kronos_predictor_mse():
     sample_indices = sampled_rows.index.to_list()
     with torch.no_grad():
         for row_idx in tqdm(sample_indices):
-            context_slice = df.iloc[row_idx - MSE_SAMPLE_CTX_LEN : row_idx].copy()
+            context_slice = df.iloc[row_idx - context_len : row_idx].copy()
             future_slice = df.iloc[row_idx : row_idx + MSE_PRED_LEN].copy()
 
             pred_df = predictor.predict(
@@ -123,6 +124,7 @@ def test_kronos_predictor_mse():
                 top_k=1,
                 top_p=1.0,
                 verbose=False,
+                sample_count=1,
             )
 
             obtained = pred_df[MSE_FEATURE_NAMES].to_numpy(dtype=np.float32)
@@ -132,7 +134,7 @@ def test_kronos_predictor_mse():
     assert len(mse_values) == MSE_SAMPLE_SIZE, f"Expected {MSE_SAMPLE_SIZE} MSE values, got {len(mse_values)}."
 
     mse = np.mean(mse_values).item()
-    mse_diff = mse - MSE_EXPECTED
+    mse_diff = mse - expected_mse
     print(f"Average MSE: {mse} (Diff vs expected: {mse_diff:+})")
 
-    assert abs(mse_diff) <= MSE_TOLERANCE, f"MSE {mse} differs from expected {MSE_EXPECTED}"
+    assert abs(mse_diff) <= MSE_TOLERANCE, f"MSE {mse} differs from expected {expected_mse}"

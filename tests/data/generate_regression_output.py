@@ -63,6 +63,7 @@ def generate_output(ctx_len: int) -> None:
             top_k=1,
             top_p=1.0,
             verbose=False,
+            sample_count=1,
         )
 
     if pred_df.shape != (PRED_LEN, len(FEATURE_NAMES)):
