@@ -60,6 +60,8 @@ def get_forecast_window(
     eff_calendar = calendar or _state.calendar
 
     if end is None:
+        # Live mode: normalize to today. price_cache never caches or delivers
+        # incomplete (in-progress) bars, so no partial-bar dropping is needed.
         end_date = pd.Timestamp.now(tz=eff_tz).normalize()
     elif isinstance(end, str):
         end_date = pd.Timestamp(end, tz=eff_tz).normalize()
