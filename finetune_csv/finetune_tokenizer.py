@@ -300,7 +300,7 @@ def main():
     
     set_seed(config.seed)
     
-    # 加载预训练tokenizer
+    # Load pretrained tokenizer
     if getattr(config, 'pre_trained_tokenizer', True):
         logger.info("Loading pretrained tokenizer...")
         print("Loading pretrained tokenizer...")
