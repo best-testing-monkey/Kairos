@@ -30,7 +30,11 @@ sys.path.append("../")
 import price_cache
 
 # ---- defaults ---------------------------------------------------------------
-STOCK_CODES = ["002354", "600580", "300207", "300418", "000001", "600036"]
+# Symbol format depends on the price_cache provider:
+#   yfinance (default): Shanghai stocks need .SS suffix, Shenzhen need .SZ
+#     e.g. "600580.SS", "000001.SZ", "002594.SZ"
+#   akshare provider: bare 6-digit codes work (600580, 000001, 002594)
+STOCK_CODES = ["002354.SZ", "600580.SS", "300207.SZ", "300418.SZ", "000001.SZ", "600036.SS"]
 DEFAULT_START = "2024-01-01"
 DEFAULT_END = datetime.now().strftime("%Y-%m-%d")
 DEFAULT_INTERVAL = "1d"

@@ -7,10 +7,17 @@ price_cache.  Data is fetched and cached automatically — no manual CSV
 wrangling required.
 
 Usage:
-    python prediction_cn_markets_day.py --symbol 000001
+    python prediction_cn_markets_day.py --symbol 000001.SS
 
 Arguments:
-    --symbol     Stock code (e.g. 002594 for BYD, 000001 for SSE Index)
+    --symbol     Ticker symbol passed directly to price_cache.
+                 The required format depends on which provider resolves it:
+                   yfinance (default): use exchange suffixes — Shanghai stocks
+                     end in .SS (e.g. 600580.SS), Shenzhen stocks in .SZ
+                     (e.g. 000001.SZ, 002594.SZ).
+                   akshare provider: bare 6-digit codes work (000001, 002594).
+                 Check your price_cache installation to know which providers
+                 are active.
 
 Output:
     - Saves prediction results to ./outputs/pred_<symbol>_data.csv and
@@ -18,8 +25,8 @@ Output:
     - Logs and progress are printed to console
 
 Example:
-    python prediction_cn_markets_day.py --symbol 000001
-    python prediction_cn_markets_day.py --symbol 002594
+    python prediction_cn_markets_day.py --symbol 000001.SZ   # Ping An Bank (yfinance)
+    python prediction_cn_markets_day.py --symbol 002594.SZ   # BYD (yfinance)
 """
 
 import os

@@ -75,7 +75,8 @@ class StockPredictorGUI:
             e.grid(row=row, column=col, padx=6, pady=5)
             return e
 
-        self.symbol_var = tk.StringVar(value="600580")
+        # Default uses yfinance .SS suffix; change to bare code if akshare provider is active
+        self.symbol_var = tk.StringVar(value="600580.SS")
         self.name_var = tk.StringVar(value="Wolong Electric Drive")
         self.pred_days_var = tk.StringVar(value="60")
         self.lookback_var = tk.StringVar(value="300")
