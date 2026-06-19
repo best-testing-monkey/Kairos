@@ -385,8 +385,11 @@ def run_comprehensive_prediction(stock_code, stock_name, pred_days, output_dir,
 
 
 if __name__ == "__main__":
+    # Symbol format depends on your price_cache provider:
+    #   yfinance (default): Shanghai stocks end in .SS, Shenzhen in .SZ
+    #   akshare provider:   bare 6-digit codes (603288, 600580, etc.)
     STOCK_CONFIG = {
-        "stock_code": "603288",
+        "stock_code": "603288.SS",   # Haitian Flavouring — yfinance format
         "stock_name": "Haitian Flavouring",
         "pred_days": 60,
         "output_dir": "./output",

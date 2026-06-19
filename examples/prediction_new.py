@@ -170,8 +170,11 @@ def run_prediction(stock_code, stock_name, pred_days, output_dir,
 
 
 if __name__ == "__main__":
+    # Symbol format depends on your price_cache provider:
+    #   yfinance (default): Shanghai stocks end in .SS, Shenzhen in .SZ
+    #   akshare provider:   bare 6-digit codes (300418, 000001, etc.)
     STOCK_CONFIG = {
-        "stock_code": "300418",
+        "stock_code": "300418.SZ",   # Kunlun Wanwei — yfinance format
         "stock_name": "Kunlun Wanwei",
         "pred_days": 100,
         "output_dir": "./output",
@@ -179,9 +182,9 @@ if __name__ == "__main__":
         "device": "cpu",
     }
 
-    # Other examples:
-    # STOCK_CONFIG = {"stock_code": "000001", "stock_name": "Ping An Bank", ...}
-    # STOCK_CONFIG = {"stock_code": "600036", "stock_name": "China Merchants Bank", ...}
-    # STOCK_CONFIG = {"stock_code": "300750", "stock_name": "CATL", ...}
+    # Other examples (yfinance format):
+    # STOCK_CONFIG = {"stock_code": "000001.SZ", "stock_name": "Ping An Bank", ...}
+    # STOCK_CONFIG = {"stock_code": "600036.SS", "stock_name": "China Merchants Bank", ...}
+    # STOCK_CONFIG = {"stock_code": "300750.SZ", "stock_name": "CATL", ...}
 
     run_prediction(**STOCK_CONFIG)
