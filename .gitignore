@@ -78,3 +78,8 @@ data/
 temp/
 tmp/
 .python-version
+
+# Example script outputs
+examples/outputs/
+examples/output/
+examples/data/
