@@ -106,6 +106,93 @@ class ConfigLoader:
         print("=" * 50)
 
 
+class LargeModelConfig:
+    """Configuration for Kronos-large training with optional distillation warm-start."""
+
+    def __init__(self, config_path: str):
+        self.loader = ConfigLoader(config_path)
+        self._load_all_configs()
+
+    def _load_all_configs(self):
+        data = self.loader.get_data_config()
+        self.data_path = data.get('data_path')
+        self.lookback_window = data.get('lookback_window', 512)
+        self.predict_window = data.get('predict_window', 48)
+        self.clip = data.get('clip', 5.0)
+        self.train_ratio = data.get('train_ratio', 0.9)
+        self.val_ratio = data.get('val_ratio', 0.1)
+        self.test_ratio = data.get('test_ratio', 0.0)
+
+        train = self.loader.get_training_config()
+        self.phase1_epochs = train.get('phase1_epochs', 15)
+        self.phase1_batch_size = train.get('phase1_batch_size', 16)
+        self.phase1_lr = train.get('phase1_learning_rate', 1e-4)
+        self.phase1_grad_clip = train.get('phase1_grad_clip', 3.0)
+        self.phase2_epochs = train.get('phase2_epochs', 30)
+        self.phase2_batch_size = train.get('phase2_batch_size', 8)
+        self.phase2_lr = train.get('phase2_learning_rate', 2e-5)
+        self.phase2_grad_clip = train.get('phase2_grad_clip', 1.0)
+        self.num_workers = train.get('num_workers', 6)
+        self.seed = train.get('seed', 42)
+        self.adam_beta1 = train.get('adam_beta1', 0.9)
+        self.adam_beta2 = train.get('adam_beta2', 0.95)
+        self.adam_weight_decay = train.get('adam_weight_decay', 0.1)
+        self.log_interval = train.get('log_interval', 50)
+        self.accumulation_steps = train.get('accumulation_steps', 4)
+        self.distill_batch_size = train.get('distill_batch_size', self.phase1_batch_size)
+
+        arch = self.loader.config.get('large_model_arch', {})
+        self.s1_bits = arch.get('s1_bits', 10)
+        self.s2_bits = arch.get('s2_bits', 10)
+        self.d_model = arch.get('d_model', 1536)
+        self.n_layers = arch.get('n_layers', 22)
+        self.n_heads = arch.get('n_heads', 24)
+        self.ff_dim = arch.get('ff_dim', 4096)
+        self.ffn_dropout_p = arch.get('ffn_dropout_p', 0.1)
+        self.attn_dropout_p = arch.get('attn_dropout_p', 0.0)
+        self.resid_dropout_p = arch.get('resid_dropout_p', 0.1)
+        self.token_dropout_p = arch.get('token_dropout_p', 0.0)
+        self.learn_te = arch.get('learn_te', True)
+
+        paths = self.loader.get_model_paths()
+        self.pretrained_tokenizer_path = paths.get('pretrained_tokenizer', '')
+        self.finetuned_tokenizer_path = paths.get('finetuned_tokenizer', '')
+        self.teacher_predictor_path = paths.get('teacher_predictor', '')
+        self.distill_cache_dir = paths.get('distill_cache_dir', '')
+        self.exp_name = paths.get('exp_name', 'kronos_large')
+        base_path = paths.get('base_path', '')
+        self.base_save_path = paths.get('base_save_path') or f"{base_path}/{self.exp_name}"
+        large_save_name = paths.get('large_model_save_name', 'kronos_large')
+        self.large_model_save_path = os.path.join(self.base_save_path, large_save_name)
+
+        exp = self.loader.get_experiment_config()
+        self.training_mode = exp.get('training_mode', 'distill_then_finetune')
+        self.skip_existing = exp.get('skip_existing', False)
+
+        dist_cfg = self.loader.config.get('distillation', {})
+        self.sample_mode = dist_cfg.get('sample_mode', 'argmax')
+        self.sampling_temperature = dist_cfg.get('sampling_temperature', 1.0)
+        self.top_p = dist_cfg.get('top_p', 1.0)
+
+        device_cfg = self.loader.get_device_config()
+        self.use_cuda = device_cfg.get('use_cuda', True)
+        self.device_id = device_cfg.get('device_id', 0)
+
+    def print_config_summary(self):
+        print('=' * 60)
+        print('Kronos-large training configuration')
+        print('=' * 60)
+        print(f"Experiment: {self.exp_name}")
+        print(f"Training mode: {self.training_mode}")
+        print(f"Architecture: d_model={self.d_model}, n_layers={self.n_layers}, "
+              f"n_heads={self.n_heads}, ff_dim={self.ff_dim}")
+        print(f"Phase 1: {self.phase1_epochs} epochs, lr={self.phase1_lr}, bs={self.phase1_batch_size}")
+        print(f"Phase 2: {self.phase2_epochs} epochs, lr={self.phase2_lr}, bs={self.phase2_batch_size}")
+        print(f"Distill cache: {self.distill_cache_dir}")
+        print(f"Save path: {self.large_model_save_path}")
+        print('=' * 60)
+
+
 class CustomFinetuneConfig:
     
     def __init__(self, config_path: str = None):
