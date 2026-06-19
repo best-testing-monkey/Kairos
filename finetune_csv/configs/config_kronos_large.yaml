@@ -1,0 +1,113 @@
+# Config template for training Kronos-large (~499M parameters).
+#
+# Workflow:
+#   1. Fill in all paths below.
+#   2. Run: python generate_distilled_tokens.py --config configs/config_kronos_large.yaml
+#   3. Run: python train_large_model.py --config configs/config_kronos_large.yaml
+#
+# Set experiment.training_mode to 'groundtruth_only' to skip distillation
+# and train directly on real data from scratch.
+
+data:
+  data_path: "/path/to/your/data.csv"
+  lookback_window: 512
+  predict_window: 48
+  max_context: 512
+  clip: 5.0
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+
+training:
+  # --- Phase 1: distillation warm-start ---
+  # The large model learns to mimic the teacher's predictions.
+  # Higher learning rate is fine here as targets are stable.
+  phase1_epochs: 15
+  phase1_batch_size: 16
+  phase1_learning_rate: 1.0e-4
+  phase1_grad_clip: 3.0
+
+  # --- Phase 2: ground-truth finetune ---
+  # The model is refined on real tokenizer outputs.
+  # Lower learning rate to avoid catastrophic forgetting.
+  phase2_epochs: 30
+  phase2_batch_size: 8
+  phase2_learning_rate: 2.0e-5
+  phase2_grad_clip: 1.0
+
+  # --- Shared ---
+  # Batch size for the distillation cache generation step.
+  distill_batch_size: 32
+  # Effective batch size = batch_size * accumulation_steps.
+  # Use accumulation to compensate for the smaller per-GPU batch.
+  accumulation_steps: 4
+  num_workers: 6
+  seed: 42
+  log_interval: 50
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+
+# Kronos-large architecture — approximately 499M parameters.
+# (d_model=1536, n_layers=22, n_heads=24: 1536/24=64 head_dim)
+large_model_arch:
+  s1_bits: 10
+  s2_bits: 10
+  d_model: 1536
+  n_layers: 22
+  n_heads: 24
+  ff_dim: 4096
+  ffn_dropout_p: 0.1
+  attn_dropout_p: 0.0
+  resid_dropout_p: 0.1
+  token_dropout_p: 0.0
+  learn_te: true
+
+model_paths:
+  # Kronos tokenizer to use for encoding training data.
+  # Use the finetuned tokenizer from your earlier finetune_csv run.
+  pretrained_tokenizer: "/path/to/Kronos-Tokenizer-base"
+  finetuned_tokenizer: "/path/to/finetuned/tokenizer/best_model"
+
+  # Teacher predictor used to generate distillation targets.
+  # Typically Kronos-base (102M) or Kronos-small (24.7M).
+  teacher_predictor: "/path/to/Kronos-base"
+
+  # Directory where generate_distilled_tokens.py writes .pt cache files.
+  distill_cache_dir: "/path/to/distill_cache"
+
+  # Experiment name — used to build save paths automatically.
+  exp_name: "kronos_large_experiment"
+  base_path: "/path/to/finetuned"
+
+  # Leave empty to auto-generate from base_path + exp_name.
+  base_save_path: ""
+  large_model_save_name: "kronos_large"
+
+experiment:
+  name: "kronos_large_distillation"
+  description: "Kronos-large training with distillation warm-start"
+
+  # Training mode:
+  #   distill_then_finetune -- Phase 1 on teacher tokens, Phase 2 on real tokens (recommended)
+  #   distill_only          -- Phase 1 only (useful for ablation)
+  #   groundtruth_only      -- skip distillation, train on real tokens only (from scratch)
+  training_mode: "distill_then_finetune"
+
+  skip_existing: false
+
+distillation:
+  # How teacher token predictions are generated:
+  #   argmax  -- deterministic; recommended for stable distillation targets
+  #   sample  -- multinomial sampling; adds diversity to targets
+  sample_mode: "argmax"
+  sampling_temperature: 1.0
+  top_p: 1.0
+
+device:
+  use_cuda: true
+  device_id: 0
+
+distributed:
+  use_ddp: false
+  backend: "nccl"
