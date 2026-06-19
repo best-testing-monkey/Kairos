@@ -6,6 +6,11 @@ description = "price_cache × Kronos integration layer for exchange-aware OHLCV 
 dependencies = [
     "pandas>=2.0",
     "numpy>=1.24",
+    "torch>=2.0",
+    "huggingface-hub>=0.20",
+    "safetensors>=0.4",
+    "einops>=0.7",
+    "tqdm>=4.60",
     "exchange-calendars>=4.0",
     "price-cache @ git+https://github.com/best-testing-monkey/price_cache.git",
 ]
@@ -16,6 +21,10 @@ dev = [
     "flake8>=7.0",
     "mypy>=1.0",
 ]
+
+[project.scripts]
+forecast = "kairos.cli.forecast:main"
+finetune = "kairos.cli.finetune:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -30,3 +39,4 @@ addopts = "-v"
 
 [tool.flake8]
 max-line-length = 120
+
