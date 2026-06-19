@@ -155,6 +155,195 @@ fetching directly from akshare or need the richer Chinese-market metadata those 
 | Data        | [price_cache](https://github.com/best-testing-monkey/price_cache)  | Gap-aware OHLCV cache, seven-provider fallback chain     |
 | Glue        | Kairos (this repo)                                                 | Adapter from price_cache output to the Kronos contract  |
 
+## Training a Kronos-Large Model
+
+Kairos adds scripts to train a **Kronos-large** predictor (~499M parameters) on your own
+data.  Two strategies are supported:
+
+| Strategy | When to use |
+|---|---|
+| **Distillation warm-start → ground-truth finetune** | Recommended. The large model first learns from a smaller teacher (base/small), then refines on real data. Converges faster and often reaches lower loss. |
+| **From-scratch on real data** | Simpler; set `training_mode: groundtruth_only`. Suitable when you have abundant data or don't have a finetuned teacher available. |
+
+### Model family
+
+| Model | Params | d_model | n_layers | n_heads | ff_dim |
+|-------|--------|---------|----------|---------|--------|
+| Kronos-mini  |   4.1M |  ~128  |   6  |  8  |  512  |
+| Kronos-small |  24.7M |  ~384  |  12  | 12  | 1024  |
+| Kronos-base  | 102.3M |   832  |  12  | 16  | 2048  |
+| **Kronos-large** | **~499M** | **1536** | **22** | **24** | **4096** |
+
+### Prerequisites
+
+```bash
+# Same dependencies as the existing finetuning pipeline
+pip install torch pyyaml pandas numpy
+```
+
+You also need a **finetuned tokenizer** from an earlier `finetune_csv` run and a **teacher
+predictor** checkpoint (e.g. a finetuned `Kronos-base`).
+
+### Step 1 — Edit the config
+
+Copy and fill in the template:
+
+```bash
+cp finetune_csv/configs/config_kronos_large.yaml finetune_csv/configs/my_large_run.yaml
+```
+
+Key fields:
+
+```yaml
+data:
+  data_path: "/path/to/your/data.csv"   # same CSV used for finetuning
+
+model_paths:
+  finetuned_tokenizer: "/path/to/finetuned/tokenizer/best_model"
+  teacher_predictor:   "/path/to/finetuned/basemodel/best_model"
+  distill_cache_dir:   "/path/to/distill_cache"    # will be created
+  base_path:           "/path/to/save/output"
+  exp_name:            "my_large_run"
+
+experiment:
+  # 'distill_then_finetune' | 'distill_only' | 'groundtruth_only'
+  training_mode: "distill_then_finetune"
+```
+
+See `finetune_csv/configs/config_kronos_large.yaml` for all options with inline comments.
+
+### Step 2 — Generate distillation token cache
+
+This one-time step runs the teacher model over your training data and saves both the
+teacher-predicted tokens and ground-truth tokens to disk.  Training never reloads the
+teacher, so GPU memory is fully available to the large model.
+
+```bash
+cd finetune_csv
+python generate_distilled_tokens.py --config configs/my_large_run.yaml
+# generates: distill_cache/train_distilled_tokens.pt
+#            distill_cache/val_distilled_tokens.pt
+```
+
+Options:
+
+```
+--split train,val   Which splits to generate (default: train,val)
+--sample            Use multinomial sampling instead of argmax for teacher predictions
+```
+
+> **Skip this step** if using `training_mode: groundtruth_only` — a GT-only cache can be
+> generated with `--split train,val` using any Kronos model as the "teacher" (its predicted
+> tokens will be ignored; only the ground-truth tokens are used in Phase 2).
+
+### Step 3 — Train
+
+```bash
+python train_large_model.py --config configs/my_large_run.yaml
+```
+
+With `distill_then_finetune` (default) the trainer runs sequentially:
+
+```
+Phase 1 — Distillation warm-start
+  └─ trains on teacher-predicted tokens
+  └─ saves best checkpoint to: <base_path>/<exp_name>/kronos_large/phase1_best/best_model/
+
+Phase 2 — Ground-truth finetune
+  └─ trains on real tokenizer outputs
+  └─ saves best checkpoint to: <base_path>/<exp_name>/kronos_large/phase2_best/best_model/
+```
+
+Optional flags:
+
+```
+--skip-phase1   Jump straight to Phase 2 (useful for resuming)
+--skip-phase2   Run Phase 1 only
+```
+
+For from-scratch training (no teacher needed):
+
+```yaml
+# in config:
+experiment:
+  training_mode: "groundtruth_only"
+```
+
+```bash
+python train_large_model.py --config configs/my_large_run.yaml
+```
+
+### Config reference
+
+```yaml
+large_model_arch:         # Kronos-large architecture (~499M params)
+  d_model: 1536
+  n_layers: 22
+  n_heads: 24             # head_dim = 1536 / 24 = 64
+  ff_dim: 4096
+  ffn_dropout_p: 0.1      # lower dropout than base (0.2) due to larger capacity
+  resid_dropout_p: 0.1
+  s1_bits: 10             # must match the tokenizer
+  s2_bits: 10
+
+training:
+  phase1_epochs: 15       # distillation warm-start epochs
+  phase1_batch_size: 16
+  phase1_learning_rate: 1.0e-4
+  phase1_grad_clip: 3.0
+
+  phase2_epochs: 30       # ground-truth finetune epochs
+  phase2_batch_size: 8
+  phase2_learning_rate: 2.0e-5   # lower LR avoids forgetting Phase 1 gains
+  phase2_grad_clip: 1.0
+
+  accumulation_steps: 4   # effective batch = batch_size × accumulation_steps
+  distill_batch_size: 32  # batch size used when generating the cache
+
+distillation:
+  sample_mode: "argmax"   # 'argmax' (stable) or 'sample' (diverse)
+  sampling_temperature: 1.0
+  top_p: 1.0
+```
+
+### Output structure
+
+```
+<base_path>/<exp_name>/
+  kronos_large/
+    phase1_best/best_model/    ← best Phase 1 checkpoint (distillation)
+    phase2_best/best_model/    ← best Phase 2 checkpoint (final model)
+  logs/
+    large_model_training_rank_0.log
+```
+
+### Inference with the trained model
+
+Load the final checkpoint exactly like any other Kronos model:
+
+```python
+from model import Kronos, KronosTokenizer, KronosPredictor
+
+tokenizer = KronosTokenizer.from_pretrained("/path/to/finetuned/tokenizer/best_model")
+model = Kronos.from_pretrained(
+    "/path/to/finetuned/kronos_large/phase2_best/best_model"
+)
+predictor = KronosPredictor(model, tokenizer, max_context=512)
+
+# Then use exactly as you would with Kronos-base:
+pred_df = predictor.predict(
+    df=x_df,
+    x_timestamp=x_timestamp,
+    y_timestamp=y_timestamp,
+    pred_len=48,
+    T=1.0,
+    top_p=0.9,
+    sample_count=5,
+)
+```
+
+---
+
 ## Upstream: Kronos
 
 This project is a fork of **Kronos: A Foundation Model for the Language of
