@@ -9,7 +9,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Add project path for importing custom modules
-sys.path.append("../")
+sys.path.append("../../")
 from model import Kronos, KronosTokenizer, KronosPredictor
 
 plt.rcParams['font.sans-serif'] = ['SimHei']

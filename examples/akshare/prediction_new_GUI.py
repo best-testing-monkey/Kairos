@@ -21,7 +21,7 @@ import matplotlib.ticker as ticker
 warnings.filterwarnings('ignore')
 
 # Add project path for importing custom modules
-sys.path.append("../")
+sys.path.append("../../")
 try:
     from model import Kronos, KronosTokenizer, KronosPredictor
 except ImportError:
