@@ -18,7 +18,13 @@ import warnings
 from datetime import datetime
 
 import matplotlib
-matplotlib.use("TkAgg")
+# Use TkAgg when running inside the GUI event loop; fall back to Agg for
+# headless environments (tests, CI) where no display is available.
+import os as _os
+if _os.environ.get("DISPLAY") or sys.platform == "win32" or sys.platform == "darwin":
+    matplotlib.use("TkAgg")
+else:
+    matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
