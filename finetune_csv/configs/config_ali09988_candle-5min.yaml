@@ -1,5 +1,4 @@
 #This is a template config for custom finetuning kronos on csv data
-#这是一份模板config，用于kronos的csv自定义数据微调
 
 data:
   data_path: "/xxxx/Kronos/finetune_csv/data/HK_ali_09988_kline_5min_all.csv"
