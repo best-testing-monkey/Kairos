@@ -1,0 +1,72 @@
+# Config template for fine-tuning Kronos-large (499.2M parameters)
+#
+# NOTE: NeoQuasar/Kronos-large has not been publicly released yet.
+# This config will work as-is once the model appears on HuggingFace.
+# Until then, swap pretrained_predictor to "NeoQuasar/Kronos-base" (102.3M)
+# to use the largest currently available predictor.
+#
+# Kronos model family:
+#   NeoQuasar/Kronos-mini       4.1M
+#   NeoQuasar/Kronos-small     24.7M
+#   NeoQuasar/Kronos-base     102.3M
+#   NeoQuasar/Kronos-large    499.2M  <-- target (not yet released)
+
+data:
+  data_path: "/path/to/your/data.csv"
+  lookback_window: 512
+  predict_window: 48
+  max_context: 512
+  clip: 5.0
+  train_ratio: 0.9
+  val_ratio: 0.1
+  test_ratio: 0.0
+
+training:
+  tokenizer_epochs: 30
+  # Larger model benefits from more predictor epochs
+  basemodel_epochs: 30
+  # Reduce batch size vs base config to fit Kronos-large in GPU memory.
+  # 16 fits on a 40 GB A100; increase with gradient accumulation as needed.
+  batch_size: 16
+  # Compensate for smaller batch with more accumulation steps (effective batch = 32)
+  accumulation_steps: 2
+  log_interval: 50
+  num_workers: 6
+  seed: 42
+
+  tokenizer_learning_rate: 0.0002
+  # Lower LR for the larger predictor — large models are more sensitive to LR
+  predictor_learning_rate: 0.0000005
+
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+
+model_paths:
+  # Tokenizer: no Kronos-Tokenizer-large yet; Kronos-Tokenizer-base is the right pairing
+  pretrained_tokenizer: "NeoQuasar/Kronos-Tokenizer-base"
+  # Predictor: swap to "NeoQuasar/Kronos-base" until Kronos-large is released
+  pretrained_predictor: "NeoQuasar/Kronos-large"
+
+  exp_name: "kronos_large_finetune"
+  base_path: "/path/to/your/finetuned_models"
+
+  # Leave empty — paths are auto-generated from exp_name + base_path
+  base_save_path: ""
+  finetuned_tokenizer: ""
+
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "kronos_large_custom_finetune"
+  description: "Fine-tune Kronos-large on custom OHLCV data"
+  use_comet: false
+
+  train_tokenizer: true
+  train_basemodel: true
+  skip_existing: false
+
+device:
+  use_cuda: true
+  device_id: 0
