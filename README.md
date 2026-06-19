@@ -121,6 +121,30 @@ upstream documentation below.
 
 ---
 
+## Examples
+
+| File | Data source | Description |
+|------|-------------|-------------|
+| `examples/prediction_cn_markets_day.py` | price_cache | Daily A-share prediction with ±10 % price-limit clipping |
+| `examples/prediction_new.py` | price_cache | Prediction with price + volume + change charts and CSV report |
+| `examples/prediction_market_factors.py` | price_cache | Comprehensive prediction with multi-dimensional market-factor enhancement |
+| `examples/prediction_example.py` | CSV | Basic Kronos usage from a local CSV |
+| `examples/prediction_batch_example.py` | CSV | Batch prediction for multiple windows |
+| `examples/prediction_wo_vol_example.py` | CSV | Prediction without volume data |
+| `examples/run_backtest_kronos.py` | CSV | Backtesting framework |
+| `examples/akshare/prediction_cn_markets_day.py` | akshare | Same as above, fetching directly via akshare |
+| `examples/akshare/prediction_new.py` | akshare + CSV | Two-step fetch-then-predict using akshare and a local CSV |
+| `examples/akshare/prediction_akshare_2024-2025.py` | akshare | Comprehensive prediction with market-factor analysis via akshare |
+| `examples/akshare/prediction_new_GUI.py` | akshare | Tkinter GUI wrapper around the akshare workflow |
+| `examples/akshare/get_akshare_date_2024-2025_x.py` | akshare / EastMoney / Baostock | Multi-source data-fetch utility that writes a local CSV |
+
+The top-level `examples/` scripts use `price_cache` (and `kairos.data.get_forecast_window`) so
+they work offline once the cache is warm and require no akshare dependency.  The
+`examples/akshare/` subdirectory preserves the original scripts for users who prefer
+fetching directly from akshare or need the richer Chinese-market metadata those scripts collect.
+
+---
+
 ## Components
 
 | Layer       | Project                                                             | Role                                                    |
