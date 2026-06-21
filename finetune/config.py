@@ -85,13 +85,13 @@ class Config:
 
         # Base directory for saving model checkpoints and results.
         # Using a general 'outputs' directory is a common practice.
-        self.save_path = "./outputs/models"
+        self.save_path = "./output/models"
         self.tokenizer_save_folder_name = 'finetune_tokenizer_demo'
         self.predictor_save_folder_name = 'finetune_predictor_demo'
         self.backtest_save_folder_name = 'finetune_backtest_demo'
 
         # Path for backtesting results.
-        self.backtest_result_path = "./outputs/backtest_results"
+        self.backtest_result_path = "./output/backtest_results"
 
         # =================================================================
         # Model & Checkpoint Paths

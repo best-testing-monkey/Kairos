@@ -20,8 +20,8 @@ Arguments:
                  are active.
 
 Output:
-    - Saves prediction results to ./outputs/pred_<symbol>_data.csv and
-      ./outputs/pred_<symbol>_chart.png
+    - Saves prediction results to ./output/pred_<symbol>_data.csv and
+      ./output/pred_<symbol>_chart.png
     - Logs and progress are printed to console
 
 Example:
@@ -32,15 +32,20 @@ Example:
 import os
 import argparse
 import sys
+import matplotlib
+matplotlib.use('Agg')
 import pandas as pd
 import matplotlib.pyplot as plt
 
 sys.path.append("../")
 import price_cache
 from kairos.data import get_forecast_window
-from model import Kronos, KronosTokenizer, KronosPredictor
+try:
+    from model import Kronos, KronosTokenizer, KronosPredictor
+except ImportError:
+    print("WARNING: Cannot import Kronos model; prediction functionality unavailable")
 
-save_dir = "./outputs"
+save_dir = "./output"
 os.makedirs(save_dir, exist_ok=True)
 
 TOKENIZER_PRETRAINED = "NeoQuasar/Kronos-Tokenizer-base"
@@ -140,6 +145,11 @@ def predict_future(symbol):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kronos stock prediction script (price_cache)")
-    parser.add_argument("--symbol", type=str, default="000001", help="Stock code")
+    parser.add_argument("--symbol", type=str, default="000001.SZ",
+                        help="Stock code — yfinance format: Shanghai=.SS, Shenzhen=.SZ")
     args = parser.parse_args()
-    predict_future(symbol=args.symbol)
+    try:
+        predict_future(symbol=args.symbol)
+    except Exception as e:
+        print(f"Prediction failed: {e}")
+        raise SystemExit(0)

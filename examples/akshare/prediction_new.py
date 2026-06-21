@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use('Agg')
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,7 +23,7 @@ try:
 except ImportError:
     print("⚠️ Cannot import Kronos model, prediction functionality will be unavailable")
 
-plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 
@@ -1150,7 +1152,7 @@ Suggestion: {summary['investment_suggestion']}"""
     plt.savefig(chart_filename, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"📊 Comprehensive prediction chart saved: {chart_filename}")
 
-    plt.show()
+    plt.close('all')
 
     return historical_prices, prediction_prices
 
@@ -1187,7 +1189,7 @@ def run_comprehensive_kronos_prediction(stock_code, stock_name, data_dir, pred_d
 
         # 3. Instantiate predictor
         print("Step 3: Initializing predictor...")
-        predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
+        predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
         print("✅ Predictor initialized")
 
         # 4. Prepare data
@@ -1318,9 +1320,9 @@ def main():
     STOCK_CONFIG = {
         "stock_code": "603288",
         "stock_name": "Haitian Flavouring",
-        "data_dir": r"D:\lianghuajiaoyi\Kronos\examples\data",
+        "data_dir": r"./examples/data",
         "pred_days": 60,
-        "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce",
+        "output_dir": r"./examples/yuce",
         "history_years": 1
     }
 

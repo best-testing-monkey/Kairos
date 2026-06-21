@@ -312,4 +312,6 @@ def _plot_and_save(x_df, x_timestamp, pred_df, y_timestamp,
 if __name__ == "__main__":
     root = tk.Tk()
     app = StockPredictorGUI(root)
+    if os.environ.get("KAIROS_HEADLESS"):
+        root.after(100, root.destroy)
     root.mainloop()

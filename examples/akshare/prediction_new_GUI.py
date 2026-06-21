@@ -27,7 +27,7 @@ try:
 except ImportError:
     print("⚠️ Unable to import Kronos model, prediction functionality unavailable")
 
-plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 
@@ -47,8 +47,8 @@ class StockPredictorGUI:
         self.default_config = {
             "stock_code": "600580",
             "stock_name": "Wolong Electric Drive",
-            "data_dir": r"D:\lianghuajiaoyi\Kronos\examples\data",
-            "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce",
+            "data_dir": r"./examples/data",
+            "output_dir": r"./examples/yuce",
             "pred_days": 60,
             "history_years": 1
         }
@@ -110,7 +110,7 @@ class StockPredictorGUI:
 
         tk.Label(dir_frame, text="Data Directory:", bg='#f0f0f0', font=("Arial", 10)).grid(row=0, column=0, sticky=tk.W,
                                                                                      padx=5, pady=5)
-        self.data_dir_var = tk.StringVar(value=r"D:\lianghuajiaoyi\Kronos\examples\data")
+        self.data_dir_var = tk.StringVar(value=r"./examples/data")
         data_dir_entry = tk.Entry(dir_frame, textvariable=self.data_dir_var, font=("Arial", 10), width=40)
         data_dir_entry.grid(row=0, column=1, padx=5, pady=5)
         tk.Button(dir_frame, text="Browse", command=self.browse_data_dir, font=("Arial", 9)).grid(row=0, column=2, padx=5,
@@ -118,7 +118,7 @@ class StockPredictorGUI:
 
         tk.Label(dir_frame, text="Output Directory:", bg='#f0f0f0', font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W,
                                                                                      padx=5, pady=5)
-        self.output_dir_var = tk.StringVar(value=r"D:\lianghuajiaoyi\Kronos\examples\yuce")
+        self.output_dir_var = tk.StringVar(value=r"./examples/yuce")
         output_dir_entry = tk.Entry(dir_frame, textvariable=self.output_dir_var, font=("Arial", 10), width=40)
         output_dir_entry.grid(row=1, column=1, padx=5, pady=5)
         tk.Button(dir_frame, text="Browse", command=self.browse_output_dir, font=("Arial", 9)).grid(row=1, column=2,
@@ -203,8 +203,8 @@ class StockPredictorGUI:
         self.stock_name_var.set("Wolong Electric Drive")
         self.pred_days_var.set("60")
         self.history_years_var.set("1")
-        self.data_dir_var.set(r"D:\lianghuajiaoyi\Kronos\examples\data")
-        self.output_dir_var.set(r"D:\lianghuajiaoyi\Kronos\examples\yuce")
+        self.data_dir_var.set(r"./examples/data")
+        self.output_dir_var.set(r"./examples/yuce")
         self.result_text.delete(1.0, tk.END)
         self.progress_var.set("Waiting to start prediction...")
 
@@ -1062,7 +1062,7 @@ def run_comprehensive_prediction_gui(stock_code, stock_name, data_dir, pred_days
             return False, error_msg
 
         update_progress("Step 3: Initializing predictor...")
-        predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
+        predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
         update_progress("✅ Predictor initialized")
 
         update_progress("Step 4: Preparing stock data...")
@@ -1440,8 +1440,11 @@ def mark_key_dates_safe(ax, future_dates, pred_df):
 # ==================== Main function ====================
 def main():
     """Main function: launch GUI interface"""
+    import os
     root = tk.Tk()
     app = StockPredictorGUI(root)
+    if os.environ.get("KAIROS_HEADLESS"):
+        root.after(100, root.destroy)
     root.mainloop()
 
 

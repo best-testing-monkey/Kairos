@@ -1,80 +1,96 @@
+"""
+prediction_example.py
+
+Basic Kronos stock prediction using price_cache for data fetching.
+
+Usage:
+    python prediction_example.py
+
+Output:
+    - ./output/<symbol>_prediction.png
+"""
+import matplotlib
+matplotlib.use('Agg')
+import os
+import sys
 import pandas as pd
 import matplotlib.pyplot as plt
-import sys
+
 sys.path.append("../")
+import price_cache
+from kairos.data import get_forecast_window
 from model import Kronos, KronosTokenizer, KronosPredictor
 
+SYMBOL   = "300418.SZ"   # Kunlun Wanwei — change to any yfinance ticker
+LOOKBACK = 400
+PRED_LEN = 120
+OUTPUT_DIR = "./output"
 
-def plot_prediction(kline_df, pred_df):
-    pred_df.index = kline_df.index[-pred_df.shape[0]:]
-    sr_close = kline_df['close']
-    sr_pred_close = pred_df['close']
-    sr_close.name = 'Ground Truth'
-    sr_pred_close.name = "Prediction"
 
-    sr_volume = kline_df['volume']
-    sr_pred_volume = pred_df['volume']
-    sr_volume.name = 'Ground Truth'
-    sr_pred_volume.name = "Prediction"
+def plot_prediction(x_df, x_timestamp, pred_df, y_timestamp, symbol, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
 
-    close_df = pd.concat([sr_close, sr_pred_close], axis=1)
-    volume_df = pd.concat([sr_volume, sr_pred_volume], axis=1)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    ax1.plot(x_timestamp.values[-200:], x_df["close"].values[-200:],
+             label="Historical", color="steelblue", linewidth=1.5)
+    ax1.plot(y_timestamp.values, pred_df["close"].values,
+             label="Predicted", color="tomato", linewidth=1.5, linestyle="--")
+    ax1.set_ylabel("Close Price")
+    ax1.set_title(f"{symbol} — {PRED_LEN}-bar forecast")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
 
-    ax1.plot(close_df['Ground Truth'], label='Ground Truth', color='blue', linewidth=1.5)
-    ax1.plot(close_df['Prediction'], label='Prediction', color='red', linewidth=1.5)
-    ax1.set_ylabel('Close Price', fontsize=14)
-    ax1.legend(loc='lower left', fontsize=12)
-    ax1.grid(True)
-
-    ax2.plot(volume_df['Ground Truth'], label='Ground Truth', color='blue', linewidth=1.5)
-    ax2.plot(volume_df['Prediction'], label='Prediction', color='red', linewidth=1.5)
-    ax2.set_ylabel('Volume', fontsize=14)
-    ax2.legend(loc='upper left', fontsize=12)
-    ax2.grid(True)
+    ax2.plot(x_timestamp.values[-200:], x_df["volume"].values[-200:],
+             label="Historical", color="steelblue", linewidth=1.5)
+    ax2.plot(y_timestamp.values, pred_df["volume"].values,
+             label="Predicted", color="tomato", linewidth=1.5, linestyle="--")
+    ax2.set_ylabel("Volume")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.show()
+    path = os.path.join(output_dir, f"{symbol.replace('.', '_')}_prediction.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close("all")
+    print(f"Chart saved: {path}")
 
 
-# 1. Load Model and Tokenizer
-tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-model = Kronos.from_pretrained("NeoQuasar/Kronos-small")
+if __name__ == "__main__":
+    # 1. Fetch data
+    price_cache.configure(remote=False)
+    print(f"Fetching {SYMBOL} daily data via price_cache ...")
+    x_df, x_timestamp, y_timestamp = get_forecast_window(
+        symbol=SYMBOL,
+        interval="1d",
+        lookback=LOOKBACK,
+        pred_len=PRED_LEN,
+        amount="auto",
+    )
+    print(f"Loaded {len(x_df)} bars  "
+          f"({x_timestamp.iloc[0].date()} → {x_timestamp.iloc[-1].date()})")
 
-# 2. Instantiate Predictor
-predictor = KronosPredictor(model, tokenizer, max_context=512)
+    # 2. Load model
+    print("Loading Kronos model ...")
+    tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+    model     = Kronos.from_pretrained("NeoQuasar/Kronos-base")
+    predictor = KronosPredictor(model, tokenizer, max_context=512)
 
-# 3. Prepare Data
-df = pd.read_csv("./data/XSHG_5min_600977.csv")
-df['timestamps'] = pd.to_datetime(df['timestamps'])
+    # 3. Predict
+    print("Running prediction ...")
+    pred_df = predictor.predict(
+        df=x_df,
+        x_timestamp=x_timestamp,
+        y_timestamp=y_timestamp,
+        pred_len=PRED_LEN,
+        T=1.0,
+        top_p=0.9,
+        sample_count=1,
+        verbose=True,
+    )
 
-lookback = 400
-pred_len = 120
-
-x_df = df.loc[:lookback-1, ['open', 'high', 'low', 'close', 'volume', 'amount']]
-x_timestamp = df.loc[:lookback-1, 'timestamps']
-y_timestamp = df.loc[lookback:lookback+pred_len-1, 'timestamps']
-
-# 4. Make Prediction
-pred_df = predictor.predict(
-    df=x_df,
-    x_timestamp=x_timestamp,
-    y_timestamp=y_timestamp,
-    pred_len=pred_len,
-    T=1.0,
-    top_p=0.9,
-    sample_count=1,
-    verbose=True
-)
-
-# 5. Visualize Results
-print("Forecasted Data Head:")
-print(pred_df.head())
-
-# Combine historical and forecasted data for plotting
-kline_df = df.loc[:lookback+pred_len-1]
-
-# visualize
-plot_prediction(kline_df, pred_df)
-
+    # 4. Results
+    print("\nForecasted Data Head:")
+    print(pred_df.head())
+    plot_prediction(x_df, x_timestamp, pred_df, y_timestamp, SYMBOL, OUTPUT_DIR)
+    print("Done.")

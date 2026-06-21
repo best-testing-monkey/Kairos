@@ -13,6 +13,9 @@ dependencies = [
     "tqdm>=4.60",
     "exchange-calendars>=4.0",
     "price-cache @ git+https://github.com/best-testing-monkey/price_cache.git",
+    "pandas-stubs~=3.0.3",
+    "plotly>=5.0",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +23,9 @@ dev = [
     "pytest>=8.0",
     "flake8>=7.0",
     "mypy>=1.0",
+]
+examples = [
+    "akshare>=1.0",
 ]
 
 [project.scripts]
@@ -30,6 +36,9 @@ finetune = "kairos.cli.finetune:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["kairos"]
 
@@ -39,4 +48,12 @@ addopts = "-v"
 
 [tool.flake8]
 max-line-length = 120
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu121" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
 
