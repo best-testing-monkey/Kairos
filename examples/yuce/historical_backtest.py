@@ -1,4 +1,6 @@
 # historical_backtest.py
+import matplotlib
+matplotlib.use('Agg')
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,7 +10,7 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 
@@ -258,7 +260,7 @@ class HistoricalBacktester:
         plt.savefig(chart_file, dpi=300, bbox_inches='tight')
         print(f"📊 Historical backtest chart saved: {chart_file}")
 
-        plt.show()
+        plt.close('all')
 
     def run_complete_backtest(self, stock_code, output_dir, lookback_days=60, pred_days=30, threshold=0.03):
         """Run complete historical backtest"""
@@ -337,8 +339,8 @@ def main():
     # Configuration parameters
     BACKTEST_CONFIG = {
         "stock_code": "300418",
-        "data_dir": r"D:\lianghuajiaoyi\Kronos\examples\data",
-        "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\historical_backtest",
+        "data_dir": r"./examples/data",
+        "output_dir": r"./examples/historical_backtest",
         "initial_capital": 100000,
         "lookback_days": 60,  # use 60 days of historical data
         "pred_days": 30,  # predict 30 days

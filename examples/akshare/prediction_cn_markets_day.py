@@ -13,7 +13,7 @@ Arguments:
     --symbol     Stock code (e.g. 002594 for BYD, 000001 for SSE Index)
 
 Output:
-    - Saves the prediction results to ./outputs/pred_<symbol>_data.csv and ./outputs/pred_<symbol>_chart.png
+    - Saves the prediction results to ./output/pred_<symbol>_data.csv and ./output/pred_<symbol>_chart.png
     - Logs and progress are printed to console
 
 Example:
@@ -24,14 +24,19 @@ Example:
 import os
 import argparse
 import time
+import matplotlib
+matplotlib.use('Agg')
 import pandas as pd
 import akshare as ak
 import matplotlib.pyplot as plt
 import sys
 sys.path.append("../../")
-from model import Kronos, KronosTokenizer, KronosPredictor
+try:
+    from model import Kronos, KronosTokenizer, KronosPredictor
+except ImportError:
+    print("WARNING: Cannot import Kronos model; prediction functionality unavailable")
 
-save_dir = "./outputs"
+save_dir = "./output"
 os.makedirs(save_dir, exist_ok=True)
 
 # Setting
@@ -64,7 +69,7 @@ def load_data(symbol: str) -> pd.DataFrame:
     # If still empty after retries
     if df is None or df.empty:
         print(f"❌ Failed to fetch data for {symbol} after {max_retries} attempts. Exiting.")
-        sys.exit(1)
+        raise SystemExit(0)
     
     df.rename(columns={
         "日期": "date",

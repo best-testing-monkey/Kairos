@@ -23,113 +23,177 @@ from config_loader import CustomFinetuneConfig
 
 
 class CustomKlineDataset(Dataset):
-    
-    def __init__(self, data_path, data_type='train', lookback_window=90, predict_window=10, 
+    """
+    Loads OHLCV kline data for Kronos fine-tuning.
+
+    data_path may be either:
+      - A single CSV file  (original behaviour — one instrument)
+      - A directory        (new) — every *.csv file in the directory is loaded
+        as an independent instrument; windows never cross instrument boundaries.
+
+    In directory mode the train/val/test split is applied independently per
+    instrument so the ratio is approximately preserved for each one.
+    """
+
+    feature_list      = ['open', 'high', 'low', 'close', 'volume', 'amount']
+    time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
+    n_features        = len(feature_list)
+
+    def __init__(self, data_path, data_type='train', lookback_window=90, predict_window=10,
                  clip=5.0, seed=100, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
-        self.data_path = data_path
-        self.data_type = data_type
+        self.data_path    = data_path
+        self.data_type    = data_type
         self.lookback_window = lookback_window
-        self.predict_window = predict_window
-        self.window = lookback_window + predict_window + 1
-        self.clip = clip
-        self.seed = seed
-        self.train_ratio = train_ratio
-        self.val_ratio = val_ratio
-        self.test_ratio = test_ratio
-        
-        self.feature_list = ['open', 'high', 'low', 'close', 'volume', 'amount']
-        self.time_feature_list = ['minute', 'hour', 'weekday', 'day', 'month']
-        
-        self.py_rng = random.Random(seed)
-        
-        self._load_and_preprocess_data()
-        self._split_data_by_time()
-        
-        self.n_samples = len(self.data) - self.window + 1
-            
-        print(f"[{data_type.upper()}] Data length: {len(self.data)}, Available samples: {self.n_samples}")
-    
-    def _load_and_preprocess_data(self):
+        self.predict_window  = predict_window
+        self.window       = lookback_window + predict_window + 1
+        self.clip         = clip
+        self.seed         = seed
+        self.train_ratio  = train_ratio
+        self.val_ratio    = val_ratio
+        self.test_ratio   = test_ratio
+        self.py_rng       = random.Random(seed)
+
+        if os.path.isdir(data_path):
+            self._load_multi_instrument()
+        else:
+            self._load_single_instrument()
+
+        print(f"[{data_type.upper()}] Total samples: {self.n_samples}")
+
+    # ── single-file path (original behaviour) ─────────────────────────────────
+
+    def _load_single_instrument(self):
         df = pd.read_csv(self.data_path)
-        
+        print(f"Original data total length: {len(df)} records")
+        arr, ts = self._preprocess_df(df)
+        arr, ts = self._split_arr(arr, ts)
+        print(f"[{self.data_type.upper()}] Data length after split: {len(arr)} records")
+        self.instruments    = [arr]
+        self.cum_sizes      = [max(0, len(arr) - self.window + 1)]
+        self.n_samples      = self.cum_sizes[-1]
+        # kept for backward compat in case external code accesses self.data
+        self.data           = pd.DataFrame(arr, columns=self.feature_list + self.time_feature_list)
+        self.timestamps     = ts
+
+    # ── directory path (multi-instrument) ─────────────────────────────────────
+
+    def _load_multi_instrument(self):
+        csv_files = sorted(
+            os.path.join(self.data_path, f)
+            for f in os.listdir(self.data_path)
+            if f.endswith('.csv')
+        )
+        print(f"[{self.data_type.upper()}] Loading {len(csv_files)} instrument files from {self.data_path}")
+
+        self.instruments = []
+        self.cum_sizes   = []
+        total = 0
+        loaded = 0
+
+        for path in csv_files:
+            try:
+                df = pd.read_csv(path)
+                if len(df) < self.window:
+                    continue
+                arr, ts = self._preprocess_df(df)
+                arr, ts = self._split_arr(arr, ts)
+                n = max(0, len(arr) - self.window + 1)
+                if n == 0:
+                    continue
+                self.instruments.append(arr)
+                total += n
+                self.cum_sizes.append(total)
+                loaded += 1
+            except Exception as exc:
+                print(f"  Skipped {os.path.basename(path)}: {exc}")
+
+        self.n_samples = total
+        print(f"[{self.data_type.upper()}] Loaded {loaded}/{len(csv_files)} instruments, "
+              f"{self.n_samples:,} samples")
+
+    # ── shared helpers ─────────────────────────────────────────────────────────
+
+    def _preprocess_df(self, df):
+        df = df.copy()
         df['timestamps'] = pd.to_datetime(df['timestamps'])
         df = df.sort_values('timestamps').reset_index(drop=True)
-        
-        self.timestamps = df['timestamps'].copy()
-        
-        df['minute'] = df['timestamps'].dt.minute
-        df['hour'] = df['timestamps'].dt.hour
-        df['weekday'] = df['timestamps'].dt.weekday
-        df['day'] = df['timestamps'].dt.day
-        df['month'] = df['timestamps'].dt.month
-        
-        self.data = df[self.feature_list + self.time_feature_list].copy()
-        
-        if self.data.isnull().any().any():
-            print("Warning: Missing values found in data, performing forward fill")
-            self.data = self.data.fillna(method='ffill')
-        
-        print(f"Original data time range: {self.timestamps.min()} to {self.timestamps.max()}")
-        print(f"Original data total length: {len(df)} records")
-    
-    def _split_data_by_time(self):
-        total_length = len(self.data)
-        
-        train_end = int(total_length * self.train_ratio)
-        val_end = int(total_length * (self.train_ratio + self.val_ratio))
-        
+        ts = df['timestamps'].copy()
+
+        df['minute']  = ts.dt.minute
+        df['hour']    = ts.dt.hour
+        df['weekday'] = ts.dt.weekday
+        df['day']     = ts.dt.day
+        df['month']   = ts.dt.month
+
+        cols = self.feature_list + self.time_feature_list
+        data = df[cols].copy()
+        if data.isnull().any().any():
+            data = data.ffill()
+
+        return data.values.astype(np.float32), ts
+
+    def _split_arr(self, arr, ts):
+        n         = len(arr)
+        train_end = int(n * self.train_ratio)
+        val_end   = int(n * (self.train_ratio + self.val_ratio))
+
         if self.data_type == 'train':
-            self.data = self.data.iloc[:train_end].copy()
-            self.timestamps = self.timestamps.iloc[:train_end].copy()
-            print(f"[{self.data_type.upper()}] Training set: first {train_end} time points ({self.train_ratio})")
-            print(f"[{self.data_type.upper()}] Training set time range: {self.timestamps.min()} to {self.timestamps.max()}")
+            return arr[:train_end], ts.iloc[:train_end]
         elif self.data_type == 'val':
-            self.data = self.data.iloc[train_end:val_end].copy()
-            self.timestamps = self.timestamps.iloc[train_end:val_end].copy()
-            print(f"[{self.data_type.upper()}] Validation set: time points {train_end+1} to {val_end} ({self.val_ratio})")
-            print(f"[{self.data_type.upper()}] Validation set time range: {self.timestamps.min()} to {self.timestamps.max()}")
-        elif self.data_type == 'test':
-            self.data = self.data.iloc[val_end:].copy()
-            self.timestamps = self.timestamps.iloc[val_end:].copy()
-            print(f"[{self.data_type.upper()}] Test set: after time point {val_end+1}")
-            print(f"[{self.data_type.upper()}] Test set time range: {self.timestamps.min()} to {self.timestamps.max()}")
-        
-        print(f"[{self.data_type.upper()}] Data length after split: {len(self.data)} records")
-    
+            return arr[train_end:val_end], ts.iloc[train_end:val_end]
+        else:
+            return arr[val_end:], ts.iloc[val_end:]
+
+    def _global_to_local(self, g):
+        """Map global sample index g → (instrument_idx, local_start_idx)."""
+        import bisect
+        i = bisect.bisect_right(self.cum_sizes, g)
+        local = g if i == 0 else g - self.cum_sizes[i - 1]
+        return i, local
+
     def set_epoch_seed(self, epoch):
-        epoch_seed = self.seed + epoch
-        self.py_rng.seed(epoch_seed)
+        self.py_rng.seed(self.seed + epoch)
         self.current_epoch = epoch
-    
+
     def __len__(self):
         return self.n_samples
-    
+
     def __getitem__(self, idx):
-        max_start = len(self.data) - self.window
-        if max_start <= 0:
-            raise ValueError("Data length insufficient to create samples")
-        
-        if self.data_type == 'train':
-            epoch = getattr(self, 'current_epoch', 0)
-            start_idx = (idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
+        epoch = getattr(self, 'current_epoch', 0)
+
+        if len(self.instruments) == 1:
+            # Single instrument — original behaviour
+            arr = self.instruments[0]
+            max_start = len(arr) - self.window
+            if max_start <= 0:
+                raise ValueError("Data length insufficient to create samples")
+            if self.data_type == 'train':
+                start_idx = (idx * 9973 + (epoch + 1) * 104729) % (max_start + 1)
+            else:
+                start_idx = idx % (max_start + 1)
         else:
-            start_idx = idx % (max_start + 1)
-        
-        end_idx = start_idx + self.window
-        
-        window_data = self.data.iloc[start_idx:end_idx]
-        
-        x = window_data[self.feature_list].values.astype(np.float32)
-        x_stamp = window_data[self.time_feature_list].values.astype(np.float32)
-        
-        x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
-        x = (x - x_mean) / (x_std + 1e-5)
-        x = np.clip(x, -self.clip, self.clip)
-        
-        x_tensor = torch.from_numpy(x)
-        x_stamp_tensor = torch.from_numpy(x_stamp)
-        
-        return x_tensor, x_stamp_tensor
+            # Multi-instrument: pseudo-random scramble stays within one instrument
+            if self.data_type == 'train':
+                scrambled = (idx * 9973 + (epoch + 1) * 104729) % self.n_samples
+            else:
+                scrambled = idx % self.n_samples
+            inst_i, local = self._global_to_local(scrambled)
+            arr       = self.instruments[inst_i]
+            max_start = len(arr) - self.window
+            start_idx = local % (max_start + 1)
+
+        end_idx     = start_idx + self.window
+        window_data = arr[start_idx:end_idx]
+
+        x       = window_data[:, :self.n_features].copy()
+        x_stamp = window_data[:, self.n_features:].copy()
+
+        x_mean = x.mean(axis=0)
+        x_std  = x.std(axis=0)
+        x      = (x - x_mean) / (x_std + 1e-5)
+        x      = np.clip(x, -self.clip, self.clip)
+
+        return torch.from_numpy(x), torch.from_numpy(x_stamp)
 
 
 

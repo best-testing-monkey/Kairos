@@ -20,6 +20,7 @@ python train_large_model.py --config configs/config_kronos_large.yaml --skip-pha
 import os
 import sys
 import time
+import signal
 import random
 import argparse
 import logging
@@ -31,6 +32,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# ---------------------------------------------------------------------------
+# Graceful interrupt support
+# ---------------------------------------------------------------------------
+
+_stop_requested = False
+
+def _sigint_handler(signum, frame):
+    global _stop_requested
+    print("\n[SIGINT] Interrupt received — finishing current batch then saving checkpoint...")
+    _stop_requested = True
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from model import Kronos
@@ -75,22 +87,71 @@ def setup_logging(exp_name: str, log_dir: str, rank: int = 0) -> logging.Logger:
 # Core training loop
 # ---------------------------------------------------------------------------
 
+def _save_checkpoint(path, raw_model, optimizer, scheduler, epoch, best_val_loss):
+    torch.save({
+        'epoch':           epoch,
+        'model_state':     raw_model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
+        'best_val_loss':   best_val_loss,
+    }, path)
+
+
 def train_phase(model, train_loader, val_loader, epochs, optimizer, scheduler,
                 save_dir, phase_name, grad_clip, accumulation_steps,
-                log_interval, device, logger, rank=0, use_ddp=False):
+                log_interval, device, logger, rank=0, use_ddp=False,
+                checkpoint_interval=500):
     """
     Train for `epochs` on pre-tokenised (s1_ids, s2_ids, stamps) batches.
-    Returns the best validation loss seen during this phase.
-    """
-    raw_model = model.module if use_ddp else model
-    best_val_loss = float('inf')
-    global_step = 0
 
-    for epoch in range(epochs):
-        epoch_start = time.time()
+    Checkpointing:
+      - After every completed epoch  → latest_checkpoint.pt
+      - Every `checkpoint_interval` optimizer steps → latest_checkpoint.pt
+      - On Ctrl-C (SIGINT)           → latest_checkpoint.pt, then clean exit
+
+    Resume: re-run with the same command; the checkpoint is auto-detected.
+    """
+    global _stop_requested
+    _stop_requested = False
+
+    prev_handler = signal.signal(signal.SIGINT, _sigint_handler)
+
+    raw_model     = model.module if use_ddp else model
+    best_val_loss = float('inf')
+    start_epoch   = 0
+    global_step   = 0
+
+    os.makedirs(save_dir, exist_ok=True)
+    ckpt_path = os.path.join(save_dir, 'latest_checkpoint.pt')
+
+    if os.path.exists(ckpt_path):
+        if rank == 0:
+            print(f"[{phase_name}] Resuming from checkpoint: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        raw_model.load_state_dict(ckpt['model_state'])
+        optimizer.load_state_dict(ckpt['optimizer_state'])
+        scheduler.load_state_dict(ckpt['scheduler_state'])
+        start_epoch   = ckpt['epoch']
+        best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        steps_per_epoch = max(len(train_loader) // accumulation_steps, 1)
+        global_step   = start_epoch * steps_per_epoch
+        if rank == 0:
+            print(f"[{phase_name}] Resumed at epoch {start_epoch + 1}/{epochs}  "
+                  f"(best val so far: {best_val_loss:.4f})")
+
+    if start_epoch >= epochs:
+        if rank == 0:
+            print(f"[{phase_name}] Already completed ({epochs} epochs). Skipping.")
+        signal.signal(signal.SIGINT, prev_handler)
+        return best_val_loss
+
+    interrupted = False
+
+    for epoch in range(start_epoch, epochs):
+        epoch_start      = time.time()
         model.train()
         epoch_train_loss = 0.0
-        train_batches = 0
+        train_batches    = 0
 
         optimizer.zero_grad()
 
@@ -99,14 +160,14 @@ def train_phase(model, train_loader, val_loader, epochs, optimizer, scheduler,
             s2_ids = s2_ids.to(device, non_blocking=True)
             stamps = stamps.to(device, non_blocking=True)
 
-            s1_in, s2_in = s1_ids[:, :-1], s2_ids[:, :-1]
-            s1_out, s2_out = s1_ids[:, 1:], s2_ids[:, 1:]
-            stamps_in = stamps[:, :-1, :]
+            s1_in,  s2_in  = s1_ids[:, :-1], s2_ids[:, :-1]
+            s1_out, s2_out = s1_ids[:, 1:],  s2_ids[:, 1:]
+            stamps_in      = stamps[:, :-1, :]
 
             s1_logits, s2_logits = raw_model(s1_in, s2_in, stamps_in)
-            loss, s1_loss, s2_loss = raw_model.head.compute_loss(s1_logits, s2_logits, s1_out, s2_out)
+            loss, s1_loss, s2_loss = raw_model.head.compute_loss(
+                s1_logits, s2_logits, s1_out, s2_out)
 
-            # Scale for gradient accumulation
             (loss / accumulation_steps).backward()
 
             if (batch_idx + 1) % accumulation_steps == 0:
@@ -114,23 +175,42 @@ def train_phase(model, train_loader, val_loader, epochs, optimizer, scheduler,
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                global_step += 1
+
+                if global_step % log_interval == 0:
+                    lr  = optimizer.param_groups[0]['lr']
+                    msg = (f"[{phase_name}] Epoch {epoch+1}/{epochs}, "
+                           f"Step {batch_idx+1}/{len(train_loader)}, "
+                           f"LR: {lr:.2e}, Loss: {loss.item():.4f} "
+                           f"(s1: {s1_loss.item():.4f}, s2: {s2_loss.item():.4f})")
+                    logger.info(msg)
+                    if rank == 0:
+                        print(msg)
+
+                # Periodic mid-epoch checkpoint
+                if rank == 0 and checkpoint_interval > 0 and global_step % checkpoint_interval == 0:
+                    _save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
+                                     epoch, best_val_loss)
+
+                # Graceful interrupt
+                if _stop_requested:
+                    if rank == 0:
+                        print(f"[{phase_name}] Saving interrupt checkpoint at step {global_step}...")
+                        _save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
+                                         epoch, best_val_loss)
+                        print(f"[{phase_name}] Checkpoint saved → {ckpt_path}")
+                        print(f"[{phase_name}] Resume by re-running the same command.")
+                    interrupted = True
+                    break
 
             epoch_train_loss += loss.item()
-            train_batches += 1
-            global_step += 1
+            train_batches    += 1
 
-            if global_step % log_interval == 0:
-                lr = optimizer.param_groups[0]['lr']
-                msg = (f"[{phase_name}] Epoch {epoch+1}/{epochs}, "
-                       f"Step {batch_idx+1}/{len(train_loader)}, "
-                       f"LR: {lr:.2e}, Loss: {loss.item():.4f} "
-                       f"(s1: {s1_loss.item():.4f}, s2: {s2_loss.item():.4f})")
-                logger.info(msg)
-                if rank == 0:
-                    print(msg)
+        if interrupted:
+            break
 
-        # Flush any remaining gradient accumulation at end of epoch
-        if (len(train_loader)) % accumulation_steps != 0:
+        # Flush remaining gradient accumulation
+        if len(train_loader) % accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=grad_clip)
             optimizer.step()
             scheduler.step()
@@ -138,17 +218,18 @@ def train_phase(model, train_loader, val_loader, epochs, optimizer, scheduler,
 
         # Validation
         model.eval()
-        val_loss = 0.0
+        val_loss    = 0.0
         val_batches = 0
         with torch.no_grad():
             for s1_ids, s2_ids, stamps in val_loader:
                 s1_ids = s1_ids.to(device, non_blocking=True)
                 s2_ids = s2_ids.to(device, non_blocking=True)
                 stamps = stamps.to(device, non_blocking=True)
-
-                s1_logits, s2_logits = raw_model(s1_ids[:, :-1], s2_ids[:, :-1], stamps[:, :-1, :])
-                v_loss, _, _ = raw_model.head.compute_loss(s1_logits, s2_logits, s1_ids[:, 1:], s2_ids[:, 1:])
-                val_loss += v_loss.item()
+                s1_logits, s2_logits = raw_model(s1_ids[:, :-1], s2_ids[:, :-1],
+                                                  stamps[:, :-1, :])
+                v_loss, _, _ = raw_model.head.compute_loss(
+                    s1_logits, s2_logits, s1_ids[:, 1:], s2_ids[:, 1:])
+                val_loss    += v_loss.item()
                 val_batches += 1
 
         if use_ddp:
@@ -156,10 +237,10 @@ def train_phase(model, train_loader, val_loader, epochs, optimizer, scheduler,
                               dtype=torch.float64, device=device)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             avg_train = t[0].item() / max(int(t[1].item()), 1)
-            avg_val = t[2].item() / max(int(t[3].item()), 1)
+            avg_val   = t[2].item() / max(int(t[3].item()), 1)
         else:
             avg_train = epoch_train_loss / max(train_batches, 1)
-            avg_val = val_loss / max(val_batches, 1)
+            avg_val   = val_loss / max(val_batches, 1)
 
         epoch_time = time.time() - epoch_start
         summary = (f"\n--- [{phase_name}] Epoch {epoch+1}/{epochs} ---\n"
@@ -171,12 +252,23 @@ def train_phase(model, train_loader, val_loader, epochs, optimizer, scheduler,
 
         if avg_val < best_val_loss and rank == 0:
             best_val_loss = avg_val
-            save_path = os.path.join(save_dir, 'best_model')
-            os.makedirs(save_path, exist_ok=True)
-            raw_model.save_pretrained(save_path)
-            msg = f"[{phase_name}] Best model saved (val loss: {best_val_loss:.4f}) -> {save_path}"
+            best_path     = os.path.join(save_dir, 'best_model')
+            os.makedirs(best_path, exist_ok=True)
+            raw_model.save_pretrained(best_path)
+            msg = (f"[{phase_name}] Best model saved "
+                   f"(val loss: {best_val_loss:.4f}) → {best_path}")
             logger.info(msg)
             print(msg)
+
+        # End-of-epoch checkpoint (next epoch to run = epoch+1)
+        if rank == 0:
+            _save_checkpoint(ckpt_path, raw_model, optimizer, scheduler,
+                             epoch + 1, best_val_loss)
+
+    signal.signal(signal.SIGINT, prev_handler)
+
+    if interrupted:
+        sys.exit(0)
 
     return best_val_loss
 

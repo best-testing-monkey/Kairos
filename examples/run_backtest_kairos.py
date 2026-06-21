@@ -13,6 +13,9 @@ Output:
     - ./output/<symbol>_backtest_results.png
 """
 import matplotlib
+from huggingface_hub.utils import tqdm
+from pandas import DataFrame
+
 matplotlib.use('Agg')
 import os
 import sys
@@ -32,13 +35,16 @@ plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ── Configuration ────────────────────────────────────────────────────────────
-SYMBOL          = "000831.SZ"   # yfinance format (SZ = Shenzhen)
-# SYMBOL          = "BTC-USD"   # yfinance format
-LOOKBACK        = 300           # bars fed to Kronos as context
-PRED_LEN        = 60            # bars Kronos forecasts (= backtest period)
-INITIAL_CAPITAL = 100_000       # CNY
-THRESHOLD       = 0.02          # predicted daily return to trigger a trade
-OUTPUT_DIR      = "./output"
+# SYMBOL          = "000831.SZ"   # yfinance format (SZ = Shenzhen)
+SYMBOL = "BTC-USD"  # yfinance format
+LOOKBACK = 300  # bars fed to Kronos as context
+PRED_LEN = 60  # bars Kronos forecasts (= backtest period)
+PRED_SAMPLES = 10  # Prediction samples to average with
+INITIAL_CAPITAL = 100_000  # CNY
+THRESHOLD = 0.02  # predicted daily return to trigger a trade
+OUTPUT_DIR = "./output"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -49,8 +55,8 @@ def fetch_data(symbol, lookback, pred_len):
     price_cache.configure(remote=False)
 
     from datetime import date
-    end_str   = date.today().isoformat()
-    start_str = str(int(end_str[:4]) - 5) + end_str[4:]   # 5 years back
+    end_str = date.today().isoformat()
+    start_str = str(int(end_str[:4]) - 5) + end_str[4:]  # 5 years back
 
     raw = price_cache.get_price_data(symbol, start_date=start_str, end_date=end_str, interval="1d")
     if raw is None or raw.empty:
@@ -58,7 +64,7 @@ def fetch_data(symbol, lookback, pred_len):
 
     raw = raw.sort_index().copy()
     raw.columns = [c.lower() for c in raw.columns]
-    raw.index   = pd.to_datetime(raw.index).tz_localize(None)
+    raw.index = pd.to_datetime(raw.index).tz_localize(None)
 
     if len(raw) < lookback + pred_len:
         raise RuntimeError(
@@ -70,6 +76,14 @@ def fetch_data(symbol, lookback, pred_len):
     # window and we can compare predictions against real prices.
     context_end = raw.index[-(pred_len + 1)]
 
+    # auto convert/compute amount
+    if "amount" in raw.columns and raw["amount"].notna().all():
+        raw["amount"] = raw["amount"].astype("float64")
+    elif "vwap" in raw.columns and raw["vwap"].notna().all():
+        raw["amount"] = (raw["vwap"] * raw["Volume"]).astype("float64")
+    else:
+        raw["amount"] = raw["close"] * raw["volume"]
+
     x_df, x_ts, y_ts = get_forecast_window(
         symbol=symbol,
         interval="1d",
@@ -80,7 +94,7 @@ def fetch_data(symbol, lookback, pred_len):
     )
 
     # Ground truth: the pred_len bars that follow context_end in raw data.
-    actual = raw.iloc[-pred_len:]['close'].copy()
+    actual = raw.iloc[-pred_len:].copy()
     actual.index = pd.to_datetime(actual.index)
 
     return x_df, x_ts, y_ts, actual
@@ -88,21 +102,28 @@ def fetch_data(symbol, lookback, pred_len):
 
 # ── Prediction ────────────────────────────────────────────────────────────────
 
-def run_model(x_df, x_ts, y_ts, pred_len):
-    print("Loading Kronos model ...")
-    tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-    model     = Kronos.from_pretrained("NeoQuasar/Kronos-base")
-    predictor = KronosPredictor(model, tokenizer, max_context=512)
+bt_tokenizer = None
+bt_model = None
+bt_predictor = None
 
-    print("Running prediction ...")
-    pred_df = predictor.predict(
+
+def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1):
+    global bt_tokenizer, bt_model, bt_predictor
+    if bt_tokenizer is None or bt_model is None or bt_predictor is None:
+        print("Loading Kronos model ...")
+        bt_tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+        bt_model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
+        bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=512)
+
+    # print("Running prediction ...")
+    pred_df = bt_predictor.predict(
         df=x_df,
         x_timestamp=x_ts,
         y_timestamp=y_ts,
         pred_len=pred_len,
         T=1.0,
         top_p=0.9,
-        sample_count=1,
+        sample_count=sample_count,
         verbose=True,
     )
     return pred_df
@@ -117,14 +138,14 @@ def backtest(predicted_close: pd.Series, actual_close: pd.Series,
                  if predicted daily return < -threshold → sell / short.
     P&L is computed on actual close prices.
     """
-    pred  = predicted_close.reset_index(drop=True)
-    n     = min(len(pred), len(actual_close))
+    pred = predicted_close.reset_index(drop=True)
+    n = min(len(pred), len(actual_close))
     price = actual_close.iloc[:n].reset_index(drop=True)
 
-    capital  = initial_capital
-    position = 0          # shares held (negative = short)
-    trades   = []
-    equity   = []
+    capital = initial_capital
+    position = 0  # shares held (negative = short)
+    trades = []
+    equity = []
 
     for i in range(n):
         p = float(price.iloc[i])
@@ -149,7 +170,7 @@ def backtest(predicted_close: pd.Series, actual_close: pd.Series,
                 position = 0
             # Open new position
             if target_pos != 0:
-                shares   = int(capital / p) * target_pos
+                shares = int(capital / p) * target_pos
                 position = shares
                 capital -= shares * p
                 trades.append(dict(day=i, action='BUY' if target_pos > 0 else 'SHORT',
@@ -171,19 +192,19 @@ def backtest(predicted_close: pd.Series, actual_close: pd.Series,
 
 def compute_metrics(equity: pd.Series, initial_capital: float, trades: list):
     rets = equity.pct_change().dropna()
-    total_ret   = (equity.iloc[-1] - initial_capital) / initial_capital
-    annual_ret  = (1 + total_ret) ** (252 / max(len(rets), 1)) - 1
-    vol         = rets.std() * np.sqrt(252)
-    sharpe      = (annual_ret - 0.03) / vol if vol > 0 else 0.0
-    peak        = equity.expanding().max()
-    max_dd      = ((equity - peak) / peak).min()
+    total_ret = (equity.iloc[-1] - initial_capital) / initial_capital
+    annual_ret = (1 + total_ret) ** (252 / max(len(rets), 1)) - 1
+    vol = rets.std() * np.sqrt(252)
+    sharpe = (annual_ret - 0.03) / vol if vol > 0 else 0.0
+    peak = equity.expanding().max()
+    max_dd = ((equity - peak) / peak).min()
     trade_pairs = [(t['price'], trades[i + 1]['price'])
                    for i, t in enumerate(trades[:-1])
                    if t['action'] in ('BUY', 'SHORT') and
-                      trades[i + 1]['action'] == 'CLOSE']
-    trade_rets  = [(s - b) / b for b, s in trade_pairs]
-    win_rate    = (sum(1 for r in trade_rets if r > 0) / len(trade_rets)
-                   if trade_rets else 0.0)
+                   trades[i + 1]['action'] == 'CLOSE']
+    trade_rets = [(s - b) / b for b, s in trade_pairs]
+    win_rate = (sum(1 for r in trade_rets if r > 0) / len(trade_rets)
+                if trade_rets else 0.0)
     return dict(total_return=total_ret, annual_return=annual_ret,
                 volatility=vol, sharpe=sharpe, max_drawdown=max_dd,
                 win_rate=win_rate, trades=len(trades),
@@ -199,8 +220,8 @@ def plot_results(equity, actual_close, pred_close, metrics, symbol, output_dir):
     # 1. Equity vs benchmark
     ax = axes[0]
     benchmark = actual_close / actual_close.iloc[0] * equity.iloc[0]
-    ax.plot(equity.index,    equity.values,    label='Strategy',      linewidth=2)
-    ax.plot(benchmark.index, benchmark.values, label='Buy-and-Hold',  linewidth=2, alpha=0.7)
+    ax.plot(equity.index, equity.values, label='Strategy', linewidth=2)
+    ax.plot(benchmark.index, benchmark.values, label='Buy-and-Hold', linewidth=2, alpha=0.7)
     ax.axhline(equity.iloc[0], color='grey', linestyle='--', linewidth=1)
     ax.set_ylabel('Portfolio Value (CNY)')
     ax.set_title(f'{symbol} — Kronos Walk-Forward Backtest', fontweight='bold')
@@ -215,9 +236,9 @@ def plot_results(equity, actual_close, pred_close, metrics, symbol, output_dir):
 
     # 2. Predicted vs actual close
     ax = axes[1]
-    ax.plot(actual_close.index, actual_close.values, label='Actual',    linewidth=2)
+    ax.plot(actual_close.index, actual_close.values, label='Actual', linewidth=2)
     ax.plot(actual_close.index[:len(pred_close)],
-            pred_close.values[:len(actual_close)],   label='Predicted', linewidth=2,
+            pred_close.values[:len(actual_close)], label='Predicted', linewidth=2,
             linestyle='--', alpha=0.8)
     ax.set_ylabel('Close Price')
     ax.legend()
@@ -225,7 +246,80 @@ def plot_results(equity, actual_close, pred_close, metrics, symbol, output_dir):
 
     # 3. Drawdown
     ax = axes[2]
-    peak     = equity.expanding().max()
+    peak = equity.expanding().max()
+    drawdown = (equity - peak) / peak
+    ax.fill_between(drawdown.index, drawdown.values, 0, alpha=0.4, color='red')
+    ax.set_ylabel('Drawdown')
+    ax.set_xlabel('Date')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(output_dir, f"{symbol.replace('.', '_')}_backtest_results.png")
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close('all')
+    print(f"Chart saved: {path}")
+
+def plot_results_candlesticks(equity, actual, pred_all, metrics, symbol, output_dir):
+
+    pred_close = pd.Series(pred_all['close'].values)
+    actual_close = actual["close"]
+
+    os.makedirs(output_dir, exist_ok=True)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+    # 1. Equity vs benchmark
+    ax = axes[0]
+    benchmark = actual_close / actual_close.iloc[0] * equity.iloc[0]
+    ax.plot(equity.index, equity.values, label='Strategy', linewidth=2)
+    ax.plot(benchmark.index, benchmark.values, label='Buy-and-Hold', linewidth=2, alpha=0.7)
+    ax.axhline(equity.iloc[0], color='grey', linestyle='--', linewidth=1)
+    ax.set_ylabel('Portfolio Value (CNY)')
+    ax.set_title(f'{symbol} — Kronos Walk-Forward Backtest', fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    metrics_txt = (f"Return: {metrics['total_return']:.1%}  "
+                   f"Sharpe: {metrics['sharpe']:.2f}  "
+                   f"MaxDD: {metrics['max_drawdown']:.1%}  "
+                   f"WinRate: {metrics['win_rate']:.0%}  "
+                   f"Trades: {metrics['trades']}")
+    ax.set_xlabel(metrics_txt, fontsize=9)
+
+    # 2. Candlestick chart — Actual (left) and Predicted (right) per bar
+    ax = axes[1]
+    n = min(len(actual), len(pred_all))
+    xs = np.arange(n)
+    w = 0.35  # half-width of each candle body
+
+    def _candles(ax, xs, ohlc, offset, color_up, color_down, alpha=0.85):
+        for i, (_, row) in enumerate(ohlc.iterrows()):
+            o, h, l, c = row['open'], row['high'], row['low'], row['close']
+            x = xs[i] + offset
+            color = color_up if c >= o else color_down
+            ax.plot([x, x], [l, h], color=color, linewidth=0.8, alpha=alpha)
+            ax.add_patch(plt.Rectangle(
+                (x - w / 2, min(o, c)), w, abs(c - o),
+                color=color, alpha=alpha,
+            ))
+
+    _candles(ax, xs, actual.iloc[:n],  offset=-w / 2, color_up='#26a69a', color_down='#ef5350')
+    _candles(ax, xs, pred_all.iloc[:n], offset=+w / 2, color_up='#42a5f5', color_down='#ff7043')
+
+    tick_step = max(1, n // 10)
+    ax.set_xticks(xs[::tick_step])
+    ax.set_xticklabels([actual.index[i].strftime('%Y-%m-%d') for i in xs[::tick_step]],
+                       rotation=30, ha='right', fontsize=7)
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylabel('Price')
+    from matplotlib.patches import Patch
+    ax.legend(handles=[
+        Patch(color='#26a69a', label='Actual ↑'), Patch(color='#ef5350', label='Actual ↓'),
+        Patch(color='#42a5f5', label='Predicted ↑'), Patch(color='#ff7043', label='Predicted ↓'),
+    ], fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    # 3. Drawdown
+    ax = axes[2]
+    peak = equity.expanding().max()
     drawdown = (equity - peak) / peak
     ax.fill_between(drawdown.index, drawdown.values, 0, alpha=0.4, color='red')
     ax.set_ylabel('Drawdown')
@@ -241,30 +335,60 @@ def plot_results(equity, actual_close, pred_close, metrics, symbol, output_dir):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def trimmed_mean(df: DataFrame, trim_max_factor=0.10) -> DataFrame:
+    retVal = {}
+    for column in df.columns:
+        Q1 = df[column].quantile(trim_max_factor)
+        Q3 = df[column].quantile(1.0 - trim_max_factor)
+        IQR = Q3 - Q1
+
+        lower = Q1 - 1.5 * IQR
+        upper = Q3 + 1.5 * IQR
+
+        retVal[column] = df.loc[(df[column] >= lower) & (df[column] <= upper), column].mean()
+    return DataFrame([retVal], index=[df.index[0]])
+
 if __name__ == "__main__":
-    print("🤖 Kronos Walk-Forward Backtest")
+    print("🤖 Kairos Walk-Forward Backtest")
     print(f"   Symbol:          {SYMBOL}")
     print(f"   Context window:  {LOOKBACK} bars")
     print(f"   Backtest period: {PRED_LEN} bars")
-    print(f"   Initial capital: {INITIAL_CAPITAL:,.0f} CNY")
+    print(f"   samples per bar: {PRED_SAMPLES} x")
+    print(f"   Initial capital: {INITIAL_CAPITAL:,.0f}")
     print(f"   Trade threshold: {THRESHOLD:.0%}")
     print()
 
     print("Step 1: Fetching data ...")
-    x_df, x_ts, y_ts, actual_close = fetch_data(SYMBOL, LOOKBACK, PRED_LEN)
+    x_df, x_ts, y_ts, actual = fetch_data(SYMBOL, LOOKBACK, PRED_LEN)
+    actual_close = actual["close"]
     print(f"  Context : {len(x_df)} bars  ({x_ts.iloc[0].date()} → {x_ts.iloc[-1].date()})")
     print(f"  Actuals : {len(actual_close)} bars matched in price history")
 
-    pred_df = run_model(x_df, x_ts, y_ts, PRED_LEN)
-    pred_close = pd.Series(pred_df['close'].values)
+    pred_all = []
+    for pred_step in tqdm(range(PRED_LEN), desc="Walking steps"):
+
+        # result_list = []
+        # for sample in range(PRED_SAMPLES):
+        #     result_list += [run_model(x_df, x_ts, y_ts[:1], 1)]
+        # pred_all_df = pd.concat(result_list, ignore_index=True)
+        # pred_all += [trimmed_mean(pred_all_df)]
+
+        pred_all += [run_model(x_df, x_ts, y_ts[:1], 1, PRED_SAMPLES)]
+
+        actual_first = actual[:1]
+        x_df.index = x_ts.values
+        x_df = pd.concat([x_df.iloc[1:], actual_first[x_df.columns]])
+        x_ts = pd.Series(x_df.index, name="x_timestamp")
+        x_df = x_df.reset_index(drop=True)
+        y_ts = y_ts.iloc[1:]
+        actual = actual[1:]
+
+    pred_all = pd.concat(pred_all)
+    pred_close = pd.Series(pred_all['close'].values)
 
     print("\nStep 2: Running backtest ...")
     if actual_close.empty:
-        # Future dates — no ground truth yet; use predicted prices as stand-in
-        print("  No actual prices for prediction period yet (future dates).")
-        print("  Using predicted prices to simulate signal-only backtest.")
-        actual_close = pred_close.copy()
-        actual_close.index = pd.to_datetime(y_ts.values)
+        raise Exception("No Close data")
 
     equity, trades = backtest(pred_close, actual_close, INITIAL_CAPITAL, THRESHOLD)
     metrics = compute_metrics(equity, INITIAL_CAPITAL, trades)
@@ -278,5 +402,6 @@ if __name__ == "__main__":
     print(f"  Trades        : {metrics['trades']}")
     print(f"  Final Capital : {metrics['final_capital']:,.0f} CNY")
 
-    plot_results(equity, actual_close, pred_close, metrics, SYMBOL, OUTPUT_DIR)
+    # plot_results(equity, actual_close, pred_close, metrics, SYMBOL, OUTPUT_DIR)
+    plot_results_candlesticks(equity, actual, pred_all, metrics, SYMBOL, OUTPUT_DIR)
     print("\nDone.")

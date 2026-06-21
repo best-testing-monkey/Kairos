@@ -20,6 +20,8 @@ import sys
 import warnings
 from datetime import datetime
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -35,7 +37,7 @@ try:
 except ImportError:
     print("WARNING: Cannot import Kronos model; prediction functionality unavailable")
 
-plt.rcParams["font.sans-serif"] = ["SimHei"]
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams["axes.unicode_minus"] = False
 
 
@@ -307,7 +309,7 @@ def plot_comprehensive(x_df, x_timestamp, pred_df, enhanced_df,
     chart_path = os.path.join(output_dir, f"{stock_code}_comprehensive_prediction.png")
     plt.savefig(chart_path, dpi=150, bbox_inches="tight")
     print(f"Chart saved: {chart_path}")
-    plt.show()
+    plt.close('all')
 
 
 # ==================== Main ====================

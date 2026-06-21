@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use('Agg')
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,9 +12,12 @@ warnings.filterwarnings('ignore')
 
 # Add project path for importing custom modules
 sys.path.append("../../")
-from model import Kronos, KronosTokenizer, KronosPredictor
+try:
+    from model import Kronos, KronosTokenizer, KronosPredictor
+except ImportError:
+    print("WARNING: Cannot import Kronos model; prediction functionality unavailable")
 
-plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 
@@ -267,7 +272,7 @@ def plot_prediction_with_details(kline_df, pred_df, future_dates, stock_code="00
     plt.savefig(chart_filename, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"📊 Prediction chart saved: {chart_filename}")
 
-    plt.show()
+    plt.close('all')
 
     return close_df, volume_df
 
@@ -355,7 +360,7 @@ def main(stock_code="002354", stock_name="Tianyu Digital Technology", data_dir="
         print("✅ Model loaded")
 
         print("Step 2: Initializing predictor...")
-        predictor = KronosPredictor(model, tokenizer, device="cuda:0", max_context=512)
+        predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
         print("✅ Predictor initialized")
 
         print("Step 3: Preparing stock data...")
@@ -459,13 +464,13 @@ if __name__ == "__main__":
         "stock_name": "Kunlun Wanwei",  # stock name
         "data_dir": "./data",  # data directory
         "pred_days": 100,  # predict 100 calendar days
-        "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce"  # output directory
+        "output_dir": r"./examples/yuce"  # output directory
     }
 
     # Other stock config examples:
-    # STOCK_CONFIG = {"stock_code": "000001", "stock_name": "Ping An Bank", "data_dir": "./data", "pred_days": 100, "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce"}
-    # STOCK_CONFIG = {"stock_code": "600036", "stock_name": "China Merchants Bank", "data_dir": "./data", "pred_days": 100, "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce"}
-    # STOCK_CONFIG = {"stock_code": "300750", "stock_name": "CATL", "data_dir": "./data", "pred_days": 100, "output_dir": r"D:\lianghuajiaoyi\Kronos\examples\yuce"}
+    # STOCK_CONFIG = {"stock_code": "000001", "stock_name": "Ping An Bank", "data_dir": "./data", "pred_days": 100, "output_dir": r"./examples/yuce"}
+    # STOCK_CONFIG = {"stock_code": "600036", "stock_name": "China Merchants Bank", "data_dir": "./data", "pred_days": 100, "output_dir": r"./examples/yuce"}
+    # STOCK_CONFIG = {"stock_code": "300750", "stock_name": "CATL", "data_dir": "./data", "pred_days": 100, "output_dir": r"./examples/yuce"}
     # =========================================================
 
     print("🤖 Intelligent Stock Prediction Tool")
