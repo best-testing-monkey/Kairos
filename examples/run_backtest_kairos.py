@@ -39,7 +39,7 @@ plt.rcParams['axes.unicode_minus'] = False
 SYMBOL = "BTC-USD"  # yfinance format
 LOOKBACK = 300  # bars fed to Kronos as context
 PRED_LEN = 60  # bars Kronos forecasts (= backtest period)
-PRED_SAMPLES = 10  # Prediction samples to average with
+PRED_SAMPLES = 100  # Prediction samples to average with
 INITIAL_CAPITAL = 100_000  # CNY
 THRESHOLD = 0.02  # predicted daily return to trigger a trade
 OUTPUT_DIR = "./output"
@@ -259,9 +259,9 @@ def plot_results(equity, actual_close, pred_close, metrics, symbol, output_dir):
     plt.close('all')
     print(f"Chart saved: {path}")
 
-def plot_results_candlesticks(equity, actual, pred_all, metrics, symbol, output_dir):
+def plot_results_candlesticks(equity, actual, predicted, metrics, symbol, output_dir):
 
-    pred_close = pd.Series(pred_all['close'].values)
+    # pred_close = pd.Series(predicted['close'].values)
     actual_close = actual["close"]
 
     os.makedirs(output_dir, exist_ok=True)
@@ -286,23 +286,22 @@ def plot_results_candlesticks(equity, actual, pred_all, metrics, symbol, output_
 
     # 2. Candlestick chart — Actual (left) and Predicted (right) per bar
     ax = axes[1]
-    n = min(len(actual), len(pred_all))
+    n = min(len(actual), len(predicted))
     xs = np.arange(n)
     w = 0.35  # half-width of each candle body
 
-    def _candles(ax, xs, ohlc, offset, color_up, color_down, alpha=0.85):
+    def _candles(ax, xs, ohlc, offset, color, alpha=0.85):
         for i, (_, row) in enumerate(ohlc.iterrows()):
             o, h, l, c = row['open'], row['high'], row['low'], row['close']
             x = xs[i] + offset
-            color = color_up if c >= o else color_down
             ax.plot([x, x], [l, h], color=color, linewidth=0.8, alpha=alpha)
             ax.add_patch(plt.Rectangle(
                 (x - w / 2, min(o, c)), w, abs(c - o),
                 color=color, alpha=alpha,
             ))
 
-    _candles(ax, xs, actual.iloc[:n],  offset=-w / 2, color_up='#26a69a', color_down='#ef5350')
-    _candles(ax, xs, pred_all.iloc[:n], offset=+w / 2, color_up='#42a5f5', color_down='#ff7043')
+    _candles(ax, xs, actual.iloc[:n],    offset=-w / 2, color='#26a69a')
+    _candles(ax, xs, predicted.iloc[:n], offset=+w / 2, color='#42a5f5')
 
     tick_step = max(1, n // 10)
     ax.set_xticks(xs[::tick_step])
@@ -312,8 +311,8 @@ def plot_results_candlesticks(equity, actual, pred_all, metrics, symbol, output_
     ax.set_ylabel('Price')
     from matplotlib.patches import Patch
     ax.legend(handles=[
-        Patch(color='#26a69a', label='Actual ↑'), Patch(color='#ef5350', label='Actual ↓'),
-        Patch(color='#42a5f5', label='Predicted ↑'), Patch(color='#ff7043', label='Predicted ↓'),
+        Patch(color='#26a69a', label='Actual'),
+        Patch(color='#42a5f5', label='Predicted'),
     ], fontsize=7)
     ax.grid(True, alpha=0.3)
 
@@ -360,6 +359,7 @@ if __name__ == "__main__":
 
     print("Step 1: Fetching data ...")
     x_df, x_ts, y_ts, actual = fetch_data(SYMBOL, LOOKBACK, PRED_LEN)
+    actual_full = actual.copy()
     actual_close = actual["close"]
     print(f"  Context : {len(x_df)} bars  ({x_ts.iloc[0].date()} → {x_ts.iloc[-1].date()})")
     print(f"  Actuals : {len(actual_close)} bars matched in price history")
@@ -367,13 +367,13 @@ if __name__ == "__main__":
     pred_all = []
     for pred_step in tqdm(range(PRED_LEN), desc="Walking steps"):
 
-        # result_list = []
-        # for sample in range(PRED_SAMPLES):
-        #     result_list += [run_model(x_df, x_ts, y_ts[:1], 1)]
-        # pred_all_df = pd.concat(result_list, ignore_index=True)
-        # pred_all += [trimmed_mean(pred_all_df)]
+        result_list = []
+        for sample in range(PRED_SAMPLES):
+            result_list += [run_model(x_df, x_ts, y_ts[:1], 1)]
+        pred_all_df = pd.concat(result_list, ignore_index=True)
+        pred_all += [trimmed_mean(pred_all_df)]
 
-        pred_all += [run_model(x_df, x_ts, y_ts[:1], 1, PRED_SAMPLES)]
+        # pred_all += [run_model(x_df, x_ts, y_ts[:1], 1, PRED_SAMPLES)]
 
         actual_first = actual[:1]
         x_df.index = x_ts.values
@@ -403,5 +403,5 @@ if __name__ == "__main__":
     print(f"  Final Capital : {metrics['final_capital']:,.0f} CNY")
 
     # plot_results(equity, actual_close, pred_close, metrics, SYMBOL, OUTPUT_DIR)
-    plot_results_candlesticks(equity, actual, pred_all, metrics, SYMBOL, OUTPUT_DIR)
+    plot_results_candlesticks(equity, actual_full, pred_all, metrics, SYMBOL, OUTPUT_DIR)
     print("\nDone.")
