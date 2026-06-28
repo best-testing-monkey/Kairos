@@ -334,7 +334,7 @@ def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, mo
     fig = make_subplots(
         rows=total_rows, cols=1,
         row_heights=row_heights,
-        shared_xaxes=False,
+        shared_xaxes=True,
         vertical_spacing=0.04,
         specs=specs,
     )
