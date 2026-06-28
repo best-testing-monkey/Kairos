@@ -137,104 +137,107 @@ def compute_signals(df, config):
 # ── Interactive control panel ─────────────────────────────────────────────────
 
 def _build_control_panel(signal_config, trace_groups):
-    """Build the HTML+CSS+JS signal control panel (toggle visibility only)."""
+    """Build two stacked HTML+CSS+JS signal panels: actual (all on) and pred (all off)."""
 
-    def _label(color, text, period_hint=''):
-        hint = f' <span style="color:#475569;font-size:10px">{period_hint}</span>' if period_hint else ''
-        return f'<label style="color:{color};cursor:pointer;flex:1">{text}{hint}</label>'
+    def _lbl(color, text, hint=''):
+        h = f' <span style="color:#475569;font-size:10px">{hint}</span>' if hint else ''
+        return f'<label style="color:{color};cursor:pointer;flex:1">{text}{h}</label>'
 
-    rows_html = []
+    def _row(fn, checked, color, text, hint=''):
+        ck = 'checked' if checked else ''
+        return f"""
+        <div class="signal-row">
+          <input type="checkbox" {ck} onchange="{fn}(this.checked)">
+          {_lbl(color, text, hint)}
+        </div>"""
+
+    actual_rows, pred_rows = [], []
 
     sma_periods = signal_config.get('sma_periods', [])
     if sma_periods:
         hint = ', '.join(str(p) for p in sma_periods)
-        rows_html.append(f"""
-        <div class="signal-row">
-          <input type="checkbox" checked onchange="toggleGroup('SMA',this.checked)">
-          {_label('#ffd700', 'SMA', hint)}
-        </div>""")
+        actual_rows.append(_row("function(v){toggleGroup('SMA',v)}", True, '#ffd700', 'SMA', hint))
+        pred_rows.append(_row("function(v){togglePredGroup('SMA',v)}", False, '#ffd700', 'SMA', hint))
 
     ema_periods = signal_config.get('ema_periods', [])
     if ema_periods:
         hint = ', '.join(str(p) for p in ema_periods)
-        rows_html.append(f"""
-        <div class="signal-row">
-          <input type="checkbox" checked onchange="toggleGroup('EMA',this.checked)">
-          {_label('#00e676', 'EMA', hint)}
-        </div>""")
+        actual_rows.append(_row("function(v){toggleGroup('EMA',v)}", True, '#00e676', 'EMA', hint))
+        pred_rows.append(_row("function(v){togglePredGroup('EMA',v)}", False, '#00e676', 'EMA', hint))
 
     if signal_config.get('bb'):
         bb = signal_config['bb']
-        rows_html.append(f"""
-        <div class="signal-row">
-          <input type="checkbox" checked onchange="toggleGroup('BB',this.checked)">
-          {_label(_BB_COLOR, 'Bollinger Bands', f"{bb['period']} / {bb['std']}σ")}
-        </div>""")
+        hint = f"{bb['period']} / {bb['std']}σ"
+        actual_rows.append(_row("function(v){toggleGroup('BB',v)}", True, _BB_COLOR, 'Bollinger Bands', hint))
+        pred_rows.append(_row("function(v){togglePredGroup('BB',v)}", False, _BB_COLOR, 'Bollinger Bands', hint))
 
     if signal_config.get('rsi'):
-        rows_html.append(f"""
-        <div class="signal-row">
-          <input type="checkbox" checked onchange="toggleGroup('RSI',this.checked)">
-          {_label(_RSI_COLOR, 'RSI', str(signal_config['rsi']['period']))}
-        </div>""")
+        hint = str(signal_config['rsi']['period'])
+        actual_rows.append(_row("function(v){toggleGroup('RSI',v)}", True, _RSI_COLOR, 'RSI', hint))
+        pred_rows.append(_row("function(v){togglePredGroup('RSI',v)}", False, _RSI_COLOR, 'RSI', hint))
 
     if signal_config.get('stoch'):
-        s = signal_config['stoch']
-        rows_html.append(f"""
-        <div class="signal-row">
-          <input type="checkbox" checked onchange="toggleGroup('STOCH',this.checked)">
-          {_label(_STOCH_K_COLOR, 'Stochastic', f"%K {s['k']} / %D {s['d']}")}
-        </div>""")
+        sc = signal_config['stoch']
+        hint = f"%K {sc['k']} / %D {sc['d']}"
+        actual_rows.append(_row("function(v){toggleGroup('STOCH',v)}", True, _STOCH_K_COLOR, 'Stochastic', hint))
+        pred_rows.append(_row("function(v){togglePredGroup('STOCH',v)}", False, _STOCH_K_COLOR, 'Stochastic', hint))
 
     if signal_config.get('macd'):
         m = signal_config['macd']
-        rows_html.append(f"""
-        <div class="signal-row">
-          <input type="checkbox" checked onchange="toggleGroup('MACD',this.checked)">
-          {_label(_MACD_LINE_COLOR, 'MACD', f"{m['fast']}/{m['slow']}/{m['signal_period']}")}
-        </div>""")
+        hint = f"{m['fast']}/{m['slow']}/{m['signal_period']}"
+        actual_rows.append(_row("function(v){toggleGroup('MACD',v)}", True, _MACD_LINE_COLOR, 'MACD', hint))
+        pred_rows.append(_row("function(v){togglePredGroup('MACD',v)}", False, _MACD_LINE_COLOR, 'MACD', hint))
 
     panel_html = f"""
 <style>
-#signal-panel {{
-  position: fixed; top: 60px; right: 10px;
+.sig-panel {{
   background: rgba(15,23,42,0.96);
   border: 1px solid #334155; border-radius: 8px;
-  padding: 12px 14px; z-index: 9999;
+  padding: 10px 14px;
   font-family: 'Courier New', monospace; font-size: 12px; color: #94a3b8;
-  min-width: 200px; max-height: 88vh; overflow-y: auto;
+  min-width: 200px;
   box-shadow: 0 4px 24px rgba(0,0,0,0.6);
 }}
-#signal-panel h3 {{
-  margin: 0 0 10px 0; color: #e2e8f0; font-size: 13px;
-  border-bottom: 1px solid #334155; padding-bottom: 6px;
+.sig-panel h3 {{
+  margin: 0 0 8px 0; color: #e2e8f0; font-size: 12px;
+  border-bottom: 1px solid #334155; padding-bottom: 5px;
   display: flex; justify-content: space-between; align-items: center;
 }}
-#signal-panel h3 button {{
+.sig-panel h3 button {{
   background: none; border: none; cursor: pointer;
-  color: #64748b; font-size: 13px; padding: 0;
+  color: #64748b; font-size: 12px; padding: 0; line-height: 1;
 }}
-#signal-panel h3 button:hover {{ color: #94a3b8; }}
+.sig-panel h3 button:hover {{ color: #94a3b8; }}
 .signal-row {{
-  display: flex; align-items: center; margin: 6px 0; gap: 6px;
+  display: flex; align-items: center; margin: 5px 0; gap: 6px;
 }}
-#panel-toggle {{
+#panels-container {{
+  position: fixed; top: 60px; right: 10px; z-index: 9999;
+  display: flex; flex-direction: column; gap: 8px;
+}}
+#panels-toggle {{
   position: fixed; top: 60px; right: 10px; z-index: 10000;
   background: rgba(15,23,42,0.9); border: 1px solid #334155;
   border-radius: 6px; color: #94a3b8; padding: 5px 10px;
   cursor: pointer; font-size: 11px; font-family: monospace;
   display: none;
 }}
-#panel-toggle:hover {{ color: #e2e8f0; }}
+#panels-toggle:hover {{ color: #e2e8f0; }}
 </style>
 
-<button id="panel-toggle" onclick="document.getElementById('signal-panel').style.display='block';this.style.display='none'">&#9654; Signals</button>
+<button id="panels-toggle" onclick="document.getElementById('panels-container').style.display='flex';this.style.display='none'">&#9654; Signals</button>
 
-<div id="signal-panel">
-  <h3>&#128200; Signals
-    <button onclick="document.getElementById('signal-panel').style.display='none';document.getElementById('panel-toggle').style.display='block'">&#x2715;</button>
-  </h3>
-  {''.join(rows_html)}
+<div id="panels-container">
+  <div class="sig-panel">
+    <h3>&#128200; Signals
+      <button onclick="document.getElementById('panels-container').style.display='none';document.getElementById('panels-toggle').style.display='block'">&#x2715;</button>
+    </h3>
+    {''.join(actual_rows)}
+  </div>
+  <div class="sig-panel">
+    <h3>&#183;&#183;&#183; Pred. Signals</h3>
+    {''.join(pred_rows)}
+  </div>
 </div>
 """
 
@@ -243,18 +246,29 @@ def _build_control_panel(signal_config, trace_groups):
 <script>
 (function() {{
   var DIV = '{CHART_DIV_ID}';
-  var traceGroups = {trace_groups_json};
+  var TG = {trace_groups_json};
 
+  // Actual signals: toggle between visible and legendonly
   window.toggleGroup = function(group, visible) {{
-    var indices = [];
-    for (var key in traceGroups) {{
-      if (key === group || key.startsWith(group + '_')) {{
-        indices = indices.concat(traceGroups[key]);
-      }}
+    var idx = [];
+    for (var k in TG) {{
+      if (!k.startsWith('pred_') && (k === group || k.startsWith(group + '_')))
+        idx = idx.concat(TG[k]);
     }}
-    if (indices.length === 0) return;
-    var vis = indices.map(function() {{ return visible ? true : 'legendonly'; }});
-    Plotly.restyle(DIV, {{visible: vis}}, indices);
+    if (!idx.length) return;
+    Plotly.restyle(DIV, {{visible: idx.map(function() {{ return visible ? true : 'legendonly'; }})}}, idx);
+  }};
+
+  // Predicted signals: toggle between visible and hidden (false)
+  window.togglePredGroup = function(group, visible) {{
+    var idx = [];
+    var prefix = 'pred_' + group;
+    for (var k in TG) {{
+      if (k === prefix || k.startsWith(prefix + '_'))
+        idx = idx.concat(TG[k]);
+    }}
+    if (!idx.length) return;
+    Plotly.restyle(DIV, {{visible: idx.map(function() {{ return visible ? true : false; }})}}, idx);
   }};
 }})();
 </script>
@@ -400,13 +414,15 @@ def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, mo
         if key in signals_actual:
             s = signals_actual[key]
             add(go.Scatter(x=s.index, y=s.values, name=f'SMA {period}',
-                           line=dict(color=color, width=1.5),
+                           mode='lines', line=dict(color=color, width=1.5),
                            legendgroup=key), row=2, group=key)
         if key in signals_pred:
             s = signals_pred[key]
+            pred_key = f'pred_{key}'
             add(go.Scatter(x=s.index, y=s.values, name=f'SMA {period} (pred)',
-                           line=dict(color=color, width=1.5, dash='dash'), opacity=0.6,
-                           legendgroup=key, showlegend=False), row=2, group=key)
+                           mode='lines', line=dict(color=color, width=1.5, dash='dot'),
+                           visible=False, legendgroup=pred_key, showlegend=False),
+                row=2, group=pred_key)
 
     ema_periods = signal_config.get('ema_periods', [])
     for i, period in enumerate(ema_periods):
@@ -415,53 +431,64 @@ def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, mo
         if key in signals_actual:
             s = signals_actual[key]
             add(go.Scatter(x=s.index, y=s.values, name=f'EMA {period}',
-                           line=dict(color=color, width=1.5),
+                           mode='lines', line=dict(color=color, width=1.5),
                            legendgroup=key), row=2, group=key)
         if key in signals_pred:
             s = signals_pred[key]
+            pred_key = f'pred_{key}'
             add(go.Scatter(x=s.index, y=s.values, name=f'EMA {period} (pred)',
-                           line=dict(color=color, width=1.5, dash='dash'), opacity=0.6,
-                           legendgroup=key, showlegend=False), row=2, group=key)
+                           mode='lines', line=dict(color=color, width=1.5, dash='dot'),
+                           visible=False, legendgroup=pred_key, showlegend=False),
+                row=2, group=pred_key)
 
     if signal_config.get('bb'):
-        # Add upper, lower (fill between), mid for both actual and pred
-        bb_pairs = [
-            ('BB_upper', 'dot', None, None),
-            ('BB_lower', 'dot', 'tonexty', 'rgba(206,147,216,0.08)'),
-            ('BB_mid', 'solid', None, None),
+        # Actual BB: solid continuous lines with fill
+        bb_pairs_actual = [
+            ('BB_upper', None, None),
+            ('BB_lower', 'tonexty', 'rgba(206,147,216,0.08)'),
+            ('BB_mid', None, None),
         ]
-        for key, style, fill, fillcolor in bb_pairs:
+        for key, fill, fillcolor in bb_pairs_actual:
             show_legend = (key == 'BB_upper')
             if key in signals_actual:
                 s = signals_actual[key]
                 add(go.Scatter(x=s.index, y=s.values,
                                name='Bollinger Bands' if show_legend else key,
-                               line=dict(color=_BB_COLOR, width=1, dash=style),
+                               mode='lines', line=dict(color=_BB_COLOR, width=1),
                                fill=fill, fillcolor=fillcolor,
                                legendgroup='BB', showlegend=show_legend), row=2, group=key)
+        # Pred BB: dotted lines, hidden by default
+        bb_pairs_pred = [
+            ('BB_upper', None, None),
+            ('BB_lower', 'tonexty', 'rgba(206,147,216,0.04)'),
+            ('BB_mid', None, None),
+        ]
+        for key, fill, fillcolor in bb_pairs_pred:
+            pred_key = f'pred_{key}'
             if key in signals_pred:
                 s = signals_pred[key]
                 add(go.Scatter(x=s.index, y=s.values,
                                name=f'{key} (pred)',
-                               line=dict(color=_BB_COLOR, width=1, dash=style),
-                               fill=fill,
-                               fillcolor='rgba(206,147,216,0.04)' if fillcolor else None,
-                               opacity=0.5, legendgroup='BB', showlegend=False), row=2, group=key)
+                               mode='lines', line=dict(color=_BB_COLOR, width=1, dash='dot'),
+                               fill=fill, fillcolor=fillcolor,
+                               visible=False, legendgroup='pred_BB', showlegend=False),
+                    row=2, group=pred_key)
 
     # ── Oscillator rows ──────────────────────────────────────────────────────
     for osc_name, osc_row in osc_row_defs:
         if osc_name == 'RSI':
-            for sig_dict, dash, opacity, suffix, show in [
-                (signals_actual, 'solid', 1.0, '', True),
-                (signals_pred, 'dash', 0.6, ' (pred)', False),
-            ]:
-                if 'RSI' in sig_dict:
-                    s = sig_dict['RSI']
-                    add(go.Scatter(x=s.index, y=s.values, name=f'RSI{suffix}',
-                                   line=dict(color=_RSI_COLOR, width=1.5, dash=dash),
-                                   opacity=opacity, legendgroup='RSI', showlegend=show),
-                        row=osc_row, group='RSI')
-            # Overbought / oversold bands
+            if 'RSI' in signals_actual:
+                s = signals_actual['RSI']
+                add(go.Scatter(x=s.index, y=s.values, name='RSI',
+                               mode='lines', line=dict(color=_RSI_COLOR, width=1.5),
+                               legendgroup='RSI', showlegend=True),
+                    row=osc_row, group='RSI')
+            if 'RSI' in signals_pred:
+                s = signals_pred['RSI']
+                add(go.Scatter(x=s.index, y=s.values, name='RSI (pred)',
+                               mode='lines', line=dict(color=_RSI_COLOR, width=1.5, dash='dot'),
+                               visible=False, legendgroup='pred_RSI', showlegend=False),
+                    row=osc_row, group='pred_RSI')
             if 'RSI' in signals_actual:
                 ref_x = [signals_actual['RSI'].index[0], signals_actual['RSI'].index[-1]]
                 for lvl in [70, 30]:
@@ -470,22 +497,30 @@ def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, mo
                                    showlegend=False, hoverinfo='skip'), row=osc_row)
 
         elif osc_name == 'STOCH':
-            for sig_dict, dash, opacity, suffix, show in [
-                (signals_actual, 'solid', 1.0, '', True),
-                (signals_pred, 'dash', 0.6, ' (pred)', False),
-            ]:
-                if 'STOCH_K' in sig_dict:
-                    s = sig_dict['STOCH_K']
-                    add(go.Scatter(x=s.index, y=s.values, name=f'%K{suffix}',
-                                   line=dict(color=_STOCH_K_COLOR, width=1.5, dash=dash),
-                                   opacity=opacity, legendgroup='STOCH', showlegend=show),
-                        row=osc_row, group='STOCH_K')
-                if 'STOCH_D' in sig_dict:
-                    s = sig_dict['STOCH_D']
-                    add(go.Scatter(x=s.index, y=s.values, name=f'%D{suffix}',
-                                   line=dict(color=_STOCH_D_COLOR, width=1.5, dash=dash),
-                                   opacity=opacity, legendgroup='STOCH', showlegend=show),
-                        row=osc_row, group='STOCH_D')
+            if 'STOCH_K' in signals_actual:
+                s = signals_actual['STOCH_K']
+                add(go.Scatter(x=s.index, y=s.values, name='%K',
+                               mode='lines', line=dict(color=_STOCH_K_COLOR, width=1.5),
+                               legendgroup='STOCH', showlegend=True),
+                    row=osc_row, group='STOCH_K')
+            if 'STOCH_D' in signals_actual:
+                s = signals_actual['STOCH_D']
+                add(go.Scatter(x=s.index, y=s.values, name='%D',
+                               mode='lines', line=dict(color=_STOCH_D_COLOR, width=1.5),
+                               legendgroup='STOCH', showlegend=True),
+                    row=osc_row, group='STOCH_D')
+            if 'STOCH_K' in signals_pred:
+                s = signals_pred['STOCH_K']
+                add(go.Scatter(x=s.index, y=s.values, name='%K (pred)',
+                               mode='lines', line=dict(color=_STOCH_K_COLOR, width=1.5, dash='dot'),
+                               visible=False, legendgroup='pred_STOCH', showlegend=False),
+                    row=osc_row, group='pred_STOCH_K')
+            if 'STOCH_D' in signals_pred:
+                s = signals_pred['STOCH_D']
+                add(go.Scatter(x=s.index, y=s.values, name='%D (pred)',
+                               mode='lines', line=dict(color=_STOCH_D_COLOR, width=1.5, dash='dot'),
+                               visible=False, legendgroup='pred_STOCH', showlegend=False),
+                    row=osc_row, group='pred_STOCH_D')
             if 'STOCH_K' in signals_actual:
                 ref_x = [signals_actual['STOCH_K'].index[0], signals_actual['STOCH_K'].index[-1]]
                 for lvl in [80, 20]:
@@ -494,34 +529,49 @@ def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, mo
                                    showlegend=False, hoverinfo='skip'), row=osc_row)
 
         elif osc_name == 'MACD':
-            for sig_dict, dash, opacity, suffix, show in [
-                (signals_actual, 'solid', 1.0, '', True),
-                (signals_pred, 'dash', 0.6, ' (pred)', False),
-            ]:
-                if 'MACD_line' in sig_dict:
-                    s = sig_dict['MACD_line']
-                    add(go.Scatter(x=s.index, y=s.values, name=f'MACD{suffix}',
-                                   line=dict(color=_MACD_LINE_COLOR, width=1.5, dash=dash),
-                                   opacity=opacity, legendgroup='MACD', showlegend=show),
-                        row=osc_row, group='MACD_line')
-                if 'MACD_signal' in sig_dict:
-                    s = sig_dict['MACD_signal']
-                    add(go.Scatter(x=s.index, y=s.values, name=f'Signal{suffix}',
-                                   line=dict(color=_MACD_SIG_COLOR, width=1.5, dash=dash),
-                                   opacity=opacity, legendgroup='MACD', showlegend=show),
-                        row=osc_row, group='MACD_signal')
-                if 'MACD_hist' in sig_dict:
-                    h = sig_dict['MACD_hist']
-                    bar_colors = [
-                        'rgba(38,166,154,0.7)' if (v is not None and not np.isnan(v) and v >= 0)
-                        else 'rgba(239,83,80,0.7)'
-                        for v in h.values
-                    ]
-                    add(go.Bar(x=h.index, y=h.values, name=f'Histogram{suffix}',
-                               marker_color=bar_colors,
-                               opacity=opacity if dash == 'dash' else 1.0,
-                               legendgroup='MACD', showlegend=False),
-                        row=osc_row, group='MACD_hist')
+            if 'MACD_line' in signals_actual:
+                s = signals_actual['MACD_line']
+                add(go.Scatter(x=s.index, y=s.values, name='MACD',
+                               mode='lines', line=dict(color=_MACD_LINE_COLOR, width=1.5),
+                               legendgroup='MACD', showlegend=True),
+                    row=osc_row, group='MACD_line')
+            if 'MACD_signal' in signals_actual:
+                s = signals_actual['MACD_signal']
+                add(go.Scatter(x=s.index, y=s.values, name='Signal',
+                               mode='lines', line=dict(color=_MACD_SIG_COLOR, width=1.5),
+                               legendgroup='MACD', showlegend=True),
+                    row=osc_row, group='MACD_signal')
+            if 'MACD_hist' in signals_actual:
+                h = signals_actual['MACD_hist']
+                bar_colors = [
+                    'rgba(38,166,154,0.7)' if (v is not None and not np.isnan(v) and v >= 0)
+                    else 'rgba(239,83,80,0.7)' for v in h.values
+                ]
+                add(go.Bar(x=h.index, y=h.values, name='Histogram',
+                           marker_color=bar_colors, legendgroup='MACD', showlegend=False),
+                    row=osc_row, group='MACD_hist')
+            if 'MACD_line' in signals_pred:
+                s = signals_pred['MACD_line']
+                add(go.Scatter(x=s.index, y=s.values, name='MACD (pred)',
+                               mode='lines', line=dict(color=_MACD_LINE_COLOR, width=1.5, dash='dot'),
+                               visible=False, legendgroup='pred_MACD', showlegend=False),
+                    row=osc_row, group='pred_MACD_line')
+            if 'MACD_signal' in signals_pred:
+                s = signals_pred['MACD_signal']
+                add(go.Scatter(x=s.index, y=s.values, name='Signal (pred)',
+                               mode='lines', line=dict(color=_MACD_SIG_COLOR, width=1.5, dash='dot'),
+                               visible=False, legendgroup='pred_MACD', showlegend=False),
+                    row=osc_row, group='pred_MACD_signal')
+            if 'MACD_hist' in signals_pred:
+                h = signals_pred['MACD_hist']
+                pred_bar_colors = [
+                    'rgba(38,166,154,0.4)' if (v is not None and not np.isnan(v) and v >= 0)
+                    else 'rgba(239,83,80,0.4)' for v in h.values
+                ]
+                add(go.Bar(x=h.index, y=h.values, name='Histogram (pred)',
+                           marker_color=pred_bar_colors, visible=False,
+                           legendgroup='pred_MACD', showlegend=False),
+                    row=osc_row, group='pred_MACD_hist')
 
     # ── Drawdown ─────────────────────────────────────────────────────────────
     peak = equity.expanding().max()
