@@ -7,11 +7,12 @@ context window; the strategy trades on predicted direction vs actual close price
 Data is fetched live via price_cache — no local CSV files required.
 
 Usage:
-    python run_backtest_kronos.py
+    python run_backtest_kronos.py [--model PATH] [--tokenizer PATH]
 
 Output:
     - ./output/<symbol>_backtest_results.png
 """
+import argparse
 import matplotlib
 from huggingface_hub.utils import tqdm
 from pandas import DataFrame
@@ -107,12 +108,15 @@ bt_model = None
 bt_predictor = None
 
 
-def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1):
+def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
+              model_path=None, tokenizer_path=None):
     global bt_tokenizer, bt_model, bt_predictor
     if bt_tokenizer is None or bt_model is None or bt_predictor is None:
-        print("Loading Kronos model ...")
-        bt_tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
-        bt_model = Kronos.from_pretrained("NeoQuasar/Kronos-base")
+        tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
+        mdl_src = model_path or "NeoQuasar/Kronos-base"
+        print(f"Loading Kronos model from {mdl_src} ...")
+        bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
+        bt_model = Kronos.from_pretrained(mdl_src)
         bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=512)
 
     # print("Running prediction ...")
@@ -124,7 +128,7 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1):
         T=1.0,
         top_p=0.9,
         sample_count=sample_count,
-        verbose=True,
+        verbose=pred_len > 1,
     )
     return pred_df
 
@@ -259,13 +263,13 @@ def plot_results(equity, actual_close, pred_close, metrics, symbol, output_dir):
     plt.close('all')
     print(f"Chart saved: {path}")
 
-def plot_results_candlesticks(equity, actual, predicted, metrics, symbol, output_dir):
-
-    # pred_close = pd.Series(predicted['close'].values)
+def plot_results_candlesticks(equity, actual, predicted, metrics, symbol,
+                              output_path, model_label):
     actual_close = actual["close"]
 
-    os.makedirs(output_dir, exist_ok=True)
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    fig, axes = plt.subplots(4, 1, figsize=(14, 13),
+                             gridspec_kw={'height_ratios': [3, 3, 2, 1.2]})
 
     # 1. Equity vs benchmark
     ax = axes[0]
@@ -277,12 +281,6 @@ def plot_results_candlesticks(equity, actual, predicted, metrics, symbol, output
     ax.set_title(f'{symbol} — Kronos Walk-Forward Backtest', fontweight='bold')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    metrics_txt = (f"Return: {metrics['total_return']:.1%}  "
-                   f"Sharpe: {metrics['sharpe']:.2f}  "
-                   f"MaxDD: {metrics['max_drawdown']:.1%}  "
-                   f"WinRate: {metrics['win_rate']:.0%}  "
-                   f"Trades: {metrics['trades']}")
-    ax.set_xlabel(metrics_txt, fontsize=9)
 
     # 2. Candlestick chart — Actual (left) and Predicted (right) per bar
     ax = axes[1]
@@ -325,11 +323,28 @@ def plot_results_candlesticks(equity, actual, predicted, metrics, symbol, output
     ax.set_xlabel('Date')
     ax.grid(True, alpha=0.3)
 
+    # 4. Report text panel
+    ax = axes[3]
+    ax.axis('off')
+    report_lines = [
+        f"Model:          {model_label}",
+        f"Total Return:   {metrics['total_return']:+.2%}    "
+        f"Annual Return:  {metrics['annual_return']:+.2%}    "
+        f"Sharpe:         {metrics['sharpe']:.2f}",
+        f"Max Drawdown:   {metrics['max_drawdown']:.2%}    "
+        f"Win Rate:       {metrics['win_rate']:.0%}          "
+        f"Trades:         {metrics['trades']}",
+        f"Final Capital:  {metrics['final_capital']:,.0f} CNY",
+    ]
+    ax.text(0.01, 0.95, '\n'.join(report_lines),
+            transform=ax.transAxes, fontsize=8.5,
+            verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='#f5f5f5', alpha=0.8))
+
     plt.tight_layout()
-    path = os.path.join(output_dir, f"{symbol.replace('.', '_')}_backtest_results.png")
-    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close('all')
-    print(f"Chart saved: {path}")
+    print(f"Chart saved: {output_path}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -348,6 +363,18 @@ def trimmed_mean(df: DataFrame, trim_max_factor=0.10) -> DataFrame:
     return DataFrame([retVal], index=[df.index[0]])
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Kairos walk-forward backtest")
+    parser.add_argument("--model", metavar="PATH", default=None,
+                        help="Local path to finetuned Kronos predictor (defaults to NeoQuasar/Kronos-base)")
+    parser.add_argument("--tokenizer", metavar="PATH", default=None,
+                        help="Local path to Kronos tokenizer (defaults to NeoQuasar/Kronos-Tokenizer-base)")
+    parser.add_argument("--output", metavar="PATH", default=None,
+                        help="Output PNG path (defaults to ./output/<symbol>_backtest_results.png)")
+    args = parser.parse_args()
+
+    _model_label = args.model or "NeoQuasar/Kronos-base"
+    _output_path = args.output or os.path.join(OUTPUT_DIR, f"{SYMBOL.replace('.', '_')}_backtest_results.png")
+
     print("🤖 Kairos Walk-Forward Backtest")
     print(f"   Symbol:          {SYMBOL}")
     print(f"   Context window:  {LOOKBACK} bars")
@@ -369,7 +396,8 @@ if __name__ == "__main__":
 
         result_list = []
         for sample in range(PRED_SAMPLES):
-            result_list += [run_model(x_df, x_ts, y_ts[:1], 1)]
+            result_list += [run_model(x_df, x_ts, y_ts[:1], 1,
+                                      model_path=args.model, tokenizer_path=args.tokenizer)]
         pred_all_df = pd.concat(result_list, ignore_index=True)
         pred_all += [trimmed_mean(pred_all_df)]
 
@@ -403,5 +431,6 @@ if __name__ == "__main__":
     print(f"  Final Capital : {metrics['final_capital']:,.0f} CNY")
 
     # plot_results(equity, actual_close, pred_close, metrics, SYMBOL, OUTPUT_DIR)
-    plot_results_candlesticks(equity, actual_full, pred_all, metrics, SYMBOL, OUTPUT_DIR)
+    plot_results_candlesticks(equity, actual_full, pred_all, metrics, SYMBOL,
+                              _output_path, _model_label)
     print("\nDone.")

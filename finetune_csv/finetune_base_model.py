@@ -415,6 +415,18 @@ def train_model(model, tokenizer, device, config, save_dir, logger):
         if rank == 0:
             print(epoch_summary)
         
+        if rank == 0:
+            epoch_num = epoch + 1
+            epoch_save_path = os.path.join(save_dir, f"epoch_{epoch_num:03d}")
+            while os.path.exists(epoch_save_path):
+                epoch_num += 1
+                epoch_save_path = os.path.join(save_dir, f"epoch_{epoch_num:03d}")
+            os.makedirs(epoch_save_path, exist_ok=True)
+            (model.module if use_ddp else model).save_pretrained(epoch_save_path)
+            epoch_save_msg = f"Epoch checkpoint saved to: {epoch_save_path} (val loss: {avg_val_loss:.4f})"
+            logger.info(epoch_save_msg)
+            print(epoch_save_msg)
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             if rank == 0:
@@ -455,7 +467,7 @@ def main():
     if getattr(config, 'pre_trained_tokenizer', True):
         tokenizer = KronosTokenizer.from_pretrained(config.finetuned_tokenizer_path)
     else:
-        import json, os
+        import json
         print("pre_trained_tokenizer=False, randomly initializing Tokenizer architecture for training")
         cfg_path_tok = os.path.join(config.pretrained_tokenizer_path if hasattr(config, 'pretrained_tokenizer_path') else config.finetuned_tokenizer_path, 'config.json')
         with open(cfg_path_tok, 'r') as f:
@@ -482,7 +494,7 @@ def main():
     if getattr(config, 'pre_trained_predictor', True):
         model = Kronos.from_pretrained(config.pretrained_predictor_path)
     else:
-        import json, os
+        import json
         print("pre_trained_predictor=False, randomly initializing Predictor architecture for training")
         cfg_path = os.path.join(config.pretrained_predictor_path, 'config.json')
         with open(cfg_path, 'r') as f:

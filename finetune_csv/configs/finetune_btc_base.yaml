@@ -1,0 +1,50 @@
+data:
+  data_path: "/media/baz/MonkeyWorks/PycharmProjects/Kairos/finetune_csv/train_data/BTC-USD_1d.csv"
+  lookback_window: 300
+  predict_window: 60
+  max_context: 512
+  clip: 5.0
+  train_ratio: 0.85
+  val_ratio: 0.15
+  test_ratio: 0.0
+
+training:
+  tokenizer_epochs: 10
+  basemodel_epochs: 20
+  batch_size: 4
+  log_interval: 20
+  num_workers: 4
+  seed: 42
+  tokenizer_learning_rate: 2.0e-4
+  predictor_learning_rate: 4.0e-5
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_weight_decay: 0.1
+  accumulation_steps: 8
+
+model_paths:
+  exp_name: "btc_base_finetune"
+  pretrained_tokenizer: "/home/baz/.cache/huggingface/hub/models--NeoQuasar--Kronos-Tokenizer-base/snapshots/0e0117387f39004a9016484a186a908917e22426"
+  pretrained_predictor: "/home/baz/.cache/huggingface/hub/models--NeoQuasar--Kronos-base/snapshots/2b554741eca47781b64468546e77fef3e85130e6"
+  finetuned_tokenizer: "/home/baz/.cache/huggingface/hub/models--NeoQuasar--Kronos-Tokenizer-base/snapshots/0e0117387f39004a9016484a186a908917e22426"
+  base_save_path: "/media/baz/MonkeyWorks/PycharmProjects/Kairos/finetune_csv/models/btc_base_finetune"
+  tokenizer_save_name: "tokenizer"
+  basemodel_save_name: "basemodel"
+
+experiment:
+  name: "btc_base_finetune"
+  description: "Fine-tune Kronos-base on BTC-USD daily data"
+  train_tokenizer: true
+  train_basemodel: true
+  pre_trained_tokenizer: true
+  pre_trained_predictor: true
+  use_comet: false
+  skip_existing: false
+
+device:
+  use_cuda: true
+  device_id: 0
+
+distributed:
+  use_ddp: false
+  backend: "nccl"
