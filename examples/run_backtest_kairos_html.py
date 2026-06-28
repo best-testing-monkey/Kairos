@@ -143,11 +143,12 @@ def _build_control_panel(signal_config, trace_groups):
         h = f' <span style="color:#475569;font-size:10px">{hint}</span>' if hint else ''
         return f'<label style="color:{color};cursor:pointer;flex:1">{text}{h}</label>'
 
-    def _row(fn, checked, color, text, hint=''):
+    def _row(group, pred, checked, color, text, hint=''):
+        fn = f"togglePredGroup('{group}',this.checked)" if pred else f"toggleGroup('{group}',this.checked)"
         ck = 'checked' if checked else ''
         return f"""
         <div class="signal-row">
-          <input type="checkbox" {ck} onchange="{fn}(this.checked)">
+          <input type="checkbox" {ck} onchange="{fn}">
           {_lbl(color, text, hint)}
         </div>"""
 
@@ -156,37 +157,37 @@ def _build_control_panel(signal_config, trace_groups):
     sma_periods = signal_config.get('sma_periods', [])
     if sma_periods:
         hint = ', '.join(str(p) for p in sma_periods)
-        actual_rows.append(_row("function(v){toggleGroup('SMA',v)}", True, '#ffd700', 'SMA', hint))
-        pred_rows.append(_row("function(v){togglePredGroup('SMA',v)}", False, '#ffd700', 'SMA', hint))
+        actual_rows.append(_row('SMA', False, True,  '#ffd700', 'SMA', hint))
+        pred_rows.append(  _row('SMA', True,  False, '#ffd700', 'SMA', hint))
 
     ema_periods = signal_config.get('ema_periods', [])
     if ema_periods:
         hint = ', '.join(str(p) for p in ema_periods)
-        actual_rows.append(_row("function(v){toggleGroup('EMA',v)}", True, '#00e676', 'EMA', hint))
-        pred_rows.append(_row("function(v){togglePredGroup('EMA',v)}", False, '#00e676', 'EMA', hint))
+        actual_rows.append(_row('EMA', False, True,  '#00e676', 'EMA', hint))
+        pred_rows.append(  _row('EMA', True,  False, '#00e676', 'EMA', hint))
 
     if signal_config.get('bb'):
         bb = signal_config['bb']
         hint = f"{bb['period']} / {bb['std']}σ"
-        actual_rows.append(_row("function(v){toggleGroup('BB',v)}", True, _BB_COLOR, 'Bollinger Bands', hint))
-        pred_rows.append(_row("function(v){togglePredGroup('BB',v)}", False, _BB_COLOR, 'Bollinger Bands', hint))
+        actual_rows.append(_row('BB', False, True,  _BB_COLOR, 'Bollinger Bands', hint))
+        pred_rows.append(  _row('BB', True,  False, _BB_COLOR, 'Bollinger Bands', hint))
 
     if signal_config.get('rsi'):
         hint = str(signal_config['rsi']['period'])
-        actual_rows.append(_row("function(v){toggleGroup('RSI',v)}", True, _RSI_COLOR, 'RSI', hint))
-        pred_rows.append(_row("function(v){togglePredGroup('RSI',v)}", False, _RSI_COLOR, 'RSI', hint))
+        actual_rows.append(_row('RSI', False, True,  _RSI_COLOR, 'RSI', hint))
+        pred_rows.append(  _row('RSI', True,  False, _RSI_COLOR, 'RSI', hint))
 
     if signal_config.get('stoch'):
         sc = signal_config['stoch']
         hint = f"%K {sc['k']} / %D {sc['d']}"
-        actual_rows.append(_row("function(v){toggleGroup('STOCH',v)}", True, _STOCH_K_COLOR, 'Stochastic', hint))
-        pred_rows.append(_row("function(v){togglePredGroup('STOCH',v)}", False, _STOCH_K_COLOR, 'Stochastic', hint))
+        actual_rows.append(_row('STOCH', False, True,  _STOCH_K_COLOR, 'Stochastic', hint))
+        pred_rows.append(  _row('STOCH', True,  False, _STOCH_K_COLOR, 'Stochastic', hint))
 
     if signal_config.get('macd'):
         m = signal_config['macd']
         hint = f"{m['fast']}/{m['slow']}/{m['signal_period']}"
-        actual_rows.append(_row("function(v){toggleGroup('MACD',v)}", True, _MACD_LINE_COLOR, 'MACD', hint))
-        pred_rows.append(_row("function(v){togglePredGroup('MACD',v)}", False, _MACD_LINE_COLOR, 'MACD', hint))
+        actual_rows.append(_row('MACD', False, True,  _MACD_LINE_COLOR, 'MACD', hint))
+        pred_rows.append(  _row('MACD', True,  False, _MACD_LINE_COLOR, 'MACD', hint))
 
     panel_html = f"""
 <style>
