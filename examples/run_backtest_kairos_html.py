@@ -136,81 +136,62 @@ def compute_signals(df, config):
 
 # ── Interactive control panel ─────────────────────────────────────────────────
 
-def _nan_safe(values):
-    """Convert pandas Series or array to list, replacing NaN with None for JSON."""
-    return [None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
-            for v in values]
+def _build_control_panel(signal_config, trace_groups):
+    """Build the HTML+CSS+JS signal control panel (toggle visibility only)."""
 
+    def _label(color, text, period_hint=''):
+        hint = f' <span style="color:#475569;font-size:10px">{period_hint}</span>' if period_hint else ''
+        return f'<label style="color:{color};cursor:pointer;flex:1">{text}{hint}</label>'
 
-def _build_control_panel(signal_config, trace_groups, embed_data):
-    """Build the HTML+CSS+JS control panel to inject into the output HTML."""
-
-    # Build panel rows HTML
     rows_html = []
 
     sma_periods = signal_config.get('sma_periods', [])
     if sma_periods:
+        hint = ', '.join(str(p) for p in sma_periods)
         rows_html.append(f"""
         <div class="signal-row">
-          <input type="checkbox" id="chk-SMA" checked onchange="toggleGroup('SMA',this.checked)">
-          <label for="chk-SMA" style="color:#ffd700">SMA</label>
-          <input class="period-input" id="sma-periods" value="{','.join(str(p) for p in sma_periods)}" title="Comma-separated periods">
-          <button class="apply-btn" onclick="applySMA()">Apply</button>
+          <input type="checkbox" checked onchange="toggleGroup('SMA',this.checked)">
+          {_label('#ffd700', 'SMA', hint)}
         </div>""")
 
     ema_periods = signal_config.get('ema_periods', [])
     if ema_periods:
+        hint = ', '.join(str(p) for p in ema_periods)
         rows_html.append(f"""
         <div class="signal-row">
-          <input type="checkbox" id="chk-EMA" checked onchange="toggleGroup('EMA',this.checked)">
-          <label for="chk-EMA" style="color:#00e676">EMA</label>
-          <input class="period-input" id="ema-periods" value="{','.join(str(p) for p in ema_periods)}" title="Comma-separated periods">
-          <button class="apply-btn" onclick="applyEMA()">Apply</button>
+          <input type="checkbox" checked onchange="toggleGroup('EMA',this.checked)">
+          {_label('#00e676', 'EMA', hint)}
         </div>""")
 
     if signal_config.get('bb'):
-        bb_period = signal_config['bb']['period']
+        bb = signal_config['bb']
         rows_html.append(f"""
         <div class="signal-row">
-          <input type="checkbox" id="chk-BB" checked onchange="toggleGroup('BB',this.checked)">
-          <label for="chk-BB" style="color:{_BB_COLOR}">Bollinger Bands</label>
-          <input class="period-input" id="bb-period" value="{bb_period}" style="width:40px" title="Period">
-          <button class="apply-btn" onclick="applyBB()">Apply</button>
+          <input type="checkbox" checked onchange="toggleGroup('BB',this.checked)">
+          {_label(_BB_COLOR, 'Bollinger Bands', f"{bb['period']} / {bb['std']}σ")}
         </div>""")
 
     if signal_config.get('rsi'):
-        rsi_period = signal_config['rsi']['period']
         rows_html.append(f"""
         <div class="signal-row">
-          <input type="checkbox" id="chk-RSI" checked onchange="toggleGroup('RSI',this.checked)">
-          <label for="chk-RSI" style="color:{_RSI_COLOR}">RSI</label>
-          <input class="period-input" id="rsi-period" value="{rsi_period}" style="width:40px" title="Period">
-          <button class="apply-btn" onclick="applyRSI()">Apply</button>
+          <input type="checkbox" checked onchange="toggleGroup('RSI',this.checked)">
+          {_label(_RSI_COLOR, 'RSI', str(signal_config['rsi']['period']))}
         </div>""")
 
     if signal_config.get('stoch'):
-        stoch = signal_config['stoch']
+        s = signal_config['stoch']
         rows_html.append(f"""
         <div class="signal-row">
-          <input type="checkbox" id="chk-STOCH" checked onchange="toggleGroup('STOCH',this.checked)">
-          <label for="chk-STOCH" style="color:{_STOCH_K_COLOR}">Stochastic</label>
-          <span style="font-size:10px;color:#64748b">%K</span>
-          <input class="period-input" id="stoch-k" value="{stoch['k']}" style="width:32px" title="%K period">
-          <span style="font-size:10px;color:#64748b">%D</span>
-          <input class="period-input" id="stoch-d" value="{stoch['d']}" style="width:32px" title="%D period">
-          <button class="apply-btn" onclick="applySTOCH()">Apply</button>
+          <input type="checkbox" checked onchange="toggleGroup('STOCH',this.checked)">
+          {_label(_STOCH_K_COLOR, 'Stochastic', f"%K {s['k']} / %D {s['d']}")}
         </div>""")
 
     if signal_config.get('macd'):
-        macd = signal_config['macd']
+        m = signal_config['macd']
         rows_html.append(f"""
         <div class="signal-row">
-          <input type="checkbox" id="chk-MACD" checked onchange="toggleGroup('MACD',this.checked)">
-          <label for="chk-MACD" style="color:{_MACD_LINE_COLOR}">MACD</label>
-          <input class="period-input" id="macd-fast" value="{macd['fast']}" style="width:32px" title="Fast EMA">
-          <input class="period-input" id="macd-slow" value="{macd['slow']}" style="width:32px" title="Slow EMA">
-          <input class="period-input" id="macd-sig" value="{macd['signal_period']}" style="width:32px" title="Signal">
-          <button class="apply-btn" onclick="applyMACD()">Apply</button>
+          <input type="checkbox" checked onchange="toggleGroup('MACD',this.checked)">
+          {_label(_MACD_LINE_COLOR, 'MACD', f"{m['fast']}/{m['slow']}/{m['signal_period']}")}
         </div>""")
 
     panel_html = f"""
@@ -221,7 +202,7 @@ def _build_control_panel(signal_config, trace_groups, embed_data):
   border: 1px solid #334155; border-radius: 8px;
   padding: 12px 14px; z-index: 9999;
   font-family: 'Courier New', monospace; font-size: 12px; color: #94a3b8;
-  min-width: 240px; max-height: 88vh; overflow-y: auto;
+  min-width: 200px; max-height: 88vh; overflow-y: auto;
   box-shadow: 0 4px 24px rgba(0,0,0,0.6);
 }}
 #signal-panel h3 {{
@@ -229,22 +210,14 @@ def _build_control_panel(signal_config, trace_groups, embed_data):
   border-bottom: 1px solid #334155; padding-bottom: 6px;
   display: flex; justify-content: space-between; align-items: center;
 }}
-#signal-panel h3 span {{ cursor: pointer; color: #64748b; font-size: 11px; }}
-#signal-panel h3 span:hover {{ color: #94a3b8; }}
+#signal-panel h3 button {{
+  background: none; border: none; cursor: pointer;
+  color: #64748b; font-size: 13px; padding: 0;
+}}
+#signal-panel h3 button:hover {{ color: #94a3b8; }}
 .signal-row {{
-  display: flex; align-items: center; margin: 5px 0; gap: 5px; flex-wrap: wrap;
+  display: flex; align-items: center; margin: 6px 0; gap: 6px;
 }}
-.signal-row label {{ cursor: pointer; flex: 1; min-width: 80px; }}
-.period-input {{
-  width: 55px; background: #0f172a; border: 1px solid #475569;
-  border-radius: 4px; color: #94a3b8; padding: 2px 4px;
-  font-family: monospace; font-size: 11px;
-}}
-.apply-btn {{
-  background: #1d4ed8; border: none; border-radius: 4px;
-  color: white; padding: 2px 7px; cursor: pointer; font-size: 11px;
-}}
-.apply-btn:hover {{ background: #2563eb; }}
 #panel-toggle {{
   position: fixed; top: 60px; right: 10px; z-index: 10000;
   background: rgba(15,23,42,0.9); border: 1px solid #334155;
@@ -255,46 +228,23 @@ def _build_control_panel(signal_config, trace_groups, embed_data):
 #panel-toggle:hover {{ color: #e2e8f0; }}
 </style>
 
-<button id="panel-toggle" onclick="showPanel()">&#9654; Signals</button>
+<button id="panel-toggle" onclick="document.getElementById('signal-panel').style.display='block';this.style.display='none'">&#9654; Signals</button>
 
 <div id="signal-panel">
-  <h3>&#128200; Signal Controls <span onclick="hidePanel()">&#x2715;</span></h3>
+  <h3>&#128200; Signals
+    <button onclick="document.getElementById('signal-panel').style.display='none';document.getElementById('panel-toggle').style.display='block'">&#x2715;</button>
+  </h3>
   {''.join(rows_html)}
 </div>
 """
 
     trace_groups_json = json.dumps(trace_groups)
-    embed_json = json.dumps({
-        'dates': [str(d)[:10] for d in embed_data['dates']],
-        'actual_close': _nan_safe(embed_data['actual_close']),
-        'actual_high': _nan_safe(embed_data['actual_high']),
-        'actual_low': _nan_safe(embed_data['actual_low']),
-        'pred_close': _nan_safe(embed_data['pred_close']),
-        'pred_high': _nan_safe(embed_data['pred_high']),
-        'pred_low': _nan_safe(embed_data['pred_low']),
-        'lookback': embed_data['lookback'],
-    })
-
     panel_js = f"""
-<script src="https://cdn.jsdelivr.net/npm/technicalindicators@3.1.0/dist/browser.js"></script>
 <script>
 (function() {{
   var DIV = '{CHART_DIV_ID}';
   var traceGroups = {trace_groups_json};
-  var ED = {embed_json};
 
-  function hidePanel() {{
-    document.getElementById('signal-panel').style.display = 'none';
-    document.getElementById('panel-toggle').style.display = 'block';
-  }}
-  function showPanel() {{
-    document.getElementById('signal-panel').style.display = 'block';
-    document.getElementById('panel-toggle').style.display = 'none';
-  }}
-  window.hidePanel = hidePanel;
-  window.showPanel = showPanel;
-
-  // ── Toggle group visibility ──────────────────────────────────────────────
   window.toggleGroup = function(group, visible) {{
     var indices = [];
     for (var key in traceGroups) {{
@@ -303,149 +253,21 @@ def _build_control_panel(signal_config, trace_groups, embed_data):
       }}
     }}
     if (indices.length === 0) return;
-    var update = {{visible: indices.map(function() {{ return visible ? true : 'legendonly'; }})}};
-    Plotly.restyle(DIV, update, indices);
+    var vis = indices.map(function() {{ return visible ? true : 'legendonly'; }});
+    Plotly.restyle(DIV, {{visible: vis}}, indices);
   }};
-
-  // ── Padding helper for technicalindicators results ─────────────────────
-  function pad(result, originalLength, mapper) {{
-    var padded = new Array(originalLength - result.length).fill(null);
-    return padded.concat(result.map(mapper || function(x) {{ return x; }}));
-  }}
-
-  // Slice to backtest period (drop context warmup)
-  function sliceTo(arr) {{ return arr.slice(ED.lookback); }}
-
-  // Update a named trace group with new y arrays (actual, pred)
-  function updateTraces(groupKey, yActual, yPred) {{
-    var indices = traceGroups[groupKey] || [];
-    if (indices.length >= 1) Plotly.restyle(DIV, {{y: [yActual]}}, [indices[0]]);
-    if (indices.length >= 2) Plotly.restyle(DIV, {{y: [yPred]}}, [indices[1]]);
-  }}
-
-  // ── SMA apply ───────────────────────────────────────────────────────────
-  window.applySMA = function() {{
-    var periods = document.getElementById('sma-periods').value
-      .split(',').map(function(s) {{ return parseInt(s.trim()); }}).filter(Boolean);
-    periods.forEach(function(p, i) {{
-      var key = 'SMA_' + p;
-      var yA = sliceTo(pad(TechnicalIndicators.SMA.calculate({{period: p, values: ED.actual_close}}), ED.actual_close.length));
-      var yP = sliceTo(pad(TechnicalIndicators.SMA.calculate({{period: p, values: ED.pred_close}}), ED.pred_close.length));
-      updateTraces(key, yA, yP);
-      // Also rename legend
-      var indices = traceGroups[key] || [];
-      if (indices.length >= 1) Plotly.restyle(DIV, {{name: 'SMA ' + p}}, [indices[0]]);
-    }});
-  }};
-
-  // ── EMA apply ───────────────────────────────────────────────────────────
-  window.applyEMA = function() {{
-    var periods = document.getElementById('ema-periods').value
-      .split(',').map(function(s) {{ return parseInt(s.trim()); }}).filter(Boolean);
-    periods.forEach(function(p, i) {{
-      var key = 'EMA_' + p;
-      var yA = sliceTo(pad(TechnicalIndicators.EMA.calculate({{period: p, values: ED.actual_close}}), ED.actual_close.length));
-      var yP = sliceTo(pad(TechnicalIndicators.EMA.calculate({{period: p, values: ED.pred_close}}), ED.pred_close.length));
-      updateTraces(key, yA, yP);
-      var indices = traceGroups[key] || [];
-      if (indices.length >= 1) Plotly.restyle(DIV, {{name: 'EMA ' + p}}, [indices[0]]);
-    }});
-  }};
-
-  // ── BB apply ────────────────────────────────────────────────────────────
-  window.applyBB = function() {{
-    var p = parseInt(document.getElementById('bb-period').value) || 20;
-    var stdDev = 2.0;
-    function calcBB(close) {{
-      var bbResult = TechnicalIndicators.BollingerBands.calculate({{
-        period: p,
-        stdDev: stdDev,
-        values: close
-      }});
-      var padded = pad(bbResult, close.length);
-      return {{
-        upper: padded.map(function(b) {{ return b !== null ? b.upper : null; }}),
-        lower: padded.map(function(b) {{ return b !== null ? b.lower : null; }}),
-        middle: padded.map(function(b) {{ return b !== null ? b.middle : null; }})
-      }};
-    }}
-    var bA = calcBB(ED.actual_close), bP = calcBB(ED.pred_close);
-    updateTraces('BB_upper', sliceTo(bA.upper), sliceTo(bP.upper));
-    updateTraces('BB_lower', sliceTo(bA.lower), sliceTo(bP.lower));
-    updateTraces('BB_mid',   sliceTo(bA.middle), sliceTo(bP.middle));
-  }};
-
-  // ── RSI apply ───────────────────────────────────────────────────────────
-  window.applyRSI = function() {{
-    var p = parseInt(document.getElementById('rsi-period').value) || 14;
-    var yA = sliceTo(pad(TechnicalIndicators.RSI.calculate({{period: p, values: ED.actual_close}}), ED.actual_close.length));
-    var yP = sliceTo(pad(TechnicalIndicators.RSI.calculate({{period: p, values: ED.pred_close}}), ED.pred_close.length));
-    updateTraces('RSI', yA, yP);
-  }};
-
-  // ── Stochastic apply ────────────────────────────────────────────────────
-  window.applySTOCH = function() {{
-    var kp = parseInt(document.getElementById('stoch-k').value) || 14;
-    var dp = parseInt(document.getElementById('stoch-d').value) || 3;
-    function calcStoch(close, high, low) {{
-      var stochResult = TechnicalIndicators.Stochastic.calculate({{
-        period: kp,
-        signalPeriod: dp,
-        high: high,
-        low: low,
-        close: close
-      }});
-      var padded = pad(stochResult, close.length);
-      return {{
-        K: padded.map(function(s) {{ return s !== null ? s.k : null; }}),
-        D: padded.map(function(s) {{ return s !== null ? s.d : null; }})
-      }};
-    }}
-    var sA = calcStoch(ED.actual_close, ED.actual_high, ED.actual_low);
-    var sP = calcStoch(ED.pred_close, ED.pred_high, ED.pred_low);
-    updateTraces('STOCH_K', sliceTo(sA.K), sliceTo(sP.K));
-    updateTraces('STOCH_D', sliceTo(sA.D), sliceTo(sP.D));
-  }};
-
-  // ── MACD apply ──────────────────────────────────────────────────────────
-  window.applyMACD = function() {{
-    var fast = parseInt(document.getElementById('macd-fast').value) || 12;
-    var slow = parseInt(document.getElementById('macd-slow').value) || 26;
-    var sig = parseInt(document.getElementById('macd-sig').value) || 9;
-    function calcMACD(close) {{
-      var macdResult = TechnicalIndicators.MACD.calculate({{
-        fastPeriod: fast,
-        slowPeriod: slow,
-        signalPeriod: sig,
-        values: close,
-        SimpleMAOscillator: false,
-        SimpleMASignal: false
-      }});
-      var padded = pad(macdResult, close.length);
-      return {{
-        line: padded.map(function(m) {{ return m !== null ? m.MACD : null; }}),
-        signal: padded.map(function(m) {{ return m !== null ? m.signal : null; }}),
-        hist: padded.map(function(m) {{ return m !== null ? m.histogram : null; }})
-      }};
-    }}
-    var mA = calcMACD(ED.actual_close), mP = calcMACD(ED.pred_close);
-    updateTraces('MACD_line',   sliceTo(mA.line),   sliceTo(mP.line));
-    updateTraces('MACD_signal', sliceTo(mA.signal), sliceTo(mP.signal));
-    updateTraces('MACD_hist',   sliceTo(mA.hist),   sliceTo(mP.hist));
-  }};
-
 }})();
 </script>
 """
     return panel_html + panel_js
 
 
-def inject_signal_controls(output_path, trace_groups, signal_config, embed_data):
+def inject_signal_controls(output_path, trace_groups, signal_config):
     """Post-process the HTML file to inject the interactive signal control panel."""
     with open(output_path, 'r', encoding='utf-8') as f:
         html = f.read()
 
-    injection = _build_control_panel(signal_config, trace_groups, embed_data)
+    injection = _build_control_panel(signal_config, trace_groups)
     html = html.replace('</body>', injection + '\n</body>', 1)
 
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -456,7 +278,7 @@ def inject_signal_controls(output_path, trace_groups, signal_config, embed_data)
 
 def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, model_label,
                       pred_multi=None, signals_actual=None, signals_pred=None,
-                      signal_config=None, embed_data=None):
+                      signal_config=None):
     """
     Create an interactive Plotly HTML chart with equity, candlesticks, quant signals,
     oscillator panels, drawdown, and a metrics table.
@@ -750,9 +572,8 @@ def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, mo
     fig.write_html(output_path, include_plotlyjs='cdn', div_id=CHART_DIV_ID)
     print(f"HTML chart saved: {output_path}")
 
-    # Inject interactive signal control panel
-    if signal_config and embed_data:
-        inject_signal_controls(output_path, trace_groups, signal_config, embed_data)
+    if signal_config:
+        inject_signal_controls(output_path, trace_groups, signal_config)
         print("Signal control panel injected.")
 
     return trace_groups
@@ -876,24 +697,11 @@ if __name__ == "__main__":
         signals_actual = {k: v.reindex(backtest_idx) for k, v in all_actual_signals.items()}
         signals_pred = {k: v.reindex(backtest_idx) for k, v in all_pred_signals.items()}
 
-        # Build embed data for in-browser recalculation
-        embed_data = {
-            'dates': list(actual_full.index),
-            'actual_close': list(actual_for_signals['close'].values),
-            'actual_high': list(actual_for_signals['high'].values) if 'high' in actual_for_signals.columns else list(actual_for_signals['close'].values),
-            'actual_low': list(actual_for_signals['low'].values) if 'low' in actual_for_signals.columns else list(actual_for_signals['close'].values),
-            'pred_close': list(pred_for_signals['close'].values),
-            'pred_high': list(pred_for_signals['high'].values) if 'high' in pred_for_signals.columns else list(pred_for_signals['close'].values),
-            'pred_low': list(pred_for_signals['low'].values) if 'low' in pred_for_signals.columns else list(pred_for_signals['close'].values),
-            'lookback': args.lookback,
-        }
-
     plot_results_html(
         equity, actual_full, pred_all, metrics, _symbol, _output_path, _model_label,
         pred_multi=pred_all_layered if args.layered > 1 else None,
         signals_actual=signals_actual,
         signals_pred=signals_pred,
         signal_config=signal_config,
-        embed_data=embed_data,
     )
     print("\nDone.")
