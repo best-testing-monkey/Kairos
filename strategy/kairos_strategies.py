@@ -319,7 +319,7 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
     return result_list
 
 if __name__ == "__main__":
-    DEMO_EXTRA_BARS = 5   # backtest days (keep small for fast demo run)
+    DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
     DEMO_SAMPLES = 1      # prediction samples per bar (1 = no ensemble)
     DEMO_LOOKBACK = 300
 
