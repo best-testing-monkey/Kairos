@@ -103,10 +103,9 @@ def fetch_data_raw(symbol, lookback, pred_len = 0) -> DataFrame:
 
 # ── Prediction ────────────────────────────────────────────────────────────────
 
-def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
-              model_path=None, tokenizer_path=None):
+def _ensure_model_loaded(model_path=None, tokenizer_path=None):
     global bt_tokenizer, bt_model, bt_predictor
-    if bt_tokenizer is None or bt_model is None or bt_predictor is None:
+    if bt_predictor is None:
         tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
         mdl_src = model_path or "NeoQuasar/Kronos-base"
         print(f"Loading Kronos model from {mdl_src} ...")
@@ -114,7 +113,10 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
         bt_model = Kronos.from_pretrained(mdl_src)
         bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=512)
 
-    # print("Running prediction ...")
+
+def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
+              model_path=None, tokenizer_path=None):
+    _ensure_model_loaded(model_path, tokenizer_path)
     pred_df = bt_predictor.predict(
         df=x_df,
         x_timestamp=x_ts,
@@ -126,6 +128,57 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
         verbose=pred_len > 1,
     )
     return pred_df
+
+
+def predict_all_batch(assets: dict) -> dict:
+    """Predict all assets in one batched GPU call instead of N sequential calls."""
+    from kairos_meta import AssetPrediction, KairosDistribution
+
+    _ensure_model_loaded()
+
+    df_list, x_ts_list, y_ts_list = [], [], []
+    cached_results = {}
+    uncached_symbols = []
+
+    for symbol, df in assets.items():
+        cache_key = (symbol, df.index[-1])
+        if cache_key in _prediction_cache:
+            cached_results[symbol] = _prediction_cache[cache_key]
+            continue
+        lookback = min(LOOKBACK, len(df))
+        x_df, x_ts = to_kronos_frame(df, lookback, amount="auto")
+        y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
+        df_list.append(x_df)
+        x_ts_list.append(x_ts)
+        y_ts_list.append(y_ts)
+        uncached_symbols.append(symbol)
+
+    if uncached_symbols:
+        seq_lens = [x.shape[0] for x in df_list]
+        if len(set(seq_lens)) == 1:
+            pred_dfs = bt_predictor.predict_batch(
+                df_list, x_ts_list, y_ts_list,
+                pred_len=1, sample_count=PRED_SAMPLES,
+            )
+        else:
+            pred_dfs = [
+                bt_predictor.predict(df, x_ts, y_ts, pred_len=1, sample_count=PRED_SAMPLES)
+                for df, x_ts, y_ts in zip(df_list, x_ts_list, y_ts_list)
+            ]
+        for symbol, pred_df in zip(uncached_symbols, pred_dfs):
+            preds = [pred_df]
+            _prediction_cache[(symbol, assets[symbol].index[-1])] = preds
+            cached_results[symbol] = preds
+
+    return {
+        symbol: AssetPrediction(
+            symbol=symbol,
+            dist=KairosDistribution(preds),
+            current_price=float(assets[symbol]["close"].iloc[-1]),
+            history=assets[symbol],
+        )
+        for symbol, preds in cached_results.items()
+    }
 
 # ── Backtest engine ───────────────────────────────────────────────────────────
 
@@ -312,6 +365,7 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
         cache_key = (symbol, signal.index[-1])
         if cache_key in _prediction_cache:
             return _prediction_cache[cache_key]
+        lookback = min(LOOKBACK, len(signal))
         x_df, x_ts = to_kronos_frame(signal, lookback, amount="auto")
         y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
 
@@ -326,10 +380,10 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
 
 if __name__ == "__main__":
     DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
-    DEMO_SAMPLES = 168      # prediction samples per bar (1 = no ensemble)
-    DEMO_LOOKBACK = 300
+    DEMO_SAMPLES = 1       # prediction samples per bar (1 = no ensemble, fast)
+    DEMO_LOOKBACK = 96     # context bars fed to model (shorter = faster attention)
 
-    # PRED_SAMPLES = DEMO_SAMPLES  # override module-level constant for this run
+    PRED_SAMPLES = DEMO_SAMPLES  # override module-level constant for this run
 
     config = OrchestratorConfig(
         initial_capital=100000.0,
@@ -343,6 +397,7 @@ if __name__ == "__main__":
         predict_fn=predict_kairos_cloud,
         assets=["BTC-USD", "ETH-USD", "SOL-USD"],
         config=config,
+        batch_predict_fn=predict_all_batch,
     )
 
     results = orchestrator.run_backtest({

@@ -133,10 +133,14 @@ class MultiAssetKairosPredictor:
         predictions = predictor.predict_all(assets)
     """
 
-    def __init__(self, predict_fn: Callable[[pd.DataFrame, str], List[pd.DataFrame]]):
+    def __init__(self, predict_fn: Callable[[pd.DataFrame, str], List[pd.DataFrame]],
+                 batch_predict_fn: Optional[Callable] = None):
         self.predict_fn = predict_fn
+        self.batch_predict_fn = batch_predict_fn
 
     def predict_all(self, assets: Dict[str, pd.DataFrame]) -> Dict[str, AssetPrediction]:
+        if self.batch_predict_fn is not None:
+            return self.batch_predict_fn(assets)
         results = {}
         for symbol, df in assets.items():
             current_price = float(df["close"].iloc[-1])

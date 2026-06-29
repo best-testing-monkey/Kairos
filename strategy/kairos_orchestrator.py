@@ -50,6 +50,8 @@ import warnings
 import json
 from datetime import datetime
 
+from tqdm import tqdm
+
 warnings.filterwarnings("ignore")
 
 # =============================================================================
@@ -341,14 +343,15 @@ class KairosOrchestrator:
     def __init__(self,
                  predict_fn: Callable[[pd.DataFrame, str], List[pd.DataFrame]],
                  assets: Optional[List[str]] = None,
-                 config: Optional[OrchestratorConfig] = None):
+                 config: Optional[OrchestratorConfig] = None,
+                 batch_predict_fn: Optional[Callable] = None):
         self.predict_fn = predict_fn
         self.assets = assets or ["BTC-USD"]
         self.config = config or OrchestratorConfig()
 
         # Sub-components
         self.predictor = KairosPredictor(predict_fn)
-        self.multi_predictor = MultiAssetKairosPredictor(predict_fn)
+        self.multi_predictor = MultiAssetKairosPredictor(predict_fn, batch_predict_fn=batch_predict_fn)
         self.tracker = StrategyPerformanceTracker(
             lookback_window=self.config.performance_lookback
         )
@@ -380,7 +383,7 @@ class KairosOrchestrator:
         if not common_dates:
             raise ValueError("No common dates found across assets after lookback")
 
-        for date in common_dates:
+        for date in tqdm(common_dates, desc="Backtesting"):
             # Build histories up to this date
             histories = {}
             for symbol, df in data_dict.items():
