@@ -115,9 +115,9 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
 
 
 def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
-              model_path=None, tokenizer_path=None):
+              model_path=None, tokenizer_path=None, return_samples=False):
     _ensure_model_loaded(model_path, tokenizer_path)
-    pred_df = bt_predictor.predict(
+    return bt_predictor.predict(
         df=x_df,
         x_timestamp=x_ts,
         y_timestamp=y_ts,
@@ -126,8 +126,8 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
         top_p=0.9,
         sample_count=sample_count,
         verbose=pred_len > 1,
+        return_samples=return_samples,
     )
-    return pred_df
 
 
 def predict_all_batch(assets: dict) -> dict:
@@ -155,18 +155,20 @@ def predict_all_batch(assets: dict) -> dict:
 
     if uncached_symbols:
         seq_lens = [x.shape[0] for x in df_list]
+        return_samples = PRED_SAMPLES > 1
         if len(set(seq_lens)) == 1:
-            pred_dfs = bt_predictor.predict_batch(
+            pred_lists = bt_predictor.predict_batch(
                 df_list, x_ts_list, y_ts_list,
-                pred_len=1, sample_count=PRED_SAMPLES,
+                pred_len=1, sample_count=PRED_SAMPLES, return_samples=return_samples,
             )
         else:
-            pred_dfs = [
-                bt_predictor.predict(df, x_ts, y_ts, pred_len=1, sample_count=PRED_SAMPLES)
+            pred_lists = [
+                bt_predictor.predict(df, x_ts, y_ts, pred_len=1, sample_count=PRED_SAMPLES, return_samples=return_samples)
                 for df, x_ts, y_ts in zip(df_list, x_ts_list, y_ts_list)
             ]
-        for symbol, pred_df in zip(uncached_symbols, pred_dfs):
-            preds = [pred_df]
+        for symbol, preds in zip(uncached_symbols, pred_lists):
+            if not isinstance(preds, list):
+                preds = [preds]
             _prediction_cache[(symbol, assets[symbol].index[-1])] = preds
             cached_results[symbol] = preds
 
@@ -180,70 +182,6 @@ def predict_all_batch(assets: dict) -> dict:
         for symbol, preds in cached_results.items()
     }
 
-
-def predict_all_multi(assets: dict) -> dict:
-    """All assets × all pred_samples in one GPU call.
-
-    Repeats each asset's input PRED_SAMPLES times in the batch so that
-    stochastic sampling (T>0, top_p<1) gives PRED_SAMPLES different draws
-    per asset — all in a single predict_batch forward pass.
-    Batch size = num_assets × PRED_SAMPLES.
-    """
-    from kairos_meta import AssetPrediction, KairosDistribution
-
-    _ensure_model_loaded()
-
-    df_list, x_ts_list, y_ts_list = [], [], []
-    symbols_expanded = []        # one entry per row in df_list
-    cached_results = {}
-    uncached_symbols = []
-
-    for symbol, df in assets.items():
-        cache_key = (symbol, df.index[-1])
-        if cache_key in _prediction_cache:
-            cached_results[symbol] = _prediction_cache[cache_key]
-            continue
-        lookback = min(LOOKBACK, len(df))
-        x_df, x_ts = to_kronos_frame(df, lookback, amount="auto")
-        y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
-        for _ in range(PRED_SAMPLES):
-            df_list.append(x_df)
-            x_ts_list.append(x_ts)
-            y_ts_list.append(y_ts)
-            symbols_expanded.append(symbol)
-        uncached_symbols.append(symbol)
-
-    if uncached_symbols:
-        seq_lens = {x_df.shape[0] for x_df in df_list}
-        if len(seq_lens) == 1:
-            pred_dfs = bt_predictor.predict_batch(
-                df_list, x_ts_list, y_ts_list, pred_len=1, sample_count=1,
-            )
-        else:
-            # fallback: different context lengths, can't batch across assets
-            pred_dfs = [
-                bt_predictor.predict(xdf, xts, yts, pred_len=1, sample_count=1)
-                for xdf, xts, yts in zip(df_list, x_ts_list, y_ts_list)
-            ]
-
-        symbol_preds: dict = {s: [] for s in uncached_symbols}
-        for symbol, pred_df in zip(symbols_expanded, pred_dfs):
-            symbol_preds[symbol].append(pred_df)
-
-        for symbol, preds in symbol_preds.items():
-            cache_key = (symbol, assets[symbol].index[-1])
-            _prediction_cache[cache_key] = preds
-            cached_results[symbol] = preds
-
-    return {
-        symbol: AssetPrediction(
-            symbol=symbol,
-            dist=KairosDistribution(preds),
-            current_price=float(assets[symbol]["close"].iloc[-1]),
-            history=assets[symbol],
-        )
-        for symbol, preds in cached_results.items()
-    }
 
 # ── Backtest engine ───────────────────────────────────────────────────────────
 
@@ -434,21 +372,24 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
         x_df, x_ts = to_kronos_frame(signal, lookback, amount="auto")
         y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
 
-    result_list = []
-    for sample in range(pred_samples):
-        result_list += [run_model(x_df, x_ts, y_ts[:1], pred_num,
-                                  model_path=model_path, tokenizer_path=tokenizer_path)]
+    result_list = run_model(
+        x_df, x_ts, y_ts[:1], pred_num,
+        sample_count=pred_samples,
+        model_path=model_path, tokenizer_path=tokenizer_path,
+        return_samples=(pred_samples > 1),
+    )
+    if not isinstance(result_list, list):
+        result_list = [result_list]
 
     if signal is not None:
         _prediction_cache[cache_key] = result_list
     return result_list
 
 if __name__ == "__main__":
-    DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
-    DEMO_SAMPLES = 1       # prediction samples per bar (1 = no ensemble, fast)
-    DEMO_LOOKBACK = 96     # context bars fed to model (shorter = faster attention)
-
-    PRED_SAMPLES = DEMO_SAMPLES  # override module-level constant for this run
+    # DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
+    DEMO_EXTRA_BARS = 2  # backtest days (~6 months of trading days)
+    PRED_SAMPLES = 100     # prediction samples per bar (1 = no ensemble, fast)
+    DEMO_LOOKBACK = 300    # context bars fed to model (shorter = faster attention)
 
     config = OrchestratorConfig(
         initial_capital=100000.0,
@@ -462,7 +403,7 @@ if __name__ == "__main__":
         predict_fn=predict_kairos_cloud,
         assets=["BTC-USD", "ETH-USD", "SOL-USD"],
         config=config,
-        batch_predict_fn=predict_all_multi,
+        batch_predict_fn=predict_all_batch,
     )
 
     results = orchestrator.run_backtest({

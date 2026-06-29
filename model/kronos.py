@@ -386,7 +386,7 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_samples=False):
     with torch.inference_mode():
         x = torch.clip(x, -clip, clip)
 
@@ -463,8 +463,10 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         ]
         z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(-1, sample_count, z.size(1), z.size(2))
-        preds = z.cpu().numpy()
-        preds = np.mean(preds, axis=1)
+        preds = z.cpu().numpy()  # (batch, sample_count, seq_len, feat)
+        if return_samples:
+            return preds          # keep individual samples
+        preds = np.mean(preds, axis=1)  # (batch, seq_len, feat)
 
         return preds
 
@@ -505,18 +507,21 @@ class KronosPredictor:
         self.tokenizer = self.tokenizer.to(self.device)
         self.model = self.model.to(self.device)
 
-    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
+    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_samples=False):
 
         x_tensor = torch.from_numpy(np.array(x).astype(np.float32)).to(self.device)
         x_stamp_tensor = torch.from_numpy(np.array(x_stamp).astype(np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.array(y_stamp).astype(np.float32)).to(self.device)
 
         preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose)
-        preds = preds[:, -pred_len:, :]
+                                          self.clip, T, top_k, top_p, sample_count, verbose, return_samples=return_samples)
+        if return_samples:
+            preds = preds[:, :, -pred_len:, :]  # (batch, sample_count, pred_len, feat)
+        else:
+            preds = preds[:, -pred_len:, :]     # (batch, pred_len, feat)
         return preds
 
-    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True, return_samples=False):
 
         if not isinstance(df, pd.DataFrame):
             raise ValueError("Input must be a pandas DataFrame.")
@@ -550,16 +555,24 @@ class KronosPredictor:
         x_stamp = x_stamp[np.newaxis, :]
         y_stamp = y_stamp[np.newaxis, :]
 
-        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose)
+        preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_samples=return_samples)
+
+        if return_samples:
+            # preds: (1, sample_count, pred_len, feat) → squeeze batch dim
+            preds = preds.squeeze(0)  # (sample_count, pred_len, feat)
+            preds = preds * (x_std + 1e-5) + x_mean
+            return [
+                pd.DataFrame(preds[i], columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
+                for i in range(sample_count)
+            ]
 
         preds = preds.squeeze(0)
         preds = preds * (x_std + 1e-5) + x_mean
-
         pred_df = pd.DataFrame(preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
         return pred_df
 
 
-    def predict_batch(self, df_list, x_timestamp_list, y_timestamp_list, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+    def predict_batch(self, df_list, x_timestamp_list, y_timestamp_list, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True, return_samples=False):
         """
         Perform parallel (batch) prediction on multiple time series. All series must have the same historical length and prediction length (pred_len).
 
@@ -649,9 +662,20 @@ class KronosPredictor:
         x_stamp_batch = np.stack(x_stamp_list, axis=0).astype(np.float32) # (B, seq_len, time_feat)
         y_stamp_batch = np.stack(y_stamp_list, axis=0).astype(np.float32) # (B, pred_len, time_feat)
 
-        preds = self.generate(x_batch, x_stamp_batch, y_stamp_batch, pred_len, T, top_k, top_p, sample_count, verbose)
-        # preds: (B, pred_len, feat)
+        preds = self.generate(x_batch, x_stamp_batch, y_stamp_batch, pred_len, T, top_k, top_p, sample_count, verbose, return_samples=return_samples)
 
+        if return_samples:
+            # preds: (B, sample_count, pred_len, feat)
+            result = []
+            for i in range(num_series):
+                series_preds = preds[i] * (stds[i] + 1e-5) + means[i]  # (sample_count, pred_len, feat)
+                result.append([
+                    pd.DataFrame(series_preds[j], columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp_list[i])
+                    for j in range(sample_count)
+                ])
+            return result  # List[List[pd.DataFrame]]
+
+        # preds: (B, pred_len, feat)
         pred_dfs = []
         for i in range(num_series):
             preds_i = preds[i] * (stds[i] + 1e-5) + means[i]
