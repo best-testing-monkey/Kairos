@@ -83,3 +83,8 @@ tmp/
 examples/outputs/
 examples/output/
 examples/data/
+/data/
+/output/
+/finetune_csv/data
+/finetune_csv/models
+/finetune_csv/train_data
