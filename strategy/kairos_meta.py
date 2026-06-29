@@ -140,7 +140,7 @@ class MultiAssetKairosPredictor:
         results = {}
         for symbol, df in assets.items():
             current_price = float(df["close"].iloc[-1])
-            predictions = self.predict_fn(df, signal=symbol)
+            predictions = self.predict_fn(df, symbol=symbol)
             dist = KairosDistribution(predictions)
             results[symbol] = AssetPrediction(
                 symbol=symbol,

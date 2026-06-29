@@ -288,33 +288,30 @@ def compute_signals(df, config):
 # ── Interactive control panel ─────────────────────────────────────────────────
 
 def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=1, **kwargs) -> List[pd.DataFrame]:
-    if kwargs == None:
-        kwargs = {}
-
-    kwargs.model = kwargs.model or "NeoQuasar/Kronos-base"  # Local path to finetuned Kronos predictor (defaults to NeoQuasar/Kronos-base)")
-    kwargs.tokenizer = kwargs.tokenizer or "NeoQuasar/Kronos-Tokenizer-base" # Local path to Kronos tokenizer (defaults to NeoQuasar/Kronos-Tokenizer-base)")
-    kwargs.output = kwargs.output or os.path.join(OUTPUT_DIR, f"{kwargs.symbol.replace('.', '_')}_backtest_results.html") # Output HTML path (defaults to ./output/<symbol>_backtest_results.html)")
-    kwargs.symbol = kwargs.symbol or SYMBOL  # Trading symbol (default {SYMBOL})")
-    kwargs.lookback = LOOKBACK  # Context window bars (default {LOOKBACK})")
-    kwargs.pred_samples = PRED_SAMPLES  # Samples per bar (default {PRED_SAMPLES})")
+    model_path = kwargs.get("model") or "NeoQuasar/Kronos-base"
+    tokenizer_path = kwargs.get("tokenizer") or "NeoQuasar/Kronos-Tokenizer-base"
+    symbol = kwargs.get("symbol") or SYMBOL
+    lookback = LOOKBACK
+    pred_samples = PRED_SAMPLES
+    output = kwargs.get("output") or os.path.join(OUTPUT_DIR, f"{symbol.replace('.', '_')}_backtest_results.html")
 
     print("Kairos Walk-Forward Backtest (HTML output)")
-    print(f"   Symbol:             {kwargs.symbol}")
-    print(f"   Context window:     {kwargs.lookback} bars")
-    print(f"   Samples per bar:    {kwargs.pred_samples} x")
+    print(f"   Symbol:             {symbol}")
+    print(f"   Context window:     {lookback} bars")
+    print(f"   Samples per bar:    {pred_samples} x")
     print()
 
-    if not signal:
+    if signal is None:
         print("Step 1: Fetching data ...")
-        x_df, x_ts, y_ts, actual = fetch_data(kwargs.symbol, kwargs.lookback, pred_historic)
+        x_df, x_ts, y_ts, actual = fetch_data(symbol, lookback, pred_historic)
     else:
-        x_df, x_ts = to_kronos_frame(signal, kwargs.lookback, amount="auto")
-        y_ts = future_timestamps( x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
+        x_df, x_ts = to_kronos_frame(signal, lookback, amount="auto")
+        y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
 
     result_list = []
-    for sample in range(kwargs.pred_samples):
+    for sample in range(pred_samples):
         result_list += [run_model(x_df, x_ts, y_ts[:1], pred_num,
-                                  model_path=kwargs.model, tokenizer_path=kwargs.tokenizer, )]
+                                  model_path=model_path, tokenizer_path=tokenizer_path)]
     return result_list
 
 if __name__ == "__main__":
