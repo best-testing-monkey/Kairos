@@ -115,14 +115,11 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
     bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
     bt_model = Kronos.from_pretrained(mdl_src)
 
-    # Device-specific optimisations applied before predictor wraps the model.
     if torch.cuda.is_available():
-        # torch.compile eliminates Python dispatch overhead and fuses kernels.
-        # First call compiles (~30s); subsequent calls are fast.
-        print("  → GPU detected: using torch.compile (first call will be slow)")
-        bt_model = torch.compile(bt_model, mode="reduce-overhead")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("  → GPU mode: autocast FP16, TF32 matmuls enabled")
     else:
-        # Dynamic INT8 quantisation: 2-4x faster matmuls on CPU.
         import torch.nn as nn
         bt_model = torch.quantization.quantize_dynamic(
             bt_model, {nn.Linear}, dtype=torch.qint8
@@ -143,7 +140,7 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
         T=1.0,
         top_p=0.9,
         sample_count=sample_count,
-        verbose=pred_len > 1,
+        verbose=False,
         return_samples=return_samples,
     )
 
@@ -405,9 +402,9 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
 
 if __name__ == "__main__":
     # DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
-    DEMO_EXTRA_BARS = 2    # backtest days (168 ~6 months of trading days)
-    PRED_SAMPLES =   96    # prediction samples per bar (1 = no ensemble, fast)
-    DEMO_LOOKBACK = 300    # context bars fed to model (shorter = faster attention)
+    DEMO_EXTRA_BARS = 10    # backtest days (168 ~6 months of trading days)
+    PRED_SAMPLES =    100    # prediction samples per bar (1 = no ensemble, fast)
+    DEMO_LOOKBACK =   300    # context bars fed to model (shorter = faster attention)
 
     config = OrchestratorConfig(
         initial_capital=100000.0,
