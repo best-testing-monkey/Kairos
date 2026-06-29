@@ -48,6 +48,8 @@ bt_tokenizer = None
 bt_model = None
 bt_predictor = None
 
+_prediction_cache: dict = {}  # (symbol, last_bar_ts) -> List[pd.DataFrame]
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
@@ -297,18 +299,19 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
     symbol = kwargs.get("symbol") or SYMBOL
     lookback = LOOKBACK
     pred_samples = PRED_SAMPLES
-    output = kwargs.get("output") or os.path.join(OUTPUT_DIR, f"{symbol.replace('.', '_')}_backtest_results.html")
-
-    print("Kairos Walk-Forward Backtest (HTML output)")
-    print(f"   Symbol:             {symbol}")
-    print(f"   Context window:     {lookback} bars")
-    print(f"   Samples per bar:    {pred_samples} x")
-    print()
 
     if signal is None:
+        print("Kairos prediction cloud")
+        print(f"   Symbol:             {symbol}")
+        print(f"   Context window:     {lookback} bars")
+        print(f"   Samples per bar:    {pred_samples} x")
+        print()
         print("Step 1: Fetching data ...")
         x_df, x_ts, y_ts, actual = fetch_data(symbol, lookback, pred_historic)
     else:
+        cache_key = (symbol, signal.index[-1])
+        if cache_key in _prediction_cache:
+            return _prediction_cache[cache_key]
         x_df, x_ts = to_kronos_frame(signal, lookback, amount="auto")
         y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
 
@@ -316,14 +319,17 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
     for sample in range(pred_samples):
         result_list += [run_model(x_df, x_ts, y_ts[:1], pred_num,
                                   model_path=model_path, tokenizer_path=tokenizer_path)]
+
+    if signal is not None:
+        _prediction_cache[cache_key] = result_list
     return result_list
 
 if __name__ == "__main__":
     DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
-    DEMO_SAMPLES = 1      # prediction samples per bar (1 = no ensemble)
+    DEMO_SAMPLES = 168      # prediction samples per bar (1 = no ensemble)
     DEMO_LOOKBACK = 300
 
-    PRED_SAMPLES = DEMO_SAMPLES  # override module-level constant for this run
+    # PRED_SAMPLES = DEMO_SAMPLES  # override module-level constant for this run
 
     config = OrchestratorConfig(
         initial_capital=100000.0,
