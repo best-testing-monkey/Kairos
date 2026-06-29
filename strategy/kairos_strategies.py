@@ -180,6 +180,71 @@ def predict_all_batch(assets: dict) -> dict:
         for symbol, preds in cached_results.items()
     }
 
+
+def predict_all_multi(assets: dict) -> dict:
+    """All assets × all pred_samples in one GPU call.
+
+    Repeats each asset's input PRED_SAMPLES times in the batch so that
+    stochastic sampling (T>0, top_p<1) gives PRED_SAMPLES different draws
+    per asset — all in a single predict_batch forward pass.
+    Batch size = num_assets × PRED_SAMPLES.
+    """
+    from kairos_meta import AssetPrediction, KairosDistribution
+
+    _ensure_model_loaded()
+
+    df_list, x_ts_list, y_ts_list = [], [], []
+    symbols_expanded = []        # one entry per row in df_list
+    cached_results = {}
+    uncached_symbols = []
+
+    for symbol, df in assets.items():
+        cache_key = (symbol, df.index[-1])
+        if cache_key in _prediction_cache:
+            cached_results[symbol] = _prediction_cache[cache_key]
+            continue
+        lookback = min(LOOKBACK, len(df))
+        x_df, x_ts = to_kronos_frame(df, lookback, amount="auto")
+        y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
+        for _ in range(PRED_SAMPLES):
+            df_list.append(x_df)
+            x_ts_list.append(x_ts)
+            y_ts_list.append(y_ts)
+            symbols_expanded.append(symbol)
+        uncached_symbols.append(symbol)
+
+    if uncached_symbols:
+        seq_lens = {x_df.shape[0] for x_df in df_list}
+        if len(seq_lens) == 1:
+            pred_dfs = bt_predictor.predict_batch(
+                df_list, x_ts_list, y_ts_list, pred_len=1, sample_count=1,
+            )
+        else:
+            # fallback: different context lengths, can't batch across assets
+            pred_dfs = [
+                bt_predictor.predict(xdf, xts, yts, pred_len=1, sample_count=1)
+                for xdf, xts, yts in zip(df_list, x_ts_list, y_ts_list)
+            ]
+
+        symbol_preds: dict = {s: [] for s in uncached_symbols}
+        for symbol, pred_df in zip(symbols_expanded, pred_dfs):
+            symbol_preds[symbol].append(pred_df)
+
+        for symbol, preds in symbol_preds.items():
+            cache_key = (symbol, assets[symbol].index[-1])
+            _prediction_cache[cache_key] = preds
+            cached_results[symbol] = preds
+
+    return {
+        symbol: AssetPrediction(
+            symbol=symbol,
+            dist=KairosDistribution(preds),
+            current_price=float(assets[symbol]["close"].iloc[-1]),
+            history=assets[symbol],
+        )
+        for symbol, preds in cached_results.items()
+    }
+
 # ── Backtest engine ───────────────────────────────────────────────────────────
 
 def backtest(predicted_close: pd.Series, actual_close: pd.Series,
@@ -397,7 +462,7 @@ if __name__ == "__main__":
         predict_fn=predict_kairos_cloud,
         assets=["BTC-USD", "ETH-USD", "SOL-USD"],
         config=config,
-        batch_predict_fn=predict_all_batch,
+        batch_predict_fn=predict_all_multi,
     )
 
     results = orchestrator.run_backtest({
