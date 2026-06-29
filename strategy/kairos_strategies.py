@@ -319,6 +319,12 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
     return result_list
 
 if __name__ == "__main__":
+    DEMO_EXTRA_BARS = 5   # backtest days (keep small for fast demo run)
+    DEMO_SAMPLES = 1      # prediction samples per bar (1 = no ensemble)
+    DEMO_LOOKBACK = 300
+
+    PRED_SAMPLES = DEMO_SAMPLES  # override module-level constant for this run
+
     config = OrchestratorConfig(
         initial_capital=100000.0,
         cross_asset_ranking=True,
@@ -334,9 +340,9 @@ if __name__ == "__main__":
     )
 
     results = orchestrator.run_backtest({
-        "BTC-USD": fetch_data_raw("BTC-USD", 300),
-        "ETH-USD": fetch_data_raw("ETH-USD", 300),
-        "SOL-USD": fetch_data_raw("SOL-USD", 300),
-    }, lookback=300)
+        "BTC-USD": fetch_data_raw("BTC-USD", DEMO_LOOKBACK).tail(DEMO_LOOKBACK + DEMO_EXTRA_BARS),
+        "ETH-USD": fetch_data_raw("ETH-USD", DEMO_LOOKBACK).tail(DEMO_LOOKBACK + DEMO_EXTRA_BARS),
+        "SOL-USD": fetch_data_raw("SOL-USD", DEMO_LOOKBACK).tail(DEMO_LOOKBACK + DEMO_EXTRA_BARS),
+    }, lookback=DEMO_LOOKBACK)
 
     print_results(results)
