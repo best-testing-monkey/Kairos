@@ -44,6 +44,10 @@ PRED_SAMPLES = 100  # Prediction samples to average with
 INITIAL_CAPITAL = 100_000  # CNY
 OUTPUT_DIR = "./output"
 
+bt_tokenizer = None
+bt_model = None
+bt_predictor = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
