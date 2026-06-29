@@ -156,9 +156,11 @@ class KairosDistribution:
                 "pct_5": float(np.percentile(arr, 5)),
                 "pct_10": float(np.percentile(arr, 10)),
                 "pct_15": float(np.percentile(arr, 15)),
+                "pct_20": float(np.percentile(arr, 20)),
                 "pct_25": float(np.percentile(arr, 25)),
                 "pct_50": float(np.percentile(arr, 50)),
                 "pct_75": float(np.percentile(arr, 75)),
+                "pct_80": float(np.percentile(arr, 80)),
                 "pct_85": float(np.percentile(arr, 85)),
                 "pct_90": float(np.percentile(arr, 90)),
                 "pct_95": float(np.percentile(arr, 95)),
@@ -166,11 +168,12 @@ class KairosDistribution:
 
     def entropy(self, col: str = "close", bins: int = 20) -> float:
         arr = self.df[col].values.astype(float)
-        hist, _ = np.histogram(arr, bins=bins, density=True)
-        hist = hist[hist > 0]
+        hist, _ = np.histogram(arr, bins=bins)
+        hist = hist[hist > 0].astype(float)
         if len(hist) == 0:
             return 0.0
-        return float(-np.sum(hist * np.log(hist)))
+        pmf = hist / hist.sum()
+        return float(-np.sum(pmf * np.log(pmf)))
 
     def cdf(self, price: float, col: str = "close") -> float:
         return float(stats.percentileofscore(self.df[col].values, price) / 100.0)
@@ -192,6 +195,8 @@ class KairosDistribution:
         p_loss = float(np.mean(values <= stop))
         if p_loss == 0:
             return 1.0
+        if entry == stop:
+            return 0.0
         b = (target - entry) / (entry - stop)
         if b <= 0:
             return 0.0
@@ -288,8 +293,8 @@ class PercentileEntryStrategy(Strategy):
                  stop_pct: float = 10.0, target_pct: float = 85.0):
         self.long_pct = long_pct / 100.0
         self.short_pct = short_pct / 100.0
-        self.stop_pct = stop_pct
-        self.target_pct = target_pct
+        self.stop_pct = int(stop_pct)
+        self.target_pct = int(target_pct)
 
     def generate_signal(self, dist, current_price, history, context):
         s = dist.stats["close"]
@@ -333,8 +338,8 @@ class DynamicBracketStrategy(Strategy):
     name = "dynamic_bracket"
 
     def __init__(self, stop_pct: float = 10.0, target_pct: float = 90.0):
-        self.stop_pct = stop_pct
-        self.target_pct = target_pct
+        self.stop_pct = int(stop_pct)
+        self.target_pct = int(target_pct)
 
     def generate_signal(self, dist, current_price, history, context):
         s = dist.stats["close"]

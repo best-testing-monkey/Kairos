@@ -1,4 +1,5 @@
 import sys
+from tabnanny import verbose
 
 from pandas import DataFrame
 
@@ -174,11 +175,11 @@ def predict_all_batch(assets: dict) -> dict:
         if len(set(seq_lens)) == 1:
             pred_lists = bt_predictor.predict_batch(
                 df_list, x_ts_list, y_ts_list,
-                pred_len=1, sample_count=PRED_SAMPLES, return_samples=return_samples,
+                pred_len=1, sample_count=PRED_SAMPLES, return_samples=return_samples, verbose=False
             )
         else:
             pred_lists = [
-                bt_predictor.predict(df, x_ts, y_ts, pred_len=1, sample_count=PRED_SAMPLES, return_samples=return_samples)
+                bt_predictor.predict(df, x_ts, y_ts, pred_len=1, sample_count=PRED_SAMPLES, return_samples=return_samples, verbose = False)
                 for df, x_ts, y_ts in zip(df_list, x_ts_list, y_ts_list)
             ]
         for symbol, preds in zip(uncached_symbols, pred_lists):
@@ -402,7 +403,7 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
 
 if __name__ == "__main__":
     # DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
-    DEMO_EXTRA_BARS = 10    # backtest days (168 ~6 months of trading days)
+    DEMO_EXTRA_BARS = 168    # backtest days (168 ~6 months of trading days)
     PRED_SAMPLES =    100    # prediction samples per bar (1 = no ensemble, fast)
     DEMO_LOOKBACK =   300    # context bars fed to model (shorter = faster attention)
 

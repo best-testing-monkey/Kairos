@@ -344,6 +344,70 @@ pred_df = predictor.predict(
 
 ---
 
+## Trading Strategies & Backtesting
+
+`strategy/kairos_strategies.py` is the main entry point for end-to-end backtesting.
+It wires the Kronos forecaster into a 42-strategy signal engine and runs a
+walk-forward backtest across multiple assets.
+
+```bash
+uv run ./strategy/kairos_strategies.py
+```
+
+### Architecture
+
+The signal pipeline has five layers, each in its own module:
+
+| Module | Strategies | Role |
+|--------|-----------|------|
+| `kairos_backtest.py` | 18 | Core directional strategies (percentile entry, skew, trend-following, …) |
+| `kairos_path.py` | 5 | Intraday path-shape strategies (rally, fade, V-shape, …) |
+| `kairos_horizon.py` | 3 | Multi-horizon hold strategies |
+| `kairos_execution.py` | 7 | Volume-aware and partial-exit strategies |
+| `kairos_meta.py` | 9 | Cross-asset, online-weighted, and tail-risk strategies |
+
+`KairosOrchestrator` assembles all 42 strategies, applies meta-filters
+(entropy, bimodality, kurtosis), wraps each strategy in a `LiquidityFilterStrategy`,
+and runs walk-forward backtesting across all assets.
+
+### Model predictions
+
+Each bar, the Kronos model draws `PRED_SAMPLES=100` stochastic samples for each
+asset in a single batched GPU call. The samples form a `KairosDistribution` — a
+statistical distribution of predicted next-bar OHLCV values used by every strategy.
+
+### Configuration
+
+Key `OrchestratorConfig` parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `entropy_threshold` | 3.0 | Block assets where prediction entropy (Shannon, nats) exceeds this |
+| `kurtosis_max` | 10.0 | Block strategies when predicted-close excess kurtosis exceeds this |
+| `min_volume_percentile` | 10.0 | Block strategies when predicted volume is below this percentile of history |
+| `debug_filters` | `False` | Print entropy/kurtosis per asset per day for debugging |
+| `cross_asset_ranking` | `True` | Rank assets by predicted Sharpe and concentrate capital on the best |
+| `online_weighting` | `True` | Weight strategy votes by recent realized performance |
+| `max_horizon` | 3 | Maximum bars a position can be held before forced exit |
+
+### Tests
+
+The strategy components have a dedicated unit-test suite that requires no GPU or
+model download:
+
+```bash
+uv run --with pytest python -m pytest tests/unit/ -q
+```
+
+| Test file | What it covers |
+|-----------|----------------|
+| `test_kairos_distribution.py` | Distribution stats, entropy, expected value, Kelly fraction |
+| `test_backtest_engine.py` | `backtest()` engine and `compute_metrics()` |
+| `test_strategy_signals.py` | Individual strategy signal generation logic |
+| `test_filters.py` | Kurtosis filter and meta-filter behaviour |
+
+---
+
 ## Upstream: Kronos
 
 This project is a fork of **Kronos: A Foundation Model for the Language of

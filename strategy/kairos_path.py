@@ -32,6 +32,12 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+try:
+    from kairos_backtest import Signal, Direction
+except ImportError:
+    Signal = None
+    Direction = None
+
 
 # =============================================================================
 # PATH PATTERN ENUMS
@@ -458,16 +464,16 @@ class PathRallyStrategy:
             return None
 
         kelly = dist.kelly_fraction(current_price, target, stop)
-        return {
-            "direction": 1,  # LONG
-            "size": min(kelly * 0.5, 1.0),
-            "entry": current_price,
-            "stop": stop,
-            "target": target,
-            "strategy_name": self.name,
-            "confidence": profile.trajectory_confidence * profile.path_confidence,
-            "expected_value": ev,
-        }
+        return Signal(
+            direction=Direction.LONG,
+            size=min(kelly * 0.5, 1.0),
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=profile.trajectory_confidence * profile.path_confidence,
+            expected_value=ev,
+        )
 
 
 class PathFadeStrategy:
@@ -506,16 +512,16 @@ class PathFadeStrategy:
             return None
 
         kelly = dist.kelly_fraction(current_price, target, stop)
-        return {
-            "direction": -1,  # SHORT
-            "size": min(kelly * 0.5, 1.0),
-            "entry": current_price,
-            "stop": stop,
-            "target": target,
-            "strategy_name": self.name,
-            "confidence": profile.trajectory_confidence * profile.path_confidence,
-            "expected_value": ev,
-        }
+        return Signal(
+            direction=Direction.SHORT,
+            size=min(kelly * 0.5, 1.0),
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=profile.trajectory_confidence * profile.path_confidence,
+            expected_value=ev,
+        )
 
 
 class PathVShapeStrategy:
@@ -550,16 +556,16 @@ class PathVShapeStrategy:
             return None
 
         kelly = dist.kelly_fraction(current_price, target, stop)
-        return {
-            "direction": 1,
-            "size": min(kelly * 0.5, 1.0),
-            "entry": current_price,
-            "stop": stop,
-            "target": target,
-            "strategy_name": self.name,
-            "confidence": profile.trajectory_confidence * profile.path_confidence,
-            "expected_value": ev,
-        }
+        return Signal(
+            direction=Direction.LONG,
+            size=min(kelly * 0.5, 1.0),
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=profile.trajectory_confidence * profile.path_confidence,
+            expected_value=ev,
+        )
 
 
 class PathInvertedVStrategy:
@@ -594,16 +600,16 @@ class PathInvertedVStrategy:
             return None
 
         kelly = dist.kelly_fraction(current_price, target, stop)
-        return {
-            "direction": -1,
-            "size": min(kelly * 0.5, 1.0),
-            "entry": current_price,
-            "stop": stop,
-            "target": target,
-            "strategy_name": self.name,
-            "confidence": profile.trajectory_confidence * profile.path_confidence,
-            "expected_value": ev,
-        }
+        return Signal(
+            direction=Direction.SHORT,
+            size=min(kelly * 0.5, 1.0),
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=profile.trajectory_confidence * profile.path_confidence,
+            expected_value=ev,
+        )
 
 
 class PathHighLowSequenceStrategy:
@@ -643,16 +649,16 @@ class PathHighLowSequenceStrategy:
 
         kelly = dist.kelly_fraction(current_price, target, stop)
         conf = max(profile.low_before_high_prob, profile.high_before_low_prob)
-        return {
-            "direction": direction,
-            "size": min(kelly * 0.5, 1.0),
-            "entry": current_price,
-            "stop": stop,
-            "target": target,
-            "strategy_name": self.name,
-            "confidence": conf * profile.path_confidence,
-            "expected_value": ev,
-        }
+        return Signal(
+            direction=Direction.LONG if direction == 1 else Direction.SHORT,
+            size=min(kelly * 0.5, 1.0),
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=conf * profile.path_confidence,
+            expected_value=ev,
+        )
 
 
 # =============================================================================

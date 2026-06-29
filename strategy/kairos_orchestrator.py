@@ -137,9 +137,10 @@ class OrchestratorConfig:
     # Meta-filters
     entropy_threshold: float = 3.0
     bimodality_filter: bool = True
-    kurtosis_max: float = 3.0
+    kurtosis_max: float = 10.0
     kurtosis_action: str = "block"  # "block", "reduce", "invert"
-    min_volume_percentile: float = 30.0
+    min_volume_percentile: float = 10.0
+    debug_filters: bool = False
 
     # Performance tracking
     performance_lookback: int = 30
@@ -492,6 +493,8 @@ class KairosOrchestrator:
         """Returns True if the distribution should be filtered out."""
         # Entropy
         ent = dist.entropy()
+        if self.config.debug_filters:
+            print(f"[debug filters] entropy={ent:.3f} threshold={self.config.entropy_threshold}")
         if ent > self.config.entropy_threshold:
             return True
 
@@ -500,6 +503,8 @@ class KairosOrchestrator:
             # Simple bimodality check via kurtosis proxy
             # (bimodal distributions tend to have negative excess kurtosis)
             kurt = dist.stats["close"].get("kurt", 0)
+            if self.config.debug_filters:
+                print(f"[debug filters] kurt={kurt:.3f} bimodality_block=<-1.0")
             if kurt < -1.0:
                 return True
 
