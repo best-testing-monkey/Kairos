@@ -105,13 +105,31 @@ def fetch_data_raw(symbol, lookback, pred_len = 0) -> DataFrame:
 
 def _ensure_model_loaded(model_path=None, tokenizer_path=None):
     global bt_tokenizer, bt_model, bt_predictor
-    if bt_predictor is None:
-        tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
-        mdl_src = model_path or "NeoQuasar/Kronos-base"
-        print(f"Loading Kronos model from {mdl_src} ...")
-        bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
-        bt_model = Kronos.from_pretrained(mdl_src)
-        bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=512)
+    if bt_predictor is not None:
+        return
+
+    import torch
+    tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
+    mdl_src = model_path or "NeoQuasar/Kronos-base"
+    print(f"Loading Kronos model from {mdl_src} ...")
+    bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
+    bt_model = Kronos.from_pretrained(mdl_src)
+
+    # Device-specific optimisations applied before predictor wraps the model.
+    if torch.cuda.is_available():
+        # torch.compile eliminates Python dispatch overhead and fuses kernels.
+        # First call compiles (~30s); subsequent calls are fast.
+        print("  → GPU detected: using torch.compile (first call will be slow)")
+        bt_model = torch.compile(bt_model, mode="reduce-overhead")
+    else:
+        # Dynamic INT8 quantisation: 2-4x faster matmuls on CPU.
+        import torch.nn as nn
+        bt_model = torch.quantization.quantize_dynamic(
+            bt_model, {nn.Linear}, dtype=torch.qint8
+        )
+        print(f"  → CPU mode: INT8 dynamic quantisation, {torch.get_num_threads()} threads")
+
+    bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=512)
 
 
 def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
@@ -387,8 +405,8 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
 
 if __name__ == "__main__":
     # DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
-    DEMO_EXTRA_BARS = 2  # backtest days (~6 months of trading days)
-    PRED_SAMPLES = 100     # prediction samples per bar (1 = no ensemble, fast)
+    DEMO_EXTRA_BARS = 2    # backtest days (168 ~6 months of trading days)
+    PRED_SAMPLES =   96    # prediction samples per bar (1 = no ensemble, fast)
     DEMO_LOOKBACK = 300    # context bars fed to model (shorter = faster attention)
 
     config = OrchestratorConfig(
