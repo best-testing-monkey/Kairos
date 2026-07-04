@@ -70,7 +70,7 @@ def fetch_data(symbol, lookback, pred_len):
 
     x_df, x_ts, y_ts = get_forecast_window(
         symbol=symbol,
-        interval="1d",
+        interval=KairosSettings.interval,
         lookback=lookback,
         pred_len=pred_len,
         end=context_end,
@@ -84,20 +84,36 @@ def fetch_data(symbol, lookback, pred_len):
     return x_df, x_ts, y_ts, actual
 
 
-def fetch_data_raw(symbol, lookback, pred_len=0) -> DataFrame:
+def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
     price_cache.configure(remote=False)
 
-    from datetime import date
-    end_str = date.today().isoformat()
-    start_str = str(int(end_str[:4]) - 5) + end_str[4:]  # 5 years back
+    from datetime import date, timedelta
+    interval = KairosSettings.interval
+    bars_per_day = {
+        "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
+        "60m": 24, "90m": 16, "1h": 24, "1d": 1, "5d": 0.2,
+        "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
+    }.get(interval, 1)
+    # Yahoo Finance hard limits by interval (days of history available)
+    yf_max_days = {
+        "1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60,
+        "60m": 729, "90m": 60, "1h": 729,
+    }.get(interval, 5 * 365)
+    bars_needed = max(min_bars or 0, lookback + pred_len)
+    days_needed = min(int(bars_needed / bars_per_day) + 30, yf_max_days)
 
-    raw = price_cache.get_price_data(symbol, start_date=start_str, end_date=end_str, interval="1d")
+    end_dt = date.today()
+    start_dt = end_dt - timedelta(days=days_needed)
+    end_str, start_str = end_dt.isoformat(), start_dt.isoformat()
+
+    raw = price_cache.get_price_data(symbol, start_date=start_str, end_date=end_str, interval=interval)
     if raw is None or raw.empty:
         raise RuntimeError(f"No price data returned for {symbol}")
 
     raw = raw.sort_index().copy()
     raw.columns = [c.lower() for c in raw.columns]
-    raw.index = pd.to_datetime(raw.index).tz_localize(None)
+    idx = pd.to_datetime(raw.index)
+    raw.index = idx.tz_convert(None) if idx.tz is not None else idx
 
     if len(raw) < lookback + pred_len:
         raise RuntimeError(
@@ -168,7 +184,7 @@ def predict_all_batch(assets: dict) -> dict:
             continue
         lookback = min(KairosSettings.lookback, len(df))
         x_df, x_ts = to_kronos_frame(df, lookback, amount="auto")
-        y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
+        y_ts = future_timestamps(x_ts.iloc[-1], KairosSettings.interval, 1, _state.calendar, _state.tz)
         df_list.append(x_df)
         x_ts_list.append(x_ts)
         y_ts_list.append(y_ts)
@@ -398,7 +414,7 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataF
             return _prediction_cache[cache_key]
         lookback = min(KairosSettings.lookback, len(signal))
         x_df, x_ts = to_kronos_frame(signal, lookback, amount="auto")
-        y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
+        y_ts = future_timestamps(x_ts.iloc[-1], KairosSettings.interval, 1, _state.calendar, _state.tz)
 
     result_list = run_model(
         x_df, x_ts, y_ts[:1], pred_num,
@@ -414,20 +430,86 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataF
     return result_list
 
 
+def _period_to_bars(period: str, interval: str) -> int:
+    """Convert a human period string (e.g. '6m', '1y') to a bar count."""
+    import re as _re
+    m = _re.fullmatch(r"(\d+)(d|w|m|y)", period.strip().lower())
+    if not m:
+        raise ValueError(
+            f"Unrecognised backtest_period {period!r}. Use e.g. '6m', '1y', '3m', '2w', '10d'."
+        )
+    n, unit = int(m.group(1)), m.group(2)
+    cal_days = {"d": n, "w": n * 7, "m": n * 30, "y": n * 365}[unit]
+    bars_per_day = {
+        "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
+        "60m": 24, "90m": 16, "1h": 24, "1d": 1, "5d": 0.2,
+        "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
+    }.get(interval, 1)
+    return max(1, int(cal_days * bars_per_day))
+
+
+# Disabled strategies per (interval, sorted-assets-key) profile.
+# Determined by --no-prediction oracle shadow runs; add new profiles as needed.
+_DISABLED_BY_PROFILE: dict = {
+    ("1d", "BTC-USD,ETH-USD,SOL-USD"): {
+        # Negative %/trade from oracle shadow run 2026-07-04
+        "dynamic_bracket",         # -0.05% / trade
+        "inverse_variance",        # -0.07% / trade
+        "distribution_overlap",    # -0.09% / trade
+        "conditional_path",        # -0.14% / trade
+        "particle_filter",         # -0.21% / trade
+        "close_direction",         # -0.23% / trade
+        "bsts_decomposition",      # -0.32% / trade
+        "path_v_shape",            # -0.34% / trade
+        "cross_asset_spread",      # -2.15% / trade
+        "volume_confirmation",     # -2.75% / trade
+        "funding_rate_prediction", # -5.22% / trade
+        "volume_fade",             # -5.60% / trade
+    },
+    ("1h", "BTC-USD,ETH-USD,SOL-USD"): {
+        # Negative Sharpe from oracle shadow run 2026-07-04
+        "volume_fade",             # Sharpe -0.00,  -4.72% / trade
+        "cross_asset_rank",        # Sharpe -0.36,  -0.00% / trade
+        "distribution_overlap",    # Sharpe -1.53,  -0.03% / trade
+        "rsi_divergence",          # Sharpe -1.72,  -0.02% / trade
+        "conditional_path",        # Sharpe -2.15,  -0.03% / trade
+        "dynamic_bracket",         # Sharpe -2.30,  -0.03% / trade
+        "inverse_variance",        # Sharpe -2.33,  -0.03% / trade
+        "close_direction",         # Sharpe -2.50,  -0.03% / trade
+        "rsi_filter",              # Sharpe -2.77,  -0.06% / trade
+        "particle_filter",         # Sharpe -2.85,  -0.04% / trade
+        "bsts_decomposition",      # Sharpe -3.79,  -0.05% / trade
+        "rl_meta_controller",      # Sharpe -6.82,  -0.14% / trade
+        "cross_asset_spread",      # Sharpe -9.17,  -0.28% / trade
+        "dfa_persistence",         # Sharpe -10.60, -0.20% / trade
+        "hurst_regime_switch",     # Sharpe -10.60, -0.21% / trade
+        "range_trading",           # Sharpe -10.80, -0.21% / trade
+        "rqa_determinism",         # Sharpe -10.84, -0.21% / trade
+        "hmm_regime",              # Sharpe -13.96, -0.24% / trade
+        "volume_confirmation",     # Sharpe -15.60, -0.41% / trade
+        "path_rally",              # Sharpe -20.11, -0.73% / trade
+        "funding_rate_prediction", # Sharpe -36.17, -2.29% / trade
+    },
+}
+_DEFAULT_ASSETS = ["BTC-USD", "ETH-USD", "SOL-USD"]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kairos walk-forward backtest - Strategies based on predictions")
     parser.add_argument("--model", metavar="PATH", default=None,
                         help="Local path to finetuned Kronos predictor (defaults to NeoQuasar/Kronos-base)")
     parser.add_argument("--tokenizer", metavar="PATH", default=None,
                         help="Local path to Kronos tokenizer (defaults to NeoQuasar/Kronos-Tokenizer-base)")
-    # parser.add_argument("--output", metavar="PATH", default=None,
-    #                     help="Output HTML path (defaults to ./output/<symbol>_backtest_results.html)")
     parser.add_argument("--symbol", metavar="SYM", default=SYMBOL,
                         help=f"Trading symbol (default {SYMBOL})")
+    parser.add_argument("--interval", metavar="INTERVAL", default=None, dest="interval",
+                        help='Bar size: "1d", "1h", "15m", etc. (default: 1d)')
+    parser.add_argument("--assets", nargs="+", metavar="SYM", default=None, dest="assets",
+                        help=f"Asset tickers to backtest (default: {' '.join(_DEFAULT_ASSETS)})")
+    parser.add_argument("--backtest_period", metavar="PERIOD", default=None, dest="backtest_period",
+                        help='Backtest duration: "6m", "1y", "3m", "2w", "10d", etc. (default: 6m)')
     parser.add_argument("--lookback", metavar="N", default=LOOKBACK, type=int,
                         help=f"Context window bars (default {LOOKBACK})")
-    # parser.add_argument("--pred_len", metavar="N", default=PRED_LEN, type=int,
-    #                     help=f"Backtest period bars (default {PRED_LEN})")
     parser.add_argument("--pred_samples", metavar="N", default=PRED_SAMPLES, type=int,
                         help=f"Samples per bar (default {PRED_SAMPLES})")
     parser.add_argument("--initial_capital", metavar="N", default=INITIAL_CAPITAL, type=float,
@@ -438,7 +520,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     KairosSettings.configure(args)
 
-    DEMO_BACKTEST_OVER_N_BARS = 168  # backtest days (168 ~6 months of trading days)
+    assets = KairosSettings.assets or _DEFAULT_ASSETS
+    profile_key = (KairosSettings.interval, ",".join(sorted(assets)))
+    disabled = _DISABLED_BY_PROFILE.get(profile_key)
+    if disabled is None:
+        print(f"  [info] No oracle-tested disabled-strategy profile for {profile_key} — all strategies enabled.")
+        disabled = set()
+
+    DEMO_BACKTEST_OVER_N_BARS = _period_to_bars(KairosSettings.backtest_period, KairosSettings.interval)
 
     config = OrchestratorConfig(
         initial_capital=KairosSettings.initial_capital,
@@ -447,26 +536,12 @@ if __name__ == "__main__":
         partial_exits=True,
         max_horizon=3,
         no_prediction=KairosSettings.no_prediction,
-        disabled_strategies={
-            # Negative %/trade from no-prediction shadow run
-            "dynamic_bracket",        # -0.05% / trade
-            "inverse_variance",       # -0.07% / trade
-            "distribution_overlap",   # -0.09% / trade
-            "conditional_path",       # -0.14% / trade
-            "particle_filter",        # -0.21% / trade
-            "close_direction",        # -0.23% / trade
-            "bsts_decomposition",     # -0.32% / trade
-            "path_v_shape",           # -0.34% / trade
-            "cross_asset_spread",     # -2.15% / trade
-            "volume_confirmation",    # -2.75% / trade
-            "funding_rate_prediction", # -5.22% / trade
-            "volume_fade",            # -5.60% / trade
-        },
+        disabled_strategies=disabled,
     )
 
     orchestrator = KairosOrchestrator(
         predict_fn=predict_kairos_cloud,
-        assets=["BTC-USD", "ETH-USD", "SOL-USD"],
+        assets=assets,
         config=config,
         batch_predict_fn=predict_all_batch,
         model=KairosSettings.model,
@@ -476,9 +551,9 @@ if __name__ == "__main__":
 
     lookback = KairosSettings.lookback
     results = orchestrator.run_backtest({
-        "BTC-USD": fetch_data_raw("BTC-USD", lookback).tail(lookback + DEMO_BACKTEST_OVER_N_BARS),
-        "ETH-USD": fetch_data_raw("ETH-USD", lookback).tail(lookback + DEMO_BACKTEST_OVER_N_BARS),
-        "SOL-USD": fetch_data_raw("SOL-USD", lookback).tail(lookback + DEMO_BACKTEST_OVER_N_BARS),
+        sym: fetch_data_raw(sym, lookback, min_bars=lookback + DEMO_BACKTEST_OVER_N_BARS)
+                 .tail(lookback + DEMO_BACKTEST_OVER_N_BARS)
+        for sym in assets
     }, lookback=lookback)
 
     top_results = orchestrator.backtest_top_strategies(results, n=len(results["strategy_rankings"]))

@@ -97,12 +97,15 @@ class KairosSettings:
     model: Optional[str] = None
     tokenizer: Optional[str] = None
     no_prediction: bool = False
+    interval: str = "1d"
+    assets: list = None   # None → caller falls back to default asset list
+    backtest_period: str = "6m"
 
     @classmethod
     def configure(cls, args) -> None:
         for attr in ("symbol", "lookback", "pred_len", "pred_samples",
                      "initial_capital", "output_dir", "model", "tokenizer",
-                     "no_prediction"):
+                     "no_prediction", "interval", "assets", "backtest_period"):
             if hasattr(args, attr) and getattr(args, attr) is not None:
                 setattr(cls, attr, getattr(args, attr))
 
