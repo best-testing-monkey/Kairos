@@ -26,30 +26,34 @@ warnings.filterwarnings('ignore')
 sys.path.append("../")
 import price_cache
 from kairos.data import get_forecast_window
-from model import Kronos, KronosTokenizer, KronosPredictor
+# model imports are deferred to _ensure_model_loaded() so --no-prediction
+# runs never touch HuggingFace Hub or trigger its auth warning.
 from typing import List
 
 import pandas as pd
 
 from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig, print_results
+from kairos_backtest import KairosSettings
 from kairos.config import _state
 
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ── Configuration ────────────────────────────────────────────────────────────
-SYMBOL = "BTC-USD"  # yfinance format
-LOOKBACK = 300  # bars fed to Kronos as context
-PRED_LEN = 60  # bars Kronos forecasts (= backtest period)
-PRED_SAMPLES = 100  # Prediction samples to average with
-INITIAL_CAPITAL = 100_000  # CNY
-OUTPUT_DIR = "./output"
+# Defaults live in KairosSettings; the __main__ block calls KairosSettings.configure(args).
+SYMBOL = KairosSettings.symbol
+LOOKBACK = KairosSettings.lookback
+PRED_LEN = KairosSettings.pred_len
+PRED_SAMPLES = KairosSettings.pred_samples
+INITIAL_CAPITAL = KairosSettings.initial_capital
+OUTPUT_DIR = KairosSettings.output_dir
 
 bt_tokenizer = None
 bt_model = None
 bt_predictor = None
 
 _prediction_cache: dict = {}  # (symbol, last_bar_ts) -> List[pd.DataFrame]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -80,7 +84,7 @@ def fetch_data(symbol, lookback, pred_len):
     return x_df, x_ts, y_ts, actual
 
 
-def fetch_data_raw(symbol, lookback, pred_len = 0) -> DataFrame:
+def fetch_data_raw(symbol, lookback, pred_len=0) -> DataFrame:
     price_cache.configure(remote=False)
 
     from datetime import date
@@ -110,6 +114,7 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
         return
 
     import torch
+    from model import Kronos, KronosTokenizer, KronosPredictor
     tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
     mdl_src = model_path or "NeoQuasar/Kronos-base"
     print(f"Loading Kronos model from {mdl_src} ...")
@@ -161,7 +166,7 @@ def predict_all_batch(assets: dict) -> dict:
         if cache_key in _prediction_cache:
             cached_results[symbol] = _prediction_cache[cache_key]
             continue
-        lookback = min(LOOKBACK, len(df))
+        lookback = min(KairosSettings.lookback, len(df))
         x_df, x_ts = to_kronos_frame(df, lookback, amount="auto")
         y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
         df_list.append(x_df)
@@ -171,15 +176,16 @@ def predict_all_batch(assets: dict) -> dict:
 
     if uncached_symbols:
         seq_lens = [x.shape[0] for x in df_list]
-        return_samples = PRED_SAMPLES > 1
+        return_samples = KairosSettings.pred_samples > 1
         if len(set(seq_lens)) == 1:
             pred_lists = bt_predictor.predict_batch(
                 df_list, x_ts_list, y_ts_list,
-                pred_len=1, sample_count=PRED_SAMPLES, return_samples=return_samples, verbose=False
+                pred_len=1, sample_count=KairosSettings.pred_samples, return_samples=return_samples, verbose=False
             )
         else:
             pred_lists = [
-                bt_predictor.predict(df, x_ts, y_ts, pred_len=1, sample_count=PRED_SAMPLES, return_samples=return_samples, verbose = False)
+                bt_predictor.predict(df, x_ts, y_ts, pred_len=1, sample_count=KairosSettings.pred_samples,
+                                     return_samples=return_samples, verbose=False)
                 for df, x_ts, y_ts in zip(df_list, x_ts_list, y_ts_list)
             ]
         for symbol, preds in zip(uncached_symbols, pred_lists):
@@ -259,6 +265,7 @@ def backtest(predicted_close: pd.Series, actual_close: pd.Series,
     equity_series = pd.Series(equity, index=actual_close.index[:n])
     return equity_series, trades
 
+
 def compute_metrics(equity: pd.Series, initial_capital: float, trades: list):
     rets = equity.pct_change().dropna()
     total_ret = (equity.iloc[-1] - initial_capital) / initial_capital
@@ -278,6 +285,7 @@ def compute_metrics(equity: pd.Series, initial_capital: float, trades: list):
                 volatility=vol, sharpe=sharpe, max_drawdown=max_dd,
                 win_rate=win_rate, trades=len(trades),
                 final_capital=equity.iloc[-1])
+
 
 # ── Signal parsing ────────────────────────────────────────────────────────────
 
@@ -310,6 +318,7 @@ def parse_signals_config(signals_str):
         elif t == 'MACD':
             config['macd'] = {'fast': 12, 'slow': 26, 'signal_period': 9}
     return config
+
 
 # ── Signal computation ────────────────────────────────────────────────────────
 
@@ -363,14 +372,17 @@ def compute_signals(df, config):
 
     return out
 
+
 # ── Interactive control panel ─────────────────────────────────────────────────
 
-def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=1, **kwargs) -> List[pd.DataFrame]:
-    model_path = kwargs.get("model") or "NeoQuasar/Kronos-base"
-    tokenizer_path = kwargs.get("tokenizer") or "NeoQuasar/Kronos-Tokenizer-base"
-    symbol = kwargs.get("symbol") or SYMBOL
-    lookback = LOOKBACK
-    pred_samples = PRED_SAMPLES
+def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataFrame]:
+    pred_historic = kwargs.get('pred_historic', 0)
+    pred_num = kwargs.get('pred_num', 1)
+    model_path = kwargs.get("model") or KairosSettings.model or "NeoQuasar/Kronos-base"
+    tokenizer_path = kwargs.get("tokenizer") or KairosSettings.tokenizer or "NeoQuasar/Kronos-Tokenizer-base"
+    symbol = kwargs.get("symbol") or KairosSettings.symbol
+    lookback = KairosSettings.lookback
+    pred_samples = KairosSettings.pred_samples
 
     if signal is None:
         print("Kairos prediction cloud")
@@ -384,7 +396,7 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
         cache_key = (symbol, signal.index[-1])
         if cache_key in _prediction_cache:
             return _prediction_cache[cache_key]
-        lookback = min(LOOKBACK, len(signal))
+        lookback = min(KairosSettings.lookback, len(signal))
         x_df, x_ts = to_kronos_frame(signal, lookback, amount="auto")
         y_ts = future_timestamps(x_ts.iloc[-1], "1d", 1, _state.calendar, _state.tz)
 
@@ -401,18 +413,55 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, pred_historic=0, pred_num=
         _prediction_cache[cache_key] = result_list
     return result_list
 
+
 if __name__ == "__main__":
-    # DEMO_EXTRA_BARS = 168  # backtest days (~6 months of trading days)
-    DEMO_EXTRA_BARS = 168    # backtest days (168 ~6 months of trading days)
-    PRED_SAMPLES =    100    # prediction samples per bar (1 = no ensemble, fast)
-    DEMO_LOOKBACK =   300    # context bars fed to model (shorter = faster attention)
+    parser = argparse.ArgumentParser(description="Kairos walk-forward backtest - Strategies based on predictions")
+    parser.add_argument("--model", metavar="PATH", default=None,
+                        help="Local path to finetuned Kronos predictor (defaults to NeoQuasar/Kronos-base)")
+    parser.add_argument("--tokenizer", metavar="PATH", default=None,
+                        help="Local path to Kronos tokenizer (defaults to NeoQuasar/Kronos-Tokenizer-base)")
+    # parser.add_argument("--output", metavar="PATH", default=None,
+    #                     help="Output HTML path (defaults to ./output/<symbol>_backtest_results.html)")
+    parser.add_argument("--symbol", metavar="SYM", default=SYMBOL,
+                        help=f"Trading symbol (default {SYMBOL})")
+    parser.add_argument("--lookback", metavar="N", default=LOOKBACK, type=int,
+                        help=f"Context window bars (default {LOOKBACK})")
+    # parser.add_argument("--pred_len", metavar="N", default=PRED_LEN, type=int,
+    #                     help=f"Backtest period bars (default {PRED_LEN})")
+    parser.add_argument("--pred_samples", metavar="N", default=PRED_SAMPLES, type=int,
+                        help=f"Samples per bar (default {PRED_SAMPLES})")
+    parser.add_argument("--initial_capital", metavar="N", default=INITIAL_CAPITAL, type=float,
+                        help=f"Initial capital (default {INITIAL_CAPITAL})")
+    parser.add_argument("--no-prediction", dest="no_prediction", action="store_true", default=False,
+                        help="Replace model predictions with actual next-bar OHLCV (oracle baseline)")
+
+    args = parser.parse_args()
+    KairosSettings.configure(args)
+
+    DEMO_BACKTEST_OVER_N_BARS = 168  # backtest days (168 ~6 months of trading days)
 
     config = OrchestratorConfig(
-        initial_capital=100000.0,
+        initial_capital=KairosSettings.initial_capital,
         cross_asset_ranking=True,
         online_weighting=True,
         partial_exits=True,
         max_horizon=3,
+        no_prediction=KairosSettings.no_prediction,
+        disabled_strategies={
+            # Negative %/trade from no-prediction shadow run
+            "dynamic_bracket",        # -0.05% / trade
+            "inverse_variance",       # -0.07% / trade
+            "distribution_overlap",   # -0.09% / trade
+            "conditional_path",       # -0.14% / trade
+            "particle_filter",        # -0.21% / trade
+            "close_direction",        # -0.23% / trade
+            "bsts_decomposition",     # -0.32% / trade
+            "path_v_shape",           # -0.34% / trade
+            "cross_asset_spread",     # -2.15% / trade
+            "volume_confirmation",    # -2.75% / trade
+            "funding_rate_prediction", # -5.22% / trade
+            "volume_fade",            # -5.60% / trade
+        },
     )
 
     orchestrator = KairosOrchestrator(
@@ -420,12 +469,17 @@ if __name__ == "__main__":
         assets=["BTC-USD", "ETH-USD", "SOL-USD"],
         config=config,
         batch_predict_fn=predict_all_batch,
+        model=KairosSettings.model,
+        tokenizer=KairosSettings.tokenizer,
+        symbol=KairosSettings.symbol,
     )
 
+    lookback = KairosSettings.lookback
     results = orchestrator.run_backtest({
-        "BTC-USD": fetch_data_raw("BTC-USD", DEMO_LOOKBACK).tail(DEMO_LOOKBACK + DEMO_EXTRA_BARS),
-        "ETH-USD": fetch_data_raw("ETH-USD", DEMO_LOOKBACK).tail(DEMO_LOOKBACK + DEMO_EXTRA_BARS),
-        "SOL-USD": fetch_data_raw("SOL-USD", DEMO_LOOKBACK).tail(DEMO_LOOKBACK + DEMO_EXTRA_BARS),
-    }, lookback=DEMO_LOOKBACK)
+        "BTC-USD": fetch_data_raw("BTC-USD", lookback).tail(lookback + DEMO_BACKTEST_OVER_N_BARS),
+        "ETH-USD": fetch_data_raw("ETH-USD", lookback).tail(lookback + DEMO_BACKTEST_OVER_N_BARS),
+        "SOL-USD": fetch_data_raw("SOL-USD", lookback).tail(lookback + DEMO_BACKTEST_OVER_N_BARS),
+    }, lookback=lookback)
 
-    print_results(results)
+    top_results = orchestrator.backtest_top_strategies(results, n=len(results["strategy_rankings"]))
+    print_results(results, top_results)

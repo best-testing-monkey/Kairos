@@ -62,7 +62,7 @@ try:
     from kairos_backtest import (
         KairosDistribution, KairosPredictor, Direction,
         Signal, Strategy, Trade, BacktestEngine,
-        DecisionTreeRouter,
+        DecisionTreeRouter, KairosSettings,
         PercentileEntryStrategy, DynamicBracketStrategy, SkewStrategy,
         RangeTradingStrategy, TrendFollowingStrategy, VolatilityArbStrategy,
         HighLowStrategy, OpenGapStrategy, FadeExtremeStrategy,
@@ -70,6 +70,9 @@ try:
         MartingaleFloorStrategy, RSIFilterStrategy, MACDFilterStrategy,
         BollingerValidationStrategy, SupportConfluenceStrategy,
         InverseVarianceSizingStrategy, CloseDirectionStrategy,
+        VaRPositionCapStrategy, DistributionOverlapStrategy,
+        ModelDecayMonitorStrategy, OvernightExposureFilter,
+        RSIDivergenceStrategy, LeverageCalibrationStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_backtest: {e}")
@@ -80,6 +83,7 @@ try:
         PathRallyStrategy, PathFadeStrategy,
         PathVShapeStrategy, PathInvertedVStrategy,
         PathHighLowSequenceStrategy,
+        ConditionalPathProbabilityStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_path: {e}")
@@ -89,6 +93,7 @@ try:
         KairosMultiHorizonPredictor, HorizonStack,
         MultiHorizonHoldStrategy, ConfidenceDecayFilterStrategy,
         RollingHorizonStrategy, MultiHorizonBacktestEngine,
+        PathIntegrationStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_horizon: {e}")
@@ -101,6 +106,7 @@ try:
         VolumeConfirmationStrategy, VolumeFadeStrategy,
         AmountFlowStrategy, PredictedVWAPStrategy,
         PartialExitBacktestEngine,
+        PyramidingStrategy, TimeBasedStopStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_execution: {e}")
@@ -116,9 +122,48 @@ try:
         KurtosisFilterStrategy, TailRiskStrategy,
         SellPremiumStrategy, BuyWingsStrategy,
         TailAsymmetryStrategy, PercentileTailStrategy,
+        RegimeClusterStrategy, MonteCarloScenarioStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_meta: {e}")
+
+try:
+    from kairos_crypto import (
+        FundingRateArbitrage, BasisTrade, StablecoinDepeg,
+        ExchangeSpreadArbitrage, LiquidationFrontRun, FundingRatePrediction,
+        OnChainFlowFilter, GammaSqueeze, HashRateFilter, FundingHarvest,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_crypto: {e}")
+
+try:
+    from kairos_forex import (
+        CarryTrade, SessionBreakout, LondonFixFade, CBDivergence,
+        SafeHavenRotation, TriangularArbitrage, CDSSpreadFilter,
+        COTPositioningFilter, AsianRangeBreakout, OISSwapSpread,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_forex: {e}")
+
+try:
+    from kairos_stocks import (
+        PEAD, EarningsMomentum, IndexRebalance, SectorRotation,
+        CointegrationPairs, MergerArb, BuybackYield, ShortSqueeze,
+        InsiderCluster, DarkPoolFilter, BuybackDrift, DividendCapture,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_stocks: {e}")
+
+try:
+    from kairos_universal import (
+        KalmanPairs, HurstRegimeSwitch, CopulaPairs, CointegrationECT,
+        HMMRegime, WaveletMomentum, DFAPersistence, TransferEntropy,
+        GNNSectorRotation, RLMetaController, FractalDimension, LZComplexity,
+        RQADeterminism, MutualInformationWeight, GaussianProcess,
+        BSTSDecomposition, ParticleFilter, SpectralClustering,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_universal: {e}")
 
 
 # =============================================================================
@@ -128,6 +173,7 @@ except ImportError as e:
 @dataclass
 class OrchestratorConfig:
     """Configuration for the Kairos orchestrator."""
+    _kwargs = None
 
     # Capital
     initial_capital: float = 10000.0
@@ -173,6 +219,19 @@ class OrchestratorConfig:
     # Logging
     verbose: bool = False
     log_signals: bool = True
+
+    # Baseline mode
+    no_prediction: bool = False
+
+    # Disabled strategies (shadow-tested and found unprofitable even with perfect predictions)
+    disabled_strategies: Set[str] = field(default_factory=lambda: {
+        "skew", "multi_horizon_hold", "dynamic_bracket", "inverse_variance",
+        "rolling_horizon", "percentile_entry", "path_v_shape", "path_execution",
+        "distribution_overlap", "volume_fade", "tail_asymmetry", "rsi_filter",
+        "path_high_low_sequence", "range_trading", "volume_confirmation",
+        "cross_asset_momentum_transfer", "momentum_continuation",
+        "trend_following", "open_gap",
+    })
 
 
 # =============================================================================
@@ -252,6 +311,113 @@ class StrategyRegistry:
             TailAsymmetryStrategy(),
             PercentileTailStrategy(),
         ])
+
+        # === NEW STRATEGIES (12) ===
+        # Standalone strategies
+        strategies.extend([
+            DistributionOverlapStrategy(),
+            ConditionalPathProbabilityStrategy(),
+            RSIDivergenceStrategy(),
+            PathIntegrationStrategy(max_horizon=config.max_horizon),
+        ])
+        # Wrappers - use TrendFollowingStrategy so close_direction can be disabled
+        base_trend = (CloseDirectionStrategy()
+                      if "close_direction" not in config.disabled_strategies
+                      else TrendFollowingStrategy())
+        strategies.extend([
+            VaRPositionCapStrategy(base_strategy=base_trend),
+            LeverageCalibrationStrategy(base_strategy=base_trend),
+            OvernightExposureFilter(base_strategy=base_trend),
+            ModelDecayMonitorStrategy(base_strategy=base_trend),
+            PyramidingStrategy(base_strategy=base_trend),
+            TimeBasedStopStrategy(base_strategy=base_trend),
+        ])
+        # Meta-selectors across all base strategies (exclude disabled ones)
+        base_pool = [s for s in [TrendFollowingStrategy(), RangeTradingStrategy(),
+                                  SkewStrategy(), MomentumContinuationStrategy()]
+                     if s.name not in config.disabled_strategies]
+        strategies.extend([
+            RegimeClusterStrategy(base_strategies=base_pool),
+            MonteCarloScenarioStrategy(base_strategies=base_pool),
+        ])
+
+        # === CRYPTO STRATEGIES (10) ===
+        strategies.extend([
+            FundingRateArbitrage(),
+            BasisTrade(),
+            StablecoinDepeg(),
+            ExchangeSpreadArbitrage(),
+            LiquidationFrontRun(),
+            FundingRatePrediction(),
+            OnChainFlowFilter(base_strategy=TrendFollowingStrategy()),
+            GammaSqueeze(),
+            HashRateFilter(base_strategy=TrendFollowingStrategy()),
+            FundingHarvest(),
+        ])
+
+        # === FOREX STRATEGIES (10) ===
+        strategies.extend([
+            CarryTrade(),
+            SessionBreakout(),
+            LondonFixFade(),
+            CBDivergence(),
+            SafeHavenRotation(),
+            TriangularArbitrage(),
+            CDSSpreadFilter(base_strategy=TrendFollowingStrategy()),
+            COTPositioningFilter(base_strategy=TrendFollowingStrategy()),
+            AsianRangeBreakout(),
+            OISSwapSpread(),
+        ])
+
+        # === STOCK STRATEGIES (12) ===
+        strategies.extend([
+            PEAD(),
+            EarningsMomentum(),
+            IndexRebalance(),
+            SectorRotation(),
+            CointegrationPairs(),
+            MergerArb(),
+            BuybackYield(),
+            ShortSqueeze(base_strategy=MomentumContinuationStrategy()),
+            InsiderCluster(base_strategy=TrendFollowingStrategy()),
+            DarkPoolFilter(base_strategy=TrendFollowingStrategy()),
+            BuybackDrift(),
+            DividendCapture(),
+        ])
+
+        # === UNIVERSAL STRATEGIES (18) ===
+        strategies.extend([
+            KalmanPairs(),
+            HurstRegimeSwitch(),
+            CopulaPairs(),
+            CointegrationECT(),
+            HMMRegime(),
+            WaveletMomentum(),
+            DFAPersistence(),
+            TransferEntropy(),
+            GNNSectorRotation(),
+            RLMetaController(all_strategies=[
+                TrendFollowingStrategy(), MomentumContinuationStrategy(),
+                RangeTradingStrategy(), SkewStrategy(),
+            ]),
+            FractalDimension(base_strategy=TrendFollowingStrategy()),
+            LZComplexity(base_strategy=TrendFollowingStrategy()),
+            RQADeterminism(),
+            MutualInformationWeight(feature_map={
+                "rsi_filter": "rsi",
+                "volume_confirmation": "volume",
+                "trend_following": "momentum",
+                "momentum_continuation": "momentum",
+            }),
+            GaussianProcess(base_strategy=TrendFollowingStrategy()),
+            BSTSDecomposition(),
+            ParticleFilter(base_strategy=TrendFollowingStrategy()),
+            SpectralClustering(),
+        ])
+
+        # Drop strategies the user has disabled
+        if config.disabled_strategies:
+            strategies = [s for s in strategies if s.name not in config.disabled_strategies]
 
         # Apply kurtosis filter to all directional strategies
         if config.kurtosis_action != "none":
@@ -345,7 +511,9 @@ class KairosOrchestrator:
                  predict_fn: Callable[[pd.DataFrame, str], List[pd.DataFrame]],
                  assets: Optional[List[str]] = None,
                  config: Optional[OrchestratorConfig] = None,
-                 batch_predict_fn: Optional[Callable] = None):
+                 batch_predict_fn: Optional[Callable] = None, **kwargs):
+
+        self._kwargs = kwargs
         self.predict_fn = predict_fn
         self.assets = assets or ["BTC-USD"]
         self.config = config or OrchestratorConfig()
@@ -366,6 +534,10 @@ class KairosOrchestrator:
         self.all_trades: List[Trade] = []
         self.active_positions: List[Dict] = []
         self.daily_logs: List[Dict] = []
+        self._prev_dist: Dict[str, KairosDistribution] = {}
+        # Shadow tracking: (date, symbol, strategy_name, direction, stop, target)
+        self._shadow_signals: List[Tuple] = []
+        self._shadow_seen: set = set()
 
     def run_backtest(self,
                      data_dict: Dict[str, pd.DataFrame],
@@ -375,6 +547,11 @@ class KairosOrchestrator:
 
         Returns a dict with summary metrics, equity curve, and trade log.
         """
+        self._data_dict = data_dict
+        self._lookback = lookback
+        self._shadow_signals = []
+        self._shadow_seen = set()
+
         # Find common date range
         all_dates = set()
         for df in data_dict.values():
@@ -404,10 +581,33 @@ class KairosOrchestrator:
 
         return self._build_results()
 
+    def _make_realized_predictions(self, date: pd.Timestamp,
+                                    histories: Dict[str, pd.DataFrame]) -> Dict:
+        """Oracle baseline: build AssetPrediction from the actual next bar."""
+        result = {}
+        for symbol, history in histories.items():
+            full_df = self._data_dict.get(symbol)
+            future = full_df[full_df.index > date] if full_df is not None else pd.DataFrame()
+            bar = future.iloc[0] if not future.empty else history.iloc[-1]
+            current_price = float(history.iloc[-1]["close"])
+            dist = KairosDistribution.from_bar(
+                bar, n_samples=KairosSettings.pred_samples, center=current_price
+            )
+            result[symbol] = AssetPrediction(
+                symbol=symbol,
+                dist=dist,
+                current_price=current_price,
+                history=history,
+            )
+        return result
+
     def _run_day(self, date: pd.Timestamp, histories: Dict[str, pd.DataFrame]):
         """Process a single day across all assets."""
         # 1. Multi-asset predictions
-        multi_preds = self.multi_predictor.predict_all(histories)
+        if self.config.no_prediction:
+            multi_preds = self._make_realized_predictions(date, histories)
+        else:
+            multi_preds = self.multi_predictor.predict_all(histories)
 
         # 2. Evaluate all strategies for each asset
         all_signals = []
@@ -427,7 +627,12 @@ class KairosOrchestrator:
                 "capital": self.capital,
                 "multi_asset_predictions": multi_preds,
                 "current_symbol": symbol,
-                "predict_fn": self.predict_fn,
+                "predict_fn": (lambda *a, **kw: []) if self.config.no_prediction else self.predict_fn,
+                "prev_dist": self._prev_dist.get(symbol),
+                "current_position": next(
+                    (p for p in self.active_positions if p["symbol"] == symbol), None
+                ),
+                "bar_index": len(self.equity_curve),
             }
 
             # Run all strategies
@@ -436,6 +641,25 @@ class KairosOrchestrator:
                 try:
                     sig = strat.generate_signal(dist, current_price, history, context)
                     if sig and sig.direction != Direction.FLAT and sig.size > 0:
+                        # Shadow tracking: record signal before competitive weighting.
+                        # Use sig.strategy_name (not strat.name) - LiquidityFilter and
+                        # other wrappers preserve the inner signal's name, so this
+                        # correctly identifies the originating strategy.
+                        # Deduplicate per (date, symbol, strategy_name): wrapper chains
+                        # like VaRPositionCap→CloseDirection emit strategy_name=
+                        # "close_direction" up to 7× per slot; only the first counts.
+                        # Also record sig.entry so _compute_shadow_performance can
+                        # convert stop/target to % offsets (fixes cross-asset strategies
+                        # whose stop/target are in a different asset's price units).
+                        _shadow_key = (date, symbol, sig.strategy_name)
+                        if _shadow_key not in self._shadow_seen:
+                            self._shadow_seen.add(_shadow_key)
+                            self._shadow_signals.append((
+                                date, symbol,
+                                sig.strategy_name, sig.direction,
+                                sig.stop, sig.target, sig.entry,
+                            ))
+
                         # Weight by online performance
                         if self.config.online_weighting:
                             weight = self.tracker.get_weight(
@@ -453,6 +677,14 @@ class KairosOrchestrator:
                     if self.config.verbose:
                         print(f"Strategy {strat.name} failed: {e}")
                     continue
+
+            # Store distribution for next day's DistributionOverlapStrategy
+            self._prev_dist[symbol] = dist
+
+            # Update calibration-tracking strategies
+            for strat in self.strategies:
+                if hasattr(strat, "update_calibration"):
+                    strat.update_calibration(dist, current_price)
 
             # Pick top signal for this asset
             if signals:
@@ -548,6 +780,13 @@ class KairosOrchestrator:
                 elif low <= pos["target"]:
                     exit_price, exit_reason = pos["target"], "target"
 
+            # Time-based stop: exit at close if target not reached by time_exit_bar
+            if exit_price is None and pos.get("time_exit_bar") is not None:
+                bar_index = len(self.equity_curve)
+                if bar_index >= pos["time_exit_bar"]:
+                    exit_price = close
+                    exit_reason = "time_stop"
+
             # Check hold expiry
             if exit_price is None and pos.get("hold_days_remaining", 1) <= 0:
                 exit_price = close
@@ -607,6 +846,7 @@ class KairosOrchestrator:
             "entry_date": date,
             "hold_days_remaining": unified.hold_days,
             "notional": notional,
+            "time_exit_bar": unified.metadata.get("time_exit_bar"),
         }
         self.active_positions.append(position)
 
@@ -674,6 +914,132 @@ class KairosOrchestrator:
         if self.equity_curve:
             self.equity_curve[-1] = (self.equity_curve[-1][0], self.capital)
 
+    def backtest_top_strategies(self, results: Dict, n: int = 3) -> List[Dict]:
+        """Build per-strategy stats for the top-n strategies from shadow performance.
+
+        Uses shadow signals (all strategies, evaluated against actual next-bar OHLCV)
+        so every strategy that generated signals appears, not just competition winners.
+        Metrics are consistent with strategy_rankings because both use shadow data.
+        """
+        rankings = results.get("strategy_rankings", [])
+        shadow_perf = results.get("shadow_performance", {})
+        initial_capital = results["summary"]["initial_capital"]
+
+        top_results = []
+        for name, _sharpe in rankings[:n]:
+            sd = shadow_perf.get(name, {})
+            pnl_list: List[float] = sd.get("pnl_list", [])
+            sharpe = sd.get("sharpe", 0.0)
+            n_signals = sd.get("signal_count", 0)
+
+            # Compound equity curve from pnl_pct (each signal allocated 10% of capital)
+            running = initial_capital
+            equity_pts: List[float] = [running]
+            for r in pnl_list:
+                running += running * r * 0.1
+                equity_pts.append(running)
+
+            eq = np.array(equity_pts)
+            total_ret = (eq[-1] - initial_capital) / initial_capital if len(eq) > 1 else 0.0
+            peak = np.maximum.accumulate(eq)
+            max_dd = float(((eq - peak) / (peak + 1e-9)).min()) if len(eq) > 1 else 0.0
+
+            wins = [r for r in pnl_list if r > 0]
+            losses = [r for r in pnl_list if r <= 0]
+            win_rate = len(wins) / n_signals if n_signals else 0.0
+            profit_factor = (abs(sum(wins)) / abs(sum(losses))
+                             if losses and sum(losses) != 0 else float("inf"))
+            total_pnl = sum(pnl_list) * initial_capital * 0.1
+            avg_pct_per_trade = float(np.mean(pnl_list)) * 100 if pnl_list else 0.0
+            avg_pct_per_win   = float(np.mean(wins))    * 100 if wins   else 0.0
+            avg_pct_per_loss  = float(np.mean(losses))  * 100 if losses else 0.0
+
+            top_results.append({
+                "strategy_name": name,
+                "sharpe": sharpe,
+                "total_return": total_ret,
+                "max_drawdown": max_dd,
+                "win_rate": win_rate,
+                "profit_factor": profit_factor,
+                "num_trades": n_signals,
+                "total_pnl": total_pnl,
+                "final_capital": eq[-1] if len(eq) > 1 else initial_capital,
+                "avg_pct_per_trade": avg_pct_per_trade,
+                "avg_pct_per_win":   avg_pct_per_win,
+                "avg_pct_per_loss":  avg_pct_per_loss,
+            })
+
+        return top_results
+
+    def _compute_shadow_performance(self) -> Dict[str, Dict]:
+        """Evaluate every recorded signal against actual next-bar OHLCV.
+
+        Returns a dict keyed by strategy_name with:
+          pnl_list  – list of per-signal pnl_pct values
+          sharpe    – annualised Sharpe across all signals
+        """
+        by_strategy: Dict[str, List[float]] = defaultdict(list)
+        for record in self._shadow_signals:
+            # Unpack with backward compat: entry field added later
+            if len(record) == 7:
+                date, symbol, sname, direction, stop, target, sig_entry = record
+            else:
+                date, symbol, sname, direction, stop, target = record
+                sig_entry = None
+
+            full_df = self._data_dict.get(symbol)
+            if full_df is None:
+                continue
+            future = full_df[full_df.index > date]
+            if future.empty:
+                continue
+            nb = future.iloc[0]
+            entry = float(nb["open"])
+            high = float(nb["high"])
+            low = float(nb["low"])
+            close = float(nb["close"])
+            if entry <= 0:
+                continue
+
+            # Convert stop/target from absolute prices to % offsets relative to
+            # sig_entry, then re-anchor to the actual next-bar open.  This keeps
+            # the evaluation correct even when a strategy (e.g. cross_asset_rank)
+            # sets stop/target in a different asset's price units.
+            ref = float(sig_entry) if sig_entry and sig_entry > 0 else entry
+            stop_price  = entry * (1.0 + (stop  - ref) / ref)
+            target_price = entry * (1.0 + (target - ref) / ref)
+
+            if direction == Direction.LONG:
+                if low <= stop_price:
+                    exit_p = stop_price
+                elif high >= target_price:
+                    exit_p = target_price
+                else:
+                    exit_p = close
+                pnl_pct = (exit_p - entry) / entry
+            else:
+                if high >= stop_price:
+                    exit_p = stop_price
+                elif low <= target_price:
+                    exit_p = target_price
+                else:
+                    exit_p = close
+                pnl_pct = (entry - exit_p) / entry
+
+            by_strategy[sname].append(pnl_pct)
+
+        result = {}
+        for sname, pnl_list in by_strategy.items():
+            n = len(pnl_list)
+            if n >= 2:
+                rets = np.array(pnl_list)
+                std_r = float(np.std(rets))
+                sharpe = float(np.mean(rets) / std_r * np.sqrt(252)) if std_r > 0 else 0.0
+            else:
+                sharpe = 0.0
+            result[sname] = {"pnl_list": pnl_list, "sharpe": sharpe, "signal_count": n}
+        return result
+
     def _build_results(self) -> Dict:
         """Compile all results into a comprehensive dict."""
         # Basic metrics
@@ -698,21 +1064,49 @@ class KairosOrchestrator:
 
         profit_factor = float(abs(sum(wins) / sum(losses))) if sum(losses) != 0 else float("inf")
 
-        # Strategy performance breakdown
-        strategy_stats = {}
-        for name, perf in self.tracker.performances.items():
-            strategy_stats[name] = {
-                "sharpe": perf.sharpe,
-                "win_rate": perf.win_rate,
-                "profit_factor": perf.profit_factor,
-                "total_pnl": perf.total_pnl,
-                "num_trades": perf.wins + perf.losses,
-            }
+        # Strategy performance breakdown - computed from ALL trades for that strategy
+        # so that Sharpe, win rate, and return are always internally consistent.
+        by_strategy: Dict[str, List[Trade]] = defaultdict(list)
+        for t in self.all_trades:
+            by_strategy[t.strategy_name].append(t)
 
-        # Best / worst strategies
-        ranked = self.tracker.get_all_rankings()
-        best_strategy = ranked[0][0] if ranked else None
-        worst_strategy = ranked[-1][0] if ranked else None
+        strategy_stats = {}
+        strategy_sharpes: List[Tuple[str, float]] = []
+        for sname, strades in by_strategy.items():
+            strades_sorted = sorted(strades, key=lambda t: t.entry_date)
+            spnls = [t.pnl for t in strades_sorted]
+            swins  = [p for p in spnls if p > 0]
+            slosses = [p for p in spnls if p <= 0]
+            srets = np.array([t.pnl_pct for t in strades_sorted])
+            if len(srets) >= 2 and np.std(srets) > 0:
+                span = max((strades_sorted[-1].exit_date - strades_sorted[0].entry_date).days, 1)
+                tpy = len(strades_sorted) * 365.0 / span
+                ssharpe = float(np.mean(srets) / np.std(srets) * np.sqrt(tpy))
+            else:
+                ssharpe = 0.0
+            pf = (abs(sum(swins)) / abs(sum(slosses))
+                  if slosses and sum(slosses) != 0 else float("inf"))
+            strategy_stats[sname] = {
+                "sharpe": ssharpe,
+                "win_rate": len(swins) / len(spnls) if spnls else 0.0,
+                "profit_factor": pf,
+                "total_pnl": sum(spnls),
+                "num_trades": len(strades_sorted),
+            }
+            strategy_sharpes.append((sname, ssharpe))
+
+        strategy_sharpes.sort(key=lambda x: x[1], reverse=True)
+        actual_ranked = strategy_sharpes
+        best_strategy = actual_ranked[0][0] if actual_ranked else None
+        worst_strategy = actual_ranked[-1][0] if actual_ranked else None
+
+        # Shadow rankings: all strategies that generated at least one signal,
+        # evaluated against actual next-bar OHLCV independent of competition.
+        shadow_perf = self._compute_shadow_performance()
+        shadow_ranked = sorted(
+            [(sname, d["sharpe"]) for sname, d in shadow_perf.items()],
+            key=lambda x: x[1], reverse=True,
+        )
 
         return {
             "summary": {
@@ -734,8 +1128,11 @@ class KairosOrchestrator:
             "strategy_performance": strategy_stats,
             "best_strategy": best_strategy,
             "worst_strategy": worst_strategy,
-            "strategy_rankings": ranked,
+            "strategy_rankings": shadow_ranked,   # primary: all strategies with signals
+            "actual_trade_rankings": actual_ranked,  # secondary: only strategies that won competition
+            "shadow_performance": shadow_perf,
             "daily_logs": self.daily_logs,
+            "no_prediction": self.config.no_prediction,
         }
 
     def run_single_asset(self, df: pd.DataFrame, lookback: int = 200) -> Dict:
@@ -802,31 +1199,72 @@ class KairosOrchestrator:
 # REPORTING UTILITIES
 # =============================================================================
 
-def print_results(results: Dict):
+def _fmt(v: float, decimals: int = 2) -> str:
+    """Format a float with space-thousands separator, e.g. 1 234 567.89"""
+    fmt = f"{v:,.{decimals}f}"
+    return fmt.replace(",", " ")   # thin space as thousands separator
+
+
+def print_results(results: Dict, top_strategy_results: Optional[List[Dict]] = None):
     """Pretty-print backtest results."""
     s = results["summary"]
-    print("=" * 60)
+    W = 68
+    print("=" * W)
     print("KAIROS BACKTEST RESULTS")
-    print("=" * 60)
-    print(f"Total Return:     {s['total_return']*100:>8.2f}%")
-    print(f"Sharpe Ratio:     {s['sharpe']:>8.2f}")
-    print(f"Max Drawdown:     {s['max_drawdown']*100:>8.2f}%")
-    print(f"Win Rate:         {s['win_rate']*100:>8.2f}%")
-    print(f"Profit Factor:    {s['profit_factor']:>8.2f}")
-    print(f"Num Trades:       {s['num_trades']:>8d}")
-    print(f"Avg Trade:        {s['avg_trade']:>8.4f}")
-    print(f"Avg Win:          {s['avg_win']:>8.4f}")
-    print(f"Avg Loss:         {s['avg_loss']:>8.4f}")
-    print(f"Final Capital:    {s['final_capital']:>8.2f}")
-    print("-" * 60)
-    print(f"Best Strategy:    {results['best_strategy']}")
-    print(f"Worst Strategy:   {results['worst_strategy']}")
-    print("=" * 60)
+    if results.get("no_prediction"):
+        print("  Mode: NO-PREDICTION  (oracle - actual next-bar OHLCV)")
+    print("=" * W)
+    print(f"  Total Return:     {_fmt(s['total_return']*100)}%")
+    print(f"  Sharpe Ratio:     {_fmt(s['sharpe'])}")
+    print(f"  Max Drawdown:     {_fmt(s['max_drawdown']*100)}%")
+    print(f"  Win Rate:         {_fmt(s['win_rate']*100)}%")
+    print(f"  Profit Factor:    {_fmt(s['profit_factor'])}")
+    print(f"  Num Trades:       {s['num_trades']:,}".replace(",", " "))
+    print(f"  Avg Trade PnL:    {_fmt(s['avg_trade'])}")
+    print(f"  Avg Win:          {_fmt(s['avg_win'])}")
+    print(f"  Avg Loss:         {_fmt(s['avg_loss'])}")
+    print(f"  Final Capital:    {_fmt(s['final_capital'])}")
+    print("-" * W)
+    print(f"  Best Strategy:    {results['best_strategy']}")
+    print(f"  Worst Strategy:   {results['worst_strategy']}")
+    print("=" * W)
 
     if results["strategy_rankings"]:
-        print("\nTOP 10 STRATEGIES BY SHARPE:")
-        for i, (name, sharpe) in enumerate(results["strategy_rankings"][:10], 1):
-            print(f"  {i:2d}. {name:30s}  Sharpe: {sharpe:6.3f}")
+        shadow_perf = results.get("shadow_performance", {})
+        print("\n  ALL STRATEGIES BY SHARPE  (shadow: each signal vs actual next-bar):")
+        for i, (name, sharpe) in enumerate(results["strategy_rankings"], 1):
+            n_sig = shadow_perf.get(name, {}).get("signal_count", 0)
+            print(f"    {i:2d}. {name:35s}  Sharpe: {_fmt(sharpe)}  ({n_sig} signals)")
+
+    if top_strategy_results:
+        n_days = len(results.get("equity_curve", [])) or 1
+        n_weeks = max(n_days / 5.0, 1.0)
+        SW = 114
+        print("\n" + "=" * SW)
+        print("  ALL STRATEGIES - SHADOW SIGNAL PERFORMANCE")
+        print("=" * SW)
+        hdr = (f"  {'Strategy':<35}  {'Sharpe':>7}  {'%/trade':>8}  {'%/win':>7}"
+               f"  {'%/loss':>7}  {'MaxDD':>8}  {'WinRate':>8}  {'sig/wk':>6}  {'Signals':>7}")
+        print(hdr)
+        print("  " + "-" * (SW - 2))
+        for r in top_strategy_results:
+            sharpeStr = f"  {_fmt(r['sharpe']):>7}"
+            if (r['sharpe'] < -100):
+                sharpeStr = f"<-100"
+            spw = r["num_trades"] / n_weeks
+            spw_str = "<1" if spw < 1 else str(int(spw))
+            print(
+                f"  {r['strategy_name']:<35}"
+                +sharpeStr+
+                f"  {_fmt(r['avg_pct_per_trade']):>7}%"
+                f"  {_fmt(r['avg_pct_per_win']):>6}%"
+                f"  {_fmt(r['avg_pct_per_loss']):>6}%"
+                f"  {_fmt(r['max_drawdown']*100):>7}%"
+                f"  {_fmt(r['win_rate']*100):>7}%"
+                f"  {spw_str:>6}"
+                f"  {r['num_trades']:>7,}".replace(",", " ")
+            )
+        print("=" * SW)
 
 
 def export_results(results: Dict, filepath: str):

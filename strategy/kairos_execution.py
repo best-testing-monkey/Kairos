@@ -527,11 +527,10 @@ class LiquidityFilterStrategy(Strategy):
         if signal is None:
             return None
 
-        # Augment metadata
+        # Augment metadata; preserve the inner strategy's name for tracking
         v = analyzer.volume_vs_history(history)
         signal.metadata["volume_percentile"] = v["percentile"]
         signal.metadata["volume_ratio"] = v["ratio"]
-        signal.strategy_name = f"{self.name}_{self.base_strategy.name}"
         return signal
 
 
@@ -1065,6 +1064,119 @@ class PartialExitBacktestEngine(BacktestEngine):
 
 
 # =============================================================================
+# PART 4: EXECUTION WRAPPERS
+# =============================================================================
+
+class PyramidingStrategy(Strategy):
+    """
+    Wraps a base strategy and encodes a pyramid add plan in signal metadata.
+
+    The strategy itself does NOT manage positions - it generates an initial signal
+    and encodes a pyramid plan in metadata. The orchestrator is responsible for
+    executing adds based on this plan.
+
+    Pyramid plan is a list of dicts, each containing:
+    - level: int (1, 2, 3, ...)
+    - add_at_price: float (price level at which to add)
+    - add_size: float (size to add at this level)
+    - stop: float (stop loss for the full position)
+    - target: float (target price for the full position)
+    """
+    name = "pyramiding"
+
+    def __init__(self, base_strategy: Strategy,
+                 pyramid_threshold_pct: float = 0.01,
+                 pyramid_add_pct: float = 0.25,
+                 max_pyramid_levels: int = 3):
+        self.base_strategy = base_strategy
+        self.pyramid_threshold_pct = pyramid_threshold_pct
+        self.pyramid_add_pct = pyramid_add_pct
+        self.max_pyramid_levels = max_pyramid_levels
+
+    def generate_signal(self, dist, current_price, history, context, **kwargs):
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+        if base_signal is None:
+            return None
+
+        # If direction is FLAT, return as-is without pyramid plan
+        if base_signal.direction == Direction.FLAT:
+            return base_signal
+
+        # Build pyramid plan
+        direction = base_signal.direction
+        base_size = base_signal.size
+        entry_price = base_signal.entry
+
+        pyramid_plan = []
+        for level in range(1, self.max_pyramid_levels + 1):
+            if direction == Direction.LONG:
+                add_at_price = entry_price * (1.0 + self.pyramid_threshold_pct * level)
+            else:  # SHORT
+                add_at_price = entry_price * (1.0 - self.pyramid_threshold_pct * level)
+
+            pyramid_plan.append({
+                "level": level,
+                "add_at_price": add_at_price,
+                "add_size": base_size * self.pyramid_add_pct,
+                "stop": base_signal.stop,
+                "target": base_signal.target,
+            })
+
+        base_signal.metadata["pyramid_plan"] = pyramid_plan
+        return base_signal
+
+
+class TimeBasedStopStrategy(Strategy):
+    """
+    Wraps a base strategy and annotates signal with time-exit metadata.
+
+    Adds time-exit information to the signal. The orchestrator checks this
+    metadata when managing positions to exit if the target isn't reached
+    by time_exit_bar.
+
+    Metadata keys added:
+    - time_exit_enabled: bool (True if time exit is enabled)
+    - time_exit_bar: int (bar index at which to exit if target not reached)
+    - time_exit_price: float (price at which to exit on time)
+    """
+    name = "time_based_stop"
+
+    def __init__(self, base_strategy: Strategy,
+                 time_bars: int = 1,
+                 exit_at: str = "close"):
+        """
+        Args:
+            base_strategy: Strategy to wrap
+            time_bars: Number of bars to wait before time exit
+            exit_at: Where to exit on time - "close" or "predicted_median"
+        """
+        self.base_strategy = base_strategy
+        self.time_bars = time_bars
+        self.exit_at = exit_at
+
+    def generate_signal(self, dist, current_price, history, context, **kwargs):
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+        if base_signal is None:
+            return None
+
+        # Get current bar index from context (default to 0 if not provided)
+        current_bar = context.get("bar_index", 0)
+
+        # Determine time exit price
+        if self.exit_at == "predicted_median":
+            time_exit_price = dist.stats["close"]["pct_50"]
+        else:  # "close"
+            time_exit_price = current_price
+
+        # Add time-exit metadata
+        base_signal.metadata["time_exit_enabled"] = True
+        base_signal.metadata["time_exit_bar"] = current_bar + self.time_bars
+        base_signal.metadata["time_exit_price"] = time_exit_price
+
+        return base_signal
+
+
+# =============================================================================
 # EXAMPLE / TEST
 # =============================================================================
 
@@ -1075,3 +1187,4 @@ if __name__ == "__main__":
     print("  VolumeAnalyzer, LiquidityFilterStrategy, VolumeConfirmationStrategy")
     print("  VolumeFadeStrategy, AmountFlowStrategy, PredictedVWAPStrategy")
     print("  PartialExitBacktestEngine")
+    print("  PyramidingStrategy, TimeBasedStopStrategy")

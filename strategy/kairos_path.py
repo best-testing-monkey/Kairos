@@ -665,6 +665,131 @@ class PathHighLowSequenceStrategy:
 # EXAMPLE / TEST
 # =============================================================================
 
+class ConditionalPathProbabilityStrategy:
+    """
+    Computes P(hit both predicted high AND predicted low) from the 60 raw samples.
+
+    High probability of hitting both extremes = range day (return FLAT + "sell_straddle" metadata)
+    Low probability of hitting both extremes = trend day (return directional signal)
+    Medium probability = ambiguous, return None
+
+    This strategy exploits the insight that range-bound days hit both high and low frequently,
+    while trending days do not.
+    """
+    name = "conditional_path"
+
+    def __init__(self, range_threshold: float = 0.70, trend_threshold: float = 0.30):
+        """
+        Args:
+            range_threshold: If p_range > this, classify as range day
+            trend_threshold: If p_range < this, classify as trend day
+        """
+        self.range_threshold = range_threshold
+        self.trend_threshold = trend_threshold
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal based on probability of hitting both predicted high and low.
+
+        Args:
+            dist: KairosDistribution with 60 samples
+            current_price: Current price
+            history: Historical data (unused)
+            context: Context dict (unused)
+
+        Returns:
+            Signal for range/trend/None, or None if ambiguous
+        """
+        if not hasattr(dist, 'predictions') or not dist.predictions:
+            return None
+
+        if not hasattr(dist, 'stats') or 'close' not in dist.stats:
+            return None
+
+        # Compute predicted high and low
+        if "high" in dist.stats:
+            pred_high = dist.stats["high"]["mean"]
+        else:
+            pred_high = dist.stats["close"]["pct_90"]
+
+        if "low" in dist.stats:
+            pred_low = dist.stats["low"]["mean"]
+        else:
+            pred_low = dist.stats["close"]["pct_10"]
+
+        # Count samples where both high >= pred_high AND low <= pred_low
+        count = 0
+        for sample in dist.predictions:
+            if not isinstance(sample, pd.DataFrame) or sample.empty:
+                continue
+
+            # Extract high from sample
+            if "high" in sample.columns:
+                h = float(sample["high"].iloc[0])
+            else:
+                h = float(sample["close"].iloc[0])
+
+            # Extract low from sample
+            if "low" in sample.columns:
+                l = float(sample["low"].iloc[0])
+            else:
+                l = float(sample["close"].iloc[0])
+
+            # Check if both extremes are hit
+            if h >= pred_high and l <= pred_low:
+                count += 1
+
+        p_range = count / len(dist.predictions)
+
+        # Get close stats for directional decisions
+        close_mean = dist.stats["close"]["mean"]
+
+        # Range day: high probability of hitting both extremes
+        if p_range > self.range_threshold:
+            return Signal(
+                direction=Direction.FLAT,
+                size=0.0,
+                entry=current_price,
+                stop=0.0,
+                target=0.0,
+                strategy_name=self.name,
+                confidence=p_range,
+                expected_value=0.0,
+                metadata={"action": "sell_straddle", "p_range": p_range},
+            )
+
+        # Trend day: low probability of hitting both extremes
+        if p_range < self.trend_threshold:
+            # Determine direction from close mean
+            if close_mean > current_price:
+                direction = Direction.LONG
+                stop = dist.stats["close"]["pct_10"]
+                target = dist.stats["close"]["pct_90"]
+            else:
+                direction = Direction.SHORT
+                stop = dist.stats["close"]["pct_90"]
+                target = dist.stats["close"]["pct_10"]
+
+            confidence = 1.0 - p_range
+            ev = dist.expected_value(current_price, target, stop)
+            size = dist.kelly_fraction(current_price, target, stop) * 0.5
+
+            return Signal(
+                direction=direction,
+                size=max(0.01, size),
+                entry=current_price,
+                stop=stop,
+                target=target,
+                strategy_name=self.name,
+                confidence=confidence,
+                expected_value=ev,
+                metadata={"p_range": p_range},
+            )
+
+        # Ambiguous: between thresholds, return None
+        return None
+
+
 if __name__ == "__main__":
     # Create synthetic predictions for demonstration
     np.random.seed(42)

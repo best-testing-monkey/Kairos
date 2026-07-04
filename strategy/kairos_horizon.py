@@ -198,14 +198,14 @@ class KairosMultiHorizonPredictor:
     """
 
     def __init__(self,
-                 predict_fn: Callable[[pd.DataFrame], List[pd.DataFrame]],
+                 predict_fn: Callable[[pd.DataFrame, ...], List[pd.DataFrame]],
                  max_horizon: int = 3,
                  synthetic_volume: Optional[str] = "median"):
         self.predict_fn = predict_fn
         self.max_horizon = max_horizon
         self.synthetic_volume = synthetic_volume
 
-    def predict(self, history: pd.DataFrame) -> HorizonStack:
+    def predict(self, history: pd.DataFrame, **kwargs) -> HorizonStack:
         base_price = float(history["close"].iloc[-1])
         base_date = history.index[-1]
         stack = HorizonStack(base_price=base_price, base_date=base_date)
@@ -214,7 +214,7 @@ class KairosMultiHorizonPredictor:
 
         for h in range(1, self.max_horizon + 1):
             # Predict next day
-            predictions = self.predict_fn(current_history)
+            predictions = self.predict_fn(current_history, **kwargs)
             dist = KairosDistribution(predictions)
             stack.horizons[h] = dist
 
@@ -536,6 +536,140 @@ class RollingHorizonStrategy(Strategy):
             metadata={
                 "t2_favorable": t2_favorable,
                 "directional_consistency": stack.directional_consistency,
+            }
+        )
+
+
+# =============================================================================
+# PATH INTEGRATION STRATEGY
+# =============================================================================
+
+class PathIntegrationStrategy(Strategy):
+    """
+    Analyzes T+1, T+2, T+3 predicted distributions to determine optimal hold period.
+    Gets HorizonStack from context["horizon_stack"].
+
+    Key insight: If directional consistency and variance tightening persist across
+    multiple horizons, extend the hold period. Otherwise, take the quick 1-day trade.
+    """
+    name = "path_integration"
+
+    def __init__(self,
+                 max_horizon: int = 3,
+                 variance_tightening_threshold: float = 0.9,
+                 entropy_spike_threshold: float = 1.5):
+        self.max_horizon = max_horizon
+        self.variance_tightening_threshold = variance_tightening_threshold
+        self.entropy_spike_threshold = entropy_spike_threshold
+
+    def _path_quality(self, stack: HorizonStack) -> Tuple[int, float]:
+        """
+        Analyzes T+1, T+2, T+3 distributions to determine optimal hold period.
+        Returns (hold_days, confidence).
+        """
+        # Get stats for each horizon
+        h1_stats = stack.horizons.get(1)
+        if h1_stats is None:
+            return (1, 0.3)
+
+        h1_stats = h1_stats.stats.get("close")
+        if h1_stats is None:
+            return (1, 0.3)
+
+        h2_stats = stack.horizons.get(2)
+        if h2_stats is None:
+            h2_stats = h1_stats
+        else:
+            h2_stats = h2_stats.stats.get("close", h1_stats)
+
+        h3_stats = stack.horizons.get(3)
+        if h3_stats is None:
+            h3_stats = h2_stats
+        else:
+            h3_stats = h3_stats.stats.get("close", h2_stats)
+
+        # Determine direction for each horizon
+        base = stack.base_price
+        d1 = 1 if h1_stats["mean"] > base else -1
+        d2 = 1 if h2_stats["mean"] > base else -1
+        d3 = 1 if h3_stats["mean"] > base else -1
+
+        # Check consistency
+        consistent = (d1 == d2 == d3)
+
+        # Check variance tightening
+        tightening = (
+            h2_stats["std"] < h1_stats["std"] * self.variance_tightening_threshold and
+            h3_stats["std"] < h2_stats["std"] * self.variance_tightening_threshold
+        )
+
+        # Determine hold period and confidence
+        if consistent and tightening:
+            return (3, 0.9)
+        elif consistent:
+            return (2, 0.7)
+        elif d1 == d2 and d2 != d3:
+            return (2, 0.5)
+        else:
+            return (1, 0.3)
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                       history: pd.DataFrame, context: Dict) -> Optional[Signal]:
+        """
+        Generates trading signal based on multi-horizon path analysis.
+        """
+        # Get horizon stack from context
+        horizon_stack = context.get("horizon_stack")
+        if horizon_stack is None:
+            return None
+
+        # Ensure T+1 is available
+        h1 = horizon_stack.horizons.get(1)
+        if h1 is None:
+            return None
+
+        # Determine hold period and path confidence
+        hold_days, path_confidence = self._path_quality(horizon_stack)
+
+        # Get T+1 stats
+        h1_stats = h1.stats.get("close")
+        if h1_stats is None:
+            return None
+
+        # Determine direction
+        if h1_stats["mean"] > current_price:
+            direction = Direction.LONG
+            stop = h1_stats["pct_10"]
+            target = h1_stats["pct_90"]
+        elif h1_stats["mean"] < current_price:
+            direction = Direction.SHORT
+            stop = h1_stats["pct_90"]
+            target = h1_stats["pct_10"]
+        else:
+            return None
+
+        # Calculate expected value using T+1 distribution
+        ev = h1.expected_value(current_price, target, stop)
+        if ev <= 0:
+            return None
+
+        # Calculate size
+        kelly = h1.kelly_fraction(current_price, target, stop)
+        size = kelly * 0.5 * path_confidence
+        size = max(0.01, size)
+
+        return Signal(
+            direction=direction,
+            size=size,
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=path_confidence,
+            expected_value=ev,
+            metadata={
+                "hold_days": hold_days,
+                "path_confidence": path_confidence,
             }
         )
 

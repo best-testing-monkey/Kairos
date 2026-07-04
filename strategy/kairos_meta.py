@@ -932,6 +932,244 @@ class PercentileTailStrategy(Strategy):
 
 
 # =============================================================================
+# REGIME CLUSTER STRATEGY (KNN-based strategy selector)
+# =============================================================================
+
+class RegimeClusterStrategy(Strategy):
+    """
+    KNN-based meta-strategy that selects the best-performing base strategy
+    based on similarity to recent market regimes.
+
+    Records market features and strategy performance in a buffer.
+    When a new signal is needed, finds k-nearest neighbors in feature space
+    and selects the strategy that performed best in similar regimes.
+    """
+    name = "regime_cluster"
+
+    def __init__(self, base_strategies: List[Strategy],
+                 feature_buffer_size: int = 100,
+                 k_neighbors: int = 5,
+                 distance_threshold: float = 0.5,
+                 fallback_strategy: Optional[Strategy] = None):
+        self.base_strategies = base_strategies
+        self.feature_buffer_size = feature_buffer_size
+        self.k_neighbors = k_neighbors
+        self.distance_threshold = distance_threshold
+        self.fallback_strategy = fallback_strategy
+        self.feature_buffer: deque = deque(maxlen=feature_buffer_size)
+
+    def record_trade(self, features: List[float], strategy_name: str, pnl: float):
+        """
+        Record a completed trade with its market features and outcome.
+
+        Args:
+            features: 5D feature vector from market regime
+            strategy_name: name of the strategy that generated the signal
+            pnl: profit/loss from the trade
+        """
+        self.feature_buffer.append((features, strategy_name, pnl))
+
+    def _extract_features(self, dist: KairosDistribution, current_price: float) -> List[float]:
+        """
+        Extract 5-dimensional feature vector from distribution and current price.
+
+        Features:
+        0. Coefficient of variation (volatility / mean)
+        1. Skewness
+        2. Percentile range (pct_90 - pct_10) / current_price
+        3. Entropy
+        4. Trend direction (1.0 if mean > price, -1.0 otherwise)
+        """
+        s = dist.stats.get("close", {})
+        cv = dist.coefficient_of_variation("close")
+        skew = s.get("skew", 0.0)
+        pct_range = (s.get("pct_90", 0) - s.get("pct_10", 0)) / current_price if current_price > 0 else 0.0
+        ent = dist.entropy("close")
+        trend = 1.0 if s.get("mean", 0) > current_price else -1.0
+
+        return [cv, skew, pct_range, ent, trend]
+
+    def _normalize_features(self, features: List[float], buffer: deque) -> List[float]:
+        """
+        Normalize features using min-max scaling based on buffer statistics.
+        Handles edge case where all values are identical.
+        """
+        if not buffer:
+            return [0.5] * len(features)
+
+        normalized = []
+        for i in range(len(features)):
+            vals = [entry[0][i] for entry in buffer]
+            min_v, max_v = min(vals), max(vals)
+            if max_v == min_v:
+                normalized.append(0.5)
+            else:
+                norm_val = (features[i] - min_v) / (max_v - min_v)
+                normalized.append(max(0.0, min(1.0, norm_val)))
+
+        return normalized
+
+    def _euclidean_distance(self, v1: List[float], v2: List[float]) -> float:
+        """Compute Euclidean distance between two feature vectors."""
+        return float(np.sqrt(sum((a - b) ** 2 for a, b in zip(v1, v2))))
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        # Extract current market features
+        features = self._extract_features(dist, current_price)
+
+        # If buffer is too small, use fallback strategy if available
+        if len(self.feature_buffer) < self.k_neighbors:
+            if self.fallback_strategy is not None:
+                return self.fallback_strategy.generate_signal(dist, current_price, history, context)
+            return None
+
+        # Normalize features (current point against buffer)
+        normalized_features = self._normalize_features(features, self.feature_buffer)
+
+        # Compute distances to all buffer entries
+        distances = []
+        for buf_entry in self.feature_buffer:
+            buf_features_normalized = self._normalize_features(buf_entry[0], self.feature_buffer)
+            dist_val = self._euclidean_distance(normalized_features, buf_features_normalized)
+            distances.append((dist_val, buf_entry))
+
+        # Sort by distance and select k-nearest
+        distances.sort(key=lambda x: x[0])
+        nearest_k = distances[:self.k_neighbors]
+
+        # If minimum distance is too large, use fallback or return None
+        if nearest_k[0][0] > self.distance_threshold:
+            if self.fallback_strategy is not None:
+                return self.fallback_strategy.generate_signal(dist, current_price, history, context)
+            return None
+
+        # Group by strategy name and compute mean pnl
+        strategy_pnls: Dict[str, List[float]] = defaultdict(list)
+        for _, (_, strategy_name, pnl) in nearest_k:
+            strategy_pnls[strategy_name].append(pnl)
+
+        # Pick strategy with highest mean pnl
+        best_strategy_name = max(
+            strategy_pnls.keys(),
+            key=lambda s: np.mean(strategy_pnls[s])
+        )
+
+        # Find and run the best strategy
+        best_strategy = None
+        for strat in self.base_strategies:
+            if strat.name == best_strategy_name:
+                best_strategy = strat
+                break
+
+        if best_strategy is None:
+            if self.fallback_strategy is not None:
+                return self.fallback_strategy.generate_signal(dist, current_price, history, context)
+            return None
+
+        # Generate signal from best strategy
+        sig = best_strategy.generate_signal(dist, current_price, history, context)
+        if sig:
+            sig.metadata["regime_cluster_selected_strategy"] = best_strategy_name
+            sig.metadata["regime_cluster_mean_pnl"] = float(np.mean(strategy_pnls[best_strategy_name]))
+            sig.metadata["regime_cluster_nearest_k"] = len(nearest_k)
+
+        return sig
+
+
+# =============================================================================
+# MONTE CARLO SCENARIO STRATEGY
+# =============================================================================
+
+class MonteCarloScenarioStrategy(Strategy):
+    """
+    Evaluates base strategies against Monte Carlo synthetic close scenarios.
+
+    For each base strategy, simulates the signal against n_scenarios synthetic
+    closes drawn from N(mean, std) to compute expected PnL and Sharpe ratio.
+    Selects the strategy with the highest expected value (or Sharpe ratio,
+    depending on selection_metric) and returns its REAL signal (on actual dist).
+    """
+    name = "monte_carlo_scenario"
+
+    def __init__(self, base_strategies: List[Strategy],
+                 n_scenarios: int = 1000,
+                 selection_metric: str = "expected_pnl"):
+        """
+        Args:
+            base_strategies: List of strategies to evaluate
+            n_scenarios: Number of synthetic closes to generate
+            selection_metric: "expected_pnl" or "sharpe" for strategy selection
+        """
+        self.base_strategies = base_strategies
+        self.n_scenarios = n_scenarios
+        self.selection_metric = selection_metric
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        s = dist.stats.get("close", {})
+        mean = s.get("mean", current_price)
+        std = s.get("std", 0.0)
+
+        # If no volatility, use fallback (first strategy)
+        if std == 0:
+            if self.base_strategies:
+                return self.base_strategies[0].generate_signal(dist, current_price, history, context)
+            return None
+
+        # Generate synthetic closes from normal distribution
+        synthetic = np.random.normal(mean, std, self.n_scenarios)
+
+        # Evaluate each strategy against synthetic scenarios
+        strategy_scores = []
+        strategy_signals = {}
+
+        for strategy in self.base_strategies:
+            # Generate signal from this strategy on real distribution
+            sig = strategy.generate_signal(dist, current_price, history, context)
+
+            if sig is None or sig.direction == Direction.FLAT:
+                expected_pnl = 0.0
+                sharpe = 0.0
+            else:
+                # Simulate PnL across synthetic scenarios
+                direction_sign = sig.direction.value
+                pnls = direction_sign * (synthetic - sig.entry) * sig.size
+                expected_pnl = float(np.mean(pnls))
+                std_pnl = float(np.std(pnls))
+                sharpe = expected_pnl / std_pnl if std_pnl > 0 else 0.0
+
+            strategy_signals[strategy.name] = sig
+
+            # Select metric for ranking
+            if self.selection_metric == "sharpe":
+                score = sharpe
+            else:  # expected_pnl
+                score = expected_pnl
+
+            strategy_scores.append((strategy.name, score, expected_pnl, sharpe))
+
+        if not strategy_scores:
+            return None
+
+        # Pick strategy with highest score
+        best_strategy_name, best_score, best_expected_pnl, best_sharpe = max(
+            strategy_scores,
+            key=lambda x: x[1]
+        )
+
+        # Return the best strategy's real signal
+        best_sig = strategy_signals[best_strategy_name]
+        if best_sig:
+            best_sig.metadata["monte_carlo_selected_strategy"] = best_strategy_name
+            best_sig.metadata["monte_carlo_expected_pnl"] = best_expected_pnl
+            best_sig.metadata["monte_carlo_sharpe"] = best_sharpe
+            best_sig.metadata["monte_carlo_n_scenarios"] = self.n_scenarios
+
+        return best_sig
+
+
+# =============================================================================
 # EXAMPLE / TEST
 # =============================================================================
 
@@ -946,3 +1184,5 @@ if __name__ == "__main__":
     print("Kurtosis / Tail:")
     print("  KurtosisFilterStrategy, TailRiskStrategy, SellPremiumStrategy")
     print("  BuyWingsStrategy, TailAsymmetryStrategy, PercentileTailStrategy")
+    print("KNN Regime & Monte Carlo:")
+    print("  RegimeClusterStrategy, MonteCarloScenarioStrategy")

@@ -79,6 +79,35 @@ warnings.filterwarnings("ignore")
 
 
 # =============================================================================
+# GLOBAL SETTINGS
+# =============================================================================
+
+class KairosSettings:
+    """Central store for CLI-configured runtime settings.
+
+    Call KairosSettings.configure(args) after argparse.parse_args(), then
+    read KairosSettings.<attr> from any strategy module.
+    """
+    symbol: str = "BTC-USD"
+    lookback: int = 300
+    pred_len: int = 60
+    pred_samples: int = 100
+    initial_capital: float = 100_000.0
+    output_dir: str = "./output"
+    model: Optional[str] = None
+    tokenizer: Optional[str] = None
+    no_prediction: bool = False
+
+    @classmethod
+    def configure(cls, args) -> None:
+        for attr in ("symbol", "lookback", "pred_len", "pred_samples",
+                     "initial_capital", "output_dir", "model", "tokenizer",
+                     "no_prediction"):
+            if hasattr(args, attr) and getattr(args, attr) is not None:
+                setattr(cls, attr, getattr(args, attr))
+
+
+# =============================================================================
 # ENUMS
 # =============================================================================
 
@@ -247,6 +276,59 @@ class KairosDistribution:
         s = self.stats.get(col, {})
         return s.get("pct_90", 0) - s.get("pct_10", 0)
 
+    @classmethod
+    def from_bar(cls, bar: pd.Series, n_samples: int = 100,
+                 center: float = None) -> "KairosDistribution":
+        """Build a realized distribution from a single OHLCV bar.
+
+        Generates N samples representing possible intraday paths bounded by the
+        bar's actual high/low.  Closes follow a truncated normal; by default
+        centred on the actual close.  Pass center=current_price (the previous
+        bar's close) to anchor stop/target relative to the trade entry rather
+        than the oracle close - this keeps pct_20 below entry for LONG signals
+        and pct_80 above entry for SHORT signals, producing proper risk/reward.
+        """
+        actual_open = float(bar["open"])
+        actual_high = float(bar["high"])
+        actual_low = float(bar["low"])
+        actual_close = float(bar["close"])
+        actual_volume = float(bar.get("volume", 1.0))
+
+        # Guard against zero-range bars
+        if actual_high <= actual_low:
+            actual_high = max(actual_open, actual_close) * 1.0005
+            actual_low = min(actual_open, actual_close) * 0.9995
+
+        seed = int(abs(actual_close) * 1000) % (2 ** 31)
+        rng = np.random.default_rng(seed)
+
+        # Closes: truncated normal, centre defaults to actual_close.
+        # When center is provided (e.g. the prior bar's close = trade entry),
+        # the distribution spans the actual H/L range anchored at entry so
+        # that stop/target levels are correctly placed relative to entry price.
+        span = actual_high - actual_low
+        close_center = center if center is not None else actual_close
+        closes = np.clip(rng.normal(close_center, span / 4.0, n_samples),
+                         actual_low, actual_high)
+
+        rows = []
+        for c in closes:
+            c = float(c)
+            # high must be ≥ max(open, close), bounded by actual high
+            max_oc = max(actual_open, c)
+            h = float(rng.uniform(max_oc, actual_high)) if actual_high > max_oc else max_oc
+            # low must be ≤ min(open, close), bounded by actual low
+            min_oc = min(actual_open, c)
+            l = float(rng.uniform(actual_low, min_oc)) if min_oc > actual_low else min_oc
+            rows.append(pd.DataFrame({
+                "open":   [actual_open],
+                "high":   [h],
+                "low":    [l],
+                "close":  [c],
+                "volume": [actual_volume],
+            }))
+        return cls(rows)
+
 
 # =============================================================================
 # PREDICTOR WRAPPER
@@ -274,7 +356,7 @@ class Strategy:
     name: str = "base"
 
     def generate_signal(self, dist: KairosDistribution, current_price: float,
-                        history: pd.DataFrame, context: Dict) -> Optional[Signal]:
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
         raise NotImplementedError
 
 
@@ -1417,6 +1499,374 @@ class BacktestEngine:
             metrics["strategy"] = strat.name
             results.append(metrics)
         return pd.DataFrame(results)
+
+
+# =============================================================================
+# STRATEGIES 19-24: NEW WRAPPER & ADVANCED STRATEGIES
+# =============================================================================
+
+class VaRPositionCapStrategy(Strategy):
+    """
+    Wraps a base strategy and caps position size based on Value at Risk (5th percentile).
+    Ensures max loss per unit doesn't exceed account risk limit.
+    """
+    name = "var_position_cap"
+
+    def __init__(self, base_strategy: Strategy, max_account_risk_pct: float = 0.01,
+                 capital: float = 1.0):
+        self.base_strategy = base_strategy
+        self.max_account_risk_pct = max_account_risk_pct
+        self.capital = capital
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+        if base_signal is None:
+            return None
+
+        var_5 = dist.stats["close"]["pct_5"]
+        entry = base_signal.entry
+
+        if base_signal.direction == Direction.LONG:
+            max_loss_per_unit = entry - var_5
+        elif base_signal.direction == Direction.SHORT:
+            max_loss_per_unit = var_5 - entry
+        else:
+            return base_signal
+
+        if max_loss_per_unit <= 0:
+            return base_signal
+
+        account_risk_limit = self.capital * self.max_account_risk_pct
+        max_units = account_risk_limit / max_loss_per_unit
+        max_notional = max_units * entry
+        max_size = max_notional / self.capital
+
+        base_signal.size = min(base_signal.size, max_size)
+        return base_signal
+
+
+class DistributionOverlapStrategy(Strategy):
+    """
+    Uses overlap coefficient with previous distribution to detect regime.
+    High overlap → range trading (mean reversion).
+    Low overlap → trend following.
+    """
+    name = "distribution_overlap"
+
+    def __init__(self, range_threshold: float = 0.85, trend_threshold: float = 0.60):
+        self.range_threshold = range_threshold
+        self.trend_threshold = trend_threshold
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        prev_dist = context.get("prev_dist")
+        if prev_dist is None:
+            return None
+
+        overlap = dist.overlap_coefficient(prev_dist, col="close")
+        s = dist.stats["close"]
+        median = s["pct_50"]
+        mean = s["mean"]
+
+        if overlap > self.range_threshold:
+            # Range-bound: mean reversion toward median
+            if current_price < median:
+                direction = Direction.LONG
+                stop = s["pct_10"]
+                target = median
+            else:
+                direction = Direction.SHORT
+                stop = s["pct_90"]
+                target = median
+        elif overlap < self.trend_threshold:
+            # Trend following: follow the mean
+            if mean > current_price:
+                direction = Direction.LONG
+                stop = s["pct_10"]
+                target = s["pct_90"]
+            elif mean < current_price:
+                direction = Direction.SHORT
+                stop = s["pct_90"]
+                target = s["pct_10"]
+            else:
+                return None
+        else:
+            return None
+
+        ev = dist.expected_value(current_price, target, stop)
+        if ev <= 0:
+            return None
+
+        kelly = dist.kelly_fraction(current_price, target, stop)
+        return Signal(
+            direction=direction,
+            size=min(kelly * 0.5, 1.0),
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=abs(overlap - 0.5) / 0.5,
+            expected_value=ev,
+        )
+
+
+class ModelDecayMonitorStrategy(Strategy):
+    """
+    Wraps a base strategy and adjusts stops/size based on calibration history.
+    Tracks whether realized prices fall within 1-sigma and 2-sigma bands.
+    """
+    name = "model_decay_monitor"
+
+    def __init__(self, base_strategy: Strategy, lookback: int = 30,
+                 target_1sigma: float = 0.68, target_2sigma: float = 0.95,
+                 widen_factor: float = 1.5, tighten_factor: float = 0.8):
+        self.base_strategy = base_strategy
+        self.lookback = lookback
+        self.target_1sigma = target_1sigma
+        self.target_2sigma = target_2sigma
+        self.widen_factor = widen_factor
+        self.tighten_factor = tighten_factor
+        self.calibration_history = []
+
+    def update_calibration(self, dist: KairosDistribution, realized_close: float) -> None:
+        """Record prediction accuracy."""
+        mean = dist.stats["close"]["mean"]
+        std = dist.stats["close"]["std"]
+        in_1s = (mean - std) <= realized_close <= (mean + std)
+        in_2s = (mean - 2 * std) <= realized_close <= (mean + 2 * std)
+        self.calibration_history.append((mean, std, realized_close, in_1s, in_2s))
+        if len(self.calibration_history) > self.lookback * 2:
+            self.calibration_history.pop(0)
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+        if base_signal is None:
+            return None
+
+        if len(self.calibration_history) < self.lookback:
+            return base_signal
+
+        recent = list(self.calibration_history)[-self.lookback:]
+        hit_rate_1s = np.mean([entry[3] for entry in recent])
+
+        if hit_rate_1s < self.target_1sigma * 0.8:
+            # Predictions too tight, widen stops
+            calibration_factor = self.widen_factor
+            size_factor = 0.5
+        elif hit_rate_1s > self.target_1sigma * 1.2:
+            # Predictions too loose, tighten
+            calibration_factor = self.tighten_factor
+            size_factor = 1.0
+        else:
+            calibration_factor = 1.0
+            size_factor = 1.0
+
+        # Apply calibration to stop
+        entry = base_signal.entry
+        if base_signal.direction == Direction.LONG:
+            stop_distance = entry - base_signal.stop
+            base_signal.stop = entry - (stop_distance * calibration_factor)
+        elif base_signal.direction == Direction.SHORT:
+            stop_distance = base_signal.stop - entry
+            base_signal.stop = entry + (stop_distance * calibration_factor)
+
+        base_signal.size = min(base_signal.size * size_factor, 1.0)
+        return base_signal
+
+
+class OvernightExposureFilter(Strategy):
+    """
+    Wrapper that returns FLAT if next-day predicted range doesn't favor the current position.
+    Useful for avoiding hold-through-news trades.
+    """
+    name = "overnight_filter"
+
+    def __init__(self, base_strategy: Strategy):
+        self.base_strategy = base_strategy
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        current_pos = context.get("current_position")
+
+        if current_pos is None:
+            # No existing position, pass through
+            return self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+
+        pred_high = dist.stats.get("high", {}).get("mean", dist.stats["close"]["pct_90"])
+        pred_low = dist.stats.get("low", {}).get("mean", dist.stats["close"]["pct_10"])
+
+        entry_price = current_pos.get("entry_price", current_price)
+        pos_direction = current_pos.get("direction")
+
+        if pos_direction == Direction.LONG and pred_high < entry_price:
+            return Signal(
+                direction=Direction.FLAT, size=0.0, entry=current_price,
+                stop=0.0, target=0.0, strategy_name=self.name,
+                confidence=1.0, expected_value=0.0,
+                metadata={"action": "close_overnight", "reason": "range_below_entry"}
+            )
+        elif pos_direction == Direction.SHORT and pred_low > entry_price:
+            return Signal(
+                direction=Direction.FLAT, size=0.0, entry=current_price,
+                stop=0.0, target=0.0, strategy_name=self.name,
+                confidence=1.0, expected_value=0.0,
+                metadata={"action": "close_overnight", "reason": "range_above_entry"}
+            )
+
+        return self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+
+
+class RSIDivergenceStrategy(Strategy):
+    """
+    Detects RSI divergence confirmed by Kairos prediction direction.
+    Bullish: price makes lower low but RSI makes higher low.
+    Bearish: price makes higher high but RSI makes lower high.
+    """
+    name = "rsi_divergence"
+
+    def __init__(self, rsi_period: int = 14, lookback_bars: int = 20,
+                 divergence_threshold: float = 2.0):
+        self.rsi_period = rsi_period
+        self.lookback_bars = lookback_bars
+        self.divergence_threshold = divergence_threshold
+
+    def _rsi(self, close: np.ndarray) -> float:
+        """Calculate RSI from close prices."""
+        if len(close) < 2:
+            return 50.0
+        delta = np.diff(close)
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        avg_gain = np.mean(gain)
+        avg_loss = np.mean(loss)
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def _find_pivots(self, arr: np.ndarray, order: int = 2) -> List[int]:
+        """Find local extrema indices."""
+        if len(arr) < 2 * order + 1:
+            return []
+        pivots = []
+        for i in range(order, len(arr) - order):
+            if arr[i] > arr[i - order] and arr[i] > arr[i + order]:
+                pivots.append(i)
+            elif arr[i] < arr[i - order] and arr[i] < arr[i + order]:
+                pivots.append(i)
+        return pivots
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        if len(history) < max(self.lookback_bars, self.rsi_period + 5):
+            return None
+
+        close = history["close"].values[-self.lookback_bars:]
+        rsi_values = np.array([
+            self._rsi(history["close"].values[max(0, i - self.rsi_period):i])
+            for i in range(len(history) - self.lookback_bars + 1, len(history) + 1)
+        ])
+
+        price_pivots = self._find_pivots(close, order=2)
+        rsi_pivots = self._find_pivots(rsi_values, order=2)
+
+        if len(price_pivots) < 2 or len(rsi_pivots) < 2:
+            return None
+
+        # Check for bullish divergence
+        last_price_low_idx = None
+        prev_price_low_idx = None
+        for idx in sorted(price_pivots, reverse=True):
+            if close[idx] <= close[max(0, idx - 1)] and close[idx] <= close[min(len(close) - 1, idx + 1)]:
+                if last_price_low_idx is None:
+                    last_price_low_idx = idx
+                elif prev_price_low_idx is None:
+                    prev_price_low_idx = idx
+                    break
+
+        if last_price_low_idx is not None and prev_price_low_idx is not None:
+            if (close[last_price_low_idx] < close[prev_price_low_idx] and
+                rsi_values[last_price_low_idx] > rsi_values[prev_price_low_idx] + self.divergence_threshold):
+                if dist.stats["close"]["mean"] > current_price:
+                    s = dist.stats["close"]
+                    ev = dist.expected_value(current_price, s["pct_90"], s["pct_10"])
+                    if ev > 0:
+                        return Signal(
+                            direction=Direction.LONG, size=0.5, entry=current_price,
+                            stop=s["pct_10"], target=s["pct_90"],
+                            strategy_name=self.name, confidence=0.7,
+                            expected_value=ev,
+                        )
+
+        # Check for bearish divergence
+        last_price_high_idx = None
+        prev_price_high_idx = None
+        for idx in sorted(price_pivots, reverse=True):
+            if close[idx] >= close[max(0, idx - 1)] and close[idx] >= close[min(len(close) - 1, idx + 1)]:
+                if last_price_high_idx is None:
+                    last_price_high_idx = idx
+                elif prev_price_high_idx is None:
+                    prev_price_high_idx = idx
+                    break
+
+        if last_price_high_idx is not None and prev_price_high_idx is not None:
+            if (close[last_price_high_idx] > close[prev_price_high_idx] and
+                rsi_values[last_price_high_idx] < rsi_values[prev_price_high_idx] - self.divergence_threshold):
+                if dist.stats["close"]["mean"] < current_price:
+                    s = dist.stats["close"]
+                    ev = dist.expected_value(current_price, s["pct_10"], s["pct_90"])
+                    if ev > 0:
+                        return Signal(
+                            direction=Direction.SHORT, size=0.5, entry=current_price,
+                            stop=s["pct_90"], target=s["pct_10"],
+                            strategy_name=self.name, confidence=0.7,
+                            expected_value=ev,
+                        )
+
+        return None
+
+
+class LeverageCalibrationStrategy(Strategy):
+    """
+    Wraps a base strategy and scales size by predicted volatility-based leverage.
+    Lower volatility → higher leverage. Higher volatility → lower leverage.
+    """
+    name = "leverage_calibration"
+
+    def __init__(self, base_strategy: Strategy,
+                 leverage_tiers: Optional[List[Tuple[float, float]]] = None,
+                 max_leverage: float = 5.0):
+        self.base_strategy = base_strategy
+        self.max_leverage = max_leverage
+        if leverage_tiers is None:
+            self.leverage_tiers = [
+                (0.02, 5.0),
+                (0.04, 3.0),
+                (0.06, 2.0),
+                (float("inf"), 1.0),
+            ]
+        else:
+            self.leverage_tiers = leverage_tiers
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+        if base_signal is None or base_signal.direction == Direction.FLAT:
+            return base_signal
+
+        s = dist.stats["close"]
+        pred_range_pct = (s["pct_90"] - s["pct_10"]) / current_price
+
+        leverage = 1.0
+        for vol_threshold, lev in self.leverage_tiers:
+            if pred_range_pct <= vol_threshold:
+                leverage = lev
+                break
+
+        base_signal.size = min(base_signal.size * leverage, self.max_leverage)
+        return base_signal
 
 
 # =============================================================================
