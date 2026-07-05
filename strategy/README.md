@@ -331,6 +331,11 @@ No external trading libraries. No GPU required.
 
 **Total: 42 strategies + 1 orchestrator**
 
+See `PIPELINE.md` for the asset-discovery pipeline (`kairos_pipeline.py`)
+that screens candidate symbols, groups correlated assets for the
+`cross_asset_*` strategies, and runs oracle/base/finetuned backtests to
+populate `_DISABLED_BY_PROFILE`.
+
 ---
 
 ## License

@@ -1,4 +1,5 @@
 import sys
+from collections import Counter
 from tabnanny import verbose
 
 from pandas import DataFrame
@@ -518,6 +519,117 @@ _DISABLED_BY_PROFILE: dict = {
         "funding_rate_prediction", # Sharpe -36.17, -2.29% / trade
     },
 }
+_COMMODITY_ETFS = {"GLD", "SLV", "USO", "UNG", "DBC", "PDBC", "CPER", "COPX", "GDX"}
+
+
+def asset_class_for(assets) -> str:
+    """Classify a group of tickers into crypto/fx/commodity/equity/mixed.
+
+    Rules: crypto tickers end in "-USD", fx tickers end in "=X", commodity
+    tickers end in "=F" or are one of the known commodity ETFs
+    (GLD/SLV/USO/UNG/DBC/PDBC/CPER/COPX/GDX). Everything else is equity.
+    A group's class is the majority class of its symbols; if no single
+    class has a strict majority, the group is "mixed".
+    """
+    classes = []
+    for sym in assets:
+        s = sym.strip()
+        if s.endswith("-USD"):
+            classes.append("crypto")
+        elif s.endswith("=X"):
+            classes.append("fx")
+        elif s.endswith("=F") or s in _COMMODITY_ETFS:
+            classes.append("commodity")
+        else:
+            classes.append("equity")
+    if not classes:
+        return "mixed"
+    counts = Counter(classes)
+    top_class, top_count = counts.most_common(1)[0]
+    if top_count * 2 > len(classes):
+        return top_class
+    return "mixed"
+
+
+# Disabled strategies per (interval, asset_class) fallback, used when no exact
+# _DISABLED_BY_PROFILE entry exists for the (interval, assets) pair.
+#
+# Derived from the 2026-07-05 oracle (--no-prediction) shadow sweep at
+# interval=1d, backtest_period=3m, across 27 asset groups (7 crypto, 10
+# equity, 3 fx, 7 commodity/mixed-commodity). Rule: a strategy is disabled
+# for a class if EITHER
+#   (a) it had negative sharpe in >=60% of that class's groups AND
+#       >=10 total signals across the class (avoids disabling on noise), OR
+#   (b) mean sharpe (degenerate |sharpe|>1000 outliers excluded) <= -5.0
+#       with >=2 groups negative.
+# Mean sharpe values in the comments are the capped/filtered means used to
+# apply the rule above.
+_DISABLED_BY_CLASS: dict = {
+    ("1d", "crypto"): {
+        "volume_fade",              # mean sharpe -153.74, neg 6/6
+        "cross_asset_spread",       # mean sharpe  -93.02, neg 5/6
+        "volume_confirmation",      # mean sharpe  -36.64, neg 6/6
+        "funding_rate_prediction",  # mean sharpe  -27.70, neg 6/6
+        "path_v_shape",             # mean sharpe  -11.07, neg 6/6
+        "bsts_decomposition",       # mean sharpe   -9.70, neg 6/6
+        "rsi_divergence",           # mean sharpe   -9.33, neg 4/7
+        "particle_filter",          # mean sharpe   -8.89, neg 6/6
+        "inverse_variance",         # mean sharpe   -8.57, neg 6/6
+        "dynamic_bracket",          # mean sharpe   -8.42, neg 6/6
+        "close_direction",          # mean sharpe   -8.14, neg 6/6
+        "hmm_regime",               # mean sharpe   -7.33, neg 3/6
+        "distribution_overlap",     # mean sharpe   -6.63, neg 6/6
+        "conditional_path",         # mean sharpe   -6.02, neg 6/6
+    },
+    ("1d", "commodity"): {
+        "volume_fade",              # mean sharpe  -70.09, neg 6/6
+        "tail_asymmetry",           # mean sharpe  -21.15, neg 4/6
+        "rsi_filter",               # mean sharpe  -15.10, neg 5/6
+        "cross_asset_spread",       # mean sharpe  -12.16, neg 2/5
+        "volume_confirmation",      # mean sharpe  -10.05, neg 6/7
+        "funding_rate_prediction",  # mean sharpe   -8.51, neg 7/7
+        "hmm_regime",               # mean sharpe   -6.43, neg 4/6
+        "distribution_overlap",     # mean sharpe   -5.94, neg 6/7
+    },
+    ("1d", "equity"): {
+        "volume_fade",              # mean sharpe  -48.73, neg 4/7
+        "rsi_filter",               # mean sharpe  -12.45, neg 7/10
+        "tail_asymmetry",           # mean sharpe  -11.35, neg 6/10
+        "funding_rate_prediction",  # mean sharpe  -11.10, neg 10/10
+        "volume_confirmation",      # mean sharpe   -5.84, neg 9/10
+        "distribution_overlap",     # mean sharpe   -4.80, neg 9/10 (>=60%, >=10 sig rule)
+        "hmm_regime",               # mean sharpe   -4.48, neg 9/10 (>=60%, >=10 sig rule)
+        "skew",                     # mean sharpe   -4.04, neg 7/10 (>=60%, >=10 sig rule)
+        "conditional_path",         # mean sharpe   -1.18, neg 7/10 (>=60%, >=10 sig rule)
+    },
+    ("1d", "fx"): {
+        "tail_asymmetry",           # mean sharpe  -12.26, neg 3/3
+        "cross_asset_spread",       # mean sharpe   -8.31, neg 2/3
+        "hmm_regime",               # mean sharpe   -5.29, neg 3/3
+        "funding_rate_prediction",  # mean sharpe   -3.75, neg 3/3 (>=60%, >=10 sig rule)
+        "distribution_overlap",     # mean sharpe   -2.68, neg 2/3 (>=60%, >=10 sig rule)
+        "conditional_path",         # mean sharpe   -0.90, neg 2/3 (>=60%, >=10 sig rule)
+    },
+}
+
+
+def resolve_disabled_strategies(interval: str, assets) -> set:
+    """Resolve the set of disabled strategy names for a run.
+
+    Resolution order:
+      1. Exact (interval, sorted-assets-key) match in _DISABLED_BY_PROFILE.
+      2. Fallback to (interval, asset_class) in _DISABLED_BY_CLASS, where
+         asset_class is computed via asset_class_for(assets).
+      3. Empty set if neither matches.
+    """
+    profile_key = (interval, ",".join(sorted(assets)))
+    exact = _DISABLED_BY_PROFILE.get(profile_key)
+    if exact is not None:
+        return exact
+    cls = asset_class_for(assets)
+    return _DISABLED_BY_CLASS.get((interval, cls), set())
+
+
 _DEFAULT_ASSETS = ["BTC-USD", "ETH-USD", "SOL-USD"]
 
 
@@ -550,11 +662,10 @@ if __name__ == "__main__":
     KairosSettings.configure(args)
 
     assets = KairosSettings.assets or _DEFAULT_ASSETS
-    profile_key = (KairosSettings.interval, ",".join(sorted(assets)))
-    disabled = _DISABLED_BY_PROFILE.get(profile_key)
-    if disabled is None:
-        print(f"  [info] No oracle-tested disabled-strategy profile for {profile_key} — all strategies enabled.")
-        disabled = set()
+    disabled = resolve_disabled_strategies(KairosSettings.interval, assets)
+    if not disabled:
+        profile_key = (KairosSettings.interval, ",".join(sorted(assets)))
+        print(f"  [info] No oracle-tested disabled-strategy profile or class fallback for {profile_key} - all strategies enabled.")
 
     DEMO_BACKTEST_OVER_N_BARS = _period_to_bars(KairosSettings.backtest_period, KairosSettings.interval)
 

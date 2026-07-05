@@ -23,6 +23,9 @@ uv run --with pytest python -m pytest tests/unit/ -q
 
 # Run a specific test file
 uv run --with pytest python -m pytest tests/unit/test_kairos_distribution.py -v
+
+# Run the asset-discovery pipeline (screening/correlation/oracle/base/finetuned stages)
+uv run ./strategy/kairos_pipeline.py --stage universe   # see strategy/PIPELINE.md for all stages/flags
 ```
 
 ## Known gotchas (hard-won)

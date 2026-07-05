@@ -167,8 +167,37 @@ except ImportError as e:
 
 
 # =============================================================================
-# ORCHESTRATOR CONFIG
+# SHARPE HELPERS
 # =============================================================================
+
+# Minimum sample size before a Sharpe ratio is considered statistically
+# meaningful. Below this, near-zero variance can blow up the ratio
+# (e.g. n=2 with two nearly-identical pnl values -> Sharpe of 1e15+).
+MIN_SIGNALS_FOR_SHARPE = 3
+# Floor applied to the std-dev denominator to avoid division by ~0.
+_SHARPE_STD_EPSILON = 1e-9
+# Hard clamp so a single pathological case can never dominate rankings.
+_SHARPE_CLAMP = 100.0
+
+
+def _safe_sharpe(returns: np.ndarray, annualization_factor: float, min_n: int = MIN_SIGNALS_FOR_SHARPE) -> float:
+    """Compute an annualised Sharpe ratio that is robust to tiny/degenerate samples.
+
+    Returns 0.0 if there are fewer than `min_n` observations (insufficient
+    sample to estimate variance reliably). Otherwise floors the std-dev
+    denominator with a small epsilon and clamps the result to
+    [-_SHARPE_CLAMP, _SHARPE_CLAMP].
+    """
+    n = len(returns)
+    if n < min_n:
+        return 0.0
+    std_r = float(np.std(returns))
+    if std_r <= 0:
+        return 0.0
+    std_r = max(std_r, _SHARPE_STD_EPSILON)
+    sharpe = float(np.mean(returns) / std_r * annualization_factor)
+    return float(np.clip(sharpe, -_SHARPE_CLAMP, _SHARPE_CLAMP))
+
 
 @dataclass
 class OrchestratorConfig:
@@ -1031,12 +1060,7 @@ class KairosOrchestrator:
         result = {}
         for sname, pnl_list in by_strategy.items():
             n = len(pnl_list)
-            if n >= 2:
-                rets = np.array(pnl_list)
-                std_r = float(np.std(rets))
-                sharpe = float(np.mean(rets) / std_r * np.sqrt(252)) if std_r > 0 else 0.0
-            else:
-                sharpe = 0.0
+            sharpe = _safe_sharpe(np.array(pnl_list), np.sqrt(252))
             result[sname] = {"pnl_list": pnl_list, "sharpe": sharpe, "signal_count": n}
         return result
 
@@ -1078,12 +1102,9 @@ class KairosOrchestrator:
             swins  = [p for p in spnls if p > 0]
             slosses = [p for p in spnls if p <= 0]
             srets = np.array([t.pnl_pct for t in strades_sorted])
-            if len(srets) >= 2 and np.std(srets) > 0:
-                span = max((strades_sorted[-1].exit_date - strades_sorted[0].entry_date).days, 1)
-                tpy = len(strades_sorted) * 365.0 / span
-                ssharpe = float(np.mean(srets) / np.std(srets) * np.sqrt(tpy))
-            else:
-                ssharpe = 0.0
+            span = max((strades_sorted[-1].exit_date - strades_sorted[0].entry_date).days, 1)
+            tpy = len(strades_sorted) * 365.0 / span
+            ssharpe = _safe_sharpe(srets, np.sqrt(tpy))
             pf = (abs(sum(swins)) / abs(sum(slosses))
                   if slosses and sum(slosses) != 0 else float("inf"))
             strategy_stats[sname] = {
