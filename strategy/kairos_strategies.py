@@ -85,6 +85,32 @@ def fetch_data(symbol, lookback, pred_len):
     return x_df, x_ts, y_ts, actual
 
 
+def is_24_7_crypto_symbol(symbol: str) -> bool:
+    """True for symbols that trade around the clock, 7 days a week (no weekend padding needed).
+
+    Crypto tickers from yfinance use the "-USD" suffix (e.g. BTC-USD, ETH-USD) and trade
+    24/7/365. Everything else - equities/ETFs (plain tickers, e.g. SPY, QQQ, DIA, XLK),
+    FX pairs ("=X" suffix, e.g. EURUSD=X), and futures ("=F" suffix) - is closed on
+    weekends (and holidays), so a naive calendar-day window undershoots the real bar count.
+    """
+    return symbol.endswith("-USD")
+
+
+def calendar_days_for_bars(bars_needed: float, bars_per_day: float, symbol: str, buffer_days: int = 30) -> int:
+    """Convert a bar count into a calendar-day window, padding for non-24/7 markets.
+
+    Equities/ETFs and FX/futures trade roughly 5 out of every 7 days, so a naive
+    bars_needed / bars_per_day calendar window undershoots real bar count by ~2/7.
+    We multiply by 7/5 for those symbols (plus a small flat cushion) before adding
+    the existing flat buffer_days, so the window still contains enough trading days.
+    Crypto symbols (24/7) are left unpadded to preserve existing behavior.
+    """
+    raw_days = bars_needed / bars_per_day
+    if not is_24_7_crypto_symbol(symbol):
+        raw_days = raw_days * (7 / 5) + 5
+    return int(raw_days) + buffer_days
+
+
 def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
     price_cache.configure(remote=False)
 
@@ -101,7 +127,7 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
         "60m": 729, "90m": 60, "1h": 729,
     }.get(interval, 5 * 365)
     bars_needed = max(min_bars or 0, lookback + pred_len)
-    days_needed = min(int(bars_needed / bars_per_day) + 30, yf_max_days)
+    days_needed = min(calendar_days_for_bars(bars_needed, bars_per_day, symbol), yf_max_days)
 
     end_dt = date.today()
     start_dt = end_dt - timedelta(days=days_needed)
