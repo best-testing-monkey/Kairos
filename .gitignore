@@ -85,6 +85,7 @@ examples/output/
 examples/data/
 /data/
 /output/
+/results/
 /finetune_csv/data
 /finetune_csv/models
 /finetune_csv/train_data

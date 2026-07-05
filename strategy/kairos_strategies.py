@@ -9,6 +9,7 @@ from kairos.calendars import future_timestamps
 sys.path.insert(0, '.')
 
 import argparse
+import json
 import ta as ta_lib
 from tqdm import tqdm
 
@@ -516,6 +517,8 @@ if __name__ == "__main__":
                         help=f"Initial capital (default {INITIAL_CAPITAL})")
     parser.add_argument("--no-prediction", dest="no_prediction", action="store_true", default=False,
                         help="Replace model predictions with actual next-bar OHLCV (oracle baseline)")
+    parser.add_argument("--export_json", metavar="PATH", default=None, dest="export_json",
+                        help="Additionally dump summary/strategy_rankings/shadow_performance to this JSON path")
 
     args = parser.parse_args()
     KairosSettings.configure(args)
@@ -558,3 +561,24 @@ if __name__ == "__main__":
 
     top_results = orchestrator.backtest_top_strategies(results, n=len(results["strategy_rankings"]))
     print_results(results, top_results)
+
+    if args.export_json:
+        # Additive-only: minimal JSON dump for the pipeline's oracle/model stages.
+        # Does not alter stdout output or any behavior when the flag is absent.
+        def _jsonable(obj):
+            if isinstance(obj, dict):
+                return {k: _jsonable(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_jsonable(v) for v in obj]
+            if isinstance(obj, np.generic):
+                return obj.item()
+            return obj
+
+        export_payload = {
+            "summary": _jsonable(results.get("summary", {})),
+            "strategy_rankings": _jsonable(results.get("strategy_rankings", [])),
+            "shadow_performance": _jsonable(results.get("shadow_performance", {})),
+        }
+        with open(args.export_json, "w") as _f:
+            json.dump(export_payload, _f, indent=2)
+        print(f"  [export_json] wrote {args.export_json}")
