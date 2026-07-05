@@ -426,7 +426,7 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
             window_len = min(current_seq_len, max_context)
 
             if i == 0:
-                # === decode_s1 ONCE on batch_orig — the big speedup ===
+                # === decode_s1 ONCE on batch_orig - the big speedup ===
                 ctx_tokens = [pre_buf[:, :window_len] if current_seq_len <= max_context else pre_buf,
                               post_buf[:, :window_len] if current_seq_len <= max_context else post_buf]
                 cur_stamp = full_stamp_orig[:, context_start:current_seq_len, :].contiguous()
@@ -445,7 +445,7 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
                 sample_post = sample_from_logits(s2_logits[:, -1, :], temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
 
             else:
-                # Subsequent steps: different contexts per sample — use expanded buffers
+                # Subsequent steps: different contexts per sample - use expanded buffers
                 ctx_tokens_exp = [pre_buf_exp[:, :window_len] if current_seq_len <= max_context else pre_buf_exp,
                                   post_buf_exp[:, :window_len] if current_seq_len <= max_context else post_buf_exp]
                 cur_stamp_exp = full_stamp_orig[:, context_start:current_seq_len, :].contiguous()

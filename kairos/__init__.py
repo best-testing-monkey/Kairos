@@ -1,4 +1,4 @@
-"""Kairos — price_cache × Kronos integration layer."""
+"""Kairos - price_cache × Kronos integration layer."""
 
 from .config import configure
 from .data import get_forecast_window

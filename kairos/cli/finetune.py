@@ -1,4 +1,4 @@
-"""kairos finetune — fetch OHLCV via price_cache and fine-tune a Kronos model.
+"""kairos finetune - fetch OHLCV via price_cache and fine-tune a Kronos model.
 
 Usage:
     uv run finetune --model kronos-base --symbol AAPL --output-model ./aapl-model

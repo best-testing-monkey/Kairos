@@ -603,7 +603,7 @@ def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, mo
     chart_height = max(900, int(sum(row_heights) / 9.2 * 1100))
     fig.update_layout(
         template='plotly_dark',
-        title=dict(text=f'{symbol} — Kronos Walk-Forward Backtest', font=dict(size=16)),
+        title=dict(text=f'{symbol} - Kronos Walk-Forward Backtest', font=dict(size=16)),
         height=chart_height,
         showlegend=True,
         legend=dict(orientation='h', y=1.02, x=0),
@@ -633,7 +633,7 @@ def plot_results_html(equity, actual, pred_all, metrics, symbol, output_path, mo
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Kairos walk-forward backtest — HTML output")
+    parser = argparse.ArgumentParser(description="Kairos walk-forward backtest - HTML output")
     parser.add_argument("--model", metavar="PATH", default=None,
                         help="Local path to finetuned Kronos predictor (defaults to NeoQuasar/Kronos-base)")
     parser.add_argument("--tokenizer", metavar="PATH", default=None,

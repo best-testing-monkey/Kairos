@@ -1,4 +1,4 @@
-"""KAI-5: Public orchestration entry point — get_forecast_window.
+"""KAI-5: Public orchestration entry point - get_forecast_window.
 
 Assembles price_cache data into the (x_df, x_timestamp, y_timestamp) tuple
 expected by KronosPredictor.predict.
@@ -40,7 +40,7 @@ def get_forecast_window(
         lookback: Number of historical bars required (== len(x_df)).
         pred_len: Number of future bars to predict (== len(y_timestamp)).
         end: Last bar date.  Defaults to now.
-        amount: "omit" | "auto" | "close_volume" — see adapter.py.
+        amount: "omit" | "auto" | "close_volume" - see adapter.py.
         calendar: exchange_calendars code; defaults to configured value.
         tz: IANA timezone; defaults to configured value.
 

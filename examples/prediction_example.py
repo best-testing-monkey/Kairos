@@ -21,7 +21,7 @@ import price_cache
 from kairos.data import get_forecast_window
 from model import Kronos, KronosTokenizer, KronosPredictor
 
-SYMBOL   = "300418.SZ"   # Kunlun Wanwei — change to any yfinance ticker
+SYMBOL   = "300418.SZ"   # Kunlun Wanwei - change to any yfinance ticker
 LOOKBACK = 400
 PRED_LEN = 120
 OUTPUT_DIR = "./output"
@@ -37,7 +37,7 @@ def plot_prediction(x_df, x_timestamp, pred_df, y_timestamp, symbol, output_dir)
     ax1.plot(y_timestamp.values, pred_df["close"].values,
              label="Predicted", color="tomato", linewidth=1.5, linestyle="--")
     ax1.set_ylabel("Close Price")
-    ax1.set_title(f"{symbol} — {PRED_LEN}-bar forecast")
+    ax1.set_title(f"{symbol} - {PRED_LEN}-bar forecast")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 

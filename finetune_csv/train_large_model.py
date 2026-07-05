@@ -41,7 +41,7 @@ _stop_requested = False
 
 def _sigint_handler(signum, frame):
     global _stop_requested
-    print("\n[SIGINT] Interrupt received — finishing current batch then saving checkpoint...")
+    print("\n[SIGINT] Interrupt received - finishing current batch then saving checkpoint...")
     _stop_requested = True
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))

@@ -2,14 +2,14 @@
 prediction_batch_example.py
 
 Demonstrates Kronos batch prediction across multiple symbols.  Data is fetched
-live via price_cache — no local CSV file required.
+live via price_cache - no local CSV file required.
 
 Usage:
     python prediction_batch_example.py
 
 Output:
-    - ./output/<symbol>_batch_pred.png  — close-price chart per symbol
-    - ./output/batch_predictions.csv    — all predictions in one table
+    - ./output/<symbol>_batch_pred.png  - close-price chart per symbol
+    - ./output/batch_predictions.csv    - all predictions in one table
 """
 import matplotlib
 matplotlib.use('Agg')
@@ -58,7 +58,7 @@ def fetch_windows(symbols, lookback, pred_len):
             print(f"    {len(x_df)} bars  "
                   f"({x_ts.iloc[0].date()} → {x_ts.iloc[-1].date()})")
         except Exception as exc:
-            print(f"    Skipped — {exc}")
+            print(f"    Skipped - {exc}")
     return dfs, x_timestamps, y_timestamps, labels
 
 
@@ -70,7 +70,7 @@ def save_chart(x_df, x_ts, pred_df, y_ts, symbol, name, output_dir):
              label="Historical", color="steelblue", linewidth=1.5)
     ax1.plot(y_ts.values, pred_df["close"].values,
              label="Predicted", color="tomato", linewidth=1.5, linestyle="--")
-    ax1.set_title(f"{name} ({symbol}) — {len(y_ts)}-day forecast",
+    ax1.set_title(f"{name} ({symbol}) - {len(y_ts)}-day forecast",
                   fontsize=13, fontweight="bold")
     ax1.set_ylabel("Close Price")
     ax1.legend()

@@ -1,4 +1,4 @@
-"""KAI error hierarchy — every failure mode before data reaches the model."""
+"""KAI error hierarchy - every failure mode before data reaches the model."""
 
 
 class KairosError(Exception):

@@ -4,7 +4,7 @@ run_backtest_kronos.py
 Walk-forward backtest: Kronos predicts the next PRED_LEN bars from a historical
 context window; the strategy trades on predicted direction vs actual close prices.
 
-Data is fetched live via price_cache — no local CSV files required.
+Data is fetched live via price_cache - no local CSV files required.
 
 Usage:
     python run_backtest_kronos.py
@@ -203,7 +203,7 @@ def plot_results(equity, actual_close, pred_close, metrics, symbol, output_dir):
     ax.plot(benchmark.index, benchmark.values, label='Buy-and-Hold',  linewidth=2, alpha=0.7)
     ax.axhline(equity.iloc[0], color='grey', linestyle='--', linewidth=1)
     ax.set_ylabel('Portfolio Value (CNY)')
-    ax.set_title(f'{symbol} — Kronos Walk-Forward Backtest', fontweight='bold')
+    ax.set_title(f'{symbol} - Kronos Walk-Forward Backtest', fontweight='bold')
     ax.legend()
     ax.grid(True, alpha=0.3)
     metrics_txt = (f"Return: {metrics['total_return']:.1%}  "
@@ -260,7 +260,7 @@ if __name__ == "__main__":
 
     print("\nStep 2: Running backtest ...")
     if actual_close.empty:
-        # Future dates — no ground truth yet; use predicted prices as stand-in
+        # Future dates - no ground truth yet; use predicted prices as stand-in
         print("  No actual prices for prediction period yet (future dates).")
         print("  Using predicted prices to simulate signal-only backtest.")
         actual_close = pred_close.copy()

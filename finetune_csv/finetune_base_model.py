@@ -27,8 +27,8 @@ class CustomKlineDataset(Dataset):
     Loads OHLCV kline data for Kronos fine-tuning.
 
     data_path may be either:
-      - A single CSV file  (original behaviour — one instrument)
-      - A directory        (new) — every *.csv file in the directory is loaded
+      - A single CSV file  (original behaviour - one instrument)
+      - A directory        (new) - every *.csv file in the directory is loaded
         as an independent instrument; windows never cross instrument boundaries.
 
     In directory mode the train/val/test split is applied independently per
@@ -162,7 +162,7 @@ class CustomKlineDataset(Dataset):
         epoch = getattr(self, 'current_epoch', 0)
 
         if len(self.instruments) == 1:
-            # Single instrument — original behaviour
+            # Single instrument - original behaviour
             arr = self.instruments[0]
             max_start = len(arr) - self.window
             if max_start <= 0:

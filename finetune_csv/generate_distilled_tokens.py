@@ -105,7 +105,7 @@ def _save_partial(cache_dir: str, split: str, lists: dict,
         'gt_s2':  torch.cat(lists['gt_s2'],  dim=0),
         'stamps': torch.cat(lists['stamps'], dim=0),
     }, tmp)
-    os.replace(tmp, final)  # atomic on Linux — never leaves a partial file
+    os.replace(tmp, final)  # atomic on Linux - never leaves a partial file
 
 
 def _load_partial(cache_dir: str, split: str):

@@ -6,7 +6,7 @@ Fetches OHLCV data for a large basket of global instruments at daily (1d) and
 hourly (1h) intervals and saves each as a separate CSV in train_data/.
 
 The train_data/ directory is consumed by CustomKlineDataset when data_path
-points to a directory — each CSV is an independent instrument and windows
+points to a directory - each CSV is an independent instrument and windows
 never cross instrument boundaries.
 
 Instruments:

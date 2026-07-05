@@ -2,7 +2,7 @@
 prediction_wo_vol_example.py
 
 Kronos stock prediction using only OHLC columns (no volume/amount).
-Data is fetched via price_cache — no local CSV file required.
+Data is fetched via price_cache - no local CSV file required.
 
 Usage:
     python prediction_wo_vol_example.py
@@ -22,7 +22,7 @@ import price_cache
 from kairos.data import get_forecast_window
 from model import Kronos, KronosTokenizer, KronosPredictor
 
-SYMBOL     = "300418.SZ"   # Kunlun Wanwei — change to any yfinance ticker
+SYMBOL     = "300418.SZ"   # Kunlun Wanwei - change to any yfinance ticker
 LOOKBACK   = 400
 PRED_LEN   = 120
 OUTPUT_DIR = "./output"
@@ -37,7 +37,7 @@ def plot_prediction(x_df, x_timestamp, pred_df, y_timestamp, symbol, output_dir)
     ax.plot(y_timestamp.values, pred_df["close"].values,
             label="Predicted", color="tomato", linewidth=1.5, linestyle="--")
     ax.set_ylabel("Close Price")
-    ax.set_title(f"{symbol} — {PRED_LEN}-bar forecast (close only)")
+    ax.set_title(f"{symbol} - {PRED_LEN}-bar forecast (close only)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -49,7 +49,7 @@ def plot_prediction(x_df, x_timestamp, pred_df, y_timestamp, symbol, output_dir)
 
 
 if __name__ == "__main__":
-    # 1. Fetch data — keep only OHLC (drop volume/amount)
+    # 1. Fetch data - keep only OHLC (drop volume/amount)
     price_cache.configure(remote=False)
     print(f"Fetching {SYMBOL} daily data via price_cache ...")
     x_df, x_timestamp, y_timestamp = get_forecast_window(

@@ -1,4 +1,4 @@
-"""KAI-2: Schema adapter — price_cache frame → Kronos OHLCV contract.
+"""KAI-2: Schema adapter - price_cache frame → Kronos OHLCV contract.
 
 Pure function; no I/O, no global state.
 """

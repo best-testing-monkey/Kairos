@@ -11,8 +11,8 @@ Usage:
 Modify STOCK_CONFIG at the bottom to target a different symbol.
 
 Output:
-    - <symbol>_prediction_chart.png  — price + volume + change chart
-    - <symbol>_detailed_predictions.csv — per-bar forecast data
+    - <symbol>_prediction_chart.png  - price + volume + change chart
+    - <symbol>_detailed_predictions.csv - per-bar forecast data
 """
 
 import os
@@ -68,7 +68,7 @@ def plot_prediction_with_details(x_df, x_timestamp, pred_df, y_timestamp,
     ax1.set_ylabel("Close Price (CNY)", fontsize=14, fontweight="bold")
     ax1.legend(loc="upper left", fontsize=12)
     ax1.grid(True, alpha=0.3)
-    ax1.set_title(f"{stock_name}({stock_code}) — Next {pred_len} Trading Days",
+    ax1.set_title(f"{stock_name}({stock_code}) - Next {pred_len} Trading Days",
                   fontsize=16, fontweight="bold", pad=20)
     ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter("%Y-%m-%d"))
     plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     #   yfinance (default): Shanghai stocks end in .SS, Shenzhen in .SZ
     #   akshare provider:   bare 6-digit codes (300418, 000001, etc.)
     STOCK_CONFIG = {
-        "stock_code": "300418.SZ",   # Kunlun Wanwei — yfinance format
+        "stock_code": "300418.SZ",   # Kunlun Wanwei - yfinance format
         "stock_name": "Kunlun Wanwei",
         "pred_days": 100,
         "output_dir": "./output",

@@ -109,7 +109,7 @@ class EnhancedMarketFactorAnalyzer:
         return self._default_market()
 
     def analyze_sector_resonance(self, stock_code):
-        """Static sector resonance — extends easily with live data."""
+        """Static sector resonance - extends easily with live data."""
         print("Analyzing sector resonance ...")
 
         hot_sectors = {
@@ -154,7 +154,7 @@ class EnhancedMarketFactorAnalyzer:
         return result
 
     def analyze_macro_factors(self):
-        """Static macro factor snapshot — update as conditions change."""
+        """Static macro factor snapshot - update as conditions change."""
         print("Analyzing macro factors ...")
         us_rate = {
             "trend": "rate_cut_cycle",
@@ -169,7 +169,7 @@ class EnhancedMarketFactorAnalyzer:
         return macro
 
     def analyze_company_fundamentals(self, stock_code):
-        """Per-stock fundamental scores — extend as needed."""
+        """Per-stock fundamental scores - extend as needed."""
         fundamentals_db = {
             "600580": {"company_name": "Wolong Electric Drive",
                        "investment_rating": "positive_attention",
@@ -282,7 +282,7 @@ def plot_comprehensive(x_df, x_timestamp, pred_df, enhanced_df,
              color="#2ca02c", linewidth=2, linestyle="--", label="Enhanced Prediction")
     ax1.axvline(x=y_timestamp.iloc[0], color="red", linestyle="--", alpha=0.6)
     factor = enhancement_info["adjustment_factor"]
-    ax1.set_title(f"{stock_name}({stock_code}) — Comprehensive Factor Prediction  "
+    ax1.set_title(f"{stock_name}({stock_code}) - Comprehensive Factor Prediction  "
                   f"(factor={factor:.3f})", fontsize=14, fontweight="bold")
     ax1.set_ylabel("Close Price (CNY)")
     ax1.legend()
@@ -391,7 +391,7 @@ if __name__ == "__main__":
     #   yfinance (default): Shanghai stocks end in .SS, Shenzhen in .SZ
     #   akshare provider:   bare 6-digit codes (603288, 600580, etc.)
     STOCK_CONFIG = {
-        "stock_code": "603288.SS",   # Haitian Flavouring — yfinance format
+        "stock_code": "603288.SS",   # Haitian Flavouring - yfinance format
         "stock_name": "Haitian Flavouring",
         "pred_days": 60,
         "output_dir": "./output",

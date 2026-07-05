@@ -3,7 +3,7 @@
 prediction_cn_markets_day.py
 
 Predicts future daily K-line (1D) data for A-share markets using Kronos and
-price_cache.  Data is fetched and cached automatically — no manual CSV
+price_cache.  Data is fetched and cached automatically - no manual CSV
 wrangling required.
 
 Usage:
@@ -12,7 +12,7 @@ Usage:
 Arguments:
     --symbol     Ticker symbol passed directly to price_cache.
                  The required format depends on which provider resolves it:
-                   yfinance (default): use exchange suffixes — Shanghai stocks
+                   yfinance (default): use exchange suffixes - Shanghai stocks
                      end in .SS (e.g. 600580.SS), Shenzhen stocks in .SZ
                      (e.g. 000001.SZ, 002594.SZ).
                    akshare provider: bare 6-digit codes work (000001, 002594).
@@ -146,7 +146,7 @@ def predict_future(symbol):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kronos stock prediction script (price_cache)")
     parser.add_argument("--symbol", type=str, default="000001.SZ",
-                        help="Stock code — yfinance format: Shanghai=.SS, Shenzhen=.SZ")
+                        help="Stock code - yfinance format: Shanghai=.SS, Shenzhen=.SZ")
     args = parser.parse_args()
     try:
         predict_future(symbol=args.symbol)

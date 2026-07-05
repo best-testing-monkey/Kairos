@@ -1,4 +1,4 @@
-"""KAI-8: Integration smoke — local SQLite round trip (no network).
+"""KAI-8: Integration smoke - local SQLite round trip (no network).
 
 Uses the seeded_db fixture from conftest.py.
 """

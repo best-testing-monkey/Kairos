@@ -4,7 +4,7 @@ prediction_GUI.py
 Tkinter GUI for Kronos stock prediction using price_cache for data.
 
 This is the price_cache counterpart to examples/akshare/prediction_new_GUI.py.
-The UI layout and threading model are identical; only the data layer changes —
+The UI layout and threading model are identical; only the data layer changes -
 get_forecast_window() replaces the akshare fetch + CSV-read workflow.
 
 Usage:
@@ -286,7 +286,7 @@ def _plot_and_save(x_df, x_timestamp, pred_df, y_timestamp,
              color="#ff7f0e", linewidth=2, linestyle="-",
              marker="o", markersize=3, label="Predicted")
     ax1.axvline(x=y_timestamp.iloc[0], color="red", linestyle="--", alpha=0.6)
-    ax1.set_title(f"{stock_name}({symbol}) — Kronos Prediction", fontsize=14, fontweight="bold")
+    ax1.set_title(f"{stock_name}({symbol}) - Kronos Prediction", fontsize=14, fontweight="bold")
     ax1.set_ylabel("Close Price")
     ax1.legend()
     ax1.grid(True, alpha=0.3)

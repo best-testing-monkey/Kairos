@@ -4,7 +4,7 @@ run_backtest_kronos.py
 Walk-forward backtest: Kronos predicts the next PRED_LEN bars from a historical
 context window; the strategy trades on predicted direction vs actual close prices.
 
-Data is fetched live via price_cache — no local CSV files required.
+Data is fetched live via price_cache - no local CSV files required.
 
 Usage:
     python run_backtest_kronos.py [--model PATH] [--tokenizer PATH]
@@ -228,7 +228,7 @@ def plot_results(equity, actual_close, pred_close, metrics, symbol, output_dir):
     ax.plot(benchmark.index, benchmark.values, label='Buy-and-Hold', linewidth=2, alpha=0.7)
     ax.axhline(equity.iloc[0], color='grey', linestyle='--', linewidth=1)
     ax.set_ylabel('Portfolio Value (CNY)')
-    ax.set_title(f'{symbol} — Kronos Walk-Forward Backtest', fontweight='bold')
+    ax.set_title(f'{symbol} - Kronos Walk-Forward Backtest', fontweight='bold')
     ax.legend()
     ax.grid(True, alpha=0.3)
     metrics_txt = (f"Return: {metrics['total_return']:.1%}  "
@@ -278,11 +278,11 @@ def plot_results_candlesticks(equity, actual, predicted, metrics, symbol,
     ax.plot(benchmark.index, benchmark.values, label='Buy-and-Hold', linewidth=2, alpha=0.7)
     ax.axhline(equity.iloc[0], color='grey', linestyle='--', linewidth=1)
     ax.set_ylabel('Portfolio Value (CNY)')
-    ax.set_title(f'{symbol} — Kronos Walk-Forward Backtest', fontweight='bold')
+    ax.set_title(f'{symbol} - Kronos Walk-Forward Backtest', fontweight='bold')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # 2. Candlestick chart — Actual (left) and Predicted (right) per bar
+    # 2. Candlestick chart - Actual (left) and Predicted (right) per bar
     ax = axes[1]
     n = min(len(actual), len(predicted))
     xs = np.arange(n)

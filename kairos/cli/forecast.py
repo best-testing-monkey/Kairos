@@ -1,4 +1,4 @@
-"""kairos forecast — fetch live/historic price data and run a Kronos prediction.
+"""kairos forecast - fetch live/historic price data and run a Kronos prediction.
 
 Usage:
     uv run forecast --model kronos-mini --symbol AAPL
