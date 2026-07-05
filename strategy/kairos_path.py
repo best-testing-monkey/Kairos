@@ -181,7 +181,11 @@ class KairosPathExtractor:
 
     def __init__(self, predictions: List[pd.DataFrame]):
         self.predictions = predictions
-        self.df = pd.concat(predictions, ignore_index=True)
+        try:
+            from kairos_backtest import fast_concat
+            self.df = fast_concat(predictions)
+        except ImportError:
+            self.df = pd.concat(predictions, ignore_index=True)
 
     def extract(self) -> PathProfile:
         profile = PathProfile()
@@ -441,8 +445,13 @@ class PathRallyStrategy:
 
     def generate_signal(self, dist, current_price, history, context):
         from kairos_path import KairosPathExtractor
-        extractor = KairosPathExtractor(dist.predictions)
-        profile = extractor.extract()
+        profile = getattr(dist, "_path_profile", None)
+        if profile is None:
+            profile = KairosPathExtractor(dist.predictions).extract()
+            try:
+                dist._path_profile = profile
+            except (AttributeError, TypeError):
+                pass
 
         if profile.path_confidence < self.min_path_conf:
             return None
@@ -489,8 +498,13 @@ class PathFadeStrategy:
 
     def generate_signal(self, dist, current_price, history, context):
         from kairos_path import KairosPathExtractor
-        extractor = KairosPathExtractor(dist.predictions)
-        profile = extractor.extract()
+        profile = getattr(dist, "_path_profile", None)
+        if profile is None:
+            profile = KairosPathExtractor(dist.predictions).extract()
+            try:
+                dist._path_profile = profile
+            except (AttributeError, TypeError):
+                pass
 
         if profile.path_confidence < self.min_path_conf:
             return None
@@ -536,8 +550,13 @@ class PathVShapeStrategy:
 
     def generate_signal(self, dist, current_price, history, context):
         from kairos_path import KairosPathExtractor
-        extractor = KairosPathExtractor(dist.predictions)
-        profile = extractor.extract()
+        profile = getattr(dist, "_path_profile", None)
+        if profile is None:
+            profile = KairosPathExtractor(dist.predictions).extract()
+            try:
+                dist._path_profile = profile
+            except (AttributeError, TypeError):
+                pass
 
         if profile.path_confidence < self.min_path_conf:
             return None
@@ -580,8 +599,13 @@ class PathInvertedVStrategy:
 
     def generate_signal(self, dist, current_price, history, context):
         from kairos_path import KairosPathExtractor
-        extractor = KairosPathExtractor(dist.predictions)
-        profile = extractor.extract()
+        profile = getattr(dist, "_path_profile", None)
+        if profile is None:
+            profile = KairosPathExtractor(dist.predictions).extract()
+            try:
+                dist._path_profile = profile
+            except (AttributeError, TypeError):
+                pass
 
         if profile.path_confidence < self.min_path_conf:
             return None
@@ -626,8 +650,13 @@ class PathHighLowSequenceStrategy:
 
     def generate_signal(self, dist, current_price, history, context):
         from kairos_path import KairosPathExtractor
-        extractor = KairosPathExtractor(dist.predictions)
-        profile = extractor.extract()
+        profile = getattr(dist, "_path_profile", None)
+        if profile is None:
+            profile = KairosPathExtractor(dist.predictions).extract()
+            try:
+                dist._path_profile = profile
+            except (AttributeError, TypeError):
+                pass
 
         if profile.path_confidence < self.min_path_conf:
             return None

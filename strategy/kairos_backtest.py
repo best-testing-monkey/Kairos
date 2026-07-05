@@ -161,6 +161,30 @@ class Trade:
 # DISTRIBUTION
 # =============================================================================
 
+def fast_concat(predictions: List[pd.DataFrame]) -> pd.DataFrame:
+    """
+    Fast equivalent of pd.concat(predictions, ignore_index=True) for the
+    common case of many small frames with identical columns and dtypes.
+    Falls back to pd.concat otherwise (identical output either way).
+    """
+    if predictions:
+        first = predictions[0]
+        cols = first.columns
+        arrs = []
+        ok = True
+        for p in predictions:
+            if p.columns is not cols and not p.columns.equals(cols):
+                ok = False
+                break
+            arrs.append(p.to_numpy())
+        if ok and arrs:
+            dt = arrs[0].dtype
+            if dt != object and all(a.dtype == dt for a in arrs) \
+                    and (first.dtypes == dt).all():
+                return pd.DataFrame(np.vstack(arrs), columns=cols.copy())
+    return pd.concat(predictions, ignore_index=True)
+
+
 class KairosDistribution:
     """
     Wraps 60 prediction samples into a statistical distribution.
@@ -170,7 +194,7 @@ class KairosDistribution:
 
     def __init__(self, predictions: List[pd.DataFrame]):
         self.predictions = predictions
-        self.df = pd.concat(predictions, ignore_index=True)
+        self.df = fast_concat(predictions)
         self.stats: Dict[str, Dict[str, float]] = {}
         self._compute_stats()
 

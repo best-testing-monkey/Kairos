@@ -55,6 +55,7 @@ bt_model = None
 bt_predictor = None
 
 _prediction_cache: dict = {}  # (symbol, last_bar_ts) -> List[pd.DataFrame]
+_dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,15 +239,20 @@ def predict_all_batch(assets: dict) -> dict:
             _prediction_cache[(symbol, assets[symbol].index[-1])] = preds
             cached_results[symbol] = preds
 
-    return {
-        symbol: AssetPrediction(
+    result = {}
+    for symbol, preds in cached_results.items():
+        dist_key = (symbol, assets[symbol].index[-1])
+        dist = _dist_cache.get(dist_key)
+        if dist is None:
+            dist = KairosDistribution(preds)
+            _dist_cache[dist_key] = dist
+        result[symbol] = AssetPrediction(
             symbol=symbol,
-            dist=KairosDistribution(preds),
+            dist=dist,
             current_price=float(assets[symbol]["close"].iloc[-1]),
             history=assets[symbol],
         )
-        for symbol, preds in cached_results.items()
-    }
+    return result
 
 
 # ── Backtest engine ───────────────────────────────────────────────────────────

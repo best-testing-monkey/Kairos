@@ -507,6 +507,28 @@ class VolumeAnalyzer:
         return None
 
 
+def _get_volume_analyzer(dist: KairosDistribution) -> "VolumeAnalyzer":
+    """Return a cached VolumeAnalyzer for this dist, computing it once.
+
+    VolumeAnalyzer(dist) is a pure function of dist.df (volume/amount
+    percentiles), and multiple strategies call it independently on the same
+    dist within a single bar/asset evaluation. Caching on the dist instance
+    avoids recomputing the same np.percentile/np.mean/np.median calls once
+    per strategy - pure memoization, output is bit-identical to calling
+    VolumeAnalyzer(dist) fresh each time. The cache lives with the dist
+    object and is naturally discarded once a new dist is built for the
+    next bar.
+    """
+    analyzer = getattr(dist, "_volume_analyzer_cache", None)
+    if analyzer is None:
+        analyzer = VolumeAnalyzer(dist)
+        try:
+            dist._volume_analyzer_cache = analyzer
+        except Exception:
+            pass
+    return analyzer
+
+
 class LiquidityFilterStrategy(Strategy):
     """
     Only passes signals if predicted volume is above a historical percentile.
@@ -519,7 +541,7 @@ class LiquidityFilterStrategy(Strategy):
         self.min_volume_percentile = min_volume_percentile
 
     def generate_signal(self, dist, current_price, history, context):
-        analyzer = VolumeAnalyzer(dist)
+        analyzer = _get_volume_analyzer(dist)
         if not analyzer.is_liquid(history, self.min_volume_percentile):
             return None
 
@@ -547,7 +569,7 @@ class VolumeConfirmationStrategy(Strategy):
         self.fade_threshold_pct = fade_threshold_pct
 
     def generate_signal(self, dist, current_price, history, context):
-        analyzer = VolumeAnalyzer(dist)
+        analyzer = _get_volume_analyzer(dist)
         v = analyzer.volume_vs_history(history)
 
         s = dist.stats["close"]
@@ -611,7 +633,7 @@ class VolumeFadeStrategy(Strategy):
         self.min_move_pct = min_move_pct
 
     def generate_signal(self, dist, current_price, history, context):
-        analyzer = VolumeAnalyzer(dist)
+        analyzer = _get_volume_analyzer(dist)
         v = analyzer.volume_vs_history(history)
 
         if v["percentile"] > self.max_volume_percentile:
@@ -664,7 +686,7 @@ class AmountFlowStrategy(Strategy):
         self.z_threshold = z_threshold
 
     def generate_signal(self, dist, current_price, history, context):
-        analyzer = VolumeAnalyzer(dist)
+        analyzer = _get_volume_analyzer(dist)
         flow = analyzer.amount_flow_direction()
 
         if flow is None:
@@ -729,7 +751,7 @@ class PredictedVWAPStrategy(Strategy):
         self.min_deviation_pct = min_deviation_pct
 
     def generate_signal(self, dist, current_price, history, context):
-        analyzer = VolumeAnalyzer(dist)
+        analyzer = _get_volume_analyzer(dist)
         vwap = analyzer.predicted_vwap()
         if vwap is None:
             return None
