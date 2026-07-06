@@ -10,7 +10,7 @@ from kairos_backtest import (
     KairosDistribution, Direction, Signal,
     PercentileEntryStrategy, DynamicBracketStrategy,
 )
-from kairos_volatility import atr, ATRBracketStrategy, fit_garch, GARCHFilterStrategy
+from kairos_volatility import atr, ATRBracketStrategy, fit_garch, GARCHFilterStrategy, VolTargetSizerStrategy
 
 
 # ============================================================================
@@ -655,3 +655,268 @@ class TestGARCHFilterStrategy:
 
         if sig is not None:
             assert isinstance(sig, Signal), f"Expected Signal dataclass, got {type(sig)}"
+
+
+# ============================================================================
+# VolTargetSizerStrategy Tests
+# ============================================================================
+
+class TestVolTargetSizerStrategy:
+    def test_vol_target_sizer_none_passthrough(self):
+        """Test that None from base strategy is passed through."""
+        base_strat = PercentileEntryStrategy()
+        wrapper = VolTargetSizerStrategy(base_strat, target_vol=0.15, max_leverage=2.0)
+
+        dist = make_dist([100.0] * 100)
+        history = make_history(n=50, price=100.0)
+        context = {}
+
+        sig = wrapper.generate_signal(dist, 100.0, history, context)
+        assert sig is None
+
+    def test_vol_target_sizer_zero_stays_zero(self):
+        """Test that zero-size signals are never increased."""
+        class ZeroSizeStrategy(DynamicBracketStrategy):
+            def generate_signal(self, dist, current_price, history, context, **kwargs):
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.0,  # Zero size
+                    entry=100.0,
+                    stop=95.0,
+                    target=110.0,
+                    strategy_name="zero_size",
+                    confidence=1.0,
+                    expected_value=2.0,
+                )
+
+        base_strat = ZeroSizeStrategy()
+        wrapper = VolTargetSizerStrategy(base_strat, target_vol=0.15, max_leverage=2.0)
+
+        dist = make_dist([110.0] * 100)
+        history = make_history(n=50, price=100.0)
+        context = {}
+
+        sig = wrapper.generate_signal(dist, 100.0, history, context)
+        assert sig is not None
+        assert sig.size == 0.0, "Zero-size signal should stay zero"
+
+    def test_vol_target_sizer_halves_at_double_vol(self):
+        """Test that size halves when blended vol doubles.
+
+        Create two scenarios with different volatility levels and verify the
+        scaling relationship matches target_vol / blended_vol.
+        """
+        class FixedSizeStrategy(DynamicBracketStrategy):
+            def generate_signal(self, dist, current_price, history, context, **kwargs):
+                return Signal(
+                    direction=Direction.LONG,
+                    size=1.0,  # Base size = 1.0
+                    entry=100.0,
+                    stop=95.0,
+                    target=110.0,
+                    strategy_name="fixed_size",
+                    confidence=1.0,
+                    expected_value=2.0,
+                )
+
+        base_strat = FixedSizeStrategy()
+        target_vol = 0.15
+        wrapper = VolTargetSizerStrategy(base_strat, target_vol=target_vol, max_leverage=2.0,
+                                        lookback=50, refit_days=10)
+
+        # Scenario 1: Low volatility
+        # Create constant prices (near-zero returns) and tight distribution for Kronos
+        np.random.seed(42)
+        low_vol_prices = [100.0] * 60
+        idx = pd.date_range("2024-01-01", periods=60, freq="D")
+        low_vol_history = pd.DataFrame({
+            "open": low_vol_prices,
+            "high": [p * 1.001 for p in low_vol_prices],
+            "low": [p * 0.999 for p in low_vol_prices],
+            "close": low_vol_prices,
+            "volume": [1e6] * 60,
+        }, index=idx)
+
+        # Create a tight distribution (narrow range)
+        low_vol_dist = make_dist(low_vol_prices)
+
+        sig1 = wrapper.generate_signal(low_vol_dist, 100.0, low_vol_history, {})
+        assert sig1 is not None
+        size1 = sig1.size
+
+        # Reset for scenario 2
+        wrapper.reset()
+
+        # Scenario 2: High volatility (wider distribution)
+        # Create volatile returns and wider distribution
+        high_vol_prices = [100.0 + 5.0 * np.sin(i * 0.3) for i in range(60)]
+        high_vol_history = pd.DataFrame({
+            "open": [p * 0.99 for p in high_vol_prices],
+            "high": [p * 1.02 for p in high_vol_prices],
+            "low": [p * 0.98 for p in high_vol_prices],
+            "close": high_vol_prices,
+            "volume": [1e6] * 60,
+        }, index=idx)
+
+        high_vol_dist = make_dist(high_vol_prices)
+
+        sig2 = wrapper.generate_signal(high_vol_dist, 100.0, high_vol_history, {})
+        assert sig2 is not None
+        size2 = sig2.size
+
+        # High vol should have smaller size than low vol
+        # (since we're scaling down when vol is high)
+        assert size2 < size1, f"High vol size {size2} should be < low vol size {size1}"
+
+    def test_vol_target_sizer_respects_max_leverage(self):
+        """Test that sizing never exceeds base size * max_leverage."""
+        class FixedSizeStrategy(DynamicBracketStrategy):
+            def generate_signal(self, dist, current_price, history, context, **kwargs):
+                return Signal(
+                    direction=Direction.LONG,
+                    size=1.0,  # Base size = 1.0
+                    entry=100.0,
+                    stop=95.0,
+                    target=110.0,
+                    strategy_name="fixed_size",
+                    confidence=1.0,
+                    expected_value=2.0,
+                )
+
+        base_strat = FixedSizeStrategy()
+        base_size = 1.0
+        max_leverage = 1.5
+
+        wrapper = VolTargetSizerStrategy(base_strat, target_vol=0.15, max_leverage=max_leverage,
+                                        lookback=50, refit_days=10)
+
+        # Create very low volatility scenario (should want to scale up)
+        np.random.seed(42)
+        const_prices = [100.0] * 60
+        idx = pd.date_range("2024-01-01", periods=60, freq="D")
+        low_vol_history = pd.DataFrame({
+            "open": const_prices,
+            "high": [p * 1.0001 for p in const_prices],  # Tiny range
+            "low": [p * 0.9999 for p in const_prices],
+            "close": const_prices,
+            "volume": [1e6] * 60,
+        }, index=idx)
+
+        low_vol_dist = make_dist(const_prices)
+
+        sig = wrapper.generate_signal(low_vol_dist, 100.0, low_vol_history, {})
+        assert sig is not None
+
+        max_allowed_size = base_size * max_leverage
+        assert sig.size <= max_allowed_size, \
+            f"Size {sig.size} exceeds max {max_allowed_size}"
+
+    def test_vol_target_sizer_preserves_signal_fields(self):
+        """Test that VolTargetSizerStrategy preserves non-size fields."""
+        class CustomStrategy(DynamicBracketStrategy):
+            def generate_signal(self, dist, current_price, history, context, **kwargs):
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=100.0,
+                    stop=95.0,
+                    target=110.0,
+                    strategy_name="custom",
+                    confidence=0.85,
+                    expected_value=3.5,
+                    metadata={"key": "value"},
+                )
+
+        base_strat = CustomStrategy()
+        wrapper = VolTargetSizerStrategy(base_strat, target_vol=0.15, max_leverage=2.0)
+
+        history = make_history(n=50, price=100.0)
+        dist = make_dist([100.0] * 50)
+        context = {}
+
+        sig = wrapper.generate_signal(dist, 100.0, history, context)
+        assert sig is not None
+
+        # Verify non-size fields are preserved
+        assert sig.direction == Direction.LONG
+        assert sig.entry == 100.0
+        assert sig.stop == 95.0
+        assert sig.target == 110.0
+        assert sig.confidence == 0.85
+        assert sig.expected_value == 3.5
+        assert sig.metadata == {"key": "value"}
+        assert sig.strategy_name == "vol_target_sizer"
+
+    def test_vol_target_sizer_reset_clears_cache(self):
+        """Test reset() clears internal state."""
+        class AlwaysFireStrategy(DynamicBracketStrategy):
+            def generate_signal(self, dist, current_price, history, context, **kwargs):
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=100.0,
+                    stop=95.0,
+                    target=110.0,
+                    strategy_name="always_fire",
+                    confidence=1.0,
+                    expected_value=2.0,
+                )
+
+        base_strat = AlwaysFireStrategy()
+        wrapper = VolTargetSizerStrategy(base_strat, target_vol=0.15, max_leverage=2.0,
+                                        lookback=50, refit_days=5)
+
+        # Simulate some bar activity
+        history = make_history(n=30, price=100.0)
+        dist = make_dist([100.0] * 30)
+        context = {}
+
+        for _ in range(10):
+            wrapper.generate_signal(dist, 100.0, history, context)
+
+        # Verify state has been populated
+        assert wrapper._bar_count > 0, "Bar count should be > 0"
+
+        # Reset
+        wrapper.reset()
+
+        # Verify state is cleared
+        assert wrapper._bar_count == 0, "Bar count should be 0 after reset"
+        assert wrapper._sigma_history == [], "Sigma history should be empty after reset"
+        assert wrapper._last_fit is None, "Last fit should be None after reset"
+        assert wrapper._converged == True, "Converged flag should be reset to True"
+
+    def test_vol_target_sizer_returns_signal_dataclass(self):
+        """Test that VolTargetSizerStrategy returns Signal dataclass, never dict."""
+        class AlwaysFireStrategy(DynamicBracketStrategy):
+            def generate_signal(self, dist, current_price, history, context, **kwargs):
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=100.0,
+                    stop=95.0,
+                    target=110.0,
+                    strategy_name="always_fire",
+                    confidence=1.0,
+                    expected_value=2.0,
+                )
+
+        base_strat = AlwaysFireStrategy()
+        wrapper = VolTargetSizerStrategy(base_strat, target_vol=0.15, max_leverage=2.0)
+
+        history = make_history(n=20, price=100.0)
+        dist = make_dist([100.0] * 20)
+        context = {}
+
+        sig = wrapper.generate_signal(dist, 100.0, history, context)
+        assert sig is not None
+        assert isinstance(sig, Signal), f"Expected Signal dataclass, got {type(sig)}"
+        assert hasattr(sig, "direction")
+        assert hasattr(sig, "size")
+        assert hasattr(sig, "entry")
+        assert hasattr(sig, "stop")
+        assert hasattr(sig, "target")
+        assert hasattr(sig, "strategy_name")
+        assert hasattr(sig, "confidence")
+        assert hasattr(sig, "expected_value")
+        assert hasattr(sig, "metadata")

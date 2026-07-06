@@ -24,7 +24,7 @@
 ## Epic E3 — Volatility
 
 - [x] E3-S01 GARCH Filter (docs/tickets/E3-S01-garch-filter.md)
-- [ ] E3-S02 Vol Target Sizer (docs/tickets/E3-S02-vol-target-sizer.md)
+- [x] E3-S02 Vol Target Sizer (docs/tickets/E3-S02-vol-target-sizer.md)
 - [ ] E3-S03 Variance Risk Premium (docs/tickets/E3-S03-variance-risk-premium.md)
 
 ## Epic E4 — Econometrics
@@ -45,7 +45,7 @@
 ## Epic E6 — Technical Filters
 
 - [x] E6-S01 Stochastic Filter (docs/tickets/E6-S01-stochastic-filter.md)
-- [ ] E6-S02 ADX Gate (docs/tickets/E6-S02-adx-gate.md)
+- [x] E6-S02 ADX Gate (docs/tickets/E6-S02-adx-gate.md)
 - [ ] E6-S03 OBV Confirmation (docs/tickets/E6-S03-obv-confirmation.md)
 - [ ] E6-S04 MTF Consensus (docs/tickets/E6-S04-mtf-consensus.md)
 
@@ -65,6 +65,6 @@
 ## Epic E9 — Sentiment Scaffolding
 
 - [x] E9-S01 News Sentiment Filter (docs/tickets/E9-S01-news-sentiment-filter.md)
-- [ ] E9-S02 Social Momentum (docs/tickets/E9-S02-social-momentum.md)
+- [x] E9-S02 Social Momentum (docs/tickets/E9-S02-social-momentum.md)
 - [ ] E9-S03 Institutional 13F (docs/tickets/E9-S03-institutional-13f.md)
 - [ ] E9-S04 Econ Calendar Guard (docs/tickets/E9-S04-econ-calendar-guard.md)

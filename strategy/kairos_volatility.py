@@ -350,3 +350,141 @@ class GARCHFilterStrategy(Strategy):
             return None
 
         return base_signal
+
+
+class VolTargetSizerStrategy(Strategy):
+    """
+    Wrapper strategy that scales signal sizes based on blended realized and predicted volatility.
+
+    Sizing wrapper: blended_vol = 0.5*(GARCH forecast) + 0.5*(Kronos predicted range vol).
+    Scales signal.size by target_vol / blended_vol, clipped so final size <= base size * max_leverage.
+    Never increases a zero-size signal; passes through None.
+
+    Kronos predicted range vol = (pct_84 - pct_16) / (2 * current_price), annualized by sqrt(252).
+
+    GARCH forecast is cached and refit every refit_days bars (weekly by default).
+
+    Args:
+        base_strategy: Strategy instance to wrap.
+        target_vol: Target annualized volatility (default 0.15 = 15%).
+        max_leverage: Maximum leverage cap on final size (default 2.0).
+        lookback: Window size for GARCH fitting (default 250).
+        refit_days: Refit GARCH model every N bars (default 5 = weekly).
+    """
+
+    name = "vol_target_sizer"
+
+    def __init__(self, base_strategy: Strategy, target_vol: float = 0.15,
+                 max_leverage: float = 2.0, lookback: int = 250, refit_days: int = 5):
+        self.base_strategy = base_strategy
+        self.target_vol = target_vol
+        self.max_leverage = max_leverage
+        self.lookback = lookback
+        self.refit_days = refit_days
+
+        # State tracking
+        self._bar_count = 0  # Track bars since last refit
+        self._sigma_history = []  # List of fitted conditional volatilities
+        self._last_fit = None  # Cached GARCH fit result
+        self._converged = True  # Track convergence status
+
+    def reset(self):
+        """Reset internal state for walk-forward validation."""
+        self._bar_count = 0
+        self._sigma_history = []
+        self._last_fit = None
+        self._converged = True
+
+    def generate_signal(self, dist, current_price, history, context, **kwargs):
+        """
+        Generate signal from base strategy and scale by vol targeting.
+
+        Returns:
+            Scaled Signal or None if base returns None.
+        """
+        # Call base strategy first
+        base_signal = self.base_strategy.generate_signal(
+            dist, current_price, history, context, **kwargs
+        )
+        if base_signal is None:
+            return None
+
+        # Never increase a zero-size signal
+        if base_signal.size == 0.0:
+            return base_signal
+
+        # Compute log returns from history
+        closes = history["close"].values
+        if len(closes) < 2:
+            # Not enough data; return base signal unchanged
+            return base_signal
+
+        log_returns = np.diff(np.log(closes))
+
+        # Refit GARCH if needed
+        if self._bar_count % self.refit_days == 0:
+            # Use trailing lookback bars for fitting
+            fit_window = log_returns[-self.lookback:] if len(log_returns) >= self.lookback else log_returns
+            self._last_fit = fit_garch(fit_window)
+            self._converged = self._last_fit.get("converged", False)
+
+            # Track this fitted sigma in history
+            if self._converged:
+                self._sigma_history.append(self._last_fit["sigma_forecast"])
+
+        self._bar_count += 1
+
+        # Compute GARCH-based volatility (daily forecast, annualized)
+        garch_vol = 0.0
+        if self._converged and self._last_fit is not None:
+            # fit_garch returns daily sigma; annualize it
+            daily_sigma = self._last_fit["sigma_forecast"]
+            garch_vol = daily_sigma * np.sqrt(252)
+        else:
+            # Fallback to realized vol if GARCH fails
+            if len(log_returns) >= 20:
+                garch_vol = np.std(log_returns[-20:]) * np.sqrt(252)
+            else:
+                garch_vol = np.std(log_returns) * np.sqrt(252)
+
+        # Compute Kronos predicted range vol
+        # range_vol = (pct_84 - pct_16) / (2 * price), annualized by sqrt(252)
+        close_stats = dist.stats.get("close", {})
+        pct_84 = close_stats.get(f"pct_{int(84)}", current_price)
+        pct_16 = close_stats.get(f"pct_{int(16)}", current_price)
+
+        if current_price > 0:
+            # Range-based vol: (84th percentile - 16th percentile) / (2 * price)
+            kronos_vol_daily = (pct_84 - pct_16) / (2.0 * current_price)
+            kronos_vol = kronos_vol_daily * np.sqrt(252)
+        else:
+            kronos_vol = 0.0
+
+        # Blend: 50% GARCH + 50% Kronos
+        blended_vol = 0.5 * garch_vol + 0.5 * kronos_vol
+
+        # Avoid division by zero
+        if blended_vol <= 0:
+            blended_vol = self.target_vol
+
+        # Scale size by target_vol / blended_vol
+        size_multiplier = self.target_vol / blended_vol
+
+        # Clip to max_leverage
+        size_multiplier = min(size_multiplier, self.max_leverage)
+
+        # Apply multiplier to base size, but never reduce below 0
+        new_size = max(0.0, base_signal.size * size_multiplier)
+
+        # Return scaled Signal
+        return Signal(
+            direction=base_signal.direction,
+            size=new_size,
+            entry=base_signal.entry,
+            stop=base_signal.stop,
+            target=base_signal.target,
+            strategy_name=self.name,
+            confidence=base_signal.confidence,
+            expected_value=base_signal.expected_value,
+            metadata=base_signal.metadata,
+        )

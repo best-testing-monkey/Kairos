@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 from kairos_backtest import (
     KairosDistribution, Direction, Signal, Strategy,
-    StochasticFilterStrategy, CloseDirectionStrategy
+    StochasticFilterStrategy, CloseDirectionStrategy, ADXGateStrategy,
+    compute_adx
 )
 
 
@@ -311,3 +312,322 @@ class TestStochasticFilterStrategy:
         assert sig.size == 0.75
         assert sig.confidence == 0.8
         assert sig.strategy_name == "fixed"
+
+
+# ============================================================================
+# Tests for ADXGateStrategy
+# ============================================================================
+
+class TestADXHelper:
+    """Test the module-level compute_adx helper function."""
+
+    def test_adx_insufficient_data(self):
+        """Test that ADX returns 50.0 (neutral) when insufficient data."""
+        history = make_history(n=5, price=100.0)
+        adx = compute_adx(history, n=14)
+        assert adx == 50.0
+
+    def test_adx_matches_stochastic_computation(self):
+        """
+        Test that compute_adx produces values consistent with StochasticFilterStrategy._compute_adx.
+        Using synthetic OHLC fixture with strong trend.
+        """
+        # Create a strong uptrend (for high ADX)
+        n = 50
+        closes = list(np.linspace(100, 150, n))
+        highs = [c * 1.02 for c in closes]
+        lows = [c * 0.98 for c in closes]
+
+        history = make_history(n=n, closes=closes, highs=highs, lows=lows)
+
+        # Compute ADX via helper
+        adx_from_helper = compute_adx(history, n=14)
+
+        # Create StochasticFilterStrategy and compute via its method
+        class DummyStrategy(Strategy):
+            name = "dummy"
+            def generate_signal(self, dist, current_price, history, context):
+                return None
+
+        stoch_filter = StochasticFilterStrategy(
+            base_strategy=DummyStrategy(),
+            adx_period=14
+        )
+        adx_from_stochastic = stoch_filter._compute_adx(history)
+
+        # Both should produce identical values
+        assert abs(adx_from_helper - adx_from_stochastic) < 1e-9, \
+            f"ADX mismatch: helper={adx_from_helper}, stochastic={adx_from_stochastic}"
+
+    def test_adx_high_on_strong_trend(self):
+        """Test that ADX is high (> 25) on a strong uptrend."""
+        n = 50
+        closes = list(np.linspace(100, 150, n))
+        highs = [c * 1.02 for c in closes]
+        lows = [c * 0.98 for c in closes]
+
+        history = make_history(n=n, closes=closes, highs=highs, lows=lows)
+        adx = compute_adx(history, n=14)
+
+        assert adx > 25.0, f"Expected ADX > 25 on strong uptrend, got {adx}"
+
+    def test_adx_low_on_sideways_market(self):
+        """Test that ADX is low (< 20) on a sideways/choppy market."""
+        n = 50
+        closes = [100 + (i % 10 - 5) for i in range(n)]  # Oscillating
+        highs = [c + 2 for c in closes]
+        lows = [c - 2 for c in closes]
+
+        history = make_history(n=n, closes=closes, highs=highs, lows=lows)
+        adx = compute_adx(history, n=14)
+
+        assert adx < 25.0, f"Expected ADX < 25 on sideways market, got {adx}"
+
+
+class TestADXGateStrategy:
+    """Test ADXGateStrategy wrapper."""
+
+    def test_adx_gate_trend_routing_passes_on_trend(self):
+        """
+        Test that trend-type strategy passes signal only when ADX > trend_min.
+        Using synthetic data with strong uptrend (high ADX).
+        """
+        # Create a strong uptrend (high ADX)
+        n = 50
+        closes = list(np.linspace(100, 150, n))
+        highs = [c * 1.02 for c in closes]
+        lows = [c * 0.98 for c in closes]
+
+        history = make_history(n=n, closes=closes, highs=highs, lows=lows)
+
+        # Base strategy that always generates LONG
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        # Trend gate with trend_min=25
+        gate = ADXGateStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            kind="trend",
+            trend_min=25.0
+        )
+
+        sig = gate.generate_signal(dist, closes[-1], history, {})
+
+        # On strong uptrend, ADX should be high, so signal should pass
+        assert sig is not None, "Signal should pass on strong trend (high ADX)"
+        assert sig.direction == Direction.LONG
+        assert sig.strategy_name == "always_long"
+
+    def test_adx_gate_trend_routing_blocks_on_flat(self):
+        """
+        Test that trend-type strategy blocks signal when ADX < trend_min.
+        Using synthetic data with sideways/choppy market (low ADX).
+        """
+        # Create a sideways market (low ADX)
+        n = 50
+        closes = [100 + (i % 10 - 5) for i in range(n)]
+        highs = [c + 2 for c in closes]
+        lows = [c - 2 for c in closes]
+
+        history = make_history(n=n, closes=closes, highs=highs, lows=lows)
+
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        # Trend gate
+        gate = ADXGateStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            kind="trend",
+            trend_min=25.0
+        )
+
+        sig = gate.generate_signal(dist, closes[-1], history, {})
+
+        # On sideways market, ADX should be low, so trend strategy should be blocked
+        assert sig is None, "Trend signal should be blocked on flat/sideways market (low ADX)"
+
+    def test_adx_gate_reversion_routing_passes_on_flat(self):
+        """
+        Test that reversion-type strategy passes signal only when ADX < reversion_max.
+        Using synthetic data with sideways/choppy market (low ADX).
+        """
+        # Create a sideways market (low ADX)
+        n = 50
+        closes = [100 + (i % 10 - 5) for i in range(n)]
+        highs = [c + 2 for c in closes]
+        lows = [c - 2 for c in closes]
+
+        history = make_history(n=n, closes=closes, highs=highs, lows=lows)
+
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        # Reversion gate with reversion_max=20
+        gate = ADXGateStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            kind="reversion",
+            reversion_max=20.0
+        )
+
+        sig = gate.generate_signal(dist, closes[-1], history, {})
+
+        # On sideways market, ADX should be low, so reversion strategy should pass
+        assert sig is not None, "Reversion signal should pass on flat/sideways market (low ADX)"
+        assert sig.direction == Direction.LONG
+        assert sig.strategy_name == "always_long"
+
+    def test_adx_gate_reversion_routing_blocks_on_trend(self):
+        """
+        Test that reversion-type strategy blocks signal when ADX > reversion_max.
+        Using synthetic data with strong uptrend (high ADX).
+        """
+        # Create a strong uptrend (high ADX)
+        n = 50
+        closes = list(np.linspace(100, 150, n))
+        highs = [c * 1.02 for c in closes]
+        lows = [c * 0.98 for c in closes]
+
+        history = make_history(n=n, closes=closes, highs=highs, lows=lows)
+
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        # Reversion gate
+        gate = ADXGateStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            kind="reversion",
+            reversion_max=20.0
+        )
+
+        sig = gate.generate_signal(dist, closes[-1], history, {})
+
+        # On strong trend, ADX should be high, so reversion strategy should be blocked
+        assert sig is None, "Reversion signal should be blocked on strong trend (high ADX)"
+
+    def test_adx_gate_passthrough_none_base_signal(self):
+        """Test that None base signal passes through unchanged."""
+        class NeverSignalStrategy(Strategy):
+            name = "never_signal"
+            def generate_signal(self, dist, current_price, history, context):
+                return None
+
+        history = make_history(n=50, price=100.0)
+        dist = make_dist([100.0] * 50)
+
+        gate = ADXGateStrategy(
+            base_strategy=NeverSignalStrategy(),
+            kind="trend"
+        )
+        sig = gate.generate_signal(dist, 100.0, history, {})
+
+        assert sig is None
+
+    def test_adx_gate_invalid_kind_raises_error(self):
+        """Test that invalid kind parameter raises ValueError."""
+        class DummyStrategy(Strategy):
+            name = "dummy"
+            def generate_signal(self, dist, current_price, history, context):
+                return None
+
+        with pytest.raises(ValueError, match="kind must be 'trend' or 'reversion'"):
+            ADXGateStrategy(
+                base_strategy=DummyStrategy(),
+                kind="invalid"
+            )
+
+    def test_adx_gate_signal_unchanged_when_passing(self):
+        """Test that passing signal maintains original attributes."""
+        class FixedSignalStrategy(Strategy):
+            name = "fixed"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.75,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.8,
+                    expected_value=15.0,
+                )
+
+        # Use strong trend so trend gate will pass
+        n = 50
+        closes = list(np.linspace(100, 150, n))
+        highs = [c * 1.02 for c in closes]
+        lows = [c * 0.98 for c in closes]
+        history = make_history(n=n, closes=closes, highs=highs, lows=lows)
+
+        dist = make_dist(closes[-100:])
+
+        gate = ADXGateStrategy(
+            base_strategy=FixedSignalStrategy(),
+            kind="trend",
+            trend_min=25.0
+        )
+
+        sig = gate.generate_signal(dist, closes[-1], history, {})
+
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+        assert sig.size == 0.75
+        assert sig.confidence == 0.8
+        assert sig.strategy_name == "fixed"
+        assert sig.expected_value == 15.0

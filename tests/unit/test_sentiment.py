@@ -5,7 +5,7 @@ import pytest
 import numpy as np
 import pandas as pd
 from kairos_backtest import KairosDistribution, Direction, Signal
-from kairos_sentiment import NewsSentimentFilterStrategy
+from kairos_sentiment import NewsSentimentFilterStrategy, SocialMomentumStrategy
 
 
 # ============================================================================
@@ -410,3 +410,419 @@ class TestNewsSentimentFilterStrategy:
         assert sig.target == base_sig.target
         assert sig.expected_value == pytest.approx(base_sig.expected_value, rel=1e-6)
         assert sig.direction == base_sig.direction
+
+
+# ============================================================================
+# Tests for SocialMomentumStrategy
+# ============================================================================
+
+class TestSocialMomentumStrategy:
+    """Test SocialMomentumStrategy standalone strategy for social momentum trading."""
+
+    def test_social_momentum_missing_context_key(self):
+        """
+        Test graceful degradation when context["social_mentions"] is missing.
+        Should return None, never raise exception.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([100.0] * 100)
+        context = {"symbol": "BTC-USD"}  # No social_mentions key
+        sig = strategy.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_social_momentum_missing_symbol_in_dict(self):
+        """
+        Test graceful degradation when symbol not in social_mentions dict.
+        Should return None, never raise exception.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([100.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"ETH-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 100}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_social_momentum_missing_symbol_context_key(self):
+        """
+        Test graceful degradation when context["symbol"] is missing.
+        Should return None, never raise exception.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([100.0] * 100)
+        context = {
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 100}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_social_momentum_missing_z_score(self):
+        """
+        Test graceful degradation when z_score is missing from mention data.
+        Should return None, never raise exception.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([100.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"sentiment": 0.8, "count": 100}}  # No z_score
+        }
+        sig = strategy.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_social_momentum_missing_sentiment(self):
+        """
+        Test graceful degradation when sentiment is missing from mention data.
+        Should return None, never raise exception.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([100.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "count": 100}}  # No sentiment
+        }
+        sig = strategy.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_social_momentum_z_score_too_low(self):
+        """
+        Test that z_score <= 3 returns None (no signal).
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([100.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 3.0, "sentiment": 0.8, "count": 100}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_social_momentum_z_score_at_threshold(self):
+        """
+        Test that z_score > 3 (just above threshold) with positive sentiment → signal.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([105.0] * 100)  # mean > current_price for Kronos agreement
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 3.1, "sentiment": 0.5, "count": 100}}
+        }
+        # History with no 5-day runup (all same price)
+        hist = make_history(n=50, price=100.0)
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+
+    def test_social_momentum_negative_sentiment(self):
+        """
+        Test that sentiment <= 0 returns None (no signal), even with high z_score.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([105.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 5.0, "sentiment": 0.0, "count": 100}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_social_momentum_long_with_kronos_agreement(self):
+        """
+        Test LONG signal when z_score > 3, sentiment > 0, no 5-day runup,
+        and Kronos agrees (mean > current_price).
+        """
+        strategy = SocialMomentumStrategy()
+        # Distribution with mean > current_price (Kronos predicts up)
+        dist = make_dist([105.0] * 100)
+        hist = make_history(n=50, price=100.0)  # Flat history, no 5-day runup
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+        assert sig.confidence == pytest.approx(min(4.0 / 6.0, 1.0), rel=1e-6)
+        assert "z_score" in sig.metadata
+        assert sig.metadata["z_score"] == pytest.approx(4.0, rel=1e-6)
+        assert sig.metadata["momentum_type"] == "crowd_inflow"
+
+    def test_social_momentum_kronos_disagreement_long_setup(self):
+        """
+        Test no signal when attempting LONG but Kronos predicts down (mean < current_price).
+        """
+        strategy = SocialMomentumStrategy()
+        # Distribution with mean < current_price (Kronos predicts down)
+        dist = make_dist([95.0] * 100)
+        hist = make_history(n=50, price=100.0)  # Flat history, no 5-day runup
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is None  # Kronos disagrees with LONG
+
+    def test_social_momentum_blowoff_fade_with_kronos_agreement(self):
+        """
+        Test SHORT fade signal when z_score > 3, sentiment > 0,
+        5-day runup > +20%, and Kronos agrees (mean < current_price).
+        """
+        strategy = SocialMomentumStrategy()
+        # Distribution with mean < current_price (Kronos predicts down, agrees with SHORT)
+        dist = make_dist([95.0] * 100)
+
+        # Build history with +25% 5-day runup
+        idx = pd.date_range("2024-01-01", periods=50, freq="D")
+        base_price = 80.0
+        prices = [base_price] * 45 + [base_price, base_price, base_price, base_price, base_price * 1.25]
+        hist = pd.DataFrame({
+            "open": prices,
+            "high": np.array(prices) * 1.01,
+            "low": np.array(prices) * 0.99,
+            "close": prices,
+            "volume": [1e6] * 50
+        }, index=idx)
+
+        current_price = base_price * 1.25  # Moved to 100
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.5, "sentiment": 0.8, "count": 200}}
+        }
+        sig = strategy.generate_signal(dist, current_price, hist, context)
+        assert sig is not None
+        assert sig.direction == Direction.SHORT
+        assert sig.confidence == pytest.approx(min(4.5 / 6.0, 1.0), rel=1e-6)
+        assert sig.metadata["trailing_5d_return"] == pytest.approx(0.25, rel=1e-6)
+        assert sig.metadata["momentum_type"] == "fade_blowoff"
+
+    def test_social_momentum_kronos_disagreement_short_setup(self):
+        """
+        Test no signal when attempting SHORT fade but Kronos predicts up (mean > current_price).
+        """
+        strategy = SocialMomentumStrategy()
+        # Distribution with mean > current_price (Kronos predicts up)
+        dist = make_dist([105.0] * 100)
+
+        # Build history with +25% 5-day runup
+        idx = pd.date_range("2024-01-01", periods=50, freq="D")
+        base_price = 80.0
+        prices = [base_price] * 45 + [base_price, base_price, base_price, base_price, base_price * 1.25]
+        hist = pd.DataFrame({
+            "open": prices,
+            "high": np.array(prices) * 1.01,
+            "low": np.array(prices) * 0.99,
+            "close": prices,
+            "volume": [1e6] * 50
+        }, index=idx)
+
+        current_price = base_price * 1.25
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.5, "sentiment": 0.8, "count": 200}}
+        }
+        sig = strategy.generate_signal(dist, current_price, hist, context)
+        assert sig is None  # Kronos disagrees with SHORT
+
+    def test_social_momentum_short_boundary_exactly_20_percent(self):
+        """
+        Test that exactly +20% 5-day return does NOT trigger fade (should be LONG).
+        Boundary condition: trailing_5d_return > 0.20 required for SHORT.
+        """
+        strategy = SocialMomentumStrategy()
+        # Kronos agrees with LONG: mean > current_price
+        dist = make_dist([130.0] * 100)
+
+        # Build history with exactly +20% 5-day runup
+        idx = pd.date_range("2024-01-01", periods=50, freq="D")
+        base_price = 100.0
+        prices = [base_price] * 45 + [base_price, base_price, base_price, base_price, base_price * 1.20]
+        hist = pd.DataFrame({
+            "open": prices,
+            "high": np.array(prices) * 1.01,
+            "low": np.array(prices) * 0.99,
+            "close": prices,
+            "volume": [1e6] * 50
+        }, index=idx)
+
+        current_price = base_price * 1.20  # 120
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, current_price, hist, context)
+        assert sig is not None
+        assert sig.direction == Direction.LONG  # At 20%, still LONG, not SHORT
+        assert sig.metadata["momentum_type"] == "crowd_inflow"
+
+    def test_social_momentum_short_boundary_above_20_percent(self):
+        """
+        Test that +20.1% 5-day return DOES trigger fade (SHORT).
+        """
+        strategy = SocialMomentumStrategy()
+        # Kronos agrees with SHORT: mean < current_price
+        dist = make_dist([115.0] * 100)
+
+        # Build history with +20.1% 5-day runup
+        idx = pd.date_range("2024-01-01", periods=50, freq="D")
+        base_price = 100.0
+        prices = [base_price] * 45 + [base_price, base_price, base_price, base_price, base_price * 1.201]
+        hist = pd.DataFrame({
+            "open": prices,
+            "high": np.array(prices) * 1.01,
+            "low": np.array(prices) * 0.99,
+            "close": prices,
+            "volume": [1e6] * 50
+        }, index=idx)
+
+        current_price = base_price * 1.201  # 120.1
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, current_price, hist, context)
+        assert sig is not None
+        assert sig.direction == Direction.SHORT  # Above 20%, SHORT fade
+        assert sig.metadata["momentum_type"] == "fade_blowoff"
+
+    def test_social_momentum_insufficient_history(self):
+        """
+        Test behavior when history has fewer than 5 bars.
+        Should default trailing_5d_return to 0.0, proceed as LONG.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([105.0] * 100)  # Kronos agrees with LONG
+
+        # History with only 3 bars
+        hist = make_history(n=3, price=100.0)
+
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+        assert sig.metadata["trailing_5d_return"] == pytest.approx(0.0, rel=1e-6)
+
+    def test_social_momentum_confidence_calculation(self):
+        """
+        Test that confidence is computed as min(z_score / 6, 1.0).
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([105.0] * 100)
+        hist = make_history(n=50, price=100.0)
+
+        # Test z_score = 3.6 → confidence = 3.6/6 = 0.6
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 3.6, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        assert sig.confidence == pytest.approx(0.6, rel=1e-6)
+
+    def test_social_momentum_confidence_capped_at_one(self):
+        """
+        Test that confidence is capped at 1.0 even when z_score is very high.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([105.0] * 100)
+        hist = make_history(n=50, price=100.0)
+
+        # Test z_score = 10.0 → confidence = min(10.0/6, 1.0) = 1.0
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 10.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        assert sig.confidence == pytest.approx(1.0, rel=1e-6)
+
+    def test_social_momentum_size_calculation(self):
+        """
+        Test that size is computed as min(kelly_fraction * 0.5, 1.0).
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([105.0] * 100)
+        hist = make_history(n=50, price=100.0)
+
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        # Size should be min(kelly * 0.5, 1.0)
+        # Kelly is computed from distribution, so size should be <= 1.0
+        assert sig.size >= 0.0
+        assert sig.size <= 1.0
+
+    def test_social_momentum_metadata_content(self):
+        """
+        Test that metadata contains expected fields: z_score, sentiment,
+        trailing_5d_return, momentum_type.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([105.0] * 100)
+        hist = make_history(n=50, price=100.0)
+
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.7, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        assert sig.metadata["z_score"] == pytest.approx(4.0, rel=1e-6)
+        assert sig.metadata["sentiment"] == pytest.approx(0.7, rel=1e-6)
+        assert sig.metadata["trailing_5d_return"] == pytest.approx(0.0, rel=1e-6)
+        assert sig.metadata["momentum_type"] == "crowd_inflow"
+
+    def test_social_momentum_return_type_signal(self):
+        """
+        Test that signal is always a Signal dataclass, never a dict.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([105.0] * 100)
+        hist = make_history(n=50, price=100.0)
+
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        assert isinstance(sig, Signal)
+        assert not isinstance(sig, dict)
+
+    def test_social_momentum_return_type_none(self):
+        """
+        Test that function returns None (not empty dict) for invalid cases.
+        """
+        strategy = SocialMomentumStrategy()
+        dist = make_dist([100.0] * 100)
+
+        # Missing context key
+        context = {"symbol": "BTC-USD"}
+        sig = strategy.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_social_momentum_custom_stop_target_percentiles(self):
+        """
+        Test that custom stop_pct and target_pct parameters are used.
+        """
+        strategy = SocialMomentumStrategy(stop_pct=10.0, target_pct=90.0)
+        dist = make_dist([105.0] * 100)
+        hist = make_history(n=50, price=100.0)
+
+        context = {
+            "symbol": "BTC-USD",
+            "social_mentions": {"BTC-USD": {"z_score": 4.0, "sentiment": 0.8, "count": 150}}
+        }
+        sig = strategy.generate_signal(dist, 100.0, hist, context)
+        assert sig is not None
+        # For LONG: stop should use pct_10, target should use pct_90
+        expected_stop = dist.stats["close"].get("pct_10")
+        expected_target = dist.stats["close"].get("pct_90")
+        assert sig.stop == pytest.approx(expected_stop, rel=1e-6)
+        assert sig.target == pytest.approx(expected_target, rel=1e-6)

@@ -233,11 +233,13 @@ class KairosDistribution:
                 "pct_5": float(np.percentile(arr, 5)),
                 "pct_10": float(np.percentile(arr, 10)),
                 "pct_15": float(np.percentile(arr, 15)),
+                "pct_16": float(np.percentile(arr, 16)),
                 "pct_20": float(np.percentile(arr, 20)),
                 "pct_25": float(np.percentile(arr, 25)),
                 "pct_50": float(np.percentile(arr, 50)),
                 "pct_75": float(np.percentile(arr, 75)),
                 "pct_80": float(np.percentile(arr, 80)),
+                "pct_84": float(np.percentile(arr, 84)),
                 "pct_85": float(np.percentile(arr, 85)),
                 "pct_90": float(np.percentile(arr, 90)),
                 "pct_95": float(np.percentile(arr, 95)),
@@ -393,6 +395,92 @@ class KairosPredictor:
     def predict(self, history: pd.DataFrame) -> KairosDistribution:
         predictions = self.predict_fn(history)
         return KairosDistribution(predictions)
+
+
+# =============================================================================
+# TECHNICAL INDICATOR HELPERS
+# =============================================================================
+
+def compute_adx(history: pd.DataFrame, n: int = 14) -> float:
+    """
+    Compute ADX (Average Directional Index) from history.
+
+    ADX measures trend strength from 0-100. Values:
+    - 0-25: weak trend
+    - 25-50: moderate trend
+    - 50-75: strong trend
+    - 75-100: very strong trend
+
+    Args:
+        history: DataFrame with OHLC data (high, low, close columns required)
+        n: period for ADX calculation (default 14)
+
+    Returns:
+        ADX value (0-100), or 50.0 (neutral) if insufficient data
+    """
+    if len(history) < n + 1:
+        return 50.0  # Default neutral
+
+    high = history["high"].values
+    low = history["low"].values
+    close = history["close"].values
+
+    # Compute True Range (TR)
+    tr_values = []
+    for i in range(1, len(close)):
+        h_l = high[i] - low[i]
+        h_c = abs(high[i] - close[i - 1])
+        l_c = abs(low[i] - close[i - 1])
+        tr = max(h_l, h_c, l_c)
+        tr_values.append(tr)
+
+    if len(tr_values) == 0:
+        return 50.0
+
+    # Compute Directional Movements
+    plus_dm_values = []
+    minus_dm_values = []
+    for i in range(1, len(high)):
+        plus_dm = high[i] - high[i - 1]
+        minus_dm = low[i - 1] - low[i]
+
+        # Only count if positive and greater than the opposite
+        if plus_dm > 0 and plus_dm > minus_dm:
+            plus_dm_values.append(plus_dm)
+        else:
+            plus_dm_values.append(0.0)
+
+        if minus_dm > 0 and minus_dm > plus_dm:
+            minus_dm_values.append(minus_dm)
+        else:
+            minus_dm_values.append(0.0)
+
+    # Compute DI values using average
+    if len(tr_values) >= n:
+        # Use SMA for numerical stability
+        tr_sum = np.mean(tr_values[-n:])
+        plus_dm_sum = np.mean(plus_dm_values[-n:])
+        minus_dm_sum = np.mean(minus_dm_values[-n:])
+
+        if tr_sum > 0:
+            plus_di = 100.0 * plus_dm_sum / tr_sum
+            minus_di = 100.0 * minus_dm_sum / tr_sum
+        else:
+            return 50.0
+
+        # Compute DX
+        di_sum = plus_di + minus_di
+        if di_sum > 0:
+            dx = 100.0 * abs(plus_di - minus_di) / di_sum
+        else:
+            dx = 0.0
+
+        # ADX is smoothed DX (simplified: use current DX as approximation)
+        adx = dx
+    else:
+        adx = 50.0
+
+    return adx
 
 
 # =============================================================================
@@ -1129,72 +1217,10 @@ class StochasticFilterStrategy(Strategy):
     def _compute_adx(self, history: pd.DataFrame) -> float:
         """
         Compute ADX (Average Directional Index) from history.
+        Delegates to the module-level compute_adx helper.
         Returns: ADX value (0-100)
         """
-        if len(history) < self.adx_period + 1:
-            return 50.0  # Default neutral
-
-        high = history["high"].values
-        low = history["low"].values
-        close = history["close"].values
-
-        # Compute True Range (TR)
-        tr_values = []
-        for i in range(1, len(close)):
-            h_l = high[i] - low[i]
-            h_c = abs(high[i] - close[i - 1])
-            l_c = abs(low[i] - close[i - 1])
-            tr = max(h_l, h_c, l_c)
-            tr_values.append(tr)
-
-        if len(tr_values) == 0:
-            return 50.0
-
-        # Compute Directional Movements
-        plus_dm_values = []
-        minus_dm_values = []
-        for i in range(1, len(high)):
-            plus_dm = high[i] - high[i - 1]
-            minus_dm = low[i - 1] - low[i]
-
-            # Only count if positive and greater than the opposite
-            if plus_dm > 0 and plus_dm > minus_dm:
-                plus_dm_values.append(plus_dm)
-            else:
-                plus_dm_values.append(0.0)
-
-            if minus_dm > 0 and minus_dm > plus_dm:
-                minus_dm_values.append(minus_dm)
-            else:
-                minus_dm_values.append(0.0)
-
-        # Compute DI values using EMA
-        if len(tr_values) >= self.adx_period:
-            # Simplified: use SMA instead of Wilder's smoothing for numerical stability
-            tr_sum = np.mean(tr_values[-self.adx_period:])
-            plus_dm_sum = np.mean(plus_dm_values[-self.adx_period:])
-            minus_dm_sum = np.mean(minus_dm_values[-self.adx_period:])
-
-            if tr_sum > 0:
-                plus_di = 100.0 * plus_dm_sum / tr_sum
-                minus_di = 100.0 * minus_dm_sum / tr_sum
-            else:
-                return 50.0
-
-            # Compute DX
-            di_sum = plus_di + minus_di
-            if di_sum > 0:
-                dx = 100.0 * abs(plus_di - minus_di) / di_sum
-            else:
-                dx = 0.0
-
-            # ADX is EMA of DX - for simplicity, use the current DX as approximation
-            # (full ADX would require tracking historical DX values)
-            adx = dx
-        else:
-            adx = 50.0
-
-        return adx
+        return compute_adx(history, n=self.adx_period)
 
     def generate_signal(self, dist, current_price, history, context):
         """
@@ -1221,6 +1247,84 @@ class StochasticFilterStrategy(Strategy):
 
         # Pass through base signal unchanged
         return base_signal
+
+
+class ADXGateStrategy(Strategy):
+    """
+    Wrapper that gates a base strategy based on trend strength (ADX).
+
+    Routes strategies by market regime:
+    - kind="trend": passes base signal only when ADX > trend_min (default 25)
+    - kind="reversion": passes base signal only when ADX < reversion_max (default 20)
+    - Otherwise returns None, blocking the signal.
+
+    This allows trend-following and mean-reversion strategies to automatically
+    adapt to market conditions.
+
+    Example:
+        trend_strat = TrendFollowingStrategy()
+        gated = ADXGateStrategy(trend_strat, kind="trend", trend_min=25.0)
+
+        reversion_strat = RangeTradingStrategy()
+        gated_reversion = ADXGateStrategy(reversion_strat, kind="reversion", reversion_max=20.0)
+    """
+    name = "adx_gate"
+
+    def __init__(self, base_strategy: Strategy, kind: str,
+                 adx_period: int = 14,
+                 trend_min: float = 25.0,
+                 reversion_max: float = 20.0):
+        """
+        Initialize ADXGateStrategy.
+
+        Args:
+            base_strategy: Strategy to wrap
+            kind: "trend" or "reversion" - determines gating behavior
+            adx_period: period for ADX calculation (default 14)
+            trend_min: ADX threshold for trend-type strategies (default 25.0)
+            reversion_max: ADX threshold for reversion-type strategies (default 20.0)
+
+        Raises:
+            ValueError: if kind is not "trend" or "reversion"
+        """
+        if kind not in ("trend", "reversion"):
+            raise ValueError(f"kind must be 'trend' or 'reversion', got {kind!r}")
+
+        self.base_strategy = base_strategy
+        self.kind = kind
+        self.adx_period = adx_period
+        self.trend_min = trend_min
+        self.reversion_max = reversion_max
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal from base strategy, then gate based on ADX.
+
+        Returns:
+            Signal from base strategy if gate condition met, None otherwise.
+            Always returns Signal or None, never dict.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Compute ADX
+        adx_val = compute_adx(history, n=self.adx_period)
+
+        # Apply gating logic
+        if self.kind == "trend":
+            # Trend strategies pass only when ADX > trend_min
+            if adx_val > self.trend_min:
+                return base_signal
+            else:
+                return None
+        else:  # kind == "reversion"
+            # Reversion strategies pass only when ADX < reversion_max
+            if adx_val < self.reversion_max:
+                return base_signal
+            else:
+                return None
 
 
 class BollingerValidationStrategy(Strategy):
