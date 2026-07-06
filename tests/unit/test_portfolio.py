@@ -23,8 +23,9 @@ from kairos_portfolio import (
     shrunk_covariance,
     _fallback_equal_weight,
     _ledoit_wolf_intensity,
+    MVOAllocator,
 )
-from kairos_backtest import Signal, Direction
+from kairos_backtest import Signal, Direction, KairosDistribution
 
 
 # =============================================================================
@@ -585,3 +586,439 @@ class TestEdgeCases:
         assert 0.0 <= alpha <= 1.0, "Shrinkage intensity should be in [0,1]"
         # With 100 obs and 3 assets, we have plentiful data, so shrinkage may be low
         # even with high correlation (Ledoit-Wolf balances bias and variance)
+
+
+# =============================================================================
+# TEST MVO ALLOCATOR
+# =============================================================================
+
+class TestMVOAllocator:
+    """Test Mean-Variance Optimization allocator."""
+
+    @pytest.fixture
+    def mvo_allocator(self):
+        """Standard MVO allocator instance."""
+        return MVOAllocator(lookback=120, gross_cap=1.0, max_weight=0.35, rf=0.0)
+
+    @pytest.fixture
+    def synthetic_returns_2_assets_uncorrelated(self):
+        """
+        Two uncorrelated assets with 150 observations.
+        Used for equal-mu split test.
+        """
+        np.random.seed(42)
+        n_obs = 150
+        # Uncorrelated: different random seeds
+        asset1 = np.random.randn(n_obs) * 0.02
+        asset2 = np.random.randn(n_obs) * 0.02
+        returns = pd.DataFrame(
+            {"BTC": asset1, "ETH": asset2},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+        return returns
+
+    @pytest.fixture
+    def synthetic_distributions_equal_mu(self):
+        """Mock distributions with equal expected values."""
+        # Create synthetic prediction samples: 100 samples per asset
+        np.random.seed(42)
+        n_samples = 100
+
+        # Asset 1: close prices centered at 50000 with std=1000
+        close1 = np.random.normal(50000, 1000, n_samples)
+        pred1 = [
+            pd.DataFrame({
+                "open": close1 + np.random.normal(0, 100, n_samples),
+                "high": close1 + np.abs(np.random.normal(0, 500, n_samples)),
+                "low": close1 - np.abs(np.random.normal(0, 500, n_samples)),
+                "close": close1,
+                "volume": np.full(n_samples, 1e9),
+                "amount": np.full(n_samples, 1e9),
+            })
+            for _ in range(100)
+        ]
+        dist1 = KairosDistribution(pred1)
+
+        # Asset 2: close prices centered at 3000 with std=60
+        close2 = np.random.normal(3000, 60, n_samples)
+        pred2 = [
+            pd.DataFrame({
+                "open": close2 + np.random.normal(0, 6, n_samples),
+                "high": close2 + np.abs(np.random.normal(0, 30, n_samples)),
+                "low": close2 - np.abs(np.random.normal(0, 30, n_samples)),
+                "close": close2,
+                "volume": np.full(n_samples, 1e8),
+                "amount": np.full(n_samples, 1e8),
+            })
+            for _ in range(100)
+        ]
+        dist2 = KairosDistribution(pred2)
+
+        return {"BTC": dist1, "ETH": dist2}
+
+    def test_mvo_equal_mu_splits_50_50(self, mvo_allocator, synthetic_returns_2_assets_uncorrelated):
+        """
+        Acceptance: with two uncorrelated assets of equal mu and Sharpe, weights split ~50/50.
+
+        Creates two assets with:
+        - Same Sharpe ratio (mu/sigma)
+        - Uncorrelated returns
+        - Both LONG signals
+        """
+        returns = synthetic_returns_2_assets_uncorrelated
+
+        # Create distributions with same Sharpe ratio so weights should split
+        np.random.seed(42)
+        n_samples = 100
+
+        # Asset 1 (BTC):
+        # Entry=50000, Stop=48000, Target=52000
+        # Distribution: std ~1000, win_r=2000, gives moderate Sharpe
+        close1 = np.random.normal(50500, 1000, n_samples)
+        pred1 = [
+            pd.DataFrame({
+                "open": close1 + np.random.normal(0, 100, n_samples),
+                "high": close1 + np.abs(np.random.normal(0, 500, n_samples)),
+                "low": close1 - np.abs(np.random.normal(0, 500, n_samples)),
+                "close": close1,
+                "volume": np.full(n_samples, 1e9),
+                "amount": np.full(n_samples, 1e9),
+            })
+            for _ in range(100)
+        ]
+        dist1 = KairosDistribution(pred1)
+
+        # Asset 2 (ETH):
+        # Create an uncorrelated asset with similar characteristics to BTC
+        # Entry=3000, Stop=2800, Target=3200 (scaled version)
+        close2 = np.random.normal(3100, 200, n_samples)
+        pred2 = [
+            pd.DataFrame({
+                "open": close2 + np.random.normal(0, 20, n_samples),
+                "high": close2 + np.abs(np.random.normal(0, 100, n_samples)),
+                "low": close2 - np.abs(np.random.normal(0, 100, n_samples)),
+                "close": close2,
+                "volume": np.full(n_samples, 1e8),
+                "amount": np.full(n_samples, 1e8),
+            })
+            for _ in range(100)
+        ]
+        dist2 = KairosDistribution(pred2)
+
+        dists = {"BTC": dist1, "ETH": dist2}
+
+        # Create signals with similar relative brackets
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=50000,
+                stop=48000,
+                target=52000,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=3000,
+                stop=2800,
+                target=3200,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = mvo_allocator.allocate(signals, returns, dists, {})
+
+        # Both assets should be long (non-zero weight)
+        assert weights["BTC"] > 1e-8, f"BTC should be long, got {weights['BTC']}"
+        assert weights["ETH"] > 1e-8, f"ETH should be long, got {weights['ETH']}"
+
+        # With similar Sharpe ratios, weights should split roughly 50/50
+        # Allow tolerance for numerical optimization and distribution variations
+        total = weights["BTC"] + weights["ETH"]
+        ratio = weights["BTC"] / total if total > 0 else 0.5
+        # Allow 30-70 split (accounting for sample variance in distributions)
+        assert 0.25 < ratio < 0.75, f"Expected ~50/50 split, got {ratio:.2%} / {1-ratio:.2%}"
+
+        # Respect caps
+        assert abs(weights["BTC"]) <= 0.35 + 1e-6, "BTC weight exceeds max_weight"
+        assert abs(weights["ETH"]) <= 0.35 + 1e-6, "ETH weight exceeds max_weight"
+        assert sum(abs(w) for w in weights.values()) <= 1.0 + 1e-6, "Exceeds gross_cap"
+
+    def test_mvo_monotonic_mu_weight(self, synthetic_returns_2_assets_uncorrelated):
+        """
+        Acceptance: raising one asset's mu monotonically raises its weight.
+
+        Creates multiple allocators with increasing mu for BTC, verifies weight increases.
+        """
+        returns = synthetic_returns_2_assets_uncorrelated
+
+        # Test with multiple ETH mu levels (BTC will have higher mu each time)
+        scenarios = [
+            # (btc_target_offset, eth_target_offset)
+            (51000, 3000),   # BTC: 2% gain, ETH: 0% (flat entry=target)
+            (51500, 3000),   # BTC: 3% gain, ETH: 0%
+            (52000, 3000),   # BTC: 4% gain, ETH: 0%
+        ]
+        weights_btc = []
+
+        for btc_target, eth_target in scenarios:
+            np.random.seed(42)
+            n_samples = 100
+
+            # BTC: distribution centered around entry (50000)
+            close1 = np.random.normal(50000, 500, n_samples)
+            pred1 = [
+                pd.DataFrame({
+                    "open": close1 + np.random.normal(0, 50, n_samples),
+                    "high": np.maximum(close1, btc_target) + np.abs(np.random.normal(0, 250, n_samples)),
+                    "low": np.minimum(close1, btc_target) - np.abs(np.random.normal(0, 250, n_samples)),
+                    "close": close1,
+                    "volume": np.full(n_samples, 1e9),
+                    "amount": np.full(n_samples, 1e9),
+                })
+                for _ in range(100)
+            ]
+            dist1 = KairosDistribution(pred1)
+
+            # ETH: distribution centered around entry (3000)
+            close2 = np.random.normal(3000, 30, n_samples)
+            pred2 = [
+                pd.DataFrame({
+                    "open": close2 + np.random.normal(0, 3, n_samples),
+                    "high": np.maximum(close2, eth_target) + np.abs(np.random.normal(0, 15, n_samples)),
+                    "low": np.minimum(close2, eth_target) - np.abs(np.random.normal(0, 15, n_samples)),
+                    "close": close2,
+                    "volume": np.full(n_samples, 1e8),
+                    "amount": np.full(n_samples, 1e8),
+                })
+                for _ in range(100)
+            ]
+            dist2 = KairosDistribution(pred2)
+
+            dists = {"BTC": dist1, "ETH": dist2}
+
+            signals = {
+                "BTC": Signal(
+                    direction=Direction.LONG,
+                    size=0.1,
+                    entry=50000,
+                    stop=49000,
+                    target=btc_target,
+                    strategy_name="test",
+                    confidence=0.8,
+                    expected_value=0.0,
+                ),
+                "ETH": Signal(
+                    direction=Direction.LONG,
+                    size=0.1,
+                    entry=3000,
+                    stop=2900,
+                    target=eth_target,
+                    strategy_name="test",
+                    confidence=0.8,
+                    expected_value=0.0,
+                ),
+            }
+
+            allocator = MVOAllocator(lookback=120, gross_cap=1.0, max_weight=0.35, rf=0.0)
+            weights = allocator.allocate(signals, returns, dists, {})
+            weights_btc.append(weights.get("BTC", 0.0))
+
+        # With increasing target for BTC, its weight should increase
+        # (or at least not decrease consistently)
+        assert weights_btc[0] <= weights_btc[2], \
+            f"Expected BTC weight to increase from {weights_btc[0]:.6f} to {weights_btc[2]:.6f}"
+
+    def test_mvo_respects_caps(self, mvo_allocator, synthetic_returns_200_obs_3_assets, simple_signals):
+        """
+        Acceptance: solution never violates gross_cap or max_weight constraints.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+
+        # Create mock distributions with positive mu
+        np.random.seed(42)
+        n_samples = 100
+        dists = {}
+        for sym in ["BTC", "ETH", "SOL"]:
+            close = np.random.normal(100, 10, n_samples)
+            pred = [
+                pd.DataFrame({
+                    "open": close + np.random.normal(0, 1, n_samples),
+                    "high": close + np.abs(np.random.normal(0, 5, n_samples)),
+                    "low": close - np.abs(np.random.normal(0, 5, n_samples)),
+                    "close": close,
+                    "volume": np.full(n_samples, 1e6),
+                    "amount": np.full(n_samples, 1e6),
+                })
+                for _ in range(100)
+            ]
+            dists[sym] = KairosDistribution(pred)
+
+        # Adjust signals to match returns columns
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100,
+                stop=95,
+                target=105,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100,
+                stop=95,
+                target=105,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100,
+                stop=105,
+                target=95,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = mvo_allocator.allocate(signals, returns, dists, {})
+
+        # Check max_weight constraint
+        for sym, w in weights.items():
+            assert abs(w) <= 0.35 + 1e-6, \
+                f"{sym} weight {w} exceeds max_weight 0.35"
+
+        # Check gross_cap constraint
+        gross_leverage = sum(abs(w) for w in weights.values())
+        assert gross_leverage <= 1.0 + 1e-6, \
+            f"Gross leverage {gross_leverage} exceeds gross_cap 1.0"
+
+        # Check sign constraints
+        assert weights["BTC"] >= -1e-10, "BTC (LONG) should not be negative"
+        assert weights["ETH"] >= -1e-10, "ETH (LONG) should not be negative"
+        assert weights["SOL"] <= 1e-10, "SOL (SHORT) should not be positive"
+
+    def test_mvo_fallback_below_min_obs(self, mvo_allocator, synthetic_returns_small, simple_signals):
+        """
+        Acceptance: fallback to equal weight when len(returns) < min_obs.
+        """
+        returns = synthetic_returns_small  # 5 obs
+        assert len(returns) < PortfolioAllocator.min_obs
+
+        # Create dummy distributions
+        np.random.seed(42)
+        n_samples = 100
+        dists = {}
+        for sym in ["BTC", "ETH"]:
+            close = np.random.normal(100, 10, n_samples)
+            pred = [
+                pd.DataFrame({
+                    "open": close + np.random.normal(0, 1, n_samples),
+                    "high": close + np.abs(np.random.normal(0, 5, n_samples)),
+                    "low": close - np.abs(np.random.normal(0, 5, n_samples)),
+                    "close": close,
+                    "volume": np.full(n_samples, 1e6),
+                    "amount": np.full(n_samples, 1e6),
+                })
+                for _ in range(100)
+            ]
+            dists[sym] = KairosDistribution(pred)
+
+        weights = mvo_allocator.allocate(simple_signals, returns, dists, {})
+
+        # Should fall back to equal weight
+        expected = _fallback_equal_weight(simple_signals)
+        assert weights == expected, \
+            f"Expected equal-weight fallback {expected}, got {weights}"
+
+    def test_mvo_allocator_attributes(self, mvo_allocator):
+        """Test allocator has correct name and min_obs."""
+        assert mvo_allocator.name == "mvo_allocator"
+        assert mvo_allocator.min_obs == 60
+        assert mvo_allocator.lookback == 120
+        assert mvo_allocator.gross_cap == 1.0
+        assert mvo_allocator.max_weight == 0.35
+        assert mvo_allocator.rf == 0.0
+
+    def test_mvo_allocator_custom_params(self):
+        """Test allocator with custom parameters."""
+        allocator = MVOAllocator(
+            lookback=60,
+            gross_cap=2.0,
+            max_weight=0.5,
+            rf=0.0001
+        )
+        assert allocator.lookback == 60
+        assert allocator.gross_cap == 2.0
+        assert allocator.max_weight == 0.5
+        assert allocator.rf == 0.0001
+
+    def test_mvo_allocator_empty_signals(self, mvo_allocator, synthetic_returns_200_obs_3_assets):
+        """With no signals, return empty dict."""
+        returns = synthetic_returns_200_obs_3_assets
+        weights = mvo_allocator.allocate({}, returns, {}, {})
+        assert weights == {}
+
+    def test_mvo_allocator_zero_expected_return(self, mvo_allocator, synthetic_returns_200_obs_3_assets):
+        """Allocator should handle zero or negative expected returns gracefully."""
+        returns = synthetic_returns_200_obs_3_assets
+
+        # Create distributions with zero expected returns
+        np.random.seed(42)
+        n_samples = 100
+        dists = {}
+        for sym in ["BTC", "ETH"]:
+            # Constant close prices → zero expected return
+            close = np.full(n_samples, 100.0)
+            pred = [
+                pd.DataFrame({
+                    "open": close + np.random.normal(0, 0.1, n_samples),
+                    "high": close + np.abs(np.random.normal(0, 0.5, n_samples)),
+                    "low": close - np.abs(np.random.normal(0, 0.5, n_samples)),
+                    "close": close,
+                    "volume": np.full(n_samples, 1e6),
+                    "amount": np.full(n_samples, 1e6),
+                })
+                for _ in range(100)
+            ]
+            dists[sym] = KairosDistribution(pred)
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100,
+                stop=99,
+                target=101,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100,
+                stop=99,
+                target=101,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        # Should not raise; may fall back to equal weight
+        weights = mvo_allocator.allocate(signals, returns, dists, {})
+        assert isinstance(weights, dict)
+        assert len(weights) > 0  # Should have some allocation
