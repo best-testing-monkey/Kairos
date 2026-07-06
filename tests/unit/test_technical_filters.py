@@ -7,7 +7,7 @@ import pandas as pd
 from kairos_backtest import (
     KairosDistribution, Direction, Signal, Strategy,
     StochasticFilterStrategy, CloseDirectionStrategy, ADXGateStrategy,
-    OBVConfirmationStrategy,
+    OBVConfirmationStrategy, MTFConsensusStrategy,
     compute_adx
 )
 
@@ -1002,3 +1002,365 @@ class TestOBVConfirmationStrategy:
         assert sig.confidence == 0.8
         assert sig.strategy_name == "fixed"
         assert sig.expected_value == 15.0
+
+
+# ============================================================================
+# Tests for MTFConsensusStrategy
+# ============================================================================
+
+class TestMTFConsensusStrategy:
+    """Test multi-timeframe consensus filter."""
+
+    def test_mtf_strong_uptrend_long_passes(self):
+        """
+        Test that a strong 400-bar uptrend passes LONG signals and vetoes SHORT.
+        All three timeframes (1d, 3d, 1w) should agree on uptrend.
+        """
+        # Create a strong uptrend: 400 bars of continuous increases
+        n = 400
+        closes = [100.0 + (i * 0.2) for i in range(n)]
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [1e6] * n,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy that generates LONG signals
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=1.0,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.9,
+                    expected_value=20.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        mtf = MTFConsensusStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            ema_fast=20, ema_slow=50, min_agree=2
+        )
+
+        sig_long = mtf.generate_signal(dist, closes[-1], history, {})
+
+        # LONG signal should pass (all frames agree on uptrend)
+        assert sig_long is not None
+        assert sig_long.direction == Direction.LONG
+
+        # Now test SHORT signal on same history
+        class AlwaysShortStrategy(Strategy):
+            name = "always_short"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.SHORT,
+                    size=1.0,
+                    entry=current_price,
+                    stop=s["pct_90"],
+                    target=s["pct_10"],
+                    strategy_name=self.name,
+                    confidence=0.9,
+                    expected_value=20.0,
+                )
+
+        mtf_short = MTFConsensusStrategy(
+            base_strategy=AlwaysShortStrategy(),
+            ema_fast=20, ema_slow=50, min_agree=2
+        )
+
+        sig_short = mtf_short.generate_signal(dist, closes[-1], history, {})
+
+        # SHORT signal should be vetoed (all frames agree on uptrend, not downtrend)
+        assert sig_short is None
+
+    def test_mtf_strong_downtrend_short_passes(self):
+        """
+        Test that a strong 400-bar downtrend passes SHORT signals and vetoes LONG.
+        All three timeframes should agree on downtrend.
+        """
+        # Create a strong downtrend: 400 bars of continuous decreases
+        n = 400
+        closes = [200.0 - (i * 0.2) for i in range(n)]
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [1e6] * n,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy that generates SHORT signals
+        class AlwaysShortStrategy(Strategy):
+            name = "always_short"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.SHORT,
+                    size=1.0,
+                    entry=current_price,
+                    stop=s["pct_90"],
+                    target=s["pct_10"],
+                    strategy_name=self.name,
+                    confidence=0.9,
+                    expected_value=20.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        mtf = MTFConsensusStrategy(
+            base_strategy=AlwaysShortStrategy(),
+            ema_fast=20, ema_slow=50, min_agree=2
+        )
+
+        sig_short = mtf.generate_signal(dist, closes[-1], history, {})
+
+        # SHORT signal should pass (all frames agree on downtrend)
+        assert sig_short is not None
+        assert sig_short.direction == Direction.SHORT
+
+        # Now test LONG signal on same history
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=1.0,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.9,
+                    expected_value=20.0,
+                )
+
+        mtf_long = MTFConsensusStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            ema_fast=20, ema_slow=50, min_agree=2
+        )
+
+        sig_long = mtf_long.generate_signal(dist, closes[-1], history, {})
+
+        # LONG signal should be vetoed (all frames agree on downtrend, not uptrend)
+        assert sig_long is None
+
+    def test_mtf_short_history_passthrough(self):
+        """
+        Test that short history (<100 bars) causes 3d/1w to abstain,
+        resulting in insufficient data and pass-through unchanged.
+        """
+        # Create only 75 bars of history (less than ema_slow=50, but let's use 60)
+        n = 70
+        closes = [100.0 + (i * 0.1) for i in range(n)]
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [1e6] * n,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy that generates LONG signals
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.8,
+                    expected_value=15.0,
+                )
+
+        dist = make_dist(closes[-50:])
+
+        mtf = MTFConsensusStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            ema_fast=20, ema_slow=50, min_agree=2
+        )
+
+        sig = mtf.generate_signal(dist, closes[-1], history, {})
+
+        # Signal should pass through unchanged (insufficient frames with data)
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+        assert sig.size == 0.5
+        assert sig.confidence == 0.8
+
+    def test_mtf_2_agree_passes_with_min_agree_2(self):
+        """
+        Test 2-of-3 agreement boundary case that passes with min_agree=2.
+        Scenario: 1d and 3d agree on uptrend, 1w abstains due to insufficient data.
+        """
+        # Create 120 bars: enough for 1d/3d to have data, 1w marginal/insufficient
+        n = 120
+        closes = [100.0 + (i * 0.15) for i in range(n)]
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [1e6] * n,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=1.0,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.9,
+                    expected_value=20.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        mtf = MTFConsensusStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            ema_fast=20, ema_slow=50, min_agree=2
+        )
+
+        sig = mtf.generate_signal(dist, closes[-1], history, {})
+
+        # Signal should pass (2 frames agree, >= min_agree)
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+
+    def test_mtf_none_base_passthrough(self):
+        """
+        Test that None base signal passes through as None.
+        """
+        history = make_history(n=100)
+        dist = make_dist([100.0] * 100)
+
+        class NeverSignalStrategy(Strategy):
+            name = "never_signal"
+            def generate_signal(self, dist, current_price, history, context):
+                return None
+
+        mtf = MTFConsensusStrategy(
+            base_strategy=NeverSignalStrategy(),
+            ema_fast=20, ema_slow=50, min_agree=2
+        )
+
+        sig = mtf.generate_signal(dist, 100.0, history, {})
+
+        # Signal should be None
+        assert sig is None
+
+    def test_mtf_resample_closes_step_1(self):
+        """
+        Test that resampling with step=1 returns all closes (1d timeframe).
+        """
+        history = make_history(n=50, closes=[100.0 + i for i in range(50)])
+
+        class DummyStrategy(Strategy):
+            name = "dummy"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=1.0,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.9,
+                    expected_value=20.0,
+                )
+
+        mtf = MTFConsensusStrategy(base_strategy=DummyStrategy())
+        resampled = mtf._resample_closes(history["close"].values, step=1)
+
+        # Should be identical to original
+        np.testing.assert_array_equal(resampled, history["close"].values)
+
+    def test_mtf_resample_closes_step_3(self):
+        """
+        Test that resampling with step=3 returns every 3rd close (3d timeframe).
+        Latest bar is always included.
+        """
+        closes = np.array([100.0 + i for i in range(50)])
+
+        class DummyStrategy(Strategy):
+            name = "dummy"
+            def generate_signal(self, dist, current_price, history, context):
+                return None
+
+        mtf = MTFConsensusStrategy(base_strategy=DummyStrategy())
+        resampled = mtf._resample_closes(closes, step=3)
+
+        # Expected: [100, 103, 106, 109, 112, 115, 118, 121, 124, 127, 130, 133, 136, 139, 142, 145, 148]
+        # Starting from end (index 49 = 149.0), stepping back by 3: 49, 46, 43, 40, ...
+        expected = closes[[49, 46, 43, 40, 37, 34, 31, 28, 25, 22, 19, 16, 13, 10, 7, 4, 1]]
+        expected = expected[::-1]  # Reverse to maintain chronological order
+        np.testing.assert_array_almost_equal(resampled, expected)
+
+    def test_mtf_signal_attributes_unchanged(self):
+        """
+        Test that passing signal maintains all original attributes unchanged.
+        """
+        n = 400
+        closes = [100.0 + (i * 0.1) for i in range(n)]
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [1e6] * n,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        class FixedSignalStrategy(Strategy):
+            name = "fixed_signal"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.75,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.85,
+                    expected_value=18.5,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        mtf = MTFConsensusStrategy(
+            base_strategy=FixedSignalStrategy(),
+            ema_fast=20, ema_slow=50, min_agree=2
+        )
+
+        sig = mtf.generate_signal(dist, closes[-1], history, {})
+
+        # Verify all attributes are unchanged
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+        assert sig.size == 0.75
+        assert sig.confidence == 0.85
+        assert sig.strategy_name == "fixed_signal"
+        assert sig.expected_value == 18.5

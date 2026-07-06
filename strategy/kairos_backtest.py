@@ -1446,6 +1446,132 @@ class OBVConfirmationStrategy(Strategy):
         return base_signal
 
 
+class MTFConsensusStrategy(Strategy):
+    """
+    Multi-timeframe consensus filter requiring majority agreement across {1d, 3d, 1w}.
+
+    Resamples history to {1d, 3d, 1w} via simple positional resampling
+    (taking every Nth close, N=1,3,5), computes trend sign (EMA_fast vs EMA_slow
+    per frame), and requires >=min_agree frames agreeing WITH the signal direction
+    for pass-through. Frames with insufficient data (<ema_slow bars) abstain.
+    If fewer than min_agree frames have enough data, passes through unchanged
+    (insufficient evidence).
+
+    Always returns Signal or None, never dict.
+    """
+    name = "mtf_consensus"
+
+    def __init__(self, base_strategy: Strategy, ema_fast: int = 20,
+                 ema_slow: int = 50, min_agree: int = 2):
+        """
+        Initialize MTFConsensusStrategy.
+
+        Args:
+            base_strategy: Strategy to wrap
+            ema_fast: Fast EMA period (default 20)
+            ema_slow: Slow EMA period (default 50)
+            min_agree: Minimum number of frames that must agree (default 2)
+        """
+        self.base_strategy = base_strategy
+        self.ema_fast = ema_fast
+        self.ema_slow = ema_slow
+        self.min_agree = min_agree
+
+    def _resample_closes(self, closes: np.ndarray, step: int) -> np.ndarray:
+        """
+        Resample closes by taking every step-th close from the end.
+        Ensures the latest bar is always included.
+
+        Args:
+            closes: Array of closing prices
+            step: Resampling step (1=1d, 3=3d, 5=1w)
+
+        Returns:
+            Resampled closes array (latest bar always included)
+        """
+        if len(closes) == 0:
+            return np.array([])
+
+        # Simple positional resampling from the end
+        # Build indices from the end backwards, then reverse to maintain order
+        indices = []
+        idx = len(closes) - 1
+        while idx >= 0:
+            indices.append(idx)
+            idx -= step
+        indices.reverse()
+
+        return closes[indices]
+
+    def _compute_trend_sign(self, closes: np.ndarray, fast_period: int,
+                           slow_period: int) -> Optional[int]:
+        """
+        Compute trend sign from EMA comparison.
+        Returns +1 if fast EMA > slow EMA, -1 if fast EMA < slow EMA,
+        None if insufficient data.
+        """
+        if len(closes) < slow_period:
+            return None
+
+        # Convert to pandas Series for ewm calculation
+        s = pd.Series(closes)
+        ema_fast = s.ewm(span=fast_period, adjust=False).mean().iloc[-1]
+        ema_slow = s.ewm(span=slow_period, adjust=False).mean().iloc[-1]
+
+        if ema_fast > ema_slow:
+            return 1
+        else:
+            return -1
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal from base strategy, then apply MTF consensus filter.
+
+        Returns:
+            Signal from base strategy if >= min_agree frames agree with direction,
+            None if vetoed, or base signal unchanged if insufficient frames have data.
+            Always returns Signal or None, never dict.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        closes = history["close"].values
+        if len(closes) < self.ema_slow:
+            # Not enough data; pass through unchanged
+            return base_signal
+
+        # Resample to {1d, 3d, 1w}
+        resampled_1d = self._resample_closes(closes, 1)
+        resampled_3d = self._resample_closes(closes, 3)
+        resampled_1w = self._resample_closes(closes, 5)
+
+        # Compute trend signs
+        trend_1d = self._compute_trend_sign(resampled_1d, self.ema_fast, self.ema_slow)
+        trend_3d = self._compute_trend_sign(resampled_3d, self.ema_fast, self.ema_slow)
+        trend_1w = self._compute_trend_sign(resampled_1w, self.ema_fast, self.ema_slow)
+
+        # Count frames with enough data and their agreement
+        frames_with_data = [t for t in [trend_1d, trend_3d, trend_1w] if t is not None]
+
+        if len(frames_with_data) < self.min_agree:
+            # Insufficient evidence (fewer than min_agree frames have data)
+            return base_signal
+
+        # Convert signal direction to +1 or -1
+        signal_sign = 1 if base_signal.direction == Direction.LONG else -1
+
+        # Count agreements
+        agreements = sum(1 for trend in frames_with_data if trend == signal_sign)
+
+        # Require >= min_agree frames agreeing with signal direction
+        if agreements >= self.min_agree:
+            return base_signal
+        else:
+            return None
+
+
 class BollingerValidationStrategy(Strategy):
     """
     Compare predicted range to Bollinger Band width.
