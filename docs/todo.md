@@ -2,7 +2,7 @@
 
 ## Epic E1 — Foundation
 
-- [ ] E1-S01 Walk-forward Harness (docs/tickets/E1-S01-walk-forward-harness.md)
+- [x] E1-S01 Walk-forward Harness (docs/tickets/E1-S01-walk-forward-harness.md)
 - [x] E1-S02 Allocator Base and Shrinkage (docs/tickets/E1-S02-allocator-base-and-shrinkage.md)
 - [x] E1-S03 ATR Bracket Wrapper (docs/tickets/E1-S03-atr-bracket-wrapper.md)
 

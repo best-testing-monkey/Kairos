@@ -1965,3 +1965,226 @@ if __name__ == "__main__":
     # comparison = engine.run_strategy_comparison(df, all_strategies, lookback=200)
     # print(comparison)
     pass
+
+
+# =============================================================================
+# WALK-FORWARD VALIDATION
+# =============================================================================
+
+def walk_forward(
+    strategy_factory: Callable[[], Strategy],
+    data: pd.DataFrame,
+    predictor: KairosPredictor,
+    train_days: int = 250,
+    test_days: int = 60,
+    step: int = 60,
+    anchored: bool = False,
+    initial_capital: float = 10000.0,
+    fee_pct: float = 0.001,
+    slippage_pct: float = 0.0005,
+    random_seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Walk-forward validation: roll non-overlapping test windows with fresh
+    strategy instances per fold. Computes per-fold and aggregate metrics,
+    including Deflated Sharpe Ratio (DSR) as overfitting score.
+
+    Parameters
+    ----------
+    strategy_factory : Callable[[], Strategy]
+        Factory function that returns a fresh Strategy instance per call.
+    data : pd.DataFrame
+        OHLCV data with DatetimeIndex.
+    predictor : KairosPredictor
+        Predictor instance for generating distributions.
+    train_days : int
+        Number of days in training window (default 250).
+    test_days : int
+        Number of days in test window (default 60).
+    step : int
+        Window step size (default 60, non-overlapping test windows).
+    anchored : bool
+        If True: expanding window (train start fixed at 0).
+        If False: sliding window (train window also rolls).
+    initial_capital : float
+        Starting capital per fold.
+    fee_pct : float
+        Transaction fee per trade.
+    slippage_pct : float
+        Slippage per trade entry.
+    random_seed : Optional[int]
+        Fixed seed for reproducibility (affects numpy/pd random state).
+
+    Returns
+    -------
+    Dict with keys:
+        - "folds": List[Dict] per-fold results {fold_id, train_metrics, test_metrics}
+        - "aggregate_metrics": Dict of aggregate metrics across all folds
+        - "overfitting_score": DSR (Deflated Sharpe Ratio)
+        - "is_sharpe_mean": In-sample (train) Sharpe mean
+        - "oos_sharpe_mean": Out-of-sample (test) Sharpe mean
+        - "sharpe_degradation": IS Sharpe - OOS Sharpe
+    """
+    if len(data) < train_days + test_days:
+        raise ValueError(
+            f"Data length ({len(data)}) must be >= train_days + test_days ({train_days + test_days})"
+        )
+    if step <= 0:
+        raise ValueError(f"step must be > 0 (got {step})")
+
+    # Seed only the local scope: save/restore the global numpy RNG state so
+    # that walk_forward()'s reproducibility guarantee doesn't leak into
+    # unrelated code (e.g. other tests) that rely on unseeded np.random.
+    _prev_random_state = np.random.get_state() if random_seed is not None else None
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    try:
+        return _walk_forward_impl(
+            strategy_factory, data, predictor, train_days, test_days, step,
+            anchored, initial_capital, fee_pct, slippage_pct,
+        )
+    finally:
+        if _prev_random_state is not None:
+            np.random.set_state(_prev_random_state)
+
+
+def _walk_forward_impl(
+    strategy_factory, data, predictor, train_days, test_days, step,
+    anchored, initial_capital, fee_pct, slippage_pct,
+):
+    folds = []
+    fold_id = 0
+    train_start = 0
+    train_end = train_start + train_days
+
+    while True:
+        test_start = train_end
+        test_end = test_start + test_days
+
+        if test_end > len(data):
+            break
+
+        train_data = data.iloc[train_start:train_end]
+        test_data = data.iloc[test_start:test_end]
+
+        # Strategy factory: fresh instance per fold
+        strategy = strategy_factory()
+
+        # In-sample (training) backtest
+        engine_is = BacktestEngine(
+            predictor=predictor,
+            fee_pct=fee_pct,
+            slippage_pct=slippage_pct,
+            initial_capital=initial_capital,
+        )
+        router_is = DecisionTreeRouter(
+            entropy_threshold=999.0,
+            custom_strategies={
+                "range": [strategy],
+                "trend": [strategy],
+                "uncertain": [strategy],
+            },
+        )
+        train_metrics = engine_is.run(train_data, router_is, lookback=10)
+
+        # Out-of-sample (test) backtest: fresh strategy instance
+        strategy_oos = strategy_factory()
+        engine_oos = BacktestEngine(
+            predictor=predictor,
+            fee_pct=fee_pct,
+            slippage_pct=slippage_pct,
+            initial_capital=initial_capital,
+        )
+        router_oos = DecisionTreeRouter(
+            entropy_threshold=999.0,
+            custom_strategies={
+                "range": [strategy_oos],
+                "trend": [strategy_oos],
+                "uncertain": [strategy_oos],
+            },
+        )
+        test_metrics = engine_oos.run(test_data, router_oos, lookback=10)
+
+        fold_result = {
+            "fold_id": fold_id,
+            "train_start": train_start,
+            "train_end": train_end,
+            "test_start": test_start,
+            "test_end": test_end,
+            "train_metrics": train_metrics,
+            "test_metrics": test_metrics,
+        }
+        folds.append(fold_result)
+
+        # Move to next fold. `train_end` (not `train_start`) is the loop
+        # variable that must strictly increase every iteration so the loop
+        # is guaranteed to terminate once test_end exceeds len(data).
+        if anchored:
+            # Expanding window: train_start stays 0, train_end grows by step.
+            train_start = 0
+            train_end = train_end + step
+        else:
+            # Sliding window: entire window rolls forward by step.
+            train_start = train_start + step
+            train_end = train_start + train_days
+
+        fold_id += 1
+
+    # Aggregate metrics
+    is_sharpes = [f["train_metrics"]["sharpe"] for f in folds]
+    oos_sharpes = [f["test_metrics"]["sharpe"] for f in folds]
+
+    is_sharpe_mean = float(np.mean(is_sharpes)) if is_sharpes else 0.0
+    oos_sharpe_mean = float(np.mean(oos_sharpes)) if oos_sharpes else 0.0
+    sharpe_degradation = is_sharpe_mean - oos_sharpe_mean
+
+    # Deflated Sharpe Ratio (DSR)
+    # Simple formula: DSR = OOS_Sharpe * (1 - exp(-degradation / max(OOS_Sharpe, 0.01)))
+    # If OOS Sharpe is high and degradation is low, DSR approaches OOS Sharpe.
+    # If degradation is high (overfitting), DSR is penalized.
+    if oos_sharpe_mean > 0 and is_sharpe_mean > 0:
+        dsr = oos_sharpe_mean * (
+            1.0 - np.exp(-sharpe_degradation / max(oos_sharpe_mean, 0.01))
+        )
+    else:
+        dsr = oos_sharpe_mean
+
+    # Aggregate metrics: mean, std, median across folds
+    all_train_metrics = [f["train_metrics"] for f in folds]
+    all_test_metrics = [f["test_metrics"] for f in folds]
+
+    def aggregate_fold_metrics(metrics_list):
+        """Compute aggregate stats across folds."""
+        keys = [
+            "total_return",
+            "sharpe",
+            "max_drawdown",
+            "win_rate",
+            "profit_factor",
+            "num_trades",
+            "avg_trade",
+            "avg_win",
+            "avg_loss",
+        ]
+        result = {}
+        for key in keys:
+            values = [m.get(key, 0.0) for m in metrics_list]
+            result[f"{key}_mean"] = float(np.mean(values))
+            result[f"{key}_std"] = float(np.std(values))
+            result[f"{key}_median"] = float(np.median(values))
+        return result
+
+    aggregate_train = aggregate_fold_metrics(all_train_metrics)
+    aggregate_test = aggregate_fold_metrics(all_test_metrics)
+
+    return {
+        "folds": folds,
+        "num_folds": len(folds),
+        "aggregate_train": aggregate_train,
+        "aggregate_test": aggregate_test,
+        "is_sharpe_mean": is_sharpe_mean,
+        "oos_sharpe_mean": oos_sharpe_mean,
+        "sharpe_degradation": sharpe_degradation,
+        "overfitting_score": float(dsr),
+    }
