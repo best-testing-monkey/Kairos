@@ -66,5 +66,5 @@
 
 - [x] E9-S01 News Sentiment Filter (docs/tickets/E9-S01-news-sentiment-filter.md)
 - [x] E9-S02 Social Momentum (docs/tickets/E9-S02-social-momentum.md)
-- [ ] E9-S03 Institutional 13F (docs/tickets/E9-S03-institutional-13f.md)
+- [x] E9-S03 Institutional 13F (docs/tickets/E9-S03-institutional-13f.md)
 - [ ] E9-S04 Econ Calendar Guard (docs/tickets/E9-S04-econ-calendar-guard.md)

@@ -110,6 +110,64 @@ class NewsSentimentFilterStrategy(Strategy):
         return signal
 
 
+class Institutional13FFilterStrategy(Strategy):
+    """
+    Filters signals based on institutional 13F ownership changes.
+
+    Wraps a base strategy and applies 13F institutional ownership filtering:
+      - Vetoes SHORT signals when institutional ownership delta > accumulation_threshold
+        (strong accumulation indicates institutional support, risky to short).
+      - Vetoes LONG signals when institutional ownership delta < -accumulation_threshold
+        (strong distribution indicates institutional caution, risky to go long).
+      - Gracefully degrades: if context["inst_ownership_delta"][symbol] is missing,
+        returns base signal unchanged.
+
+    Args:
+        base_strategy: The wrapped strategy to filter.
+        accumulation_threshold: Quarterly ownership change in % points to trigger veto.
+                               Default 2.0 (veto short on > +2%, veto long on < -2%).
+    """
+    name = "institutional_13f_filter"
+
+    def __init__(self, base_strategy: Strategy, accumulation_threshold: float = 2.0):
+        self.base_strategy = base_strategy
+        self.accumulation_threshold = accumulation_threshold
+
+    def generate_signal(self, dist, current_price, history, context):
+        # Get base signal from wrapped strategy
+        signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if signal is None:
+            return None
+
+        # Graceful degradation: if 13F context missing, return base signal unchanged
+        ownership_delta_dict = context.get("inst_ownership_delta")
+        if ownership_delta_dict is None:
+            return signal
+
+        symbol = context.get("symbol")
+        if symbol is None or symbol not in ownership_delta_dict:
+            return signal
+
+        delta = ownership_delta_dict[symbol]
+
+        # Determine sign of signal direction: LONG=1, SHORT=-1, FLAT=0
+        direction_sign = signal.direction.value
+
+        # If FLAT signal or direction sign is 0, pass through unchanged
+        if direction_sign == 0:
+            return signal
+
+        # Veto SHORT when delta > accumulation_threshold (strong institutional accumulation)
+        if direction_sign == -1 and delta > self.accumulation_threshold:
+            return None
+
+        # Veto LONG when delta < -accumulation_threshold (strong institutional distribution)
+        if direction_sign == 1 and delta < -self.accumulation_threshold:
+            return None
+
+        return signal
+
+
 class SocialMomentumStrategy(Strategy):
     """
     Standalone strategy trading social media mention momentum with blow-off detection.

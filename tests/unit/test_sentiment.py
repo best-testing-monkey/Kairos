@@ -5,7 +5,7 @@ import pytest
 import numpy as np
 import pandas as pd
 from kairos_backtest import KairosDistribution, Direction, Signal
-from kairos_sentiment import NewsSentimentFilterStrategy, SocialMomentumStrategy
+from kairos_sentiment import NewsSentimentFilterStrategy, SocialMomentumStrategy, Institutional13FFilterStrategy
 
 
 # ============================================================================
@@ -826,3 +826,393 @@ class TestSocialMomentumStrategy:
         expected_target = dist.stats["close"].get("pct_90")
         assert sig.stop == pytest.approx(expected_stop, rel=1e-6)
         assert sig.target == pytest.approx(expected_target, rel=1e-6)
+
+
+# ============================================================================
+# Tests for Institutional13FFilterStrategy
+# ============================================================================
+
+class TestInstitutional13FFilterStrategy:
+    """Test Institutional13FFilterStrategy graceful degradation and filtering logic."""
+
+    def test_13f_none_base_signal(self):
+        """Test pass-through on None base signal."""
+        base = MockNoneStrategy()
+        filt = Institutional13FFilterStrategy(base)
+        dist = make_dist([100.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 3.0}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_13f_missing_context_key(self):
+        """
+        Test missing context key → identical behavior to unwrapped strategy.
+        Verifies field-by-field identity.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8, expected_value=100.0)
+        filt = Institutional13FFilterStrategy(base)
+        dist = make_dist([110.0] * 100)
+        # No "inst_ownership_delta" key in context
+        context = {"symbol": "BTC-USD"}
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+
+        # Get unwrapped base signal for comparison
+        base_sig = base.generate_signal(dist, 100.0, make_history(), context)
+
+        assert sig is not None
+        assert sig.direction == base_sig.direction
+        assert sig.size == pytest.approx(base_sig.size, rel=1e-6)
+        assert sig.confidence == pytest.approx(base_sig.confidence, rel=1e-6)
+        assert sig.expected_value == pytest.approx(base_sig.expected_value, rel=1e-6)
+        assert sig.entry == base_sig.entry
+        assert sig.stop == base_sig.stop
+        assert sig.target == base_sig.target
+
+    def test_13f_missing_symbol_in_dict(self):
+        """
+        Test missing symbol in ownership_delta dict → pass through unchanged.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"ETH-USD": 1.5}  # ownership dict exists but no BTC-USD
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        base_sig = base.generate_signal(dist, 100.0, make_history(), context)
+
+        assert sig is not None
+        assert sig.direction == base_sig.direction
+        assert sig.size == pytest.approx(base_sig.size, rel=1e-6)
+        assert sig.confidence == pytest.approx(base_sig.confidence, rel=1e-6)
+
+    def test_13f_missing_symbol_context_key(self):
+        """
+        Test missing symbol in context → pass through unchanged.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base)
+        dist = make_dist([110.0] * 100)
+        context = {
+            # No "symbol" key
+            "inst_ownership_delta": {"BTC-USD": 2.5}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+    def test_13f_veto_short_on_strong_accumulation(self):
+        """
+        Test SHORT signal vetoed when delta > accumulation_threshold.
+        SHORT signal (direction=-1) + delta=+3% > +2% threshold → None
+        Verifies test_13f_veto_short_vs_accumulation requirement.
+        """
+        base = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([90.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 3.0}  # Strong accumulation, > 2.0
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_13f_veto_short_at_threshold(self):
+        """
+        Test SHORT signal vetoed at exactly accumulation_threshold.
+        SHORT + delta=+2.0 exactly equal to threshold should veto.
+        """
+        base = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([90.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 2.0}  # At threshold
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        # delta > threshold requires delta > 2.0, so exactly 2.0 should pass through
+        assert sig is not None
+
+    def test_13f_veto_short_above_threshold(self):
+        """
+        Test SHORT signal vetoed above threshold.
+        SHORT + delta=+2.1 > +2.0 → None
+        """
+        base = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([90.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 2.1}  # Just above threshold
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_13f_veto_long_on_strong_distribution(self):
+        """
+        Test LONG signal vetoed when delta < -accumulation_threshold.
+        LONG signal (direction=1) + delta=-3% < -2% threshold → None
+        Symmetric to short veto.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": -3.0}  # Strong distribution, < -2.0
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_13f_veto_long_at_threshold(self):
+        """
+        Test LONG signal vetoed at exactly negative accumulation_threshold.
+        LONG + delta=-2.0 exactly equal to -threshold should pass through.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": -2.0}  # At negative threshold
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        # delta < -threshold requires delta < -2.0, so exactly -2.0 should pass through
+        assert sig is not None
+
+    def test_13f_veto_long_below_threshold(self):
+        """
+        Test LONG signal vetoed below negative threshold.
+        LONG + delta=-2.1 < -2.0 → None
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": -2.1}  # Just below -threshold
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_13f_short_passes_on_accumulation_below_threshold(self):
+        """
+        Test SHORT signal passes when delta <= accumulation_threshold.
+        SHORT + delta=+1.5% <= +2.0% → pass through
+        Verifies test_13f_below_threshold_pass requirement.
+        """
+        base = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([90.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 1.5}  # Below threshold
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+        assert sig.direction == Direction.SHORT
+
+    def test_13f_long_passes_on_positive_delta(self):
+        """
+        Test LONG signal passes on positive delta (strong accumulation).
+        LONG + delta=+3.0% → pass through (no veto for LONG on positive delta)
+        Verifies long passes on +3% requirement.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 3.0}  # Strong accumulation
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+
+    def test_13f_short_passes_on_negative_delta(self):
+        """
+        Test SHORT signal passes on negative delta (strong distribution).
+        SHORT + delta=-3.0% → pass through (no veto for SHORT on negative delta)
+        Verifies short passes on -3% requirement.
+        """
+        base = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([90.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": -3.0}  # Strong distribution
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+        assert sig.direction == Direction.SHORT
+
+    def test_13f_small_delta_passes_both_directions(self):
+        """
+        Test small delta (±1%) passes both LONG and SHORT.
+        Verifies small delta (±1%) passes both requirement.
+        """
+        # Test LONG with +1%
+        base_long = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt_long = Institutional13FFilterStrategy(base_long, accumulation_threshold=2.0)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 1.0}  # Small positive delta
+        }
+        sig = filt_long.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+
+        # Test SHORT with -1%
+        base_short = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        filt_short = Institutional13FFilterStrategy(base_short, accumulation_threshold=2.0)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": -1.0}  # Small negative delta
+        }
+        sig = filt_short.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+        assert sig.direction == Direction.SHORT
+
+    def test_13f_small_delta_plus_one_passes_both(self):
+        """
+        Test delta of exactly ±1% (the requirement value) passes both directions.
+        """
+        # Test LONG with +1%
+        base_long = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base_long, accumulation_threshold=2.0)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 1.0}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+        # Test SHORT with -1%
+        base_short = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": -1.0}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+    def test_13f_none_base_passthrough(self):
+        """
+        Test None base pass-through.
+        When base strategy returns None, filter returns None regardless of delta.
+        """
+        base = MockNoneStrategy()
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([100.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 5.0}  # Even high delta
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_13f_flat_signal_passthrough(self):
+        """
+        Test FLAT signals pass through unchanged regardless of delta.
+        FLAT direction has value 0, should not be vetoed.
+        """
+        base = MockStrategy(direction=Direction.FLAT, size=0.0, confidence=0.0)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([100.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 3.0}  # Strong accumulation
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+        assert sig.direction == Direction.FLAT
+        assert sig.size == 0.0
+
+    def test_13f_signal_other_fields_unchanged(self):
+        """
+        Test that filtering only affects direction/return None,
+        not size, entry, stop, target, confidence, etc. when passing through.
+        """
+        base = MockStrategy(
+            direction=Direction.LONG,
+            size=0.7,
+            confidence=0.6,
+            expected_value=150.0
+        )
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 0.5}  # Below threshold
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        base_sig = base.generate_signal(dist, 100.0, make_history(), context)
+
+        assert sig.size == pytest.approx(base_sig.size, rel=1e-6)
+        assert sig.entry == base_sig.entry
+        assert sig.stop == base_sig.stop
+        assert sig.target == base_sig.target
+        assert sig.expected_value == pytest.approx(base_sig.expected_value, rel=1e-6)
+        assert sig.confidence == pytest.approx(base_sig.confidence, rel=1e-6)
+        assert sig.direction == base_sig.direction
+
+    def test_13f_custom_accumulation_threshold(self):
+        """
+        Test custom accumulation_threshold parameter.
+        With threshold=3.5, delta=3.0 should pass SHORT, delta=4.0 should veto.
+        """
+        base_short = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base_short, accumulation_threshold=3.5)
+        dist = make_dist([90.0] * 100)
+
+        # delta=3.0 < 3.5 should pass
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 3.0}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+        # delta=4.0 > 3.5 should veto
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 4.0}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_13f_return_type_signal(self):
+        """
+        Test that signal is always a Signal dataclass (when not None), never a dict.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 0.5}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+        assert isinstance(sig, Signal)
+        assert not isinstance(sig, dict)
+
+    def test_13f_return_type_none(self):
+        """
+        Test that function returns None (not empty dict) for vetoed cases.
+        """
+        base = MockStrategy(direction=Direction.SHORT, size=0.5, confidence=0.8)
+        filt = Institutional13FFilterStrategy(base, accumulation_threshold=2.0)
+        dist = make_dist([90.0] * 100)
+        context = {
+            "symbol": "BTC-USD",
+            "inst_ownership_delta": {"BTC-USD": 3.0}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+        assert not isinstance(sig, dict)
