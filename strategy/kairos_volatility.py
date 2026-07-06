@@ -488,3 +488,145 @@ class VolTargetSizerStrategy(Strategy):
             expected_value=base_signal.expected_value,
             metadata=base_signal.metadata,
         )
+
+
+class VarianceRiskPremiumStrategy(Strategy):
+    """
+    Standalone strategy trading variance risk premium based on Kronos-implied
+    vs realized volatility.
+
+    When Kronos-implied variance >> realized variance (vol expansion expected):
+    - Enter in direction of skew sign (or mean vs median fallback)
+    - Use wide bracket (pct_5/pct_95 for LONG, reversed for SHORT)
+
+    When Kronos-implied variance << realized variance (vol compression expected):
+    - Fade mean reversion: LONG if current_price < mean else SHORT
+    - Use tight bracket (pct_25/pct_75, reversed for SHORT)
+
+    Otherwise: no signal
+
+    Args:
+        entry_ratio: Threshold for vol expansion (default 1.5). Enters expansion
+                     when implied/realized > entry_ratio.
+    """
+
+    name = "variance_risk_premium"
+
+    def __init__(self, entry_ratio: float = 1.5):
+        self.entry_ratio = entry_ratio
+
+    def generate_signal(self, dist, current_price, history, context, **kwargs):
+        """
+        Generate signal based on variance risk premium (implied vs realized).
+
+        Returns:
+            Signal or None
+        """
+        # Require at least 21 rows for 20-day realized variance
+        if len(history) < 21:
+            return None
+
+        # Compute realized variance: np.var of trailing 20 daily log returns
+        closes = history["close"].values
+        log_returns = np.diff(np.log(closes))
+        realized_var = np.var(log_returns[-20:])
+
+        # Compute Kronos-implied variance from distribution
+        close_stats = dist.stats.get("close", {})
+        pct_84 = close_stats.get(f"pct_{int(84)}", current_price)
+        pct_16 = close_stats.get(f"pct_{int(16)}", current_price)
+
+        if current_price <= 0:
+            return None
+
+        # Implied variance: ((pct_84 - pct_16) / (2 * current_price))^2
+        implied_var = ((pct_84 - pct_16) / (2.0 * current_price)) ** 2
+
+        # Avoid division by zero
+        if realized_var <= 0:
+            return None
+
+        ratio = implied_var / realized_var
+
+        # =====================================================================
+        # EXPANSION TRADE: implied >> realized (ratio > entry_ratio)
+        # =====================================================================
+        if ratio > self.entry_ratio:
+            # Determine direction from skew sign, fallback to mean vs median
+            skew = close_stats.get("skew", None)
+            if skew is not None and skew != 0:
+                # Positive skew → right tail fatter → LONG (mean above median)
+                direction = Direction.LONG if skew > 0 else Direction.SHORT
+            else:
+                # Fallback: compare mean to median
+                mean = close_stats.get("mean", current_price)
+                median = close_stats.get("pct_50", current_price)
+                direction = Direction.LONG if mean > median else Direction.SHORT
+
+            # Wide bracket: pct_5 / pct_95 for LONG, reversed for SHORT
+            pct_5 = close_stats.get(f"pct_{int(5)}", current_price)
+            pct_95 = close_stats.get(f"pct_{int(95)}", current_price)
+
+            if direction == Direction.LONG:
+                stop = pct_5
+                target = pct_95
+            else:  # SHORT
+                stop = pct_95
+                target = pct_5
+
+            trade_type = "vol_expansion"
+
+        # =====================================================================
+        # COMPRESSION FADE: implied << realized (ratio < 1/entry_ratio)
+        # =====================================================================
+        elif ratio < 1.0 / self.entry_ratio:
+            # Fade mean reversion: LONG if below mean, SHORT if above
+            mean = close_stats.get("mean", current_price)
+            if current_price < mean:
+                direction = Direction.LONG
+                # Tight bracket: pct_25 / pct_75 for LONG
+                pct_25 = close_stats.get(f"pct_{int(25)}", current_price)
+                pct_75 = close_stats.get(f"pct_{int(75)}", current_price)
+                stop = pct_25
+                target = pct_75
+            else:
+                direction = Direction.SHORT
+                # Tight bracket reversed for SHORT
+                pct_25 = close_stats.get(f"pct_{int(25)}", current_price)
+                pct_75 = close_stats.get(f"pct_{int(75)}", current_price)
+                stop = pct_75
+                target = pct_25
+
+            trade_type = "vol_compression"
+
+        # =====================================================================
+        # NEUTRAL BAND: no signal
+        # =====================================================================
+        else:
+            return None
+
+        # Compute expected value
+        ev = dist.expected_value(current_price, target, stop)
+        if ev <= 0:
+            return None
+
+        # Size: min(kelly_fraction * 0.5, 1.0)
+        kelly = dist.kelly_fraction(current_price, target, stop)
+        size = min(kelly * 0.5, 1.0)
+
+        return Signal(
+            direction=direction,
+            size=size,
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=1.0,
+            expected_value=ev,
+            metadata={
+                "ratio": float(ratio),
+                "implied_var": float(implied_var),
+                "realized_var": float(realized_var),
+                "trade_type": trade_type,
+            },
+        )

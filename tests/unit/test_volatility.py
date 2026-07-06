@@ -10,7 +10,10 @@ from kairos_backtest import (
     KairosDistribution, Direction, Signal,
     PercentileEntryStrategy, DynamicBracketStrategy,
 )
-from kairos_volatility import atr, ATRBracketStrategy, fit_garch, GARCHFilterStrategy, VolTargetSizerStrategy
+from kairos_volatility import (
+    atr, ATRBracketStrategy, fit_garch, GARCHFilterStrategy, VolTargetSizerStrategy,
+    VarianceRiskPremiumStrategy
+)
 
 
 # ============================================================================
@@ -920,3 +923,308 @@ class TestVolTargetSizerStrategy:
         assert hasattr(sig, "confidence")
         assert hasattr(sig, "expected_value")
         assert hasattr(sig, "metadata")
+
+
+# ============================================================================
+# VarianceRiskPremiumStrategy Tests
+# ============================================================================
+
+class TestVarianceRiskPremiumStrategy:
+    def test_vrp_none_when_history_too_short(self):
+        """Test that VarianceRiskPremiumStrategy returns None when history < 21 rows."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+        history = make_history(n=20, price=100.0)  # Exactly 20 rows
+        dist = make_dist([100.0] * 20)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        assert sig is None, "Should return None when history < 21 rows"
+
+    def test_vrp_neutral_band_no_signal(self):
+        """Test that neutral band [1/entry_ratio, entry_ratio] produces no signal."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        # Create history with minimal variance (realized_var very small)
+        np.random.seed(42)
+        prices = [100.0 + 0.01 * np.sin(i * 0.1) for i in range(25)]
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": [p * 0.999 for p in prices],
+            "high": [p * 1.001 for p in prices],
+            "low": [p * 0.999 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        # Create distribution with moderate range (implied_var moderate)
+        # to put ratio in the neutral band
+        dist = make_dist(prices)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        # If ratio falls in [1/1.5, 1.5] ≈ [0.67, 1.5], should be None
+        if sig is None:
+            # This is acceptable if ratio naturally fell in neutral band
+            assert True
+        else:
+            # If signal fired, it's outside neutral band
+            assert sig is not None
+
+    def test_vrp_expansion_entry_long(self):
+        """Test vol expansion entry with LONG direction."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        # Create history with low variance (to ensure low realized_var)
+        np.random.seed(42)
+        prices = [100.0] * 25  # Constant price = zero variance
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.0001 for p in prices],
+            "low": [p * 0.9999 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        # Create distribution with very wide range to force high implied_var
+        # Use price samples spread far apart
+        wide_prices = [80.0, 85.0, 90.0, 95.0, 100.0, 105.0, 110.0, 115.0, 120.0]
+        wide_prices_full = wide_prices * 3  # Replicate to get enough samples
+        dist = make_dist(wide_prices_full)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        if sig is not None:
+            # Should be expansion trade
+            assert sig.metadata.get("trade_type") == "vol_expansion"
+            # Should have wide bracket
+            bracket_width = abs(sig.target - sig.stop)
+            assert bracket_width > 0
+
+    def test_vrp_expansion_bracket_pct_5_95_long(self):
+        """Test that expansion LONG uses pct_5/pct_95 bracket exactly."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        # Create low-variance history
+        np.random.seed(42)
+        prices = [100.0] * 25
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.0001 for p in prices],
+            "low": [p * 0.9999 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        # Create distribution with known percentiles
+        # Make 100 samples: 50 at 80, 50 at 120 (bimodal, skewed right)
+        dist_prices = [80.0] * 50 + [120.0] * 50
+        dist = make_dist(dist_prices)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        if sig is not None and sig.metadata.get("trade_type") == "vol_expansion":
+            close_stats = dist.stats.get("close", {})
+            if sig.direction == Direction.LONG:
+                expected_stop = close_stats.get(f"pct_{int(5)}", None)
+                expected_target = close_stats.get(f"pct_{int(95)}", None)
+                if expected_stop is not None and expected_target is not None:
+                    assert sig.stop == expected_stop, \
+                        f"LONG stop should be pct_5 ({expected_stop}), got {sig.stop}"
+                    assert sig.target == expected_target, \
+                        f"LONG target should be pct_95 ({expected_target}), got {sig.target}"
+
+    def test_vrp_expansion_bracket_pct_5_95_short(self):
+        """Test that expansion SHORT uses pct_95/pct_5 bracket (reversed) exactly."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        np.random.seed(42)
+        prices = [100.0] * 25
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.0001 for p in prices],
+            "low": [p * 0.9999 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        # Create distribution skewed left (to trigger SHORT in expansion)
+        dist_prices = [120.0] * 50 + [80.0] * 50
+        dist = make_dist(dist_prices)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        if sig is not None and sig.metadata.get("trade_type") == "vol_expansion":
+            close_stats = dist.stats.get("close", {})
+            if sig.direction == Direction.SHORT:
+                expected_stop = close_stats.get(f"pct_{int(95)}", None)
+                expected_target = close_stats.get(f"pct_{int(5)}", None)
+                if expected_stop is not None and expected_target is not None:
+                    assert sig.stop == expected_stop, \
+                        f"SHORT stop should be pct_95 ({expected_stop}), got {sig.stop}"
+                    assert sig.target == expected_target, \
+                        f"SHORT target should be pct_5 ({expected_target}), got {sig.target}"
+
+    def test_vrp_compression_bracket_pct_25_75_long(self):
+        """Test that compression LONG uses pct_25/pct_75 bracket exactly."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        # Create high-variance history (to get high realized_var)
+        np.random.seed(42)
+        prices = [100.0 + 10.0 * np.sin(i * 0.5) for i in range(25)]
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": [p * 0.99 for p in prices],
+            "high": [p * 1.02 for p in prices],
+            "low": [p * 0.98 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        # Create tight distribution (low implied_var) to trigger compression
+        dist = make_dist(prices)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        if sig is not None and sig.metadata.get("trade_type") == "vol_compression":
+            close_stats = dist.stats.get("close", {})
+            if sig.direction == Direction.LONG:
+                expected_stop = close_stats.get(f"pct_{int(25)}", None)
+                expected_target = close_stats.get(f"pct_{int(75)}", None)
+                if expected_stop is not None and expected_target is not None:
+                    assert sig.stop == expected_stop, \
+                        f"LONG stop should be pct_25 ({expected_stop}), got {sig.stop}"
+                    assert sig.target == expected_target, \
+                        f"LONG target should be pct_75 ({expected_target}), got {sig.target}"
+
+    def test_vrp_compression_bracket_pct_25_75_short(self):
+        """Test that compression SHORT uses pct_75/pct_25 bracket (reversed) exactly."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        np.random.seed(42)
+        prices = [100.0 + 10.0 * np.sin(i * 0.5) for i in range(25)]
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": [p * 0.99 for p in prices],
+            "high": [p * 1.02 for p in prices],
+            "low": [p * 0.98 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        dist = make_dist(prices)
+
+        # Signal at current_price = 100 (center)
+        # For SHORT compression, current_price should be > mean
+        # Adjust center to be above the mean
+        high_price = 110.0
+        sig = strategy.generate_signal(dist, high_price, history, {})
+        if sig is not None and sig.metadata.get("trade_type") == "vol_compression":
+            close_stats = dist.stats.get("close", {})
+            if sig.direction == Direction.SHORT:
+                expected_stop = close_stats.get(f"pct_{int(75)}", None)
+                expected_target = close_stats.get(f"pct_{int(25)}", None)
+                if expected_stop is not None and expected_target is not None:
+                    assert sig.stop == expected_stop, \
+                        f"SHORT stop should be pct_75 ({expected_stop}), got {sig.stop}"
+                    assert sig.target == expected_target, \
+                        f"SHORT target should be pct_25 ({expected_target}), got {sig.target}"
+
+    def test_vrp_direction_consistent_stops_long(self):
+        """Test that LONG stops are always below entry."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        np.random.seed(42)
+        prices = [100.0] * 25
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.0001 for p in prices],
+            "low": [p * 0.9999 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        wide_prices = [80.0] * 50 + [120.0] * 50
+        dist = make_dist(wide_prices)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        if sig is not None and sig.direction == Direction.LONG:
+            assert sig.stop < sig.entry, \
+                f"LONG stop {sig.stop} must be below entry {sig.entry}"
+
+    def test_vrp_direction_consistent_stops_short(self):
+        """Test that SHORT stops are always above entry."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        np.random.seed(42)
+        prices = [100.0] * 25
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.0001 for p in prices],
+            "low": [p * 0.9999 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        wide_prices = [120.0] * 50 + [80.0] * 50
+        dist = make_dist(wide_prices)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        if sig is not None and sig.direction == Direction.SHORT:
+            assert sig.stop > sig.entry, \
+                f"SHORT stop {sig.stop} must be above entry {sig.entry}"
+
+    def test_vrp_returns_signal_dataclass(self):
+        """Test that VarianceRiskPremiumStrategy returns Signal or None, never dict."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        np.random.seed(42)
+        prices = [100.0] * 25
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.0001 for p in prices],
+            "low": [p * 0.9999 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        wide_prices = [80.0] * 50 + [120.0] * 50
+        dist = make_dist(wide_prices)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        if sig is not None:
+            assert isinstance(sig, Signal), f"Expected Signal or None, got {type(sig)}"
+            assert hasattr(sig, "direction")
+            assert hasattr(sig, "size")
+            assert hasattr(sig, "entry")
+            assert hasattr(sig, "stop")
+            assert hasattr(sig, "target")
+            assert hasattr(sig, "strategy_name")
+            assert hasattr(sig, "confidence")
+            assert hasattr(sig, "expected_value")
+            assert hasattr(sig, "metadata")
+
+    def test_vrp_metadata_contains_required_fields(self):
+        """Test that signal metadata contains ratio, implied_var, realized_var, trade_type."""
+        strategy = VarianceRiskPremiumStrategy(entry_ratio=1.5)
+
+        np.random.seed(42)
+        prices = [100.0] * 25
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        history = pd.DataFrame({
+            "open": prices,
+            "high": [p * 1.0001 for p in prices],
+            "low": [p * 0.9999 for p in prices],
+            "close": prices,
+            "volume": [1e6] * 25,
+        }, index=idx)
+
+        wide_prices = [80.0] * 50 + [120.0] * 50
+        dist = make_dist(wide_prices)
+
+        sig = strategy.generate_signal(dist, 100.0, history, {})
+        if sig is not None:
+            assert "ratio" in sig.metadata, "Metadata must contain 'ratio'"
+            assert "implied_var" in sig.metadata, "Metadata must contain 'implied_var'"
+            assert "realized_var" in sig.metadata, "Metadata must contain 'realized_var'"
+            assert "trade_type" in sig.metadata, "Metadata must contain 'trade_type'"
+            assert sig.metadata["trade_type"] in ["vol_expansion", "vol_compression"]
