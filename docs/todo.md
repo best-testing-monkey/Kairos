@@ -25,7 +25,7 @@
 
 - [x] E3-S01 GARCH Filter (docs/tickets/E3-S01-garch-filter.md)
 - [x] E3-S02 Vol Target Sizer (docs/tickets/E3-S02-vol-target-sizer.md)
-- [x] E3-S03 Variance Risk Premium (docs/tickets/E3-S03-variance-risk-premium.md)
+- [ ] E3-S03 Variance Risk Premium (docs/tickets/E3-S03-variance-risk-premium.md)
 
 ## Epic E4 — Econometrics
 
@@ -46,7 +46,7 @@
 
 - [x] E6-S01 Stochastic Filter (docs/tickets/E6-S01-stochastic-filter.md)
 - [x] E6-S02 ADX Gate (docs/tickets/E6-S02-adx-gate.md)
-- [ ] E6-S03 OBV Confirmation (docs/tickets/E6-S03-obv-confirmation.md)
+- [x] E6-S03 OBV Confirmation (docs/tickets/E6-S03-obv-confirmation.md)
 - [ ] E6-S04 MTF Consensus (docs/tickets/E6-S04-mtf-consensus.md)
 
 ## Epic E7 — Execution & Microstructure

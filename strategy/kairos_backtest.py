@@ -1327,6 +1327,125 @@ class ADXGateStrategy(Strategy):
                 return None
 
 
+class OBVConfirmationStrategy(Strategy):
+    """
+    On-Balance Volume (OBV) confirmation filter.
+
+    Computes OBV from realized volume (cumulative volume signed by close-to-close change).
+    Calculates the slope of the last slope_window OBV values via linear regression.
+    Vetoes signals when OBV slope sign disagrees with signal direction:
+    - LONG signals vetoed if slope is negative
+    - SHORT signals vetoed if slope is positive
+    Flat/zero slope passes through; matching sign passes through unchanged.
+
+    Complements VolumeConfirmationStrategy (which uses predicted volume).
+    """
+    name = "obv_confirmation"
+
+    def __init__(self, base_strategy: Strategy, slope_window: int = 20):
+        """
+        Initialize OBVConfirmationStrategy.
+
+        Args:
+            base_strategy: Strategy to wrap
+            slope_window: Window size for OBV slope calculation (default 20)
+        """
+        self.base_strategy = base_strategy
+        self.slope_window = slope_window
+
+    def _compute_obv(self, history: pd.DataFrame) -> Tuple[List[float], float]:
+        """
+        Compute OBV values from history.
+
+        OBV is cumulative volume signed by close-to-close change:
+        - If close > previous close: add volume
+        - If close < previous close: subtract volume
+        - If close == previous close: add 0 (no change to OBV)
+
+        Returns:
+            (obv_values, current_obv) tuple
+        """
+        closes = history["close"].values
+        volumes = history["volume"].values
+
+        if len(closes) < 2:
+            return [0.0], 0.0
+
+        obv_values = [0.0]  # OBV starts at 0
+        obv = 0.0
+
+        for i in range(1, len(closes)):
+            price_change = closes[i] - closes[i - 1]
+            if price_change > 0:
+                obv += volumes[i]
+            elif price_change < 0:
+                obv -= volumes[i]
+            # If price_change == 0, add 0 to OBV (no change)
+            obv_values.append(obv)
+
+        return obv_values, obv
+
+    def _compute_obv_slope(self, history: pd.DataFrame) -> float:
+        """
+        Compute the slope of OBV over the last slope_window bars.
+
+        Uses numpy.polyfit with degree 1 (linear regression).
+        Returns the slope coefficient.
+
+        Returns:
+            slope value (positive = rising OBV, negative = falling OBV)
+        """
+        obv_values, _ = self._compute_obv(history)
+
+        if len(obv_values) < self.slope_window:
+            # Not enough data; return 0 (neutral, no veto)
+            return 0.0
+
+        # Get the last slope_window OBV values
+        obv_window = obv_values[-self.slope_window:]
+        x = np.arange(len(obv_window), dtype=float)
+        y = np.array(obv_window, dtype=float)
+
+        # Fit a degree-1 polynomial (linear)
+        try:
+            coeffs = np.polyfit(x, y, deg=1)
+            slope = coeffs[0]  # First element is the slope
+        except Exception:
+            # If polyfit fails, return 0 (neutral)
+            return 0.0
+
+        return slope
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal from base strategy, then apply OBV slope filter.
+
+        Returns:
+            Signal from base strategy if OBV slope agrees with direction, None if vetoed.
+            Always returns Signal or None, never dict.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Compute OBV slope
+        obv_slope = self._compute_obv_slope(history)
+
+        # Apply veto logic
+        if base_signal.direction == Direction.LONG:
+            # Veto LONG if slope is negative (OBV falling)
+            if obv_slope < 0:
+                return None
+        elif base_signal.direction == Direction.SHORT:
+            # Veto SHORT if slope is positive (OBV rising)
+            if obv_slope > 0:
+                return None
+
+        # Pass through base signal unchanged (flat slope or matching sign)
+        return base_signal
+
+
 class BollingerValidationStrategy(Strategy):
     """
     Compare predicted range to Bollinger Band width.

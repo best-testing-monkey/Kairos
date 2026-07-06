@@ -7,6 +7,7 @@ import pandas as pd
 from kairos_backtest import (
     KairosDistribution, Direction, Signal, Strategy,
     StochasticFilterStrategy, CloseDirectionStrategy, ADXGateStrategy,
+    OBVConfirmationStrategy,
     compute_adx
 )
 
@@ -625,6 +626,376 @@ class TestADXGateStrategy:
 
         sig = gate.generate_signal(dist, closes[-1], history, {})
 
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+        assert sig.size == 0.75
+        assert sig.confidence == 0.8
+        assert sig.strategy_name == "fixed"
+        assert sig.expected_value == 15.0
+
+
+# ============================================================================
+# Tests for OBVConfirmationStrategy
+# ============================================================================
+
+class TestOBVConfirmationStrategy:
+    """Test the On-Balance Volume confirmation filter."""
+
+    def test_obv_hand_computed_fixture(self):
+        """
+        Test OBV computation against hand-computed values on a small fixture.
+
+        Use a simple series where we can verify OBV manually:
+        - 5-bar series with known closes and volumes
+        - Compute OBV = cumulative volume signed by price change
+        - Verify to exact precision
+        """
+        # Simple 5-bar fixture:
+        # Day 1: close=100, vol=1000 -> OBV=0 (starting point)
+        # Day 2: close=101 (up), vol=1000 -> OBV=0 + 1000 = 1000
+        # Day 3: close=100 (down), vol=1000 -> OBV=1000 - 1000 = 0
+        # Day 4: close=102 (up), vol=1000 -> OBV=0 + 1000 = 1000
+        # Day 5: close=102 (flat), vol=1000 -> OBV=1000 + 0 = 1000
+
+        closes = [100.0, 101.0, 100.0, 102.0, 102.0]
+        volumes = [1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": volumes,
+        }, index=pd.date_range("2024-01-01", periods=len(closes), freq="D"))
+
+        # Create a dummy base strategy
+        class DummyStrategy(Strategy):
+            name = "dummy"
+            def generate_signal(self, dist, current_price, history, context):
+                return None
+
+        obv_filter = OBVConfirmationStrategy(
+            base_strategy=DummyStrategy(),
+            slope_window=20
+        )
+
+        obv_values, current_obv = obv_filter._compute_obv(history)
+
+        # Expected OBV values
+        expected_obv = [0.0, 1000.0, 0.0, 1000.0, 1000.0]
+
+        # Check each value
+        for i, (computed, expected) in enumerate(zip(obv_values, expected_obv)):
+            assert abs(computed - expected) < 1e-6, \
+                f"OBV mismatch at index {i}: expected {expected}, got {computed}"
+
+        # Check current OBV (last value)
+        assert abs(current_obv - 1000.0) < 1e-6, \
+            f"Current OBV mismatch: expected 1000.0, got {current_obv}"
+
+    def test_obv_slope_disagreement_veto_long(self):
+        """
+        Test that LONG signals are vetoed when OBV slope is negative (falling OBV trend).
+        Create prices that decline (causing negative OBV) while generating LONG signal.
+        """
+        # Create a series where price goes DOWN (creating negative OBV slope)
+        # but we generate a LONG signal (disagreement = should veto)
+        n = 30
+        closes = list(np.linspace(110, 100, n))  # Prices trending DOWN
+        # Constant volume (OBV slope depends only on price movement)
+        volumes = [5000.0] * n
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": volumes,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy that always generates LONG (despite falling prices)
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        obv_filter = OBVConfirmationStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            slope_window=15
+        )
+
+        sig = obv_filter.generate_signal(dist, closes[-1], history, {})
+
+        # Signal should be vetoed (None) because OBV slope is negative (prices declining)
+        # and signal is LONG (disagreement)
+        assert sig is None, "LONG signal should be vetoed when OBV slope is negative"
+
+    def test_obv_slope_disagreement_veto_short(self):
+        """
+        Test that SHORT signals are vetoed when OBV slope is positive (rising OBV trend).
+        Create prices that increase (causing positive OBV) while generating SHORT signal.
+        """
+        # Create a series where price goes UP (creating positive OBV slope)
+        # but we generate a SHORT signal (disagreement = should veto)
+        n = 30
+        closes = list(np.linspace(100, 110, n))  # Prices trending UP
+        # Constant volume (OBV slope depends only on price movement)
+        volumes = [5000.0] * n
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": volumes,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy that always generates SHORT (despite rising prices)
+        class AlwaysShortStrategy(Strategy):
+            name = "always_short"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.SHORT,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_90"],
+                    target=s["pct_10"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        obv_filter = OBVConfirmationStrategy(
+            base_strategy=AlwaysShortStrategy(),
+            slope_window=15
+        )
+
+        sig = obv_filter.generate_signal(dist, closes[-1], history, {})
+
+        # Signal should be vetoed (None) because OBV slope is positive (prices rising)
+        # and signal is SHORT (disagreement)
+        assert sig is None, "SHORT signal should be vetoed when OBV slope is positive"
+
+    def test_obv_slope_agreement_pass_long(self):
+        """
+        Test that LONG signals pass through when OBV slope is positive (rising OBV trend).
+        """
+        # Create a series where price goes UP (creating positive OBV slope)
+        # and we generate a LONG signal (agreement = should pass)
+        n = 30
+        closes = list(np.linspace(100, 110, n))  # Prices trending UP
+        # Constant volume (OBV slope depends on price movement)
+        volumes = [5000.0] * n
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": volumes,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy that always generates LONG
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        obv_filter = OBVConfirmationStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            slope_window=15
+        )
+
+        sig = obv_filter.generate_signal(dist, closes[-1], history, {})
+
+        # Signal should pass through because OBV slope is positive (agrees with LONG)
+        assert sig is not None, "LONG signal should pass when OBV slope is positive"
+        assert sig.direction == Direction.LONG
+        assert sig.strategy_name == "always_long"
+
+    def test_obv_slope_agreement_pass_short(self):
+        """
+        Test that SHORT signals pass through when OBV slope is negative (falling OBV trend).
+        """
+        # Create a series where price goes DOWN (creating negative OBV slope)
+        # and we generate a SHORT signal (agreement = should pass)
+        n = 30
+        closes = list(np.linspace(110, 100, n))  # Prices trending DOWN
+        # Constant volume (OBV slope depends on price movement)
+        volumes = [5000.0] * n
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": volumes,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy that always generates SHORT
+        class AlwaysShortStrategy(Strategy):
+            name = "always_short"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.SHORT,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_90"],
+                    target=s["pct_10"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        obv_filter = OBVConfirmationStrategy(
+            base_strategy=AlwaysShortStrategy(),
+            slope_window=15
+        )
+
+        sig = obv_filter.generate_signal(dist, closes[-1], history, {})
+
+        # Signal should pass through because OBV slope is negative (agrees with SHORT)
+        assert sig is not None, "SHORT signal should pass when OBV slope is negative"
+        assert sig.direction == Direction.SHORT
+        assert sig.strategy_name == "always_short"
+
+    def test_obv_flat_slope_passthrough(self):
+        """
+        Test that signals pass through when OBV slope is near-zero (flat).
+        Constant volume with tiny alternating price moves summing to near-zero slope.
+        """
+        # Create a series with constant volume and tiny near-flat price movement
+        n = 30
+        # Alternating tiny up/down moves that net to nearly flat
+        closes = [100.0 + (0.001 * (-1)**i) for i in range(n)]
+        volumes = [5000.0] * n  # Constant volume
+
+        history = pd.DataFrame({
+            "open": [c - 0.0005 for c in closes],
+            "high": [c + 0.001 for c in closes],
+            "low": [c - 0.001 for c in closes],
+            "close": closes,
+            "volume": volumes,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy that generates LONG
+        class AlwaysLongStrategy(Strategy):
+            name = "always_long"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.5,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.5,
+                    expected_value=10.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        obv_filter = OBVConfirmationStrategy(
+            base_strategy=AlwaysLongStrategy(),
+            slope_window=15
+        )
+
+        sig = obv_filter.generate_signal(dist, closes[-1], history, {})
+
+        # With flat OBV, signal should pass through (neither positive nor negative slope blocks)
+        assert sig is not None, "LONG signal should pass with flat OBV slope (near-zero)"
+        assert sig.direction == Direction.LONG
+
+    def test_obv_passthrough_none_base_signal(self):
+        """Test that None base signal passes through unchanged."""
+        class NeverSignalStrategy(Strategy):
+            name = "never_signal"
+            def generate_signal(self, dist, current_price, history, context):
+                return None
+
+        history = make_history(n=50, price=100.0)
+        dist = make_dist([100.0] * 50)
+
+        obv_filter = OBVConfirmationStrategy(base_strategy=NeverSignalStrategy())
+        sig = obv_filter.generate_signal(dist, 100.0, history, {})
+
+        assert sig is None
+
+    def test_obv_signal_unchanged_when_passing(self):
+        """
+        Test that passing signal maintains all original attributes unchanged
+        (field-by-field).
+        """
+        # Create a series with positive OBV slope
+        n = 30
+        closes = list(np.linspace(100, 110, n))
+        volumes = [5000 + (100 * i) for i in range(n)]
+
+        history = pd.DataFrame({
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": volumes,
+        }, index=pd.date_range("2024-01-01", periods=n, freq="D"))
+
+        # Base strategy with specific signal attributes
+        class FixedSignalStrategy(Strategy):
+            name = "fixed"
+            def generate_signal(self, dist, current_price, history, context):
+                s = dist.stats["close"]
+                return Signal(
+                    direction=Direction.LONG,
+                    size=0.75,
+                    entry=current_price,
+                    stop=s["pct_10"],
+                    target=s["pct_90"],
+                    strategy_name=self.name,
+                    confidence=0.8,
+                    expected_value=15.0,
+                )
+
+        dist = make_dist(closes[-100:])
+
+        obv_filter = OBVConfirmationStrategy(
+            base_strategy=FixedSignalStrategy(),
+            slope_window=15
+        )
+
+        sig = obv_filter.generate_signal(dist, closes[-1], history, {})
+
+        # Verify all signal attributes are unchanged
         assert sig is not None
         assert sig.direction == Direction.LONG
         assert sig.size == 0.75
