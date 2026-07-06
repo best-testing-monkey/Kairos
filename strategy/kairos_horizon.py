@@ -215,7 +215,11 @@ class KairosMultiHorizonPredictor:
         for h in range(1, self.max_horizon + 1):
             # Predict next day
             predictions = self.predict_fn(current_history, **kwargs)
-            dist = KairosDistribution(predictions)
+            try:
+                from kairos_backtest import distribution_for
+                dist = distribution_for(predictions)
+            except ImportError:
+                dist = KairosDistribution(predictions)
             stack.horizons[h] = dist
 
             # Build synthetic bar for next iteration

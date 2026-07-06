@@ -244,7 +244,8 @@ def predict_all_batch(assets: dict) -> dict:
         dist_key = (symbol, assets[symbol].index[-1])
         dist = _dist_cache.get(dist_key)
         if dist is None:
-            dist = KairosDistribution(preds)
+            from kairos_backtest import distribution_for
+            dist = distribution_for(preds)
             _dist_cache[dist_key] = dist
         result[symbol] = AssetPrediction(
             symbol=symbol,

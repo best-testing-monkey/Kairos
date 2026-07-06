@@ -170,10 +170,12 @@ def fast_concat(predictions: List[pd.DataFrame]) -> pd.DataFrame:
     if predictions:
         first = predictions[0]
         cols = first.columns
+        col_list = cols.tolist()
         arrs = []
         ok = True
         for p in predictions:
-            if p.columns is not cols and not p.columns.equals(cols):
+            pc = p.columns
+            if pc is not cols and pc.tolist() != col_list:
                 ok = False
                 break
             arrs.append(p.to_numpy())
@@ -183,6 +185,25 @@ def fast_concat(predictions: List[pd.DataFrame]) -> pd.DataFrame:
                     and (first.dtypes == dt).all():
                 return pd.DataFrame(np.vstack(arrs), columns=cols.copy())
     return pd.concat(predictions, ignore_index=True)
+
+
+_dist_memo: dict = {}
+
+
+def distribution_for(predictions: List[pd.DataFrame]) -> "KairosDistribution":
+    """
+    Memoized KairosDistribution construction, keyed by the identity of the
+    predictions list. The list is retained in the memo so ids stay valid.
+    Callers that reuse the same cached predictions list get the same
+    (immutable in practice) distribution back instead of rebuilding it.
+    """
+    key = id(predictions)
+    entry = _dist_memo.get(key)
+    if entry is not None and entry[0] is predictions:
+        return entry[1]
+    dist = KairosDistribution(predictions)
+    _dist_memo[key] = (predictions, dist)
+    return dist
 
 
 class KairosDistribution:
