@@ -29,7 +29,7 @@
 
 ## Epic E4 — Econometrics
 
-- [ ] E4-S01 Lagged OLS and ARIMA Disagreement (docs/tickets/E4-S01-lagged-ols-and-arima-disagreement.md)
+- [x] E4-S01 Lagged OLS and ARIMA Disagreement (docs/tickets/E4-S01-lagged-ols-and-arima-disagreement.md)
 - [ ] E4-S02 VAR Lead-Lag (docs/tickets/E4-S02-var-leadlag.md)
 - [ ] E4-S03 Seasonality Filter (docs/tickets/E4-S03-seasonality-filter.md)
 - [ ] E4-S04 Changepoint Guard (docs/tickets/E4-S04-changepoint-guard.md)
@@ -64,7 +64,7 @@
 
 ## Epic E9 — Sentiment Scaffolding
 
-- [ ] E9-S01 News Sentiment Filter (docs/tickets/E9-S01-news-sentiment-filter.md)
+- [x] E9-S01 News Sentiment Filter (docs/tickets/E9-S01-news-sentiment-filter.md)
 - [ ] E9-S02 Social Momentum (docs/tickets/E9-S02-social-momentum.md)
 - [ ] E9-S03 Institutional 13F (docs/tickets/E9-S03-institutional-13f.md)
 - [ ] E9-S04 Econ Calendar Guard (docs/tickets/E9-S04-econ-calendar-guard.md)
