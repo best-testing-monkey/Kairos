@@ -18,6 +18,11 @@ Key contracts:
     count: int, z_score: float, sentiment: float ∈ [-1, 1]
     Missing keys or symbols → standalone strategy returns None.
 
+  - context["econ_events"] = list of {date, impact} (list of dicts)
+    date: str (YYYY-MM-DD), date, or datetime object
+    impact: "high", "medium", "low" (str)
+    Missing context key or current_date → pass-through unchanged.
+
 The NewsSentimentFilterStrategy wrapper:
   - Wraps a base strategy
   - Reads news sentiment for the current symbol
@@ -32,9 +37,20 @@ The SocialMomentumStrategy standalone strategy:
   - Gated on Kronos direction agreement
   - Gracefully degrades: missing context/symbol → None
   - Returns Signal or None, never dict
+
+The EconCalendarGuardStrategy wrapper:
+  - Wraps a base strategy
+  - Reads context["econ_events"] (list of {date, impact})
+  - Reads context["current_date"]
+  - Vetoes new entries if HIGH-impact events fall within (current_date, current_date + guard_days]
+  - Exposes should_tighten_stops(context) method for orchestrator to consult
+  - Handles string and date/datetime objects for dates
+  - Gracefully degrades: missing context keys → pass-through unchanged
+  - Returns Signal or None, never dict
 """
 
 import numpy as np
+from datetime import datetime, date, timedelta
 from kairos_backtest import Strategy, Signal, Direction
 
 
@@ -300,3 +316,122 @@ class SocialMomentumStrategy(Strategy):
                 "momentum_type": "fade_blowoff" if trailing_5d_return > 0.20 else "crowd_inflow",
             }
         )
+
+
+class EconCalendarGuardStrategy(Strategy):
+    """
+    Filters signals based on economic calendar events.
+
+    Wraps a base strategy and applies economic calendar filtering:
+      - Vetoes new entries when HIGH-impact events fall within the guard window
+        (current_date, current_date + guard_days] (tomorrow through guard_days ahead).
+      - Exposes should_tighten_stops(context) helper for orchestrator to consult
+        regarding open positions in the guard window.
+      - Gracefully degrades: if context["econ_events"] or context["current_date"]
+        is missing, returns base signal unchanged.
+      - Handles string ("YYYY-MM-DD"), date, and datetime objects for date parsing.
+
+    Args:
+        base_strategy: The wrapped strategy to filter.
+        guard_days: Number of days ahead to monitor for high-impact events.
+                   Default 1 (tomorrow only).
+    """
+    name = "econ_calendar_guard"
+
+    def __init__(self, base_strategy: Strategy, guard_days: int = 1):
+        self.base_strategy = base_strategy
+        self.guard_days = guard_days
+
+    def _parse_date(self, date_obj):
+        """
+        Convert various date formats to date object.
+        Handles: str (YYYY-MM-DD), datetime.date, datetime.datetime.
+        Returns: datetime.date or None if parsing fails.
+        """
+        if isinstance(date_obj, str):
+            try:
+                return datetime.strptime(date_obj, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return None
+        elif isinstance(date_obj, datetime):
+            return date_obj.date()
+        elif isinstance(date_obj, date):
+            return date_obj
+        return None
+
+    def should_tighten_stops(self, context):
+        """
+        Check if any HIGH-impact event falls within the guard window.
+        Returns True if stops should be tightened for open positions.
+
+        Args:
+            context: Dict containing "econ_events" and "current_date" keys.
+
+        Returns:
+            bool: True if in guard window, False otherwise.
+                  Returns False if context keys are missing.
+        """
+        # Graceful degradation: missing context keys
+        econ_events = context.get("econ_events")
+        current_date_obj = context.get("current_date")
+
+        if econ_events is None or current_date_obj is None:
+            return False
+
+        # Parse current_date
+        current_date = self._parse_date(current_date_obj)
+        if current_date is None:
+            return False
+
+        # Check for HIGH-impact events in guard window
+        guard_end = current_date + timedelta(days=self.guard_days)
+
+        for event in econ_events:
+            event_date = self._parse_date(event.get("date"))
+            impact = event.get("impact", "").lower()
+
+            if event_date is None:
+                continue
+
+            # Check if event is within guard window: (current_date, current_date + guard_days]
+            if current_date < event_date <= guard_end and impact == "high":
+                return True
+
+        return False
+
+    def generate_signal(self, dist, current_price, history, context):
+        # Get base signal from wrapped strategy
+        signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if signal is None:
+            return None
+
+        # Graceful degradation: if econ context missing, return base signal unchanged
+        econ_events = context.get("econ_events")
+        if econ_events is None:
+            return signal
+
+        current_date_obj = context.get("current_date")
+        if current_date_obj is None:
+            return signal
+
+        # Parse current_date
+        current_date = self._parse_date(current_date_obj)
+        if current_date is None:
+            return signal
+
+        # Check for HIGH-impact events in guard window
+        # Guard window is (current_date, current_date + guard_days] (tomorrow through guard_days ahead)
+        guard_end = current_date + timedelta(days=self.guard_days)
+
+        for event in econ_events:
+            event_date = self._parse_date(event.get("date"))
+            impact = event.get("impact", "").lower()
+
+            if event_date is None:
+                continue
+
+            # Veto new entries when HIGH-impact event is in guard window
+            if current_date < event_date <= guard_end and impact == "high":
+                return None
+
+        return signal

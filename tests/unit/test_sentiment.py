@@ -4,8 +4,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy
 import pytest
 import numpy as np
 import pandas as pd
+from datetime import datetime, date, timedelta
 from kairos_backtest import KairosDistribution, Direction, Signal
-from kairos_sentiment import NewsSentimentFilterStrategy, SocialMomentumStrategy, Institutional13FFilterStrategy
+from kairos_sentiment import NewsSentimentFilterStrategy, SocialMomentumStrategy, Institutional13FFilterStrategy, EconCalendarGuardStrategy
 
 
 # ============================================================================
@@ -1212,6 +1213,455 @@ class TestInstitutional13FFilterStrategy:
         context = {
             "symbol": "BTC-USD",
             "inst_ownership_delta": {"BTC-USD": 3.0}
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+        assert not isinstance(sig, dict)
+
+
+# ============================================================================
+# Tests for EconCalendarGuardStrategy
+# ============================================================================
+
+class TestEconCalendarGuardStrategy:
+    """Test EconCalendarGuardStrategy graceful degradation and econ calendar filtering."""
+
+    def test_econ_calendar_none_base_signal(self):
+        """Test pass-through on None base signal."""
+        base = MockNoneStrategy()
+        filt = EconCalendarGuardStrategy(base)
+        dist = make_dist([100.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16", "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_econ_calendar_missing_econ_events_context_key(self):
+        """
+        Test missing context["econ_events"] key → identical behavior to unwrapped strategy.
+        Verifies field-by-field identity.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8, expected_value=100.0)
+        filt = EconCalendarGuardStrategy(base)
+        dist = make_dist([110.0] * 100)
+        # No "econ_events" key in context
+        context = {"current_date": "2024-01-15"}
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+
+        # Get unwrapped base signal for comparison
+        base_sig = base.generate_signal(dist, 100.0, make_history(), context)
+
+        assert sig is not None
+        assert sig.direction == base_sig.direction
+        assert sig.size == pytest.approx(base_sig.size, rel=1e-6)
+        assert sig.confidence == pytest.approx(base_sig.confidence, rel=1e-6)
+        assert sig.expected_value == pytest.approx(base_sig.expected_value, rel=1e-6)
+        assert sig.entry == base_sig.entry
+        assert sig.stop == base_sig.stop
+        assert sig.target == base_sig.target
+
+    def test_econ_calendar_missing_current_date_context_key(self):
+        """
+        Test missing context["current_date"] key → pass through unchanged.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "econ_events": [{"date": "2024-01-16", "impact": "high"}]
+            # No "current_date" key
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        base_sig = base.generate_signal(dist, 100.0, make_history(), context)
+
+        assert sig is not None
+        assert sig.direction == base_sig.direction
+        assert sig.size == pytest.approx(base_sig.size, rel=1e-6)
+
+    def test_econ_calendar_empty_events_list(self):
+        """
+        Test empty context["econ_events"] list → pass through unchanged.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": []  # Empty events list
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        base_sig = base.generate_signal(dist, 100.0, make_history(), context)
+
+        assert sig is not None
+        assert sig.direction == base_sig.direction
+
+    def test_econ_calendar_high_impact_tomorrow_veto(self):
+        """
+        Test HIGH-impact event tomorrow → veto new entries.
+        Current date: 2024-01-15, HIGH event: 2024-01-16 → VETO
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16", "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_econ_calendar_high_impact_today_passthrough(self):
+        """
+        Test HIGH-impact event today → pass through (not in guard window).
+        Current date: 2024-01-15, HIGH event: 2024-01-15 → PASS
+        Guard window is (current_date, current_date + guard_days] (exclusive on left, inclusive on right)
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-15", "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+    def test_econ_calendar_high_impact_beyond_guard_window_passthrough(self):
+        """
+        Test HIGH-impact event beyond guard window → pass through.
+        Current date: 2024-01-15, guard_days=1, HIGH event: 2024-01-17 → PASS
+        Guard window is (2024-01-15, 2024-01-16]
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-17", "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+    def test_econ_calendar_medium_impact_tomorrow_passthrough(self):
+        """
+        Test MEDIUM-impact event tomorrow → pass through (not high impact).
+        Current date: 2024-01-15, MEDIUM event: 2024-01-16 → PASS
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16", "impact": "medium"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+    def test_econ_calendar_low_impact_tomorrow_passthrough(self):
+        """
+        Test LOW-impact event tomorrow → pass through (not high impact).
+        Current date: 2024-01-15, LOW event: 2024-01-16 → PASS
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16", "impact": "low"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+    def test_econ_calendar_multiple_events_one_high_veto(self):
+        """
+        Test multiple events with one HIGH-impact in guard window → veto.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [
+                {"date": "2024-01-16", "impact": "low"},
+                {"date": "2024-01-16", "impact": "high"},  # This one triggers veto
+                {"date": "2024-01-17", "impact": "high"}   # Outside guard window
+            ]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_econ_calendar_guard_days_2_veto(self):
+        """
+        Test guard_days=2 → HIGH-impact event 2 days ahead should be vetoed.
+        Current date: 2024-01-15, guard_days=2, HIGH event: 2024-01-17 → VETO
+        Guard window: (2024-01-15, 2024-01-17]
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=2)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-17", "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_econ_calendar_guard_days_2_beyond_passthrough(self):
+        """
+        Test guard_days=2 → HIGH-impact event beyond guard window passes.
+        Current date: 2024-01-15, guard_days=2, HIGH event: 2024-01-18 → PASS
+        Guard window: (2024-01-15, 2024-01-17]
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=2)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-18", "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+    def test_econ_calendar_date_object_input(self):
+        """
+        Test date object input (datetime.date) for both current_date and event dates.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        current = date(2024, 1, 15)
+        event_tomorrow = date(2024, 1, 16)
+        context = {
+            "current_date": current,
+            "econ_events": [{"date": event_tomorrow, "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_econ_calendar_datetime_object_input(self):
+        """
+        Test datetime object input (datetime.datetime) for both current_date and event dates.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        current = datetime(2024, 1, 15, 10, 30, 0)
+        event_tomorrow = datetime(2024, 1, 16, 13, 30, 0)
+        context = {
+            "current_date": current,
+            "econ_events": [{"date": event_tomorrow, "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_econ_calendar_mixed_date_formats(self):
+        """
+        Test mixed date formats: string current_date and datetime event date.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",  # String
+            "econ_events": [{"date": date(2024, 1, 16), "impact": "high"}]  # date object
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_econ_calendar_invalid_date_string_passthrough(self):
+        """
+        Test invalid date string → graceful degradation, pass through unchanged.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "invalid-date",  # Invalid format
+            "econ_events": [{"date": "2024-01-16", "impact": "high"}]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        # Since current_date parsing fails, should pass through
+        assert sig is not None
+
+    def test_econ_calendar_invalid_event_date_skip(self):
+        """
+        Test invalid event date → skip that event.
+        Multiple events: one invalid, one HIGH-impact in guard window.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [
+                {"date": "invalid", "impact": "high"},  # Skipped
+                {"date": "2024-01-16", "impact": "high"}  # This one triggers veto
+            ]
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is None
+
+    def test_econ_calendar_missing_impact_field_passthrough(self):
+        """
+        Test event with missing "impact" field → treat as non-HIGH, pass through.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16"}]  # Missing "impact" field
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+
+    def test_econ_calendar_should_tighten_stops_high_impact_tomorrow(self):
+        """
+        Test should_tighten_stops() returns True when HIGH-impact event tomorrow.
+        """
+        base = MockStrategy()
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16", "impact": "high"}]
+        }
+        assert filt.should_tighten_stops(context) is True
+
+    def test_econ_calendar_should_tighten_stops_high_impact_beyond_window(self):
+        """
+        Test should_tighten_stops() returns False when HIGH-impact event beyond guard window.
+        """
+        base = MockStrategy()
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-17", "impact": "high"}]
+        }
+        assert filt.should_tighten_stops(context) is False
+
+    def test_econ_calendar_should_tighten_stops_medium_impact(self):
+        """
+        Test should_tighten_stops() returns False for MEDIUM-impact event.
+        """
+        base = MockStrategy()
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16", "impact": "medium"}]
+        }
+        assert filt.should_tighten_stops(context) is False
+
+    def test_econ_calendar_should_tighten_stops_missing_events(self):
+        """
+        Test should_tighten_stops() returns False when econ_events missing.
+        """
+        base = MockStrategy()
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        context = {"current_date": "2024-01-15"}  # No econ_events
+        assert filt.should_tighten_stops(context) is False
+
+    def test_econ_calendar_should_tighten_stops_missing_date(self):
+        """
+        Test should_tighten_stops() returns False when current_date missing.
+        """
+        base = MockStrategy()
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        context = {
+            "econ_events": [{"date": "2024-01-16", "impact": "high"}]
+        }  # No current_date
+        assert filt.should_tighten_stops(context) is False
+
+    def test_econ_calendar_should_tighten_stops_with_date_object(self):
+        """
+        Test should_tighten_stops() works with date objects.
+        """
+        base = MockStrategy()
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        context = {
+            "current_date": date(2024, 1, 15),
+            "econ_events": [{"date": date(2024, 1, 16), "impact": "high"}]
+        }
+        assert filt.should_tighten_stops(context) is True
+
+    def test_econ_calendar_should_tighten_stops_guard_days_3(self):
+        """
+        Test should_tighten_stops() with guard_days=3.
+        """
+        base = MockStrategy()
+        filt = EconCalendarGuardStrategy(base, guard_days=3)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-18", "impact": "high"}]  # 3 days ahead
+        }
+        assert filt.should_tighten_stops(context) is True
+
+    def test_econ_calendar_should_tighten_stops_empty_events(self):
+        """
+        Test should_tighten_stops() with empty events list.
+        """
+        base = MockStrategy()
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": []
+        }
+        assert filt.should_tighten_stops(context) is False
+
+    def test_econ_calendar_signal_fields_unchanged(self):
+        """
+        Test that when passing through, all signal fields are unchanged.
+        """
+        base = MockStrategy(
+            direction=Direction.LONG,
+            size=0.7,
+            confidence=0.6,
+            expected_value=150.0
+        )
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16", "impact": "low"}]  # Not HIGH
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        base_sig = base.generate_signal(dist, 100.0, make_history(), context)
+
+        assert sig.size == pytest.approx(base_sig.size, rel=1e-6)
+        assert sig.entry == base_sig.entry
+        assert sig.stop == base_sig.stop
+        assert sig.target == base_sig.target
+        assert sig.expected_value == pytest.approx(base_sig.expected_value, rel=1e-6)
+        assert sig.confidence == pytest.approx(base_sig.confidence, rel=1e-6)
+        assert sig.direction == base_sig.direction
+
+    def test_econ_calendar_return_type_signal(self):
+        """
+        Test that signal is always a Signal dataclass (when not None), never a dict.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": []
+        }
+        sig = filt.generate_signal(dist, 100.0, make_history(), context)
+        assert sig is not None
+        assert isinstance(sig, Signal)
+        assert not isinstance(sig, dict)
+
+    def test_econ_calendar_return_type_none(self):
+        """
+        Test that function returns None (not empty dict) for vetoed cases.
+        """
+        base = MockStrategy(direction=Direction.LONG, size=0.5, confidence=0.8)
+        filt = EconCalendarGuardStrategy(base, guard_days=1)
+        dist = make_dist([110.0] * 100)
+        context = {
+            "current_date": "2024-01-15",
+            "econ_events": [{"date": "2024-01-16", "impact": "high"}]
         }
         sig = filt.generate_signal(dist, 100.0, make_history(), context)
         assert sig is None
