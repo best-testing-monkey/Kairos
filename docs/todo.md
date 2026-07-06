@@ -44,7 +44,7 @@
 
 ## Epic E6 — Technical Filters
 
-- [ ] E6-S01 Stochastic Filter (docs/tickets/E6-S01-stochastic-filter.md)
+- [x] E6-S01 Stochastic Filter (docs/tickets/E6-S01-stochastic-filter.md)
 - [ ] E6-S02 ADX Gate (docs/tickets/E6-S02-adx-gate.md)
 - [ ] E6-S03 OBV Confirmation (docs/tickets/E6-S03-obv-confirmation.md)
 - [ ] E6-S04 MTF Consensus (docs/tickets/E6-S04-mtf-consensus.md)

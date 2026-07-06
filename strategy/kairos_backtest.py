@@ -1056,6 +1056,173 @@ class MACDFilterStrategy(Strategy):
         )
 
 
+class StochasticFilterStrategy(Strategy):
+    """
+    Wraps a base strategy with a Stochastic Oscillator + ADX filter.
+
+    Veto LONG signals when %K > overbought UNLESS trend is strong (ADX > adx_trend).
+    Veto SHORT signals when %K < oversold UNLESS trend is strong (ADX > adx_trend).
+    Otherwise pass base signal through unchanged.
+
+    Uses:
+    - %K = 100 * (close - lowest_low) / (highest_high - lowest_low) over k_period bars
+    - %D = SMA(%K, d_period)
+    - ADX (Average Directional Index) over adx_period bars
+    """
+    name = "stochastic_filter"
+
+    def __init__(self, base_strategy: Strategy,
+                 k_period: int = 14, d_period: int = 3,
+                 overbought: float = 80.0, oversold: float = 20.0,
+                 adx_period: int = 14, adx_trend: float = 25.0):
+        self.base_strategy = base_strategy
+        self.k_period = k_period
+        self.d_period = d_period
+        self.overbought = overbought
+        self.oversold = oversold
+        self.adx_period = adx_period
+        self.adx_trend = adx_trend
+
+    def _compute_stochastic(self, history: pd.DataFrame) -> Tuple[float, float]:
+        """
+        Compute %K and %D from history.
+        Returns: (k_value, d_value)
+        """
+        if len(history) < self.k_period:
+            return 50.0, 50.0
+
+        # Get the last k_period bars
+        close = history["close"].values[-self.k_period:]
+        high = history["high"].values[-self.k_period:]
+        low = history["low"].values[-self.k_period:]
+
+        # Compute %K for the entire history window (need for %D)
+        all_close = history["close"].values
+        all_high = history["high"].values
+        all_low = history["low"].values
+
+        k_values = []
+        for i in range(len(all_close) - self.k_period + 1):
+            window_high = all_high[i:i + self.k_period].max()
+            window_low = all_low[i:i + self.k_period].min()
+            range_val = window_high - window_low
+            if range_val == 0:
+                k_values.append(50.0)
+            else:
+                k = 100.0 * (all_close[i + self.k_period - 1] - window_low) / range_val
+                k_values.append(k)
+
+        if len(k_values) == 0:
+            return 50.0, 50.0
+
+        # Current %K
+        k_current = k_values[-1]
+
+        # Compute %D as SMA of %K over d_period
+        if len(k_values) >= self.d_period:
+            d_current = np.mean(k_values[-self.d_period:])
+        else:
+            d_current = k_current
+
+        return k_current, d_current
+
+    def _compute_adx(self, history: pd.DataFrame) -> float:
+        """
+        Compute ADX (Average Directional Index) from history.
+        Returns: ADX value (0-100)
+        """
+        if len(history) < self.adx_period + 1:
+            return 50.0  # Default neutral
+
+        high = history["high"].values
+        low = history["low"].values
+        close = history["close"].values
+
+        # Compute True Range (TR)
+        tr_values = []
+        for i in range(1, len(close)):
+            h_l = high[i] - low[i]
+            h_c = abs(high[i] - close[i - 1])
+            l_c = abs(low[i] - close[i - 1])
+            tr = max(h_l, h_c, l_c)
+            tr_values.append(tr)
+
+        if len(tr_values) == 0:
+            return 50.0
+
+        # Compute Directional Movements
+        plus_dm_values = []
+        minus_dm_values = []
+        for i in range(1, len(high)):
+            plus_dm = high[i] - high[i - 1]
+            minus_dm = low[i - 1] - low[i]
+
+            # Only count if positive and greater than the opposite
+            if plus_dm > 0 and plus_dm > minus_dm:
+                plus_dm_values.append(plus_dm)
+            else:
+                plus_dm_values.append(0.0)
+
+            if minus_dm > 0 and minus_dm > plus_dm:
+                minus_dm_values.append(minus_dm)
+            else:
+                minus_dm_values.append(0.0)
+
+        # Compute DI values using EMA
+        if len(tr_values) >= self.adx_period:
+            # Simplified: use SMA instead of Wilder's smoothing for numerical stability
+            tr_sum = np.mean(tr_values[-self.adx_period:])
+            plus_dm_sum = np.mean(plus_dm_values[-self.adx_period:])
+            minus_dm_sum = np.mean(minus_dm_values[-self.adx_period:])
+
+            if tr_sum > 0:
+                plus_di = 100.0 * plus_dm_sum / tr_sum
+                minus_di = 100.0 * minus_dm_sum / tr_sum
+            else:
+                return 50.0
+
+            # Compute DX
+            di_sum = plus_di + minus_di
+            if di_sum > 0:
+                dx = 100.0 * abs(plus_di - minus_di) / di_sum
+            else:
+                dx = 0.0
+
+            # ADX is EMA of DX - for simplicity, use the current DX as approximation
+            # (full ADX would require tracking historical DX values)
+            adx = dx
+        else:
+            adx = 50.0
+
+        return adx
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal from base strategy, then apply stochastic + ADX filter.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Compute stochastic and ADX
+        k_val, d_val = self._compute_stochastic(history)
+        adx_val = self._compute_adx(history)
+
+        # Apply veto logic
+        if base_signal.direction == Direction.LONG:
+            # Veto LONG if %K > overbought UNLESS ADX > adx_trend
+            if k_val > self.overbought and adx_val <= self.adx_trend:
+                return None
+        elif base_signal.direction == Direction.SHORT:
+            # Veto SHORT if %K < oversold UNLESS ADX > adx_trend
+            if k_val < self.oversold and adx_val <= self.adx_trend:
+                return None
+
+        # Pass through base signal unchanged
+        return base_signal
+
+
 class BollingerValidationStrategy(Strategy):
     """
     Compare predicted range to Bollinger Band width.
