@@ -233,3 +233,157 @@ class ARIMADisagreementStrategy(Strategy):
             forecast += coef[lag] * closes[-lag]
 
         return forecast
+
+
+# =============================================================================
+# VAR LEAD-LAG STRATEGY
+# =============================================================================
+
+class VARLeadLagStrategy(Strategy):
+    """
+    Standalone VAR(1) lead-lag strategy detecting cross-asset influences.
+
+    Fits a VAR(1) model on the returns panel to detect when asset j's lagged
+    return significantly (|t|>2) predicts asset i's return. If yesterday's
+    j-move implies an i-move that agrees with Kronos direction, emits a signal.
+
+    Context requirements:
+        - context["returns_window"]: DataFrame of daily returns (columns=symbols, rows=dates)
+        - context["symbol"]: The target symbol being evaluated
+
+    Parameters
+    ----------
+    stop_pct : float, default 15.0
+        Stop-loss percentile (for longs; reversed for shorts).
+    target_pct : float, default 85.0
+        Take-profit percentile (for longs; reversed for shorts).
+    t_stat_threshold : float, default 2.0
+        Threshold for significance of t-statistic on lagged coefficients.
+    lookback : int, default 60
+        Minimum number of rows required in returns_window.
+    """
+    name = "var_leadlag"
+
+    def __init__(self, stop_pct: float = 15.0, target_pct: float = 85.0,
+                 t_stat_threshold: float = 2.0, lookback: int = 60):
+        self.stop_pct = int(stop_pct)
+        self.target_pct = int(target_pct)
+        self.t_stat_threshold = t_stat_threshold
+        self.lookback = lookback
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        """
+        Fit VAR(1) on returns panel and check for lead-lag relationships.
+
+        Returns Signal if a significant lead-lag from another asset agrees
+        with Kronos direction, else None.
+        """
+        # Validate context
+        if context is None or "returns_window" not in context or "symbol" not in context:
+            return None
+
+        returns_window = context.get("returns_window")
+        symbol = context.get("symbol")
+
+        # Validate returns_window
+        if returns_window is None or len(returns_window) < self.lookback:
+            return None
+
+        # Check that symbol is in the returns window
+        if symbol not in returns_window.columns:
+            return None
+
+        try:
+            # Extract the target return series
+            y = returns_window[symbol].values  # Shape (n,)
+
+            if len(y) < 2:
+                return None
+
+            n_obs, n_assets = returns_window.shape
+
+            # Build regression for VAR(1): r_i,t = c + Σ_j β_j*r_j,t-1 + e_t
+            # y_reg: returns for t=1..n-1
+            y_reg = y[1:]
+
+            # Design matrix: [intercept, lagged_returns_t-1]
+            X = np.ones((n_obs - 1, 1 + n_assets))
+            X[:, 1:] = returns_window.iloc[:-1, :].values  # Lagged returns at t-1
+
+            # Fit via OLS
+            fit_result = _lagged_ols(y_reg, X)
+
+            coef = fit_result["coef"]  # Shape (1 + n_assets,)
+            tstats = fit_result["tstats"]  # Shape (1 + n_assets,)
+
+        except Exception:
+            return None
+
+        # Check for significant lead-lag relationships
+        kronos_mean = dist.stats["close"]["mean"]
+        kronos_direction = np.sign(kronos_mean - current_price)
+
+        # If Kronos is neutral, no trade
+        if kronos_direction == 0:
+            return None
+
+        # Look for significant j (other assets) that imply agreement
+        # Index 0 is intercept, indices 1..n_assets are the lagged returns
+        agreement_found = False
+        max_abs_t = 0.0
+
+        for j in range(n_assets):
+            t_stat = tstats[1 + j]  # t-stat for the j-th lagged return coefficient
+
+            if abs(t_stat) > self.t_stat_threshold:
+                # Compute implied move: yesterday's j-return × coefficient
+                yesterday_return_j = returns_window.iloc[-2, j]
+                coef_j = coef[1 + j]
+                implied_move = coef_j * yesterday_return_j
+                implied_direction = np.sign(implied_move)
+
+                # Check if implied direction agrees with Kronos
+                if implied_direction == kronos_direction and implied_direction != 0:
+                    agreement_found = True
+                    max_abs_t = max(max_abs_t, abs(t_stat))
+
+        if not agreement_found:
+            return None
+
+        # Emit signal with agreement
+        if kronos_direction > 0:
+            # LONG
+            direction = Direction.LONG
+            stop = dist.stats["close"][f"pct_{self.stop_pct}"]
+            target = dist.stats["close"][f"pct_{self.target_pct}"]
+        else:
+            # SHORT
+            direction = Direction.SHORT
+            stop = dist.stats["close"][f"pct_{self.target_pct}"]
+            target = dist.stats["close"][f"pct_{self.stop_pct}"]
+
+        # Calculate expected value and position size
+        ev = dist.expected_value(current_price, target, stop)
+        if ev <= 0:
+            return None
+
+        kelly = dist.kelly_fraction(current_price, target, stop)
+        size = min(kelly * 0.5, 1.0)
+
+        # Confidence from t-stat (scale to [0, 1])
+        # Use sigmoid: confidence approaches 1 as |t| increases
+        confidence = max_abs_t / (max_abs_t + self.t_stat_threshold)
+        confidence = min(max(confidence, 0.0), 1.0)
+
+        return Signal(
+            direction=direction,
+            size=size,
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=confidence,
+            expected_value=ev,
+            metadata={"max_abs_t": float(max_abs_t)},
+        )
