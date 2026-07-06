@@ -1,12 +1,14 @@
 """
-ATR (Average True Range) volatility tools and wrapper strategies.
+ATR (Average True Range) and GARCH volatility tools and wrapper strategies.
 
 Wilder-smoothed ATR computation and ATRBracketStrategy wrapper for dynamic
-bracket adjustment based on volatility.
+bracket adjustment based on volatility. GARCH(1,1) filter wrapper for
+volatility regime detection and filtering.
 """
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 from kairos_backtest import Strategy, Signal, Direction
 
 
@@ -48,6 +50,121 @@ def atr(history: pd.DataFrame, n: int = 14) -> float:
         atr_val = (atr_val * (n - 1) + trs[i]) / n
 
     return float(atr_val)
+
+
+def fit_garch(returns: np.ndarray) -> dict:
+    """
+    Fit GARCH(1,1) model via maximum likelihood estimation (scipy L-BFGS-B).
+
+    Uses variance targeting: omega = longrun_variance * (1 - alpha - beta),
+    where longrun_variance is the sample variance of returns.
+
+    Args:
+        returns: 1-D array of log returns (assumed demeaned or near zero mean).
+
+    Returns:
+        Dictionary with keys:
+            - "omega": long-run variance coefficient
+            - "alpha": ARCH coefficient (news impact)
+            - "beta": GARCH coefficient (persistence)
+            - "converged": boolean, True if optimizer converged
+            - "sigma_forecast": next-day conditional volatility forecast
+    """
+    returns = np.asarray(returns, dtype=float)
+    if len(returns) < 10:
+        return {
+            "omega": 0.0,
+            "alpha": 0.0,
+            "beta": 0.0,
+            "converged": False,
+            "sigma_forecast": np.sqrt(np.var(returns)) if len(returns) > 0 else 1.0,
+        }
+
+    # Demean returns for better numerical stability
+    mu = np.mean(returns)
+    r_centered = returns - mu
+    longrun_var = np.var(r_centered)
+
+    # Avoid division by zero or log(0)
+    if longrun_var <= 0:
+        longrun_var = 1e-8
+
+    # Initial guess: alpha=0.1, beta=0.8 (standard for financial data)
+    alpha_init = 0.1
+    beta_init = 0.8
+    omega_init = longrun_var * (1 - alpha_init - beta_init)
+    if omega_init <= 1e-8:
+        omega_init = 1e-8
+
+    def garch_likelihood(params):
+        """Negative log-likelihood for GARCH(1,1)."""
+        alpha, beta = params
+        # Variance targeting: omega = longrun_var * (1 - alpha - beta)
+        omega = longrun_var * (1 - alpha - beta)
+
+        # Enforce constraints
+        if alpha < 1e-8 or beta < 1e-8 or alpha + beta >= 0.9999:
+            return 1e10
+
+        if omega <= 1e-8:
+            return 1e10
+
+        # Initialize sigma^2
+        sigma2 = np.full(len(r_centered), longrun_var)
+        nll = 0.0
+
+        for t in range(1, len(r_centered)):
+            # Update conditional variance: sigma_t^2 = omega + alpha * r_{t-1}^2 + beta * sigma_{t-1}^2
+            sigma2[t] = omega + alpha * (r_centered[t - 1] ** 2) + beta * sigma2[t - 1]
+
+            # Avoid log(negative) or log(0)
+            if sigma2[t] <= 1e-8:
+                sigma2[t] = 1e-8
+
+            # Negative log-likelihood contribution: 0.5 * (log(sigma2) + r^2/sigma2)
+            nll += 0.5 * (np.log(sigma2[t]) + (r_centered[t] ** 2) / sigma2[t])
+
+        return nll
+
+    # Optimize alpha and beta with L-BFGS-B
+    bounds = [(1e-8, 0.5), (1e-8, 0.95)]
+    result = minimize(
+        garch_likelihood,
+        [alpha_init, beta_init],
+        method="L-BFGS-B",
+        bounds=bounds,
+        options={"maxiter": 300},
+    )
+
+    if result.success:
+        alpha_opt, beta_opt = result.x
+        omega_opt = longrun_var * (1 - alpha_opt - beta_opt)
+        converged = True
+    else:
+        # Fallback to initial guess if optimization fails
+        alpha_opt = alpha_init
+        beta_opt = beta_init
+        omega_opt = omega_init
+        converged = False
+
+    # Compute next-day variance forecast
+    # sigma_T+1^2 = omega + alpha * r_T^2 + beta * sigma_T^2
+    # where sigma_T^2 is the last computed conditional variance
+    sigma2_last = longrun_var
+    for t in range(1, len(r_centered)):
+        sigma2_last = omega_opt + alpha_opt * (r_centered[t - 1] ** 2) + beta_opt * sigma2_last
+        if sigma2_last <= 1e-8:
+            sigma2_last = 1e-8
+
+    sigma_forecast = np.sqrt(sigma2_last)
+
+    return {
+        "omega": float(omega_opt),
+        "alpha": float(alpha_opt),
+        "beta": float(beta_opt),
+        "converged": bool(converged),
+        "sigma_forecast": float(sigma_forecast),
+    }
 
 
 class ATRBracketStrategy(Strategy):
@@ -131,3 +248,105 @@ class ATRBracketStrategy(Strategy):
             expected_value=base_signal.expected_value,
             metadata=base_signal.metadata,
         )
+
+
+class GARCHFilterStrategy(Strategy):
+    """
+    Wrapper strategy that filters signals based on GARCH(1,1) volatility regimes.
+
+    Fits GARCH(1,1) on trailing log returns, forecasts next-day volatility,
+    and blocks the wrapped strategy's signal when forecast volatility exceeds
+    a percentile threshold of the trailing fitted volatility series.
+
+    Args:
+        base_strategy: Strategy instance to wrap.
+        sigma_cap_pct: Percentile threshold for blocking (default 90.0).
+                       Block when forecast_sigma > this percentile of trailing sigmas.
+        lookback: Window size for GARCH fitting (default 250).
+        refit_days: Refit GARCH model every N bars (default 5 = weekly).
+    """
+
+    name = "garch_filter"
+
+    def __init__(self, base_strategy: Strategy, sigma_cap_pct: float = 90.0,
+                 lookback: int = 250, refit_days: int = 5):
+        self.base_strategy = base_strategy
+        self.sigma_cap_pct = sigma_cap_pct
+        self.lookback = lookback
+        self.refit_days = refit_days
+
+        # State tracking
+        self._bar_count = 0  # Track bars since last refit
+        self._sigma_history = []  # List of fitted conditional volatilities
+        self._last_fit = None  # Cached GARCH fit result
+        self._converged = True  # Track convergence status
+
+    def reset(self):
+        """Reset internal state for walk-forward validation."""
+        self._bar_count = 0
+        self._sigma_history = []
+        self._last_fit = None
+        self._converged = True
+
+    def generate_signal(self, dist, current_price, history, context, **kwargs):
+        """
+        Generate signal from base strategy and filter by GARCH volatility.
+
+        Returns:
+            Signal if base strategy generates one and volatility is below cap,
+            None otherwise (either base blocked or GARCH blocked).
+        """
+        # Call base strategy first
+        base_signal = self.base_strategy.generate_signal(
+            dist, current_price, history, context, **kwargs
+        )
+        if base_signal is None:
+            return None
+
+        # Compute log returns from history
+        closes = history["close"].values
+        if len(closes) < 2:
+            # Not enough data; pass through with warning
+            context["garch_warning"] = True
+            return base_signal
+
+        log_returns = np.diff(np.log(closes))
+
+        # Refit GARCH if needed
+        if self._bar_count % self.refit_days == 0:
+            # Use trailing lookback bars for fitting
+            fit_window = log_returns[-self.lookback:] if len(log_returns) >= self.lookback else log_returns
+            self._last_fit = fit_garch(fit_window)
+            self._converged = self._last_fit.get("converged", False)
+
+            # Track this fitted sigma in history
+            if self._converged:
+                self._sigma_history.append(self._last_fit["sigma_forecast"])
+
+        self._bar_count += 1
+
+        # If GARCH fit did not converge, pass through with warning
+        if not self._converged:
+            context["garch_warning"] = True
+            return base_signal
+
+        # Get forecast volatility and cap threshold
+        if self._last_fit is None:
+            # No fit available yet; pass through
+            context["garch_warning"] = True
+            return base_signal
+
+        forecast_sigma = self._last_fit["sigma_forecast"]
+
+        # Compute sigma_cap as percentile of trailing fitted sigmas
+        if len(self._sigma_history) < 2:
+            # Not enough history; pass through
+            return base_signal
+
+        sigma_cap = np.percentile(self._sigma_history, self.sigma_cap_pct)
+
+        # Block signal if forecast sigma exceeds cap
+        if forecast_sigma > sigma_cap:
+            return None
+
+        return base_signal

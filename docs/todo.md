@@ -23,7 +23,7 @@
 
 ## Epic E3 — Volatility
 
-- [ ] E3-S01 GARCH Filter (docs/tickets/E3-S01-garch-filter.md)
+- [x] E3-S01 GARCH Filter (docs/tickets/E3-S01-garch-filter.md)
 - [ ] E3-S02 Vol Target Sizer (docs/tickets/E3-S02-vol-target-sizer.md)
 - [ ] E3-S03 Variance Risk Premium (docs/tickets/E3-S03-variance-risk-premium.md)
 
