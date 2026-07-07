@@ -5,7 +5,7 @@ import pytest
 import numpy as np
 import pandas as pd
 from kairos_backtest import Direction, Signal, Strategy, KairosDistribution
-from kairos_execution import volume_profile, VolumeProfileLevelsStrategy, CVDDivergenceStrategy
+from kairos_execution import volume_profile, VolumeProfileLevelsStrategy, CVDDivergenceStrategy, TWAPExecutionStrategy
 
 
 # ============================================================================
@@ -501,3 +501,216 @@ class TestCVDDivergenceStrategy:
         assert not isinstance(signal, dict)
         assert signal.metadata["cvd_slope"] is not None
         assert signal.metadata["price_slope"] is not None
+
+
+# ============================================================================
+# TWAPExecutionStrategy tests
+# ============================================================================
+
+class TestTWAPExecutionStrategy:
+    """Test TWAP (Time-Weighted Average Price) execution wrapper."""
+
+    def _make_dist_with_path(self, close_path):
+        """
+        Create a KairosDistribution with a known predicted close path.
+
+        Args:
+            close_path: Array of close prices (the predicted path)
+
+        Returns:
+            KairosDistribution with df containing the path
+        """
+        # Create a single prediction DataFrame with the path as close prices
+        df = pd.DataFrame({"close": close_path})
+        dist = KairosDistribution([df])
+        return dist
+
+    def _make_signal(self, direction, entry, stop, target):
+        """Create a test Signal with known brackets."""
+        return Signal(
+            direction=direction, size=0.5, entry=entry, stop=stop, target=target,
+            strategy_name="test", confidence=0.8, expected_value=1.0, metadata={},
+        )
+
+    def test_twap_none_passthrough(self):
+        """None base signal → None."""
+        strat = TWAPExecutionStrategy(StubStrategy(None), n_slices=4)
+        dist = self._make_dist_with_path(np.array([100.0, 101.0, 102.0, 103.0]))
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+        assert signal is None
+
+    def test_twap_average_fill_effective_entry(self):
+        """Effective entry == mean of first n_slices path values."""
+        path = np.array([100.0, 102.0, 104.0, 106.0, 108.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert signal is not None
+        # First 4 values: [100, 102, 104, 106], mean = 103.0
+        expected_entry = np.mean([100.0, 102.0, 104.0, 106.0])
+        assert signal.entry == pytest.approx(expected_entry)
+        assert signal.entry == pytest.approx(103.0)
+
+    def test_twap_bracket_distance_preserved(self):
+        """Stop and target distances from entry are preserved."""
+        path = np.array([100.0, 102.0, 104.0, 106.0])
+        dist = self._make_dist_with_path(path)
+
+        # Original: entry=100, stop=95 (5 below), target=110 (10 above)
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        # Effective entry = mean([100, 102, 104, 106]) = 103
+        # Entry shift = 103 - 100 = 3
+        # New stop should be 95 + 3 = 98
+        # New target should be 110 + 3 = 113
+
+        assert signal.entry == pytest.approx(103.0)
+        assert signal.stop == pytest.approx(98.0)
+        assert signal.target == pytest.approx(113.0)
+
+        # Verify distances are preserved
+        original_stop_dist = 100.0 - 95.0
+        original_target_dist = 110.0 - 100.0
+        new_stop_dist = signal.entry - signal.stop
+        new_target_dist = signal.target - signal.entry
+
+        assert new_stop_dist == pytest.approx(original_stop_dist)
+        assert new_target_dist == pytest.approx(original_target_dist)
+
+    def test_twap_fills_in_metadata(self):
+        """metadata["fills"] contains n_slices float values equal to path slice."""
+        path = np.array([100.0, 101.0, 102.0, 103.0, 104.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert "fills" in signal.metadata
+        fills = signal.metadata["fills"]
+        assert isinstance(fills, list)
+        assert len(fills) == 4
+        assert fills == pytest.approx([100.0, 101.0, 102.0, 103.0])
+
+    def test_twap_flat_path_fallback(self):
+        """When path unavailable, entry unchanged and fills all == current_price."""
+        # Create a dist with no close column (will trigger fallback)
+        df = pd.DataFrame({"open": [100.0, 101.0]})  # no close
+        dist = KairosDistribution([df])
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+
+        current_price = 100.0
+        signal = strat.generate_signal(dist, current_price, make_profile_history(), {})
+
+        assert signal is not None
+        # Entry should be unchanged (all prices = current_price, so mean = current_price)
+        assert signal.entry == pytest.approx(100.0)
+        assert signal.stop == pytest.approx(95.0)
+        assert signal.target == pytest.approx(110.0)
+
+        # Fills should all be current_price
+        fills = signal.metadata["fills"]
+        assert len(fills) == 4
+        assert all(f == pytest.approx(current_price) for f in fills)
+
+    def test_twap_short_path_shorter_than_n_slices(self):
+        """Path shorter than n_slices uses only available values."""
+        path = np.array([100.0, 101.0])  # Only 2 values
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        # Should use only 2 values: mean([100, 101]) = 100.5
+        assert signal.entry == pytest.approx(100.5)
+        fills = signal.metadata["fills"]
+        assert len(fills) == 2
+        assert fills == pytest.approx([100.0, 101.0])
+
+    def test_twap_different_n_slices(self):
+        """n_slices parameter controls how many values to use."""
+        path = np.array([100.0, 101.0, 102.0, 103.0, 104.0, 105.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+
+        # Test with n_slices=2
+        strat2 = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=2)
+        signal2 = strat2.generate_signal(dist, 100.0, make_profile_history(), {})
+        assert signal2.entry == pytest.approx(100.5)  # mean([100, 101])
+        assert len(signal2.metadata["fills"]) == 2
+
+        # Test with n_slices=6
+        strat6 = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=6)
+        signal6 = strat6.generate_signal(dist, 100.0, make_profile_history(), {})
+        assert signal6.entry == pytest.approx(102.5)  # mean([100, 101, 102, 103, 104, 105])
+        assert len(signal6.metadata["fills"]) == 6
+
+    def test_twap_short_direction(self):
+        """SHORT signals work with bracket shifting."""
+        path = np.array([100.0, 99.0, 98.0, 97.0])
+        dist = self._make_dist_with_path(path)
+
+        # SHORT: entry=100, stop=105 (5 above), target=90 (10 below)
+        base_signal = self._make_signal(Direction.SHORT, entry=100.0, stop=105.0, target=90.0)
+        strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        # Effective entry = mean([100, 99, 98, 97]) = 98.5
+        # Entry shift = 98.5 - 100 = -1.5
+        # New stop = 105 - 1.5 = 103.5
+        # New target = 90 - 1.5 = 88.5
+
+        assert signal.entry == pytest.approx(98.5)
+        assert signal.stop == pytest.approx(103.5)
+        assert signal.target == pytest.approx(88.5)
+
+        # Verify distances (for SHORT)
+        original_stop_dist = 105.0 - 100.0
+        original_target_dist = 100.0 - 90.0
+        new_stop_dist = signal.stop - signal.entry
+        new_target_dist = signal.entry - signal.target
+
+        assert new_stop_dist == pytest.approx(original_stop_dist)
+        assert new_target_dist == pytest.approx(original_target_dist)
+
+    def test_twap_returns_signal_not_dict(self):
+        """Return value is always Signal, never dict."""
+        path = np.array([100.0, 101.0, 102.0, 103.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert isinstance(signal, Signal)
+        assert not isinstance(signal, dict)
+
+    def test_twap_preserves_base_metadata(self):
+        """Metadata from base signal is preserved."""
+        path = np.array([100.0, 101.0, 102.0, 103.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        base_signal.metadata["custom_key"] = "custom_value"
+
+        strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert "custom_key" in signal.metadata
+        assert signal.metadata["custom_key"] == "custom_value"
+        assert "fills" in signal.metadata

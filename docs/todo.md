@@ -53,7 +53,7 @@
 
 - [x] E7-S01 Volume Profile Levels (docs/tickets/E7-S01-volume-profile-levels.md)
 - [x] E7-S02 CVD Divergence (docs/tickets/E7-S02-cvd-divergence.md)
-- [ ] E7-S03 TWAP Execution (docs/tickets/E7-S03-twap-execution.md)
+- [x] E7-S03 TWAP Execution (docs/tickets/E7-S03-twap-execution.md)
 - [ ] E7-S04 Implementation Shortfall (docs/tickets/E7-S04-implementation-shortfall.md)
 - [ ] E7-S05 TCA Report (docs/tickets/E7-S05-tca-report.md)
 

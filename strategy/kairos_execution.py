@@ -1489,6 +1489,107 @@ class CVDDivergenceStrategy(Strategy):
         )
 
 
+class TWAPExecutionStrategy(Strategy):
+    """
+    Time-Weighted Average Price (TWAP) execution wrapper.
+
+    Splits entry across the first n_slices steps of the predicted path,
+    computing an effective entry as the mean of slice prices.
+    Recomputes stop/target by shifting them to preserve bracket distances
+    from the new effective entry.
+    Records per-slice prices in signal.metadata["fills"].
+
+    Usage:
+        base_strat = SomeDirectionalStrategy()
+        twap_strat = TWAPExecutionStrategy(base_strat, n_slices=4)
+        signal = twap_strat.generate_signal(dist, current_price, history, context)
+    """
+    name = "twap_execution"
+
+    def __init__(self, base_strategy: Strategy, n_slices: int = 4):
+        """
+        Args:
+            base_strategy: The underlying strategy to wrap
+            n_slices: Number of slices for TWAP execution (default 4)
+        """
+        self.base_strategy = base_strategy
+        self.n_slices = max(1, int(n_slices))
+
+    def _extract_predicted_path(self, dist: KairosDistribution, current_price: float) -> np.ndarray:
+        """
+        Extract the predicted intraday/next-period path from dist.
+
+        Tries to read individual close samples from dist.df, averaging across samples.
+        If unavailable (e.g., single-sample dist), falls back to flat path at current_price.
+
+        Args:
+            dist: KairosDistribution with predictions
+            current_price: Current market price (used as fallback)
+
+        Returns:
+            np.ndarray of predicted prices (length >= n_slices, or flat array of current_price)
+        """
+        try:
+            # Try to extract close prices from dist.df
+            if hasattr(dist, "df") and "close" in dist.df.columns:
+                close_prices = dist.df["close"].values.astype(float)
+                if len(close_prices) > 0:
+                    return close_prices
+        except Exception:
+            pass
+
+        # Fallback: flat path at current price
+        return np.full(self.n_slices, current_price, dtype=float)
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate a TWAP signal by wrapping the base strategy's signal.
+
+        Returns None if base signal is None. Otherwise, computes effective entry
+        as the mean of the first n_slices predicted path values, then recomputes
+        stop/target to preserve bracket distances.
+        """
+        # Pass through None from base strategy
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Extract predicted path
+        path = self._extract_predicted_path(dist, current_price)
+
+        # Take the first n_slices values from the path (or all if path is shorter)
+        n_slices_actual = min(self.n_slices, len(path))
+        slice_prices = path[:n_slices_actual]
+
+        # Compute effective entry as mean of slice prices
+        effective_entry = float(np.mean(slice_prices))
+
+        # Compute the shift amount
+        entry_shift = effective_entry - base_signal.entry
+
+        # Shift stop and target to preserve bracket distances
+        new_stop = base_signal.stop + entry_shift
+        new_target = base_signal.target + entry_shift
+
+        # Create a new signal with the adjusted entry and brackets
+        twap_signal = Signal(
+            direction=base_signal.direction,
+            size=base_signal.size,
+            entry=effective_entry,
+            stop=new_stop,
+            target=new_target,
+            strategy_name=self.name,
+            confidence=base_signal.confidence,
+            expected_value=base_signal.expected_value,
+            metadata=dict(base_signal.metadata)  # Copy metadata
+        )
+
+        # Record per-slice fills
+        twap_signal.metadata["fills"] = slice_prices.tolist()
+
+        return twap_signal
+
+
 # =============================================================================
 # EXAMPLE / TEST
 # =============================================================================
