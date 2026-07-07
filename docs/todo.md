@@ -19,7 +19,7 @@
 - [x] E2-S09 CVaR Allocator (docs/tickets/E2-S09-cvar-allocator.md)
 - [x] E2-S10 Kelly Allocator (docs/tickets/E2-S10-kelly-allocator.md)
 - [x] E2-S11 Rebalancer (docs/tickets/E2-S11-rebalancer.md)
-- [ ] E2-S12 Orchestrator Allocator Integration (docs/tickets/E2-S12-orchestrator-allocator-integration.md)
+- [x] E2-S12 Orchestrator Allocator Integration (docs/tickets/E2-S12-orchestrator-allocator-integration.md)
 
 ## Epic E3 — Volatility
 
