@@ -25,11 +25,13 @@ from kairos_portfolio import (
     _ledoit_wolf_intensity,
     _max_sharpe_solve,
     _bl_posterior,
+    _eigen_portfolios,
     MVOAllocator,
     RiskParityAllocator,
     HRPAllocator,
     MinVarAllocator,
     BlackLittermanAllocator,
+    EigenAllocator,
 )
 from kairos_backtest import Signal, Direction, KairosDistribution
 
@@ -2764,3 +2766,420 @@ class TestMaxSharpeSolverRegression:
         assert isinstance(weights, dict)
         assert len(weights) == len(symbols)
         assert all(w >= -1e-10 for w in weights.values())
+
+
+# =============================================================================
+# TEST EIGEN PORTFOLIO ALLOCATOR
+# =============================================================================
+
+class TestEigenPortfolios:
+    """Test the _eigen_portfolios helper function."""
+
+    def test_eigen_portfolios_orthogonal(self):
+        """
+        Acceptance: eigenvectors returned by _eigen_portfolios are mutually orthogonal.
+        Verify pairwise dot products are approximately zero.
+        """
+        # Create a simple correlation matrix
+        np.random.seed(42)
+        n = 5
+        # Generate a correlation matrix: start with random matrix, symmetrize, normalize
+        A = np.random.randn(n, n)
+        corr = A @ A.T  # Symmetric positive semi-definite
+        # Normalize to correlation matrix (diagonal = 1)
+        diag_std = np.sqrt(np.diag(corr))
+        corr = corr / np.outer(diag_std, diag_std)
+        np.fill_diagonal(corr, 1.0)
+
+        # Extract top-k eigenvectors (excluding PC1)
+        k = 3
+        V = _eigen_portfolios(corr, k)
+
+        # Check orthogonality: V'V should be approximately I (since eigh returns orthonormal)
+        gram = V.T @ V
+        expected_gram = np.eye(k)
+
+        # Pairwise dot products should be ≈ 0 (off-diagonal)
+        # and ≈ 1 on diagonal (normalization)
+        for i in range(k):
+            for j in range(k):
+                if i == j:
+                    assert abs(gram[i, j] - 1.0) < 1e-10, \
+                        f"Diagonal: gram[{i},{j}] = {gram[i,j]}, expected 1.0"
+                else:
+                    assert abs(gram[i, j]) < 1e-10, \
+                        f"Off-diagonal: gram[{i},{j}] = {gram[i,j]}, expected 0.0"
+
+    def test_eigen_portfolios_excludes_pc1(self):
+        """
+        Acceptance: _eigen_portfolios excludes the dominant eigenvector (PC1).
+        Verify the returned eigenvectors are not the dominant one.
+        """
+        # Create correlation matrix with clear dominant PC1
+        np.random.seed(123)
+        n = 4
+        # One strong common factor
+        factor = np.random.randn(100)
+        returns = np.tile(factor.reshape(-1, 1), (1, n)) + 0.1 * np.random.randn(100, n)
+        corr = np.corrcoef(returns.T)
+
+        # Get dominant eigenvector
+        eigvals, eigvecs = np.linalg.eigh(corr)
+        pc1 = eigvecs[:, -1]  # Largest eigenvector
+
+        # Get next-2 eigenvectors from our helper
+        k = 2
+        V = _eigen_portfolios(corr, k)
+
+        # Check that PC1 is not in V
+        # PC1 should be orthogonal to all columns of V (dot product ≈ 0)
+        for i in range(k):
+            dot_prod = np.abs(np.dot(pc1, V[:, i]))
+            assert dot_prod < 1e-10, \
+                f"PC1 is not orthogonal to V[:, {i}]: dot product = {dot_prod}"
+
+    def test_eigen_portfolios_k_validation(self):
+        """Verify _eigen_portfolios rejects invalid k values."""
+        corr = np.eye(3)
+
+        # k < 1 should raise
+        with pytest.raises(ValueError):
+            _eigen_portfolios(corr, k=0)
+
+        # k >= n should raise
+        with pytest.raises(ValueError):
+            _eigen_portfolios(corr, k=3)
+
+        # k = n-1 should work (3-1=2 eigenvectors after removing PC1)
+        V = _eigen_portfolios(corr, k=2)
+        assert V.shape == (3, 2)
+
+    def test_eigen_portfolios_shape(self):
+        """Verify _eigen_portfolios returns correct shape."""
+        n = 5
+        k = 2
+        corr = np.eye(n) + 0.1 * np.random.randn(n, n)
+        corr = (corr + corr.T) / 2  # Symmetrize
+        np.fill_diagonal(corr, 1.0)  # Ensure correlation
+
+        V = _eigen_portfolios(corr, k)
+
+        assert V.shape == (n, k), f"Expected shape ({n}, {k}), got {V.shape}"
+
+
+class TestEigenAllocator:
+    """Test the EigenAllocator class."""
+
+    def test_eigen_allocator_basic(self, synthetic_returns_200_obs_3_assets):
+        """
+        Basic test: EigenAllocator produces weights for 2+ assets.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        symbols = list(returns.columns)
+
+        signals = {
+            sym: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=102.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            )
+            for sym in symbols
+        }
+
+        allocator = EigenAllocator(n_components=2, lookback=120)
+        weights = allocator.allocate(signals, returns, {}, {})
+
+        assert isinstance(weights, dict)
+        assert len(weights) == len(symbols)
+        assert all(isinstance(v, float) for v in weights.values())
+
+    def test_eigen_allocator_weights_sum_to_1(self, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: weights sum to 1 in absolute value.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        symbols = list(returns.columns)
+
+        signals = {
+            sym: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=102.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            )
+            for sym in symbols
+        }
+
+        allocator = EigenAllocator(n_components=2, lookback=120)
+        weights = allocator.allocate(signals, returns, {}, {})
+
+        gross = sum(abs(w) for w in weights.values())
+        assert abs(gross - 1.0) < 1e-6, f"Weights sum to {gross}, expected 1.0"
+
+    def test_eigen_allocator_signs_follow_direction(self, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: weights sign matches signal direction (LONG=+, SHORT=-, FLAT=0).
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        symbols = list(returns.columns)
+
+        signals = {
+            symbols[0]: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=102.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            ),
+            symbols[1]: Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100.0,
+                stop=101.0,
+                target=98.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            ),
+            symbols[2]: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=102.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            ),
+        }
+
+        allocator = EigenAllocator(n_components=2, lookback=120)
+        weights = allocator.allocate(signals, returns, {}, {})
+
+        # Check signs
+        if abs(weights[symbols[0]]) > 1e-10:
+            assert weights[symbols[0]] > 0, "LONG signal should have positive weight"
+        if abs(weights[symbols[1]]) > 1e-10:
+            assert weights[symbols[1]] < 0, "SHORT signal should have negative weight"
+        if abs(weights[symbols[2]]) > 1e-10:
+            assert weights[symbols[2]] > 0, "LONG signal should have positive weight"
+
+    def test_eigen_allocator_below_min_obs_fallback(self, synthetic_returns_small, simple_signals):
+        """
+        Acceptance: below min_obs threshold, falls back to equal weight.
+        """
+        returns = synthetic_returns_small  # 5 observations < min_obs=60
+
+        allocator = EigenAllocator()
+        weights = allocator.allocate(simple_signals, returns, {}, {})
+
+        # Should be equal weight
+        assert weights == {"BTC": 0.5, "ETH": 0.5}
+
+    def test_eigen_allocator_single_asset_fallback(self, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: with only 1 asset, falls back to equal weight.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        symbol = returns.columns[0]
+
+        signals = {
+            symbol: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=102.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            )
+        }
+
+        allocator = EigenAllocator()
+        weights = allocator.allocate(signals, returns, {}, {})
+
+        # Should fall back to equal weight
+        assert weights == {symbol: 1.0}
+
+    def test_eigen_allocator_no_signals(self, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: with no signals, returns empty dict.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+
+        allocator = EigenAllocator()
+        weights = allocator.allocate({}, returns, {}, {})
+
+        assert weights == {}
+
+    def test_eigen_pc1_exclusion_reduces_correlation(self):
+        """
+        Acceptance: PC1 exclusion reduces average pairwise correlation of
+        resulting weight vector with equal-weight basket.
+
+        Generate seeded panel with one dominant market factor plus idiosyncratic
+        structure, verify that eigen-portfolio weights have lower correlation
+        with equal-weight vector than the market mode eigenvector does.
+        """
+        np.random.seed(42)
+        n_obs = 200
+        n_assets = 5
+
+        # Create data with dominant market factor + idiosyncratic noise
+        market_factor = np.random.randn(n_obs)
+        returns = np.zeros((n_obs, n_assets))
+
+        for i in range(n_assets):
+            # Each asset has strong market component + idiosyncratic component
+            market_weight = 0.8
+            idio_weight = 0.2
+            returns[:, i] = market_weight * market_factor + idio_weight * np.random.randn(n_obs)
+
+        returns_df = pd.DataFrame(
+            returns,
+            columns=[f"Asset{i}" for i in range(n_assets)],
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+
+        symbols = list(returns_df.columns)
+        signals = {
+            sym: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=102.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            )
+            for sym in symbols
+        }
+
+        # Compute equal-weight vector
+        equal_weight_vec = np.ones(n_assets) / n_assets
+
+        # Compute correlation matrix
+        corr = np.corrcoef(returns_df.T)
+
+        # Get PC1 (market mode)
+        eigvals, eigvecs = np.linalg.eigh(corr)
+        pc1 = eigvecs[:, -1]  # Largest eigenvector
+
+        # Compute eigen-allocator weights
+        allocator = EigenAllocator(n_components=3, lookback=120)
+        weights_dict = allocator.allocate(signals, returns_df, {}, {})
+
+        eigen_weights = np.array([weights_dict[sym] for sym in symbols])
+        # Normalize to unit norm for fair correlation comparison
+        eigen_weights_norm = eigen_weights / (np.linalg.norm(eigen_weights) + 1e-10)
+
+        # Normalize PC1 and equal-weight for fair comparison
+        pc1_norm = pc1 / (np.linalg.norm(pc1) + 1e-10)
+        equal_weight_norm = equal_weight_vec / (np.linalg.norm(equal_weight_vec) + 1e-10)
+
+        # Correlation of eigen-weights with equal-weight
+        corr_eigen_ew = np.abs(np.dot(eigen_weights_norm, equal_weight_norm))
+
+        # Correlation of PC1 with equal-weight
+        corr_pc1_ew = np.abs(np.dot(pc1_norm, equal_weight_norm))
+
+        # Eigen-portfolio should be more orthogonal to equal-weight than PC1 is
+        # (i.e., lower correlation)
+        assert corr_eigen_ew < corr_pc1_ew, \
+            f"Eigen correlation {corr_eigen_ew} should be < PC1 correlation {corr_pc1_ew}"
+
+    def test_eigen_allocator_short_window_fallback(self, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: with very short trailing window (<2 obs), falls back to equal weight.
+        """
+        # Create a returns dataframe with only 1 observation
+        returns = synthetic_returns_200_obs_3_assets.iloc[:1]
+
+        symbols = list(returns.columns)
+        signals = {
+            sym: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=102.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            )
+            for sym in symbols
+        }
+
+        allocator = EigenAllocator(lookback=120)
+        # This should trigger the fallback because correlation requires at least 2 obs
+        weights = allocator.allocate(signals, returns, {}, {})
+
+        # Should fall back to equal weight
+        assert weights == {sym: 1.0 / len(symbols) for sym in symbols}
+
+    def test_eigen_allocator_name(self):
+        """Test the allocator name attribute."""
+        allocator = EigenAllocator()
+        assert allocator.name == "eigen_allocator"
+
+    def test_eigen_allocator_init_params(self):
+        """Test initialization parameters."""
+        allocator = EigenAllocator(n_components=5, lookback=250)
+        assert allocator.n_components == 5
+        assert allocator.lookback == 250
+
+    def test_eigen_allocator_n_components_respected(self, synthetic_returns_200_obs_3_assets):
+        """
+        Verify that n_components parameter is respected.
+        With n_components=1 and 3 assets, should use only 1 eigenvector (after PC1).
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        symbols = list(returns.columns)
+
+        signals = {
+            sym: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=102.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=1.0,
+            )
+            for sym in symbols
+        }
+
+        # Create allocators with different n_components
+        allocator1 = EigenAllocator(n_components=1, lookback=120)
+        allocator2 = EigenAllocator(n_components=2, lookback=120)
+
+        weights1 = allocator1.allocate(signals, returns, {}, {})
+        weights2 = allocator2.allocate(signals, returns, {}, {})
+
+        # Both should produce valid weights
+        assert isinstance(weights1, dict)
+        assert isinstance(weights2, dict)
+        assert len(weights1) == len(symbols)
+        assert len(weights2) == len(symbols)
+
+        # Weights should be different (different number of components used)
+        weights_array1 = np.array([weights1[sym] for sym in symbols])
+        weights_array2 = np.array([weights2[sym] for sym in symbols])
+        # They should not be identical
+        assert not np.allclose(weights_array1, weights_array2), \
+            "Different n_components should produce different weights"

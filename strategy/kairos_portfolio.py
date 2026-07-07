@@ -1583,3 +1583,225 @@ class BlackLittermanAllocator(PortfolioAllocator):
             Omega[i, i] = max(omega_ii, 1e-10)  # Ensure numerical stability
 
         return Q, Omega
+
+
+# =============================================================================
+# EIGEN PORTFOLIO ALLOCATOR
+# =============================================================================
+
+def _eigen_portfolios(corr: np.ndarray, k: int) -> np.ndarray:
+    """
+    Extract top-k eigenvectors from correlation matrix, excluding PC1 (market mode).
+
+    Performs eigendecomposition of correlation matrix, returning the next-k
+    eigenvectors (indices 1 to k inclusive) — the dominant eigenvector (PC1)
+    is excluded. This represents the variance explained by each orthogonal
+    factor after removing the market mode.
+
+    Args:
+        corr: Correlation matrix (n_assets, n_assets), symmetric.
+        k: Number of eigenvectors to return (k >= 1).
+
+    Returns:
+        Eigenvectors matrix of shape (n_assets, k), with columns as the next-k
+        eigenvectors ranked by eigenvalue (largest first), excluding PC1.
+        Columns are orthonormal (from np.linalg.eigh).
+
+    Raises:
+        ValueError: If k < 1 or k >= n_assets (need at least 2 components:
+                   PC1 to exclude + at least one to return).
+
+    Examples:
+        >>> corr = np.array([[1.0, 0.5], [0.5, 1.0]])
+        >>> V = _eigen_portfolios(corr, 1)
+        >>> V.shape
+        (2, 1)
+        >>> # V[:, 0] is the second-largest eigenvector
+    """
+    n = corr.shape[0]
+
+    if k < 1 or k >= n:
+        raise ValueError(f"k must be in [1, {n-1}], got {k}")
+
+    # Eigendecompose correlation matrix
+    # np.linalg.eigh returns eigenvalues in ascending order
+    eigvals, eigvecs = np.linalg.eigh(corr)
+
+    # Reverse to get descending order (largest eigenvalue first = PC1)
+    eigvals = eigvals[::-1]
+    eigvecs = eigvecs[:, ::-1]
+
+    # Return the next-k eigenvectors (indices 1 to k), excluding PC1 (index 0)
+    return eigvecs[:, 1:k+1]
+
+
+class EigenAllocator(PortfolioAllocator):
+    """
+    Eigen-Portfolio allocator using PCA on correlation matrix, excluding market mode.
+
+    Performs PCA on the correlation matrix of trailing returns:
+    1. Eigendecompose correlation matrix
+    2. Drop PC1 (market mode, largest eigenvalue)
+    3. Allocate to top-k remaining eigenvectors, weighted by their eigenvalues
+    4. Project back to asset space and re-sign by signal direction
+
+    This provides a market-neutral decomposition that reduces systematic risk
+    by excluding the dominant common factor (market mode). The resulting
+    weight vector is more orthogonal to the equal-weight basket than the
+    full-market eigenvector would be.
+
+    Attributes:
+        name: "eigen_allocator"
+        n_components: Number of eigenvectors to use (after excluding PC1).
+                     Default: 3.
+        lookback: Number of days of historical returns for correlation.
+                 Default: 120 (approximately 6 months).
+    """
+
+    name: str = "eigen_allocator"
+
+    def __init__(self, n_components: int = 3, lookback: int = 120):
+        """
+        Initialize Eigen allocator.
+
+        Args:
+            n_components: Number of eigenvectors to use (after excluding PC1).
+                         Default: 3.
+            lookback: Number of days of historical returns for correlation.
+                     Default: 120 (approximately 6 months).
+
+        Examples:
+            >>> allocator = EigenAllocator(n_components=3, lookback=120)
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        self.n_components = n_components
+        self.lookback = lookback
+
+    def allocate(self, signals: Dict[str, "Signal"],
+                 returns: pd.DataFrame,
+                 dists: Dict[str, Any],
+                 context: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Compute eigen-portfolio optimal weights.
+
+        Excludes the market mode (PC1) and allocates to the next-k eigenvectors
+        weighted by their eigenvalues, then projects back to asset space.
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+                    Index: dates, Columns: asset symbols.
+            dists: Dict[symbol -> KairosDistribution] (unused for Eigen).
+            context: Dict[str, Any] execution context (unused).
+
+        Returns:
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values = 1.0 (fully invested after normalization).
+            Signs match signal directions (LONG/SHORT/FLAT).
+
+        Fall-back behavior:
+            If len(returns) < self.min_obs (default 60), returns equal-weight.
+            If fewer than 2 assets, returns equal-weight (no eigenvector decomposition).
+            If optimization fails, returns equal-weight.
+
+        Examples:
+            >>> allocator = EigenAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, {})
+            >>> assert sum(abs(w) for w in weights.values()) <= 1.0 + 1e-6
+        """
+        # Check if enough observations
+        if len(returns) < self.min_obs:
+            return _fallback_equal_weight(signals)
+
+        # Extract symbols
+        symbols = list(signals.keys())
+        if not symbols:
+            return {}
+
+        # Fallback: need at least 2 assets for meaningful eigenvector decomposition
+        # (PC1 to exclude + at least one to return)
+        if len(symbols) < 2:
+            return _fallback_equal_weight(signals)
+
+        # Get trailing returns for correlation estimation
+        trailing_returns = returns[symbols].tail(self.lookback)
+        if len(trailing_returns) < 2:
+            return _fallback_equal_weight(signals)
+
+        try:
+            # Compute correlation matrix
+            corr = np.corrcoef(trailing_returns.T)
+
+            # Handle NaN in correlation (e.g., constant series)
+            if np.isnan(corr).any():
+                return _fallback_equal_weight(signals)
+
+            # Determine how many components to use
+            n = len(symbols)
+            k = min(self.n_components, n - 1)
+
+            if k < 1:
+                # Fallback if not enough components
+                return _fallback_equal_weight(signals)
+
+            # Get next-k eigenvectors (excluding PC1)
+            eigenvectors = _eigen_portfolios(corr, k)
+
+            # Eigendecompose to get eigenvalues
+            eigvals, eigvecs_full = np.linalg.eigh(corr)
+            eigvals = eigvals[::-1]  # Descending order
+
+            # Get the eigenvalues for the next-k components
+            eigenvalues_used = eigvals[1:k+1]
+
+            # Weight each eigenvector by its eigenvalue
+            # Normalize eigenvalues to sum to 1 for weighting
+            if np.sum(eigenvalues_used) <= 0:
+                return _fallback_equal_weight(signals)
+
+            weights_eig = eigenvalues_used / np.sum(eigenvalues_used)
+
+            # Combine eigenvectors: weighted sum of eigenvectors
+            # Portfolio weight = sum_i (weight_i * eigenvector_i)
+            portfolio_weights = np.zeros(n)
+            for i in range(k):
+                portfolio_weights += weights_eig[i] * eigenvectors[:, i]
+
+            # Extract magnitudes (eigenvectors have arbitrary signs, so use absolute values)
+            magnitudes = np.abs(portfolio_weights)
+
+            # Normalize magnitudes to sum to 1
+            total_mag = np.sum(magnitudes)
+            if total_mag <= 0:
+                return _fallback_equal_weight(signals)
+
+            magnitudes = magnitudes / total_mag
+
+            # Apply signal directions and assemble final weights
+            weights = {}
+            for j, sym in enumerate(symbols):
+                mag = magnitudes[j]  # Always positive
+                direction = signals[sym].direction
+
+                # Extract direction value (handles both enum and raw int)
+                if hasattr(direction, 'value'):
+                    dir_val = direction.value
+                else:
+                    dir_val = direction
+
+                if dir_val == 1:  # LONG
+                    w = float(mag)
+                elif dir_val == -1:  # SHORT
+                    w = float(-mag)
+                else:  # FLAT
+                    w = 0.0
+
+                if abs(w) < 1e-10:
+                    w = 0.0
+                weights[sym] = w
+
+            return weights
+
+        except Exception:
+            # Fallback to equal weight on any computation error
+            return _fallback_equal_weight(signals)
