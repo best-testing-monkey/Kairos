@@ -2760,6 +2760,318 @@ class CVaRAllocator(PortfolioAllocator):
         return weights
 
 
+# =============================================================================
+# KELLY ALLOCATOR
+# =============================================================================
+
+def _kelly_weights(mu: np.ndarray, cov: np.ndarray, fraction: float = 0.25) -> np.ndarray:
+    """
+    Compute multi-asset Kelly criterion weights.
+
+    Solves: w = fraction * Σ⁻¹ mu
+    where:
+      mu = vector of expected returns (per asset)
+      Σ = covariance matrix (shrunk, positive definite)
+      fraction = fractional-Kelly parameter (0 < fraction <= 1)
+
+    This is the continuous-time Kelly formula, which maximizes long-run wealth
+    growth rate subject to available returns and covariance.
+
+    Args:
+        mu: Expected returns array (n_assets,).
+        cov: Shrunk covariance matrix (n_assets, n_assets), positive definite.
+        fraction: Fractional Kelly parameter (default 0.25).
+                 Smaller values reduce Kelly sizing for robustness.
+
+    Returns:
+        Signed weights (n_assets,) from the Kelly formula.
+
+    Raises:
+        np.linalg.LinAlgError: If Σ is singular or inversion fails.
+
+    Notes:
+        The raw Kelly weights may be negative (short bets) or exceed 1.0
+        (leveraged longs). Clipping to caps is applied by the allocator.
+    """
+    n = len(mu)
+
+    # Solve Σ w_raw = mu, then scale by fraction
+    # w_raw = Σ^-1 mu
+    # w = fraction * w_raw
+    try:
+        # Use solve instead of inv for numerical stability
+        w_raw = np.linalg.solve(cov, mu)
+    except np.linalg.LinAlgError:
+        raise
+
+    w = fraction * w_raw
+    return w
+
+
+class KellyAllocator(PortfolioAllocator):
+    """
+    Multi-asset Kelly criterion allocator with fractional Kelly and shrinkage.
+
+    Implements the continuous-time Kelly formula: w = f * Σ⁻¹ mu
+    where:
+      f = fractional Kelly parameter (default 0.25)
+      Σ = shrunk covariance of trailing returns
+      mu = expected returns from Kronos distributions
+
+    Expected returns are extracted as:
+      mu_i = dists[symbol].stats["close"]["mean"] / signals[symbol].entry - 1
+
+    The allocator respects:
+      - max_weight: |w_i| <= max_weight (default 0.35)
+      - gross_cap: sum(|w_i|) <= gross_cap (default 1.0)
+      - Sign constraints: w_i sign matches signal direction (zero if disagreement)
+
+    Falls back to equal-weight allocation when:
+      - Fewer than min_obs observations (default 60)
+      - Covariance matrix is singular (LinAlgError)
+      - Missing or invalid expected returns
+
+    Attributes:
+        name: "kelly_allocator"
+        fraction: Fractional Kelly parameter (0 < f <= 1). Default: 0.25.
+        lookback: Number of days for covariance estimation. Default: 120.
+        gross_cap: Gross leverage cap (sum of |w_i|). Default: 1.0.
+        max_weight: Maximum absolute weight per asset. Default: 0.35.
+    """
+
+    name: str = "kelly_allocator"
+
+    def __init__(
+        self,
+        fraction: float = 0.25,
+        lookback: int = 120,
+        gross_cap: float = 1.0,
+        max_weight: float = 0.35,
+    ):
+        """
+        Initialize Kelly allocator.
+
+        Args:
+            fraction: Fractional Kelly parameter (0 < f <= 1).
+                     Default: 0.25 (conservative 1/4 Kelly).
+            lookback: Number of days of historical returns for covariance.
+                     Default: 120 (approximately 6 months).
+            gross_cap: Gross leverage cap (sum of |w_i|).
+                      Default: 1.0.
+            max_weight: Maximum absolute weight for any single asset.
+                       Default: 0.35.
+
+        Examples:
+            >>> allocator = KellyAllocator(fraction=0.25, lookback=120)
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        if not (0.0 < fraction <= 1.0):
+            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+        self.fraction = fraction
+        self.lookback = lookback
+        self.gross_cap = gross_cap
+        self.max_weight = max_weight
+
+    def allocate(
+        self,
+        signals: Dict[str, "Signal"],
+        returns: pd.DataFrame,
+        dists: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Compute Kelly-optimal weights.
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+                    Index: dates, Columns: asset symbols.
+            dists: Dict[symbol -> KairosDistribution] predicted distributions per asset.
+            context: Dict[str, Any] execution context (unused).
+
+        Returns:
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values <= gross_cap.
+            Individual absolute values <= max_weight.
+            Signs match signal directions (or zero if disagreement).
+
+        Fall-back behavior:
+            If len(returns) < self.min_obs (default 60), returns equal-weight allocation.
+            If covariance is singular (LinAlgError), returns equal-weight allocation.
+            If expected returns are missing/invalid, returns equal-weight allocation.
+
+        Examples:
+            >>> allocator = KellyAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, {})
+            >>> assert sum(abs(w) for w in weights.values()) <= 1.0
+        """
+        # Check if enough observations
+        if len(returns) < self.min_obs:
+            return _fallback_equal_weight(signals)
+
+        # Extract symbols
+        symbols = list(signals.keys())
+        if not symbols:
+            return {}
+
+        # Get trailing returns for covariance estimation
+        trailing_returns = returns[symbols].tail(self.lookback)
+        if len(trailing_returns) < 2:
+            return _fallback_equal_weight(signals)
+
+        # Compute shrunk covariance
+        try:
+            cov = shrunk_covariance(trailing_returns)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Compute expected returns from Kronos distributions
+        try:
+            mu = self._compute_expected_returns(symbols, signals, dists)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Solve Kelly
+        try:
+            weights_dict = self._solve_kelly(symbols, mu, cov, signals)
+            return weights_dict
+        except Exception:
+            # Fallback to equal weight on solver failure
+            return _fallback_equal_weight(signals)
+
+    def _compute_expected_returns(
+        self,
+        symbols: List[str],
+        signals: Dict[str, "Signal"],
+        dists: Dict[str, Any],
+    ) -> np.ndarray:
+        """
+        Extract expected returns from Kronos distributions.
+
+        For each symbol:
+          mu_i = dists[symbol].stats["close"]["mean"] / signals[symbol].entry - 1
+
+        If the distribution is missing or stats unavailable, default to 0.0.
+
+        Args:
+            symbols: List of asset symbols (in order matching covariance).
+            signals: Dict[symbol -> Signal] for entry prices.
+            dists: Dict[symbol -> KairosDistribution] for predicted distributions.
+
+        Returns:
+            Expected returns array (n_assets,), with 0.0 for missing data.
+
+        Raises:
+            No exceptions raised; defaults to 0.0 for any missing/invalid data.
+        """
+        mu = []
+        for sym in symbols:
+            signal = signals[sym]
+            dist = dists.get(sym)
+
+            # Default to 0.0 if distribution missing
+            if dist is None:
+                mu.append(0.0)
+                continue
+
+            try:
+                # Try to extract mean and entry price
+                mean_close = dist.stats.get("close", {}).get("mean")
+                entry = signal.entry
+
+                if mean_close is None or entry is None or entry <= 0:
+                    mu.append(0.0)
+                    continue
+
+                # Expected return: (mean_close / entry) - 1
+                exp_ret = float(mean_close / entry - 1.0)
+                mu.append(exp_ret)
+            except Exception:
+                # Defensive: any exception -> 0.0
+                mu.append(0.0)
+
+        return np.array(mu)
+
+    def _solve_kelly(
+        self,
+        symbols: List[str],
+        mu: np.ndarray,
+        cov: np.ndarray,
+        signals: Dict[str, "Signal"],
+    ) -> Dict[str, float]:
+        """
+        Solve the Kelly problem and apply caps/direction constraints.
+
+        Steps:
+        1. Compute raw Kelly weights: w_raw = fraction * Σ^-1 * mu
+        2. Clip to max_weight: |w_i| <= max_weight
+        3. Scale uniformly if sum(|w_i|) > gross_cap
+        4. Zero out weights where sign disagrees with signal direction
+
+        The last step implements the Kelly principle: if Kelly computes a
+        position opposite the signal direction, we don't take the trade
+        (set weight to 0).
+
+        Args:
+            symbols: List of asset symbols (in order matching mu and cov).
+            mu: Expected returns array (n_assets,).
+            cov: Shrunk covariance matrix (n_assets, n_assets).
+            signals: Dict[symbol -> Signal] for direction and metadata.
+
+        Returns:
+            Dict[symbol -> float] of optimal weights, clipped and signed.
+
+        Raises:
+            ValueError: If Kelly solution fails to solve.
+        """
+        try:
+            w_raw = _kelly_weights(mu, cov, fraction=self.fraction)
+        except np.linalg.LinAlgError:
+            raise ValueError("Covariance matrix is singular; cannot solve Kelly")
+
+        # Clip to max_weight
+        w_clipped = np.clip(w_raw, -self.max_weight, self.max_weight)
+
+        # Scale uniformly if sum(|w|) > gross_cap
+        gross_weight = np.sum(np.abs(w_clipped))
+        if gross_weight > self.gross_cap:
+            w_clipped = w_clipped * (self.gross_cap / gross_weight)
+
+        # Apply signal directions and zero out disagreements
+        weights = {}
+        for i, sym in enumerate(symbols):
+            w = w_clipped[i]
+            signal = signals[sym]
+
+            # Extract signal direction
+            direction = signal.direction
+            try:
+                dir_val = direction.value if hasattr(direction, 'value') else direction
+            except:
+                dir_val = direction
+
+            # Check sign agreement
+            if dir_val == 1:  # LONG
+                # w should be >= 0; if negative, zero it out
+                if w < 0:
+                    w = 0.0
+            elif dir_val == -1:  # SHORT
+                # w should be <= 0; if positive, zero it out
+                if w > 0:
+                    w = 0.0
+            else:  # FLAT or other
+                # No position
+                w = 0.0
+
+            # Zero out numerical noise
+            if abs(w) < 1e-10:
+                w = 0.0
+
+            weights[sym] = float(w)
+
+        return weights
+
+
 def _compute_cvar(returns: np.ndarray, alpha: float = 0.95) -> float:
     """
     Compute CVaR_alpha for a portfolio over a set of scenarios.

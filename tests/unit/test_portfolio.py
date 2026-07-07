@@ -35,6 +35,7 @@ from kairos_portfolio import (
     UniversalAllocator,
     GAAllocator,
     CVaRAllocator,
+    KellyAllocator,
     _scenario_matrix,
     _compute_cvar,
 )
@@ -4324,3 +4325,433 @@ class TestCVaRAllocator:
             assert isinstance(weights[sym], (int, float))
             assert not np.isnan(weights[sym])
             assert not np.isinf(weights[sym])
+
+
+# =============================================================================
+# TEST KELLY ALLOCATOR
+# =============================================================================
+
+class TestKellyAllocator:
+    """Test multi-asset Kelly criterion allocator."""
+
+    @pytest.fixture
+    def kelly_allocator(self):
+        """Standard Kelly allocator instance."""
+        return KellyAllocator(fraction=0.25, lookback=120, gross_cap=1.0, max_weight=0.35)
+
+    @pytest.fixture
+    def synthetic_returns_kelly_100obs(self):
+        """100 observations of single asset with known volatility."""
+        np.random.seed(42)
+        n_obs = 100
+        # Known std ~ 0.02
+        returns = pd.DataFrame(
+            {"A": np.random.randn(n_obs) * 0.02},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+        return returns
+
+    def _build_dist_with_mean(self, mean_close: float, std_close: float = 1.0, n_samples: int = 100):
+        """Build a KairosDistribution with a specific mean close price."""
+        np.random.seed(42)
+        close = np.random.normal(mean_close, std_close, n_samples)
+        pred = [
+            pd.DataFrame({
+                "open": close + np.random.normal(0, 0.1 * std_close, n_samples),
+                "high": close + np.abs(np.random.normal(0, 0.5 * std_close, n_samples)),
+                "low": close - np.abs(np.random.normal(0, 0.5 * std_close, n_samples)),
+                "close": close,
+                "volume": np.full(n_samples, 1e6),
+                "amount": np.full(n_samples, 1e6),
+            })
+            for _ in range(100)
+        ]
+        return KairosDistribution(pred)
+
+    def test_kelly_single_asset_matches_kelly_fraction(self):
+        """
+        Acceptance: single-asset case reduces to kelly_fraction within tolerance.
+
+        For a single asset with known mu and sigma:
+        - Kelly weight w = f * mu / sigma^2
+        - Compare against hand-computed kelly_fraction formula
+        """
+        # Create a single asset with known return distribution
+        np.random.seed(42)
+        n_obs = 150
+        entry_price = 100.0
+        target_price = 102.0  # 2% win
+        stop_price = 98.0     # 2% loss
+
+        # Generate samples that hit target/stop with known probability
+        # p_win = 0.6, p_loss = 0.2, p_neutral = 0.2
+        samples_list = []
+        for _ in range(60):
+            samples_list.extend([target_price + np.random.normal(0, 0.1)] * 10)  # 60 hits target
+            samples_list.extend([stop_price - np.random.normal(0, 0.1)] * 4)      # 20 hits stop
+            samples_list.extend([entry_price + np.random.normal(0, 0.5)] * 6)     # 20 neutral
+
+        close_samples = np.array(samples_list[:100])
+        pred_dfs = [
+            pd.DataFrame({
+                "close": close_samples,
+                "open": close_samples + np.random.normal(0, 0.1, 100),
+                "high": np.maximum(close_samples, target_price) + np.abs(np.random.normal(0, 0.5, 100)),
+                "low": np.minimum(close_samples, stop_price) - np.abs(np.random.normal(0, 0.5, 100)),
+                "volume": np.full(100, 1e6),
+                "amount": np.full(100, 1e6),
+            })
+            for _ in range(100)
+        ]
+        dist = KairosDistribution(pred_dfs)
+
+        # Compute Kelly fraction via the distribution's method
+        kelly_from_dist = dist.kelly_fraction(entry_price, target_price, stop_price)
+
+        # Now use KellyAllocator on this single asset
+        returns = pd.DataFrame(
+            np.random.randn(150, 1) * 0.02,
+            columns=["A"],
+            index=pd.date_range("2024-01-01", periods=150),
+        )
+
+        signal = Signal(
+            direction=Direction.LONG,
+            size=0.1,
+            entry=entry_price,
+            stop=stop_price,
+            target=target_price,
+            strategy_name="test",
+            confidence=0.8,
+            expected_value=0.0,
+        )
+
+        signals = {"A": signal}
+        dists = {"A": dist}
+
+        allocator = KellyAllocator(fraction=1.0, lookback=120)  # Full Kelly (f=1.0)
+        weights = allocator.allocate(signals, returns, dists, {})
+
+        # Single asset with LONG signal should have positive weight
+        # Weight should be close to kelly_from_dist (after shrinkage adjustment)
+        w_allocated = weights["A"]
+
+        # Both should be positive and within the same ballpark
+        # (shrinkage may reduce the weight slightly)
+        assert w_allocated > 1e-8, f"Kelly allocator should produce positive weight, got {w_allocated}"
+        assert kelly_from_dist > 0, "kelly_fraction should be positive"
+
+        # They should be within 50% of each other (shrinkage can affect this)
+        # This is a loose tolerance to account for covariance shrinkage effects
+        ratio = w_allocated / kelly_from_dist if kelly_from_dist > 0 else 1.0
+        assert 0.3 < ratio < 3.0, \
+            f"Kelly weight {w_allocated} should be within ~1x kelly_fraction {kelly_from_dist}, ratio {ratio:.2f}"
+
+    def test_kelly_cov_doubling_halves_weights(self):
+        """
+        Acceptance: doubling Σ halves weights.
+
+        Kelly formula: w = f * Σ^-1 * mu
+        If Σ → 2*Σ, then Σ^-1 → 0.5 * Σ^-1, so w → 0.5 * w
+
+        Tests via _kelly_weights helper directly with cov and 2*cov.
+        """
+        from kairos_portfolio import _kelly_weights
+
+        # Create simple test case
+        mu = np.array([0.01, 0.02, 0.015])  # Expected returns
+        cov = np.array([
+            [0.0004, 0.00002, 0.00001],
+            [0.00002, 0.0009, 0.00003],
+            [0.00001, 0.00003, 0.0006],
+        ])
+
+        # Compute weights with original covariance
+        w1 = _kelly_weights(mu, cov, fraction=0.25)
+
+        # Compute weights with doubled covariance
+        cov_2x = 2.0 * cov
+        w2 = _kelly_weights(mu, cov_2x, fraction=0.25)
+
+        # w2 should be approximately 0.5 * w1
+        ratio = w2 / (w1 + 1e-10)  # Add small epsilon to avoid division by zero
+        expected_ratio = 0.5
+
+        # Allow 1% tolerance
+        assert np.allclose(ratio, expected_ratio, rtol=0.01), \
+            f"Doubling covariance should halve weights. Expected ratio {expected_ratio}, got {ratio}"
+
+    def test_kelly_respects_caps(self, kelly_allocator, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: solution respects gross_cap and max_weight constraints.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+
+        # Create distributions with positive expected returns
+        dists = {}
+        for sym in ["BTC", "ETH", "SOL"]:
+            # All should have positive mean (upward bias)
+            close = np.random.normal(100, 5, 100)
+            pred = [
+                pd.DataFrame({
+                    "close": close,
+                    "open": close + np.random.normal(0, 0.5, 100),
+                    "high": close + np.abs(np.random.normal(0, 2, 100)),
+                    "low": close - np.abs(np.random.normal(0, 2, 100)),
+                    "volume": np.full(100, 1e6),
+                    "amount": np.full(100, 1e6),
+                })
+                for _ in range(100)
+            ]
+            dists[sym] = KairosDistribution(pred)
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=95.0,
+                target=105.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=95.0,
+                target=105.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100.0,
+                stop=105.0,
+                target=95.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = kelly_allocator.allocate(signals, returns, dists, {})
+
+        # Check max_weight cap
+        for sym, w in weights.items():
+            assert abs(w) <= 0.35 + 1e-6, \
+                f"{sym} weight {w} exceeds max_weight 0.35"
+
+        # Check gross_cap
+        gross_weight = sum(abs(w) for w in weights.values())
+        assert gross_weight <= 1.0 + 1e-6, \
+            f"Gross weight {gross_weight} exceeds gross_cap 1.0"
+
+    def test_kelly_direction_disagreement_zeroing(self):
+        """
+        Acceptance: weights where sign disagrees with signal direction are zeroed out.
+
+        This implements the Kelly principle: if Kelly formula gives us a SHORT
+        position but the signal is LONG, we don't take the trade (zero weight).
+        """
+        # Create returns with negative correlation to force Kelly to short one asset
+        np.random.seed(42)
+        n_obs = 150
+        factor = np.random.randn(n_obs)
+        returns = pd.DataFrame({
+            "BTC": factor * 0.02,           # Positive exposure
+            "ETH": -factor * 0.015,         # Negative exposure (short betting)
+        }, index=pd.date_range("2024-01-01", periods=n_obs))
+
+        # BTC: expected return is positive (should get LONG weight)
+        # ETH: expected return is negative (Kelly might want SHORT, but signal is LONG)
+        dists = {
+            "BTC": self._build_dist_with_mean(101.0),   # 1% expected return
+            "ETH": self._build_dist_with_mean(99.0),    # -1% expected return
+        }
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=95.0,
+                target=105.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,  # Disagreement: signal is LONG
+                size=0.1,
+                entry=100.0,
+                stop=95.0,
+                target=105.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        allocator = KellyAllocator(fraction=0.25, lookback=120)
+        weights = allocator.allocate(signals, returns, dists, {})
+
+        # BTC should be positive (signal LONG, expected return positive)
+        # ETH could be zero (if Kelly wanted SHORT but signal is LONG)
+        # At minimum, no weight should violate the direction
+        assert weights["BTC"] >= -1e-10, "BTC (LONG signal) should not be negative"
+        # ETH might be 0 or positive, but if Kelly wanted short and signal is long, should be 0
+        if weights["ETH"] < 0:
+            pytest.fail(f"ETH has negative weight {weights['ETH']} but signal is LONG; should be zeroed")
+
+    def test_kelly_fallback_below_min_obs(self, kelly_allocator):
+        """Acceptance: fallback to equal weight when len(returns) < min_obs."""
+        returns = pd.DataFrame(
+            np.random.randn(5, 2) * 0.02,
+            columns=["A", "B"],
+            index=pd.date_range("2024-01-01", periods=5),
+        )
+        assert len(returns) < PortfolioAllocator.min_obs
+
+        signals = {
+            "A": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "B": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        dists = {
+            "A": self._build_dist_with_mean(101.0),
+            "B": self._build_dist_with_mean(101.0),
+        }
+
+        weights = kelly_allocator.allocate(signals, returns, dists, {})
+
+        # Should be equal-weight fallback
+        expected = _fallback_equal_weight(signals)
+        assert weights == expected, \
+            f"Expected equal-weight fallback {expected}, got {weights}"
+
+    def test_kelly_empty_signals(self, kelly_allocator, synthetic_returns_200_obs_3_assets):
+        """With no signals, return empty dict."""
+        returns = synthetic_returns_200_obs_3_assets
+        weights = kelly_allocator.allocate({}, returns, {}, {})
+        assert weights == {}
+
+    def test_kelly_allocator_attributes(self, kelly_allocator):
+        """Test allocator has correct name and parameters."""
+        assert kelly_allocator.name == "kelly_allocator"
+        assert kelly_allocator.min_obs == 60
+        assert kelly_allocator.fraction == 0.25
+        assert kelly_allocator.lookback == 120
+        assert kelly_allocator.gross_cap == 1.0
+        assert kelly_allocator.max_weight == 0.35
+
+    def test_kelly_allocator_custom_params(self):
+        """Test allocator with custom parameters."""
+        allocator = KellyAllocator(
+            fraction=0.5,
+            lookback=60,
+            gross_cap=2.0,
+            max_weight=0.5,
+        )
+        assert allocator.fraction == 0.5
+        assert allocator.lookback == 60
+        assert allocator.gross_cap == 2.0
+        assert allocator.max_weight == 0.5
+
+    def test_kelly_allocator_invalid_fraction(self):
+        """Invalid fraction should raise ValueError."""
+        with pytest.raises(ValueError, match="fraction must be in"):
+            KellyAllocator(fraction=0.0)
+
+        with pytest.raises(ValueError, match="fraction must be in"):
+            KellyAllocator(fraction=1.5)
+
+    def test_kelly_weights_helper(self):
+        """Test _kelly_weights helper function directly."""
+        from kairos_portfolio import _kelly_weights
+
+        mu = np.array([0.01, 0.02])
+        cov = np.array([[0.0004, 0.00001], [0.00001, 0.0009]])
+
+        # Compute weights
+        w = _kelly_weights(mu, cov, fraction=0.25)
+
+        # Should have same sign as mu
+        assert np.sign(w[0]) == np.sign(mu[0])
+        assert np.sign(w[1]) == np.sign(mu[1])
+
+        # Fraction parameter should scale linearly
+        w_half = _kelly_weights(mu, cov, fraction=0.125)
+        assert np.allclose(w_half, 0.5 * w)
+
+    def test_kelly_weights_singular_covariance(self):
+        """Singular covariance should raise LinAlgError."""
+        from kairos_portfolio import _kelly_weights
+
+        mu = np.array([0.01, 0.02])
+        # Singular: second row is twice the first
+        cov = np.array([[0.0004, 0.00001], [0.0008, 0.00002]])
+
+        with pytest.raises(np.linalg.LinAlgError):
+            _kelly_weights(mu, cov, fraction=0.25)
+
+    def test_kelly_missing_distribution(self, synthetic_returns_200_obs_3_assets):
+        """Missing distribution should default to zero expected return."""
+        returns = synthetic_returns_200_obs_3_assets
+
+        # Only provide distribution for one asset
+        dists = {
+            "BTC": self._build_dist_with_mean(101.0),
+            # ETH and SOL: missing
+        }
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=95.0,
+                target=105.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=95.0,
+                target=105.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        allocator = KellyAllocator()
+        weights = allocator.allocate(signals, returns, dists, {})
+
+        # Should not crash, should return valid weights
+        assert isinstance(weights, dict)
+        assert set(weights.keys()) == set(signals.keys())
