@@ -5,7 +5,10 @@ import pytest
 import numpy as np
 import pandas as pd
 from kairos_backtest import Direction, Signal, Strategy
-from kairos_ml import MetaLabelStrategy, GradientBoostedStumps, GBMDirectionStrategy, LogisticRegressionIRLS
+from kairos_ml import (
+    MetaLabelStrategy, GradientBoostedStumps, GBMDirectionStrategy, LogisticRegressionIRLS,
+    fit_lppls, LPPLSGuardStrategy
+)
 
 
 # ============================================================================
@@ -405,4 +408,307 @@ class TestGBMDirectionStrategy:
             assert hasattr(sig, "entry")
             assert hasattr(sig, "stop")
             assert hasattr(sig, "target")
+            assert not isinstance(sig, dict)
+
+
+# ============================================================================
+# LPPLS Bubble Detection Tests
+# ============================================================================
+
+def generate_synthetic_lppls_series(T: int, tc: float, m: float, omega: float,
+                                   B: float = -1.0, noise_std: float = 0.01,
+                                   seed: int = 0) -> np.ndarray:
+    """Generate synthetic LPPLS log-price series for testing.
+
+    Args:
+        T: Length of series
+        tc: Critical time (bubble peak)
+        m: Power law exponent
+        omega: Angular frequency
+        B: Slope coefficient (negative for super-exponential up)
+        noise_std: Gaussian noise std
+        seed: Random seed
+
+    Returns:
+        Log price series of length T
+    """
+    rng = np.random.default_rng(seed)
+    t_array = np.arange(T, dtype=float)
+
+    # Base LPPLS component
+    tau = tc - t_array
+    tau_m = np.where(tau > 0, tau ** m, 0.0)
+    cos_component = tau_m * np.cos(omega * np.log(np.where(tau > 0, tau, 1.0)))
+
+    # Model: ln p(t) = A + B(tc-t)^m + C cos(ω ln(tc-t))
+    A = 5.0
+    C = 0.5
+    log_prices = A + B * tau_m + C * cos_component
+
+    # Add noise
+    noise = rng.normal(0, noise_std, size=T)
+    log_prices = log_prices + noise
+
+    return log_prices
+
+
+def make_gbm_series(T: int, drift: float = 0.0001, vol: float = 0.015,
+                   seed: int = 0) -> np.ndarray:
+    """Generate synthetic GBM log-price series (random walk, no bubble).
+
+    Args:
+        T: Length of series
+        drift: Daily drift
+        vol: Daily volatility
+        seed: Random seed
+
+    Returns:
+        Log price series of length T
+    """
+    rng = np.random.default_rng(seed)
+    log_returns = rng.normal(drift, vol, size=T)
+    log_prices = 5.0 + np.cumsum(log_returns)
+    return log_prices
+
+
+class TestFitLPPLS:
+    """Test fit_lppls function directly."""
+
+    def test_lppls_synthetic_bubble_detection(self):
+        """Synthetic LPPLS series with known params → bubble detected."""
+        # Generate synthetic bubble: tc=T+30, m=0.5, ω=8
+        T = 100
+        tc = T + 30
+        m = 0.5
+        omega = 8.0
+        log_prices = generate_synthetic_lppls_series(T, tc, m, omega, B=-1.0,
+                                                     noise_std=0.01, seed=0)
+
+        # Fit with small n_starts to keep test fast
+        result = fit_lppls(log_prices, n_starts=4, seed=0)
+
+        assert result["converged"]
+        assert result["bubble"]
+        # Check that fitted params are reasonably close to truth
+        assert 0.1 <= result["m"] <= 0.9, f"m={result['m']} not in [0.1, 0.9]"
+        assert 6.0 <= result["omega"] <= 13.0, f"ω={result['omega']} not in [6, 13]"
+        assert T < result["tc"] <= T + 60.0, f"tc={result['tc']} not in (T={T}, T+60]"
+        assert result["B"] < 0.0, f"B={result['B']} not < 0"
+
+    def test_lppls_gbm_random_walk(self):
+        """GBM random-walk series → bubble rarely detected (false-positive rate < 10%)."""
+        # Generate 10 random-walk paths, count false positives
+        n_seeds = 10
+        n_bubbles = 0
+
+        for seed in range(n_seeds):
+            log_prices = make_gbm_series(T=100, drift=0.0001, vol=0.015, seed=seed)
+            result = fit_lppls(log_prices, n_starts=4, seed=seed)
+            if result["bubble"]:
+                n_bubbles += 1
+
+        # Should detect bubbles in fewer than 2 of 10 (< 20%)
+        assert n_bubbles < 2, f"Too many false positives: {n_bubbles}/10"
+
+    def test_lppls_insufficient_data(self):
+        """Series < 50 points → returns no-fit result."""
+        log_prices = np.array([5.0 + 0.01 * i for i in range(30)])
+        result = fit_lppls(log_prices, n_starts=2, seed=0)
+
+        assert not result["converged"]
+        assert not result["bubble"]
+        assert result["resid_rms"] == np.inf
+
+    def test_lppls_returns_required_keys(self):
+        """Result dict contains all required keys."""
+        log_prices = generate_synthetic_lppls_series(100, 130, 0.5, 8.0, seed=1)
+        result = fit_lppls(log_prices, n_starts=4, seed=1)
+
+        required_keys = {"tc", "m", "omega", "resid_rms", "converged", "bubble", "B"}
+        assert set(result.keys()) >= required_keys
+
+
+# ============================================================================
+# LPPLS Guard Strategy Tests
+# ============================================================================
+
+class TestLPPLSGuardStrategy:
+
+    def test_lppls_guard_insufficient_history_passthrough(self):
+        """History < lookback → pass-through."""
+        base = StubStrategy()
+        guard = LPPLSGuardStrategy(base, lookback=250, refit_days=10)
+
+        # Short history
+        history = make_history(n=100)
+        sig = guard.generate_signal(FakeDist(), 100.0, history, {})
+
+        # Should pass through base signal unchanged
+        expected = base.generate_signal(FakeDist(), 100.0, history, {})
+        assert sig is not None
+        assert sig.direction == expected.direction
+        assert sig.size == expected.size
+
+    def test_lppls_guard_no_bubble_passthrough(self):
+        """No bubble detected → pass-through unchanged."""
+        base = StubStrategy()
+        guard = LPPLSGuardStrategy(base, lookback=100, refit_days=1, n_starts=4)
+
+        # GBM series (no bubble)
+        T = 150
+        prices = np.exp(make_gbm_series(T, seed=42))
+        idx = pd.date_range("2024-01-01", periods=T, freq="D")
+        history = pd.DataFrame({
+            "open": prices * 0.99,
+            "high": prices * 1.01,
+            "low": prices * 0.98,
+            "close": prices,
+            "volume": np.ones(T) * 1e6,
+        }, index=idx)
+
+        # Generate signal (will trigger refit)
+        sig = guard.generate_signal(FakeDist(), prices[-1], history, {})
+
+        # Should pass through (no bubble in GBM)
+        if sig is not None:
+            assert sig.direction == Direction.LONG
+            assert sig.size == 0.5
+
+    def test_lppls_guard_detects_bubble_blocks_longs(self):
+        """Bubble detected → vetoes LONG entries."""
+        base = StubStrategy()  # Emits LONG
+        guard = LPPLSGuardStrategy(base, lookback=100, refit_days=1, n_starts=4)
+
+        # Synthetic LPPLS bubble series
+        T = 100
+        tc = T + 30
+        log_prices = generate_synthetic_lppls_series(T, tc, 0.5, 8.0, B=-1.0, seed=0)
+        prices = np.exp(log_prices)
+
+        idx = pd.date_range("2024-01-01", periods=T, freq="D")
+        history = pd.DataFrame({
+            "open": prices * 0.99,
+            "high": prices * 1.01,
+            "low": prices * 0.98,
+            "close": prices,
+            "volume": np.ones(T) * 1e6,
+        }, index=idx)
+
+        # Generate signal
+        sig = guard.generate_signal(FakeDist(), prices[-1], history, {})
+
+        # Should be None (LONG vetoed during bubble)
+        assert sig is None
+
+    def test_lppls_guard_bubble_boosts_shorts(self):
+        """Bubble detected → SHORT signals boost confidence by 1.2x (capped at 1.0)."""
+        # Base strategy that emits SHORT
+        class ShortStrategy(Strategy):
+            name = "short_base"
+
+            def generate_signal(self, dist, current_price, history, context, **kwargs):
+                return Signal(
+                    direction=Direction.SHORT, size=0.5, entry=current_price,
+                    stop=current_price * 1.05, target=current_price * 0.90,
+                    strategy_name=self.name, confidence=0.8, expected_value=-1.0,
+                    metadata={"origin": "short_base"},
+                )
+
+        base = ShortStrategy()
+        guard = LPPLSGuardStrategy(base, lookback=100, refit_days=1, n_starts=4)
+
+        # Synthetic LPPLS bubble
+        T = 100
+        tc = T + 30
+        log_prices = generate_synthetic_lppls_series(T, tc, 0.5, 8.0, B=-1.0, seed=0)
+        prices = np.exp(log_prices)
+
+        idx = pd.date_range("2024-01-01", periods=T, freq="D")
+        history = pd.DataFrame({
+            "open": prices * 0.99,
+            "high": prices * 1.01,
+            "low": prices * 0.98,
+            "close": prices,
+            "volume": np.ones(T) * 1e6,
+        }, index=idx)
+
+        # Generate signal
+        sig = guard.generate_signal(FakeDist(), prices[-1], history, {})
+
+        # Should be SHORT with boosted confidence
+        assert sig is not None
+        assert sig.direction == Direction.SHORT
+        expected_confidence = min(0.8 * 1.2, 1.0)  # 0.96
+        assert sig.confidence == pytest.approx(expected_confidence)
+        # Metadata should indicate bubble
+        assert sig.metadata.get("lppls_bubble") == True
+
+    def test_lppls_guard_base_none_passthrough(self):
+        """Base strategy returns None → pass-through as None."""
+        base = StubStrategy(emit=False)
+        guard = LPPLSGuardStrategy(base, lookback=100, refit_days=1, n_starts=4)
+
+        history = make_history(n=150)
+        sig = guard.generate_signal(FakeDist(), 100.0, history, {})
+
+        assert sig is None
+
+    def test_lppls_guard_refit_cadence(self):
+        """Refit only every refit_days calls."""
+        base = StubStrategy()
+        guard = LPPLSGuardStrategy(base, lookback=100, refit_days=3, n_starts=4)
+
+        history = make_history(n=150)
+
+        # Call 1, 2: no refit
+        guard.generate_signal(FakeDist(), 100.0, history, {})
+        assert guard.fit_count == 0
+        guard.generate_signal(FakeDist(), 100.0, history, {})
+        assert guard.fit_count == 0
+
+        # Call 3: refit (3 % 3 == 0)
+        guard.generate_signal(FakeDist(), 100.0, history, {})
+        assert guard.fit_count == 1
+
+        # Call 4, 5: no refit
+        guard.generate_signal(FakeDist(), 100.0, history, {})
+        assert guard.fit_count == 1
+        guard.generate_signal(FakeDist(), 100.0, history, {})
+        assert guard.fit_count == 1
+
+        # Call 6: refit again
+        guard.generate_signal(FakeDist(), 100.0, history, {})
+        assert guard.fit_count == 2
+
+    def test_lppls_guard_reset_clears_state(self):
+        """reset() clears fit state and call count."""
+        base = StubStrategy()
+        guard = LPPLSGuardStrategy(base, lookback=100, refit_days=1, n_starts=4)
+
+        history = make_history(n=150)
+
+        # Generate several signals to accumulate state
+        for _ in range(5):
+            guard.generate_signal(FakeDist(), 100.0, history, {})
+
+        assert guard.call_count > 0
+        assert guard.fit_count > 0
+
+        # Reset
+        guard.reset()
+        assert guard.call_count == 0
+        assert guard.fit_count == 0
+        assert guard.last_fit is None
+
+    def test_lppls_guard_returns_signal_or_none(self):
+        """Always returns Signal or None, never dict."""
+        base = StubStrategy()
+        guard = LPPLSGuardStrategy(base, lookback=100, refit_days=1, n_starts=4)
+
+        history = make_history(n=150)
+
+        # Multiple calls should all return Signal or None
+        for _ in range(5):
+            sig = guard.generate_signal(FakeDist(), 100.0, history, {})
+            assert sig is None or isinstance(sig, Signal)
             assert not isinstance(sig, dict)

@@ -19,6 +19,13 @@ Module 2: GBM Direction Classifier
 - Labels: next-day direction from historical closes.
 - Trades when P(direction) > p_min AND Kronos agrees.
 - Retrain weekly on trailing lookback rows (never per-bar).
+
+Module 3: LPPLS Bubble Detection
+- Fits log-periodic power law singularity (Sornette) model via multi-start
+  Nelder-Mead nonlinear optimization on 3 params (tc, m, ω), with linear
+  params profiled out via least squares.
+- Detects bubbles: 0.1<m<0.9, 6<ω<13, tc within (T, T+60], B<0 (super-exponential).
+- LPPLSGuardStrategy wrapper: vetoes LONG entries during bubbles, boosts SHORT.
 """
 
 import numpy as np
@@ -26,6 +33,7 @@ import pandas as pd
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
+from scipy.optimize import minimize
 
 from kairos_backtest import Strategy, Signal, Direction
 
@@ -856,3 +864,306 @@ class GBMDirectionStrategy(Strategy):
         log_ret = np.diff(np.log(close[-period:]))
         volatility = float(np.std(log_ret))
         return max(volatility, 0.001)  # Ensure minimum value
+
+
+# =============================================================================
+# LPPLS Bubble Detection (Sornette)
+# =============================================================================
+
+def fit_lppls(log_prices: np.ndarray, n_starts: int = 8, seed: int = 0) -> Dict[str, Any]:
+    """Fit log-periodic power law singularity (LPPLS) model via multi-start Nelder-Mead.
+
+    Model: ln p(t) = A + B(tc-t)^m + C1(tc-t)^m cos(ω ln(tc-t)) + C2(tc-t)^m sin(ω ln(tc-t))
+
+    Nonlinear 3-parameter reduction: optimize (tc, m, ω) via Nelder-Mead, profile out
+    (A, B, C1, C2) via linear least squares at each step.
+
+    Args:
+        log_prices: Log prices (at least 50 points), indexed t=0,1,...,T-1
+        n_starts: Number of random starting points for Nelder-Mead
+        seed: Random seed for reproducible starts
+
+    Returns:
+        Dictionary with keys:
+        - "tc": critical time (optimal tc)
+        - "m": power law exponent
+        - "omega": angular frequency
+        - "resid_rms": RMS residual of fit
+        - "converged": bool, True if optimization succeeded
+        - "bubble": bool, True iff bubble signature (m ∈ [0.1, 0.9], ω ∈ [6, 13],
+                    tc ∈ (T, T+60], B < 0, converged)
+        - "B": slope coefficient (negative for super-exponential up)
+    """
+    T = len(log_prices)
+    if T < 50:
+        return {
+            "tc": float(T), "m": 0.5, "omega": 8.0,
+            "resid_rms": np.inf, "converged": False, "bubble": False, "B": 0.0
+        }
+
+    t_array = np.arange(T, dtype=float)
+    y = log_prices
+
+    rng = np.random.default_rng(seed)
+
+    # Multi-start Nelder-Mead
+    best_loss = np.inf
+    best_params = None
+
+    for start_idx in range(n_starts):
+        # Random starting point: tc in (T, T+60), m in [0.1, 0.9], ω in [6, 13]
+        tc_start = float(T + rng.uniform(1, 60))
+        m_start = float(rng.uniform(0.1, 0.9))
+        omega_start = float(rng.uniform(6, 13))
+
+        x0 = np.array([tc_start, m_start, omega_start])
+
+        try:
+            result = minimize(
+                _lppls_objective,
+                x0,
+                args=(t_array, y),
+                method="Nelder-Mead",
+                options={"maxiter": 200, "xatol": 1e-6, "fatol": 1e-9}
+            )
+
+            if result.fun < best_loss:
+                best_loss = result.fun
+                best_params = result.x
+        except (ValueError, RuntimeError):
+            continue
+
+    if best_params is None:
+        return {
+            "tc": float(T), "m": 0.5, "omega": 8.0,
+            "resid_rms": np.inf, "converged": False, "bubble": False, "B": 0.0
+        }
+
+    # Unpack best params and fit linear coefficients
+    tc, m, omega = best_params
+    tc = float(tc)
+    m = float(m)
+    omega = float(omega)
+
+    # Fit linear coefficients A, B, C1, C2 via least squares
+    X = _build_lppls_design_matrix(t_array, tc, m, omega)
+    try:
+        coeffs = np.linalg.lstsq(X, y, rcond=None)[0]
+        A, B, C1, C2 = coeffs
+    except (np.linalg.LinAlgError, ValueError):
+        A, B, C1, C2 = 0.0, 0.0, 0.0, 0.0
+
+    # Compute residuals
+    y_pred = X @ coeffs
+    residuals = y - y_pred
+    resid_rms = float(np.sqrt(np.mean(residuals ** 2)))
+
+    # Check bubble signature
+    converged = best_loss < np.inf
+    bubble = (
+        converged
+        and 0.1 <= m <= 0.9
+        and 6.0 <= omega <= 13.0
+        and T < tc <= T + 60.0
+        and B < 0.0
+    )
+
+    return {
+        "tc": tc,
+        "m": m,
+        "omega": omega,
+        "resid_rms": resid_rms,
+        "converged": converged,
+        "bubble": bubble,
+        "B": float(B),
+    }
+
+
+def _lppls_objective(params: np.ndarray, t_array: np.ndarray,
+                     y: np.ndarray) -> float:
+    """Objective function for LPPLS: squared error with profiled linear coefficients.
+
+    Args:
+        params: [tc, m, omega]
+        t_array: Time indices
+        y: Log prices
+
+    Returns:
+        Squared error after profiling out A, B, C1, C2
+    """
+    tc, m, omega = params
+
+    # Guard against invalid params
+    if tc <= np.max(t_array) or m <= 0 or omega <= 0:
+        return 1e10
+
+    try:
+        X = _build_lppls_design_matrix(t_array, tc, m, omega)
+        coeffs = np.linalg.lstsq(X, y, rcond=None)[0]
+        y_pred = X @ coeffs
+        sse = float(np.sum((y - y_pred) ** 2))
+        return sse
+    except (ValueError, np.linalg.LinAlgError):
+        return 1e10
+
+
+def _build_lppls_design_matrix(t_array: np.ndarray, tc: float, m: float,
+                               omega: float) -> np.ndarray:
+    """Build design matrix X for LPPLS model with given (tc, m, omega).
+
+    Columns: [1, (tc-t)^m, (tc-t)^m cos(ω ln(tc-t)), (tc-t)^m sin(ω ln(tc-t))]
+
+    Args:
+        t_array: Time array
+        tc: Critical time
+        m: Power law exponent
+        omega: Angular frequency
+
+    Returns:
+        Design matrix of shape (len(t_array), 4)
+    """
+    tau = tc - t_array  # tc - t for each t
+
+    # Guard against negative tau
+    if np.any(tau <= 0):
+        raise ValueError("tc must be > all time indices")
+
+    tau_m = tau ** m
+    cos_term = tau_m * np.cos(omega * np.log(tau))
+    sin_term = tau_m * np.sin(omega * np.log(tau))
+
+    X = np.column_stack([
+        np.ones_like(t_array),  # A
+        tau_m,                  # B * (tc-t)^m
+        cos_term,               # C1 * (tc-t)^m cos(ω ln(tc-t))
+        sin_term                # C2 * (tc-t)^m sin(ω ln(tc-t))
+    ])
+
+    return X
+
+
+# =============================================================================
+# LPPLS Guard Strategy
+# =============================================================================
+
+class LPPLSGuardStrategy(Strategy):
+    """LPPLS bubble detection wrapper around any base strategy.
+
+    Fits the log-periodic power law singularity model on trailing log-prices.
+    When bubble signature detected:
+    - Vetoes new LONG entries (returns None)
+    - Passes SHORT signals through, boosting confidence by 1.2x (capped at 1.0)
+
+    When no bubble: pass-through unchanged.
+    When history < lookback: pass-through unchanged.
+
+    Parameters:
+        base_strategy: Strategy to wrap
+        lookback: Window for LPPLS fit (default 250)
+        refit_days: Refit every N calls (default 10)
+        n_starts: Number of Nelder-Mead starts (default 8, reduce to 4 in tests)
+        seed: Random seed for reproducibility
+    """
+
+    name = "lppls_guard"
+
+    def __init__(self, base_strategy: Strategy, lookback: int = 250,
+                 refit_days: int = 10, n_starts: int = 8, seed: int = 0):
+        self.base_strategy = base_strategy
+        self.lookback = lookback
+        self.refit_days = refit_days
+        self.n_starts = n_starts
+        self.seed = seed
+
+        # State tracking
+        self.call_count = 0
+        self.fit_count = 0
+        self.last_fit = None  # Dict from fit_lppls
+
+    def reset(self) -> None:
+        """Reset state for walk-forward folds."""
+        self.call_count = 0
+        self.fit_count = 0
+        self.last_fit = None
+
+    def generate_signal(self, dist, current_price: float, history: pd.DataFrame,
+                        context: Dict[str, Any], **kwargs) -> Optional[Signal]:
+        """Generate signal via base strategy, filtered by LPPLS bubble detection.
+
+        Args:
+            dist: KairosDistribution
+            current_price: Current price
+            history: Historical OHLCV data
+            context: Context dict
+
+        Returns:
+            Signal (potentially modified) or None
+        """
+        self.call_count += 1
+
+        # Get base signal (may be None)
+        base_sig = self.base_strategy.generate_signal(dist, current_price,
+                                                      history, context, **kwargs)
+
+        # Refit every refit_days calls
+        if self.call_count % self.refit_days == 0:
+            self._refit_lppls(history)
+
+        # Insufficient history -> pass-through
+        if len(history) < self.lookback:
+            return base_sig
+
+        # No fit -> pass-through
+        if self.last_fit is None:
+            return base_sig
+
+        bubble_detected = self.last_fit.get("bubble", False)
+
+        # No bubble -> pass-through
+        if not bubble_detected:
+            return base_sig
+
+        # Bubble detected -> apply guard logic
+        if base_sig is None:
+            return None
+
+        # Veto LONG entries during bubble
+        if base_sig.direction == Direction.LONG:
+            return None
+
+        # SHORT signals: boost confidence by 1.2x, capped at 1.0
+        if base_sig.direction == Direction.SHORT:
+            boosted_confidence = min(base_sig.confidence * 1.2, 1.0)
+            return Signal(
+                direction=base_sig.direction,
+                size=base_sig.size,
+                entry=base_sig.entry,
+                stop=base_sig.stop,
+                target=base_sig.target,
+                strategy_name=base_sig.strategy_name,
+                confidence=boosted_confidence,
+                expected_value=base_sig.expected_value,
+                metadata={**base_sig.metadata, "lppls_bubble": True,
+                          "lppls_fit": self.last_fit}
+            )
+
+        # Fallback (shouldn't reach)
+        return base_sig
+
+    def _refit_lppls(self, history: pd.DataFrame) -> None:
+        """Refit LPPLS model on trailing lookback log-prices.
+
+        Args:
+            history: Historical OHLCV data
+        """
+        if len(history) < self.lookback:
+            self.last_fit = None
+            return
+
+        # Extract trailing log prices
+        closes = history["close"].values[-self.lookback:]
+        log_prices = np.log(closes)
+
+        # Fit LPPLS
+        self.last_fit = fit_lppls(log_prices, n_starts=self.n_starts, seed=self.seed)
+        self.fit_count += 1
