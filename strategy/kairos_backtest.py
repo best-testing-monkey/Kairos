@@ -2510,7 +2510,7 @@ def walk_forward(
     """
     Walk-forward validation: roll non-overlapping test windows with fresh
     strategy instances per fold. Computes per-fold and aggregate metrics,
-    including Deflated Sharpe Ratio (DSR) as overfitting score.
+    including Sharpe retention ratio as overfitting score.
 
     Parameters
     ----------
@@ -2543,7 +2543,7 @@ def walk_forward(
     Dict with keys:
         - "folds": List[Dict] per-fold results {fold_id, train_metrics, test_metrics}
         - "aggregate_metrics": Dict of aggregate metrics across all folds
-        - "overfitting_score": DSR (Deflated Sharpe Ratio)
+        - "overfitting_score": Sharpe retention ratio in [0,1]; higher = healthier, < 0.5 suggests overfitting
         - "is_sharpe_mean": In-sample (train) Sharpe mean
         - "oos_sharpe_mean": Out-of-sample (test) Sharpe mean
         - "sharpe_degradation": IS Sharpe - OOS Sharpe
@@ -2662,16 +2662,17 @@ def _walk_forward_impl(
     oos_sharpe_mean = float(np.mean(oos_sharpes)) if oos_sharpes else 0.0
     sharpe_degradation = is_sharpe_mean - oos_sharpe_mean
 
-    # Deflated Sharpe Ratio (DSR)
-    # Simple formula: DSR = OOS_Sharpe * (1 - exp(-degradation / max(OOS_Sharpe, 0.01)))
-    # If OOS Sharpe is high and degradation is low, DSR approaches OOS Sharpe.
-    # If degradation is high (overfitting), DSR is penalized.
-    if oos_sharpe_mean > 0 and is_sharpe_mean > 0:
-        dsr = oos_sharpe_mean * (
-            1.0 - np.exp(-sharpe_degradation / max(oos_sharpe_mean, 0.01))
-        )
+    # Sharpe retention ratio: measures OOS Sharpe as a fraction of IS Sharpe.
+    # Score in [0, 1]; higher = healthier (less overfitting).
+    # Semantics: if a strategy's OOS Sharpe retained 80% of its IS Sharpe,
+    # score = 0.8. If it retained 20%, score = 0.2 (suggests overfitting).
+    # Edge case: OOS positive despite non-positive IS (not overfit) scores 1.0.
+    if is_sharpe_mean > 0:
+        overfitting_score = float(np.clip(oos_sharpe_mean / is_sharpe_mean, 0.0, 1.0))
+    elif oos_sharpe_mean > 0:
+        overfitting_score = 1.0
     else:
-        dsr = oos_sharpe_mean
+        overfitting_score = 0.0
 
     # Aggregate metrics: mean, std, median across folds
     all_train_metrics = [f["train_metrics"] for f in folds]
@@ -2709,5 +2710,5 @@ def _walk_forward_impl(
         "is_sharpe_mean": is_sharpe_mean,
         "oos_sharpe_mean": oos_sharpe_mean,
         "sharpe_degradation": sharpe_degradation,
-        "overfitting_score": float(dsr),
+        "overfitting_score": float(overfitting_score),
     }

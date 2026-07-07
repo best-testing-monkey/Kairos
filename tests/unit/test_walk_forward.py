@@ -202,8 +202,8 @@ class TestOverfittingDetection:
         assert isinstance(result["oos_sharpe_mean"], (int, float))
         assert isinstance(result["sharpe_degradation"], (int, float))
 
-    def test_dsr_less_than_is_sharpe(self, minimal_data, fast_predictor, null_strategy_factory):
-        """DSR should generally be lower than or equal to IS Sharpe (penalizes overfitting)."""
+    def test_sharpe_retention_in_valid_range(self, minimal_data, fast_predictor, null_strategy_factory):
+        """Sharpe retention ratio should always be in [0, 1]."""
         result = walk_forward(
             null_strategy_factory,
             minimal_data,
@@ -215,13 +215,11 @@ class TestOverfittingDetection:
             random_seed=42,
         )
 
-        dsr = result["overfitting_score"]
+        score = result["overfitting_score"]
         is_sharpe = result["is_sharpe_mean"]
 
-        # DSR should not exceed IS Sharpe (overfitting penalty)
-        # In most cases DSR <= IS Sharpe, though not guaranteed for all inputs
-        # We just verify computation happened
-        assert dsr is not None
+        # Sharpe retention ratio must be in [0, 1]
+        assert 0.0 <= score <= 1.0, f"Overfitting score {score} out of bounds [0, 1]"
         assert is_sharpe is not None
 
 
@@ -503,6 +501,40 @@ class TestEdgeCases:
 # =============================================================================
 # INTEGRATION TESTS
 # =============================================================================
+
+
+class TestHealthyStrategy:
+    """Test that a healthy (non-overfit) strategy scores above 0.5."""
+
+    def test_healthy_strategy_high_retention(self, minimal_data, fast_predictor, simple_strategy_factory):
+        """
+        A strategy using the same logic for IS and OOS (no cheating, no noise)
+        should retain most of its Sharpe and score > 0.5.
+        """
+        result = walk_forward(
+            simple_strategy_factory,
+            minimal_data,
+            fast_predictor,
+            train_days=25,
+            test_days=15,
+            step=15,
+            anchored=False,
+            random_seed=42,
+        )
+
+        score = result["overfitting_score"]
+        is_sharpe = result["is_sharpe_mean"]
+        oos_sharpe = result["oos_sharpe_mean"]
+
+        # Healthy strategy: score should be high (close to 1.0 if IS ≈ OOS)
+        # For simple_strategy_factory using the same logic throughout, we expect
+        # retention > 0.5 (at least half of IS Sharpe retained in OOS).
+        if is_sharpe > 0:
+            # Only assert if we have meaningful IS Sharpe to compare
+            assert score > 0.5, (
+                f"Healthy strategy should retain >50% of IS Sharpe, "
+                f"but got {score:.4f} (IS={is_sharpe:.4f}, OOS={oos_sharpe:.4f})"
+            )
 
 
 class TestOverfitFixtureCollapse:
