@@ -34,7 +34,7 @@
 - [x] E4-S03 Seasonality Filter (docs/tickets/E4-S03-seasonality-filter.md)
 - [x] E4-S04 Changepoint Guard (docs/tickets/E4-S04-changepoint-guard.md)
 - [x] E4-S05 Granger Pairs (docs/tickets/E4-S05-granger-pairs.md)
-- [ ] E4-S06 Matrix Profile Anomaly (docs/tickets/E4-S06-matrix-profile-anomaly.md)
+- [x] E4-S06 Matrix Profile Anomaly (docs/tickets/E4-S06-matrix-profile-anomaly.md)
 
 ## Epic E5 — ML
 

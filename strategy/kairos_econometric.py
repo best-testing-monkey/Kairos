@@ -1335,3 +1335,285 @@ class ChangepointGuardStrategy(Strategy):
 
         self.prev_prob_young = prob_young
         return detected
+
+
+# =============================================================================
+# MATRIX PROFILE ANOMALY DETECTION
+# =============================================================================
+
+def matrix_profile(series: np.ndarray, window: int = 20) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute matrix profile using STOMP-like approach with z-normalized distances.
+
+    The matrix profile is a vector where each element profile[i] is the
+    z-normalized Euclidean distance between the subsequence starting at position i
+    and its nearest non-trivial neighbor. An exclusion zone of window//2 around
+    the current position prevents self-matches.
+
+    Parameters
+    ----------
+    series : np.ndarray
+        Input time series, shape (n,).
+    window : int, default 20
+        Subsequence length.
+
+    Returns
+    -------
+    profile : np.ndarray, shape (n - window + 1,)
+        Matrix profile: z-normalized distance to nearest neighbor for each subsequence.
+        For zero-variance windows, returns inf.
+    profile_index : np.ndarray, shape (n - window + 1,)
+        Index of the nearest neighbor for each subsequence.
+    """
+    n = len(series)
+    m = n - window + 1  # Number of subsequences
+
+    if m < 2:
+        # Not enough data for a meaningful matrix profile
+        return np.array([], dtype=float), np.array([], dtype=int)
+
+    profile = np.full(m, np.inf, dtype=float)
+    profile_index = np.full(m, -1, dtype=int)
+
+    exclusion_zone = window // 2
+
+    # Precompute all subsequences and their means/stds for z-normalization
+    subsequences = np.lib.stride_tricks.as_strided(
+        series, shape=(m, window), strides=(series.strides[0], series.strides[0])
+    )
+
+    # Compute mean and std for each subsequence
+    means = np.mean(subsequences, axis=1)
+    stds = np.std(subsequences, axis=1, ddof=0)
+
+    # Handle zero-variance subsequences: they will have profile = inf
+    nonzero_std_mask = stds > 1e-10
+
+    # Compute normalized subsequences (z-score normalize each)
+    # For efficiency, only store them for nonzero-std subsequences
+    for i in range(m):
+        if not nonzero_std_mask[i]:
+            # Zero-variance window; distance is inf
+            profile[i] = np.inf
+            continue
+
+        # Normalize subsequence i
+        subseq_i = (subsequences[i] - means[i]) / (stds[i] + 1e-10)
+
+        # Compute distance to all other subsequences
+        min_dist = np.inf
+        best_j = -1
+
+        for j in range(m):
+            # Skip exclusion zone around i
+            if abs(i - j) <= exclusion_zone:
+                continue
+
+            # Skip if j has zero variance
+            if not nonzero_std_mask[j]:
+                continue
+
+            # Normalize subsequence j
+            subseq_j = (subsequences[j] - means[j]) / (stds[j] + 1e-10)
+
+            # Compute Euclidean distance
+            dist = np.sqrt(np.sum((subseq_i - subseq_j) ** 2))
+
+            if dist < min_dist:
+                min_dist = dist
+                best_j = j
+
+        profile[i] = min_dist
+        profile_index[i] = best_j
+
+    return profile, profile_index.astype(int)
+
+
+class MatrixProfileAnomalyStrategy(Strategy):
+    """
+    Standalone strategy detecting anomalies and motifs via matrix profile.
+
+    Computes the matrix profile on trailing `lookback` closes using STOMP.
+    For the last `window` bars (today's window):
+    - If profile value is a **discord** (> mean + discord_z * std), abstain.
+    - If profile value indicates a **motif** match (< mean - 1*std or < motif_max_dist),
+      trade the direction that followed the historical match position, gated on
+      Kronos agreement.
+
+    Parameters
+    ----------
+    window : int, default 20
+        Subsequence length for matrix profile.
+    lookback : int, default 250
+        Number of trailing closes to use for profile computation.
+    discord_z : float, default 2.0
+        Z-score threshold for discord detection (profile > mean + discord_z * std).
+    motif_max_dist : float or None, default None
+        Optional max distance threshold for motif match. If None, uses mean - 1*std.
+    horizon : int, default 5
+        Number of bars following historical match to evaluate return direction.
+    stop_pct : float, default 15.0
+        Stop-loss percentile (for longs; reversed for shorts).
+    target_pct : float, default 85.0
+        Take-profit percentile (for longs; reversed for shorts).
+    """
+    name = "matrix_profile_anomaly"
+
+    def __init__(self, window: int = 20, lookback: int = 250, discord_z: float = 2.0,
+                 motif_max_dist: Optional[float] = None, horizon: int = 5,
+                 stop_pct: float = 15.0, target_pct: float = 85.0):
+        self.window = window
+        self.lookback = lookback
+        self.discord_z = discord_z
+        self.motif_max_dist = motif_max_dist
+        self.horizon = horizon
+        self.stop_pct = int(stop_pct)
+        self.target_pct = int(target_pct)
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        """
+        Detect discord (abstain) or motif (trade historical follow-through).
+
+        Returns None if:
+        - History is too short
+        - Today's window is a discord
+        - Kronos does not agree with the implied direction
+        - No motif match found
+
+        Returns a Signal if a motif match is found and Kronos agrees.
+        """
+        # Validate history
+        if history is None or len(history) < self.lookback + self.horizon:
+            return None
+
+        # Extract trailing closes
+        closes = history["close"].tail(self.lookback + self.horizon).values.astype(float)
+        if len(closes) < self.lookback + self.horizon:
+            return None
+
+        # Compute matrix profile on the lookback portion (not including horizon)
+        lookback_closes = closes[:self.lookback]
+        profile, profile_index = matrix_profile(lookback_closes, self.window)
+
+        if len(profile) == 0:
+            return None
+
+        # Today's window is the last `window` bars of the lookback portion
+        today_window_idx = len(profile) - 1
+
+        # Get profile statistics (excluding inf values)
+        finite_profile = profile[np.isfinite(profile)]
+        if len(finite_profile) == 0:
+            return None
+
+        mean_profile = np.mean(finite_profile)
+        std_profile = np.std(finite_profile, ddof=0)
+
+        # Check for discord: today's window
+        today_profile_value = profile[today_window_idx]
+        discord_threshold = mean_profile + self.discord_z * std_profile
+
+        if today_profile_value > discord_threshold:
+            # Discord detected: unprecedented pattern, model unreliable
+            return None
+
+        # Check for motif match
+        # Motif threshold: mean - 1*std (strong match)
+        if self.motif_max_dist is not None:
+            motif_threshold = self.motif_max_dist
+        else:
+            motif_threshold = mean_profile - 1.0 * std_profile
+
+        if today_profile_value >= motif_threshold:
+            # Not a strong motif; neither discord nor motif -> abstain
+            return None
+
+        # Motif found: find the historical match position
+        match_idx = profile_index[today_window_idx]
+        if match_idx < 0 or match_idx >= len(lookback_closes) - self.window + 1:
+            return None
+
+        # Compute match quality: higher quality = lower distance
+        # match_quality = 1 - (profile_value / max_profile)
+        max_profile = np.max(finite_profile[finite_profile < np.inf])
+        if max_profile <= today_profile_value:
+            max_profile = today_profile_value + 1e-10
+        match_quality = max(1.0 - today_profile_value / max_profile, 0.0)
+
+        # Extract the return over the `horizon` bars following the historical match
+        # The match starts at position match_idx and ends at match_idx + window - 1
+        # The following bars start at match_idx + window and go for `horizon` bars
+        follow_start = match_idx + self.window
+        follow_end = follow_start + self.horizon
+
+        if follow_end > len(closes):
+            # Not enough data to evaluate the follow-through
+            return None
+
+        # Compute return over the following horizon
+        follow_start_price = closes[follow_start - 1]  # Entry at the end of the match
+        follow_end_price = closes[follow_end - 1]      # Exit at the end of the horizon
+
+        if follow_start_price <= 0 or follow_end_price <= 0:
+            return None
+
+        follow_return = follow_end_price - follow_start_price
+        follow_direction = np.sign(follow_return)
+
+        if follow_direction == 0:
+            # No directional follow-through
+            return None
+
+        # Gate on Kronos agreement
+        kronos_mean = dist.stats["close"]["mean"]
+        kronos_direction = np.sign(kronos_mean - current_price)
+
+        if kronos_direction == 0:
+            return None
+
+        # Check agreement
+        if follow_direction != kronos_direction:
+            return None
+
+        # Emit signal
+        if kronos_direction > 0:
+            # LONG
+            direction = Direction.LONG
+            stop = dist.stats["close"][f"pct_{self.stop_pct}"]
+            target = dist.stats["close"][f"pct_{self.target_pct}"]
+        else:
+            # SHORT
+            direction = Direction.SHORT
+            stop = dist.stats["close"][f"pct_{self.target_pct}"]
+            target = dist.stats["close"][f"pct_{self.stop_pct}"]
+
+        # Calculate expected value and position size
+        ev = dist.expected_value(current_price, target, stop)
+        if ev <= 0:
+            return None
+
+        kelly = dist.kelly_fraction(current_price, target, stop)
+        # Size by match quality: size = min(kelly * 0.5 * match_quality, 1.0)
+        size = min(kelly * 0.5 * match_quality, 1.0)
+
+        # Confidence bounded by match_quality
+        confidence = min(max(match_quality, 0.0), 1.0)
+
+        return Signal(
+            direction=direction,
+            size=size,
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=confidence,
+            expected_value=ev,
+            metadata={
+                "match_idx": int(match_idx),
+                "profile_value": float(today_profile_value),
+                "mean_profile": float(mean_profile),
+                "std_profile": float(std_profile),
+                "match_quality": float(match_quality),
+            },
+        )

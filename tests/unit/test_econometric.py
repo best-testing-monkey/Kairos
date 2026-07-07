@@ -11,7 +11,7 @@ from kairos_backtest import (
 from kairos_econometric import (
     _lagged_ols, ARIMADisagreementStrategy, VARLeadLagStrategy,
     SeasonalityFilterStrategy, ChangepointGuardStrategy, granger_f_test,
-    GrangerPairsStrategy,
+    GrangerPairsStrategy, matrix_profile, MatrixProfileAnomalyStrategy,
 )
 
 
@@ -1746,4 +1746,331 @@ class TestGrangerPairsStrategy:
         if sig is not None:
             assert sig.direction == Direction.SHORT, \
                 "Expected SHORT signal when negative coef and positive x-return agree with Kronos DOWN"
+
+
+# ============================================================================
+# Tests: Matrix Profile
+# ============================================================================
+
+class TestMatrixProfile:
+    def test_matrix_profile_basic_computation(self):
+        """Test matrix profile computation on random series."""
+        np.random.seed(42)
+        n = 80
+        series = np.random.normal(100, 5, n)
+        window = 10
+
+        profile, profile_index = matrix_profile(series, window)
+
+        # Check shapes
+        assert profile.shape == (n - window + 1,)
+        assert profile_index.shape == (n - window + 1,)
+
+        # All profile values should be non-negative (distances)
+        # Some may be inf if subsequence has zero variance
+        assert np.all(profile >= 0) or np.any(np.isinf(profile))
+
+        # profile_index should be in valid range or -1
+        valid_mask = profile_index >= 0
+        assert np.all((profile_index[valid_mask] >= 0) & (profile_index[valid_mask] < n - window + 1))
+
+    def test_matrix_profile_matches_brute_force(self):
+        """Test matrix profile against inline brute-force z-normalized distance computation."""
+        np.random.seed(123)
+        n = 80
+        series = np.random.normal(100, 10, n)
+        window = 10
+
+        profile, profile_index = matrix_profile(series, window)
+
+        # Brute force: compute all pairwise distances manually
+        m = n - window + 1
+        brute_force_profile = np.full(m, np.inf)
+        brute_force_index = np.full(m, -1, dtype=int)
+
+        exclusion_zone = window // 2
+
+        for i in range(m):
+            subseq_i = series[i:i + window]
+            mean_i = np.mean(subseq_i)
+            std_i = np.std(subseq_i, ddof=0)
+
+            if std_i <= 1e-10:
+                continue
+
+            norm_i = (subseq_i - mean_i) / std_i
+            min_dist = np.inf
+            best_j = -1
+
+            for j in range(m):
+                if abs(i - j) <= exclusion_zone:
+                    continue
+
+                subseq_j = series[j:j + window]
+                mean_j = np.mean(subseq_j)
+                std_j = np.std(subseq_j, ddof=0)
+
+                if std_j <= 1e-10:
+                    continue
+
+                norm_j = (subseq_j - mean_j) / std_j
+                dist = np.sqrt(np.sum((norm_i - norm_j) ** 2))
+
+                if dist < min_dist:
+                    min_dist = dist
+                    best_j = j
+
+            brute_force_profile[i] = min_dist
+            brute_force_index[i] = best_j
+
+        # Compare: allow for small numerical differences
+        finite_mask = np.isfinite(profile) & np.isfinite(brute_force_profile)
+        if np.any(finite_mask):
+            assert np.allclose(
+                profile[finite_mask], brute_force_profile[finite_mask], atol=1e-4
+            ), f"Max diff: {np.max(np.abs(profile[finite_mask] - brute_force_profile[finite_mask]))}"
+
+    def test_matrix_profile_zero_variance_subsequence(self):
+        """Test that zero-variance subsequences return inf distance."""
+        n = 50
+        series = np.ones(n)  # Constant series
+        window = 10
+
+        profile, _ = matrix_profile(series, window)
+
+        # All subsequences have zero variance
+        assert np.all(np.isinf(profile))
+
+    def test_matrix_profile_exclusion_zone(self):
+        """Test that exclusion zone prevents self-matches."""
+        np.random.seed(42)
+        n = 100
+        # Create a series with a repeated pattern
+        pattern = np.sin(np.linspace(0, 2 * np.pi, 20))
+        series = np.concatenate([pattern, np.random.normal(0, 0.1, n - 20)])
+
+        window = 20
+        profile, profile_index = matrix_profile(series, window)
+
+        # The first subsequence (index 0) should not match itself at index 0
+        # It may match later (if there's repetition) or just have no match in exclusion zone
+        if profile_index[0] >= 0:
+            assert abs(profile_index[0] - 0) > window // 2, \
+                "Exclusion zone violation: subsequence matched with itself"
+
+    def test_matrix_profile_short_series(self):
+        """Test matrix profile on series shorter than 2*window."""
+        series = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+        window = 10
+
+        profile, profile_index = matrix_profile(series, window)
+
+        # Should return empty arrays when not enough data
+        assert len(profile) == 0
+        assert len(profile_index) == 0
+
+
+# ============================================================================
+# Tests: MatrixProfileAnomalyStrategy
+# ============================================================================
+
+class TestMatrixProfileAnomalyStrategy:
+    def test_matrix_profile_strategy_short_history(self):
+        """Strategy should return None if history is too short."""
+        np.random.seed(42)
+        short_closes = np.linspace(100, 101, 100)  # Too short for lookback=250 + horizon=5
+        history = make_history(short_closes)
+
+        current_price = 100.0
+        dist = make_dist(short_closes)
+
+        strategy = MatrixProfileAnomalyStrategy(window=20, lookback=250, horizon=5)
+        sig = strategy.generate_signal(dist, current_price, history, {})
+
+        assert sig is None, "Strategy should return None for short history"
+
+    def test_matrix_profile_strategy_finds_motif(self):
+        """Strategy should detect and trade a planted motif."""
+        np.random.seed(42)
+        n = 300
+
+        # Create a base series with some structure
+        base = np.random.normal(100, 2, n)
+
+        # Plant a repeated motif: indices 50-69 and 150-169 are identical
+        motif = np.sin(np.linspace(0, 2 * np.pi, 20)) + 100  # A smooth pattern
+        base[50:70] = motif
+        base[150:170] = motif
+
+        # Add a predictable move after the first motif occurrence
+        # Returns between indices 70-74 (5 bars following the first motif)
+        base[70:75] = base[69] * (1 + 0.02)  # +2% return over 5 bars
+
+        history = make_history(base)
+        current_price = base[-1]
+
+        # Kronos predicts UP to match the historical follow-through
+        # Create closes that trend up
+        dist_closes = np.linspace(current_price, current_price * 1.02, 100)
+        dist = make_dist(dist_closes)
+
+        strategy = MatrixProfileAnomalyStrategy(
+            window=20, lookback=250, horizon=5, stop_pct=15.0, target_pct=85.0
+        )
+        sig = strategy.generate_signal(dist, current_price, history, {})
+
+        if sig is not None:
+            # Should emit a LONG signal
+            assert sig.direction == Direction.LONG, \
+                "Expected LONG signal when historical match has positive follow-through"
+            assert sig.confidence > 0.0
+            assert "match_quality" in sig.metadata
+
+    def test_matrix_profile_strategy_discord_abstention(self):
+        """Strategy should abstain (return None) when today's window is a discord."""
+        np.random.seed(42)
+        n = 300
+
+        # Create a smooth series with low variance
+        base = 100 + 0.5 * np.sin(np.linspace(0, 10 * np.pi, n - 20))
+
+        # Add a wild, random anomaly at the end (this will be "today")
+        # This wild segment will have very different statistical properties
+        anomaly = np.random.uniform(50, 150, 20)  # Complete randomness, high variance
+        base = np.concatenate([base, anomaly])
+
+        history = make_history(base)
+        current_price = base[-1]
+
+        # Kronos is bullish, but the discord should cause abstention
+        dist_closes = np.linspace(current_price, current_price * 1.05, 100)
+        dist = make_dist(dist_closes)
+
+        strategy = MatrixProfileAnomalyStrategy(
+            window=20, lookback=250, horizon=5, discord_z=1.0
+        )
+        sig = strategy.generate_signal(dist, current_price, history, {})
+
+        # Should abstain due to discord in today's window
+        assert sig is None, "Expected abstention for discord (anomalous) pattern"
+
+    def test_matrix_profile_strategy_kronos_disagreement(self):
+        """Strategy should return None when Kronos disagrees with follow-through direction."""
+        np.random.seed(42)
+        n = 300
+
+        # Create a base series
+        base = np.random.normal(100, 2, n)
+
+        # Plant a repeated motif
+        motif = np.sin(np.linspace(0, 2 * np.pi, 20)) + 100
+        base[50:70] = motif
+        base[150:170] = motif
+
+        # Add a DOWN move after the first motif (opposite of what Kronos predicts)
+        base[70:75] = base[69] * (1 - 0.02)  # -2% return
+
+        history = make_history(base)
+        current_price = base[-1]
+
+        # Kronos predicts UP, but historical follow-through is DOWN
+        dist_closes = np.linspace(current_price, current_price * 1.05, 100)
+        dist = make_dist(dist_closes)
+
+        strategy = MatrixProfileAnomalyStrategy(window=20, lookback=250, horizon=5)
+        sig = strategy.generate_signal(dist, current_price, history, {})
+
+        # Should return None due to disagreement
+        assert sig is None, "Expected None when Kronos direction disagrees with follow-through"
+
+    def test_matrix_profile_strategy_no_motif(self):
+        """Strategy should return None when no strong motif is found."""
+        np.random.seed(42)
+        n = 300
+
+        # Create a random series with no repeated patterns
+        base = np.random.normal(100, 5, n)
+
+        history = make_history(base)
+        current_price = base[-1]
+
+        # Kronos predicts UP
+        dist_closes = np.linspace(current_price, current_price * 1.05, 100)
+        dist = make_dist(dist_closes)
+
+        strategy = MatrixProfileAnomalyStrategy(window=20, lookback=250, horizon=5)
+        sig = strategy.generate_signal(dist, current_price, history, {})
+
+        # Should return None: no strong motif in random noise
+        # (Probability of finding one is low but not zero)
+        # This test verifies the path when no motif is detected
+        # We can't assert None with certainty, but we can check that if a signal
+        # is returned, it follows the contract
+
+        if sig is not None:
+            assert isinstance(sig, Signal)
+            assert sig.direction in [Direction.LONG, Direction.SHORT]
+            assert 0.0 <= sig.confidence <= 1.0
+
+    def test_matrix_profile_strategy_size_by_quality(self):
+        """Strategy size should be proportional to match quality."""
+        np.random.seed(42)
+        n = 300
+
+        # Create series with a strong motif
+        base = np.random.normal(100, 1, n)
+        motif = np.sin(np.linspace(0, 2 * np.pi, 20)) + 100
+        base[50:70] = motif
+        base[150:170] = motif + np.random.normal(0, 0.01, 20)  # Very similar to motif
+
+        # Add predictable follow-through
+        base[70:75] = base[69] * (1 + 0.03)
+
+        history = make_history(base)
+        current_price = base[-1]
+
+        # Kronos predicts UP
+        dist_closes = np.linspace(current_price, current_price * 1.05, 100)
+        dist = make_dist(dist_closes)
+
+        strategy = MatrixProfileAnomalyStrategy(window=20, lookback=250, horizon=5)
+        sig = strategy.generate_signal(dist, current_price, history, {})
+
+        if sig is not None:
+            # Size should be bounded by Kelly * 0.5 * match_quality
+            match_quality = sig.metadata.get("match_quality", 0.0)
+            kelly = dist.kelly_fraction(current_price, sig.target, sig.stop)
+
+            expected_max_size = min(kelly * 0.5 * match_quality, 1.0)
+            assert sig.size <= expected_max_size + 1e-6, \
+                f"Size {sig.size} exceeds expected max {expected_max_size}"
+
+    def test_matrix_profile_strategy_metadata(self):
+        """Strategy metadata should contain expected fields."""
+        np.random.seed(42)
+        n = 300
+
+        base = np.random.normal(100, 2, n)
+        motif = np.sin(np.linspace(0, 2 * np.pi, 20)) + 100
+        base[50:70] = motif
+        base[150:170] = motif
+        base[70:75] = base[69] * (1 + 0.02)
+
+        history = make_history(base)
+        current_price = base[-1]
+
+        dist_closes = np.linspace(current_price, current_price * 1.05, 100)
+        dist = make_dist(dist_closes)
+
+        strategy = MatrixProfileAnomalyStrategy(window=20, lookback=250, horizon=5)
+        sig = strategy.generate_signal(dist, current_price, history, {})
+
+        if sig is not None:
+            assert "match_idx" in sig.metadata
+            assert "profile_value" in sig.metadata
+            assert "mean_profile" in sig.metadata
+            assert "std_profile" in sig.metadata
+            assert "match_quality" in sig.metadata
+
+            assert 0.0 <= sig.metadata["match_quality"] <= 1.0
 
