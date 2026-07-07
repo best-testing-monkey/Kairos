@@ -1805,3 +1805,215 @@ class EigenAllocator(PortfolioAllocator):
         except Exception:
             # Fallback to equal weight on any computation error
             return _fallback_equal_weight(signals)
+
+
+# =============================================================================
+# UNIVERSAL PORTFOLIO ALLOCATOR (COVER)
+# =============================================================================
+
+class UniversalAllocator(PortfolioAllocator):
+    """
+    Universal Portfolio allocator (Cover 1991): wealth-weighted mixture of CRPs.
+
+    Maintains a Dirichlet grid of constant-rebalanced portfolios (CRPs) over the
+    signaled assets and tracks cumulative wealth per grid point. On each call,
+    the allocator updates the wealth of each grid point using realized returns,
+    then outputs the wealth-weighted mixture of grid points (normalized and
+    re-signed per signal direction).
+
+    This stateful allocator learns online which portfolio combinations performed
+    best over the rolling window. The wealth-weighting mechanism automatically
+    gives more weight to grid points that have generated higher cumulative returns.
+
+    **State management:**
+    - Grid is regenerated when the symbol set changes (detecting universe drift).
+    - Wealth is reset to 1.0 when grid is regenerated.
+    - reset() method clears all state for walk-forward folds.
+
+    Attributes:
+        name: "universal_allocator"
+        grid_step: Resolution of the Dirichlet grid (default 0.1).
+                  Weights take values in {0, 0.1, 0.2, ..., 1.0}.
+        grid_symbols: Current symbol set (None if not yet initialized).
+        grid: List of constant-rebalanced portfolio weight vectors.
+        wealth: Array of cumulative wealth per grid point.
+    """
+
+    name: str = "universal_allocator"
+
+    def __init__(self, grid_step: float = 0.1):
+        """
+        Initialize Universal allocator.
+
+        Args:
+            grid_step: Resolution of the Dirichlet grid. Default: 0.1.
+                      With 3 assets and grid_step=0.1, generates 66 CRPs.
+
+        Examples:
+            >>> allocator = UniversalAllocator(grid_step=0.1)
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        self.grid_step = float(grid_step)
+        self.grid = None
+        self.grid_symbols = None
+        self.wealth = None
+
+    def allocate(
+        self,
+        signals: Dict[str, "Signal"],
+        returns: pd.DataFrame,
+        dists: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Allocate using wealth-weighted mixture of constant-rebalanced portfolios.
+
+        On each call:
+        1. Check if symbol set has changed; regenerate grid if needed (reset wealth to 1)
+        2. Update wealth for each grid point using today's log returns
+        3. Compute wealth-weighted average allocation
+        4. Apply signal directions and return as dict
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+                    Index: dates, Columns: asset symbols.
+                    Last row is used for today's return update.
+            dists: Dict[symbol -> KairosDistribution] (unused for Universal).
+            context: Dict[str, Any] execution context (unused).
+
+        Returns:
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values = 1.0 (fully invested after normalization).
+            Signs match signal directions (LONG/SHORT/FLAT).
+
+        Fall-back behavior:
+            If len(returns) < self.min_obs (default 60), returns equal-weight.
+            If no signals, returns empty dict.
+
+        Examples:
+            >>> allocator = UniversalAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, {})
+            >>> assert sum(abs(w) for w in weights.values()) <= 1.0 + 1e-6
+        """
+        symbols = list(signals.keys())
+
+        # Check if enough observations
+        if len(returns) < self.min_obs:
+            return _fallback_equal_weight(signals)
+
+        if not symbols:
+            return {}
+
+        # Check if symbol set changed; regenerate grid if needed
+        if self.grid is None or set(symbols) != set(self.grid_symbols):
+            self._regenerate_grid(symbols)
+
+        # Get today's returns (last row of the DataFrame)
+        today_returns = returns[symbols].iloc[-1].values  # numpy array
+
+        # Update wealth for each grid point: wealth_i *= (1 + grid_weights_i · returns)
+        for i, grid_weights in enumerate(self.grid):
+            daily_return = float(np.dot(grid_weights, today_returns))
+            self.wealth[i] *= (1.0 + daily_return)
+
+        # Compute wealth-weighted mixture
+        total_wealth = np.sum(self.wealth)
+        if total_wealth <= 0:
+            # All wealth wiped out; reset and fall back to equal weight
+            self._regenerate_grid(symbols)
+            return _fallback_equal_weight(signals)
+
+        wealth_weights = self.wealth / total_wealth
+
+        # Average the grid points weighted by their wealth
+        avg_allocation = np.zeros(len(symbols))
+        for i, grid_weights in enumerate(self.grid):
+            avg_allocation += wealth_weights[i] * grid_weights
+
+        # Apply signal directions
+        weights = {}
+        for j, sym in enumerate(symbols):
+            mag = float(avg_allocation[j])
+            direction = signals[sym].direction
+
+            # Extract direction value (handles both enum and raw int)
+            if hasattr(direction, 'value'):
+                dir_val = direction.value
+            else:
+                dir_val = direction
+
+            if dir_val == 1:  # LONG
+                w = float(mag)
+            elif dir_val == -1:  # SHORT
+                w = float(-mag)
+            else:  # FLAT
+                w = 0.0
+
+            if abs(w) < 1e-10:
+                w = 0.0
+            weights[sym] = w
+
+        return weights
+
+    def reset(self) -> None:
+        """
+        Reset all internal state for walk-forward folds.
+
+        Clears the grid and wealth array so the next call starts fresh.
+        """
+        self.grid = None
+        self.grid_symbols = None
+        self.wealth = None
+
+    def _regenerate_grid(self, symbols: List[str]) -> None:
+        """
+        Generate all constant-rebalanced portfolio combinations.
+
+        Creates a Dirichlet grid of all weight vectors where:
+        - Each component is a multiple of self.grid_step
+        - All components sum to exactly 1.0
+        - For n assets and step=0.1: generates C(n + num_steps - 1, num_steps) vectors
+
+        Args:
+            symbols: List of asset symbols (order is preserved).
+
+        Sets:
+            self.grid: List of numpy arrays, each of shape (n_assets,)
+            self.grid_symbols: Stores symbols for future change detection
+            self.wealth: Initializes wealth to 1.0 for each grid point
+        """
+        n = len(symbols)
+        num_steps = int(round(1.0 / self.grid_step))
+
+        grid = []
+
+        # Recursive generator for all non-negative integer partitions
+        # summing to num_steps (representing multiples of grid_step)
+        def generate_partitions(n_assets, remaining_steps, current_partition):
+            """
+            Generate all partitions of remaining_steps into n_assets non-negative integers.
+
+            Args:
+                n_assets: Number of assets still to allocate.
+                remaining_steps: Sum of integers to allocate.
+                current_partition: List of weights accumulated so far.
+            """
+            if n_assets == 1:
+                # Last asset gets all remaining steps
+                final_partition = current_partition + [remaining_steps]
+                grid.append(np.array(final_partition, dtype=float) * self.grid_step)
+            else:
+                # Try each value from 0 to remaining_steps for this asset
+                for steps_here in range(remaining_steps + 1):
+                    generate_partitions(
+                        n_assets - 1,
+                        remaining_steps - steps_here,
+                        current_partition + [steps_here]
+                    )
+
+        generate_partitions(n, num_steps, [])
+
+        self.grid = grid
+        self.grid_symbols = symbols
+        self.wealth = np.ones(len(grid), dtype=float)

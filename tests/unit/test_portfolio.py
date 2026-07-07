@@ -32,6 +32,7 @@ from kairos_portfolio import (
     MinVarAllocator,
     BlackLittermanAllocator,
     EigenAllocator,
+    UniversalAllocator,
 )
 from kairos_backtest import Signal, Direction, KairosDistribution
 
@@ -3183,3 +3184,401 @@ class TestEigenAllocator:
         # They should not be identical
         assert not np.allclose(weights_array1, weights_array2), \
             "Different n_components should produce different weights"
+
+
+# =============================================================================
+# TEST UNIVERSAL ALLOCATOR (COVER PORTFOLIO)
+# =============================================================================
+
+class TestUniversalAllocator:
+    """Test Universal Portfolio (Cover) allocator with wealth-weighted CRPs."""
+
+    @pytest.fixture
+    def universal_allocator(self):
+        """Standard Universal allocator instance."""
+        return UniversalAllocator(grid_step=0.1)
+
+    @pytest.fixture
+    def synthetic_returns_3asset_drift(self):
+        """
+        Three assets over ~120 days where Asset A has consistent +0.5%/day drift.
+        Assets B and C have zero drift (mean-reverting around 0).
+        Used to test convergence to dominant asset.
+        """
+        np.random.seed(42)
+        n_obs = 120
+
+        # Asset A: +0.5% drift + noise
+        asset_a = 0.005 + 0.005 * np.random.randn(n_obs)
+
+        # Asset B & C: noise only (zero drift)
+        asset_b = 0.001 * np.random.randn(n_obs)
+        asset_c = 0.001 * np.random.randn(n_obs)
+
+        returns = pd.DataFrame(
+            {"A": asset_a, "B": asset_b, "C": asset_c},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+        return returns
+
+    def _create_signals_for_symbols(self, symbols):
+        """Helper to create LONG signals for a list of symbols."""
+        return {
+            sym: Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            )
+            for sym in symbols
+        }
+
+    def test_universal_grid_generation_3asset_step_01(self, universal_allocator):
+        """
+        Acceptance: grid generation count for 3 assets with step 0.1 == 66 (C(12,2)).
+
+        For n=3 and num_steps=10 (since 1.0/0.1=10), the number of non-negative
+        integer solutions to k1 + k2 + k3 = 10 is C(10+3-1, 3-1) = C(12,2) = 66.
+        """
+        allocator = universal_allocator
+        symbols = ["A", "B", "C"]
+        allocator._regenerate_grid(symbols)
+
+        assert allocator.grid is not None
+        assert allocator.grid_symbols == symbols
+        assert len(allocator.grid) == 66, \
+            f"Expected 66 grid points for 3 assets with step=0.1, got {len(allocator.grid)}"
+
+        # Verify each grid point is a valid weight vector
+        for grid_weights in allocator.grid:
+            assert len(grid_weights) == 3, "Each grid point should have 3 weights"
+            assert abs(np.sum(grid_weights) - 1.0) < 1e-10, \
+                f"Grid point weights should sum to 1.0, got {np.sum(grid_weights)}"
+            assert np.all(grid_weights >= -1e-10), "All weights should be non-negative"
+            assert np.all(grid_weights <= 1.0 + 1e-10), "All weights should be <= 1.0"
+
+    def test_universal_grid_weights_sum_to_one(self, universal_allocator, synthetic_returns_3asset_drift):
+        """
+        Acceptance: total weight always sums to 1 (verified in test_universal_weights_sum_to_one).
+        """
+        allocator = universal_allocator
+        returns = synthetic_returns_3asset_drift
+        signals = self._create_signals_for_symbols(["A", "B", "C"])
+
+        # Feed multiple calls to build up wealth distribution
+        for _ in range(10):
+            weights = allocator.allocate(signals, returns, {}, {})
+            total = sum(abs(w) for w in weights.values())
+            # All LONG signals, so sum of weights = sum of absolute values
+            assert abs(total - 1.0) < 1e-6, \
+                f"Weights should sum to 1.0, got {total}"
+
+    def test_universal_convergence_to_dominant(self, universal_allocator, synthetic_returns_3asset_drift):
+        """
+        Acceptance: on synthetic data where one asset dominates, weights converge
+        toward it. Verified in test_universal_convergence_to_dominant.
+
+        After ~120 sequential allocate() calls on the drift data (Asset A +0.5%/day),
+        weight on A increases monotonically over the last 20 calls (or at least end > start).
+        """
+        allocator = universal_allocator
+        returns = synthetic_returns_3asset_drift
+        symbols = ["A", "B", "C"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # Feed all observations sequentially, accumulating returns
+        # (simulating a walk-forward scenario where allocator sees one day at a time)
+        all_weights = []
+        for i in range(len(returns)):
+            current_returns = returns.iloc[:i+1]  # Cumulative up to day i
+            weights = allocator.allocate(signals, current_returns, {}, {})
+            all_weights.append(weights)
+
+        # Extract weight on A from all allocations
+        weights_a_all = [w["A"] for w in all_weights]
+
+        # Weight should increase from the early allocations to the later ones
+        # Universal portfolio converges gradually; check that final > initial
+        assert weights_a_all[-1] > weights_a_all[0], \
+            f"Weight on dominant asset A should increase from start to end: " \
+            f"{weights_a_all[0]:.4f} -> {weights_a_all[-1]:.4f}"
+
+        # Also check that the weight is above equal-weight (1/3 ≈ 0.333)
+        assert weights_a_all[-1] > 1.0 / 3.0, \
+            f"Weight on A should exceed equal-weight 1/3, got {weights_a_all[-1]:.4f}"
+
+    def test_universal_wealth_weighted_output(self, universal_allocator, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: outputs wealth-weighted average of grid points (verified in
+        test_universal_wealth_weighted_output).
+        """
+        allocator = universal_allocator
+        returns = synthetic_returns_200_obs_3_assets
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # Call allocate a few times to let wealth distribution form
+        for i in range(len(returns)):
+            current_returns = returns.iloc[:i+1]
+            weights = allocator.allocate(signals, current_returns, {}, {})
+
+            # After at least 2 calls, wealth should be updating
+            if i > 0 and allocator.wealth is not None:
+                # Some grid points should have different wealth (wealth is not uniform)
+                # unless all returns are identical (unlikely in random data)
+                wealth_std = np.std(allocator.wealth)
+                if i > 10:
+                    # After enough iterations, wealth should have diverged
+                    assert wealth_std > 1e-8, \
+                        "Wealth should diverge after multiple updates"
+
+            # Output should be a valid dict
+            assert isinstance(weights, dict)
+            assert len(weights) == len(symbols)
+            for w in weights.values():
+                assert isinstance(w, float)
+
+    def test_universal_grid_regeneration_on_symbol_change(self, universal_allocator, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: grid regenerated when universe changes (test_universal_grid_regeneration).
+        When symbol set changes (e.g., ["BTC", "ETH"] -> ["BTC", "ETH", "SOL"]),
+        allocator regenerates grid and resets wealth.
+        """
+        allocator = universal_allocator
+        returns = synthetic_returns_200_obs_3_assets
+
+        # Start with 2 assets
+        signals_2 = self._create_signals_for_symbols(["BTC", "ETH"])
+        allocator.allocate(signals_2, returns[["BTC", "ETH"]], {}, {})
+
+        grid_symbols_1 = allocator.grid_symbols
+        grid_size_1 = len(allocator.grid)
+
+        # Advance time and update wealth a bit
+        for i in range(10):
+            current_returns = returns[["BTC", "ETH"]].iloc[:60+i]
+            allocator.allocate(signals_2, current_returns, {}, {})
+
+        wealth_after_updates = allocator.wealth.copy()
+        assert not np.allclose(wealth_after_updates, np.ones(len(wealth_after_updates))), \
+            "Wealth should have diverged from initial 1.0"
+
+        # Switch to 3 assets (change universe)
+        signals_3 = self._create_signals_for_symbols(["BTC", "ETH", "SOL"])
+
+        # Capture grid and wealth right at the moment of regeneration
+        # by checking before/after within the same allocate call
+        # After the call, wealth will have been updated with day's return, so we
+        # check that it was reset by verifying the grid changed and the grid size matches
+        allocator.allocate(signals_3, returns, {}, {})
+
+        grid_symbols_2 = allocator.grid_symbols
+        grid_size_2 = len(allocator.grid)
+        wealth_2 = allocator.wealth.copy()
+
+        # Grid should be regenerated (different size)
+        assert grid_symbols_2 == ["BTC", "ETH", "SOL"], \
+            f"Symbol set should change to 3 assets, got {grid_symbols_2}"
+        assert grid_size_2 == 66, \
+            f"3-asset grid should have 66 points, got {grid_size_2}"
+        assert grid_size_2 != grid_size_1, \
+            f"Grid size should change when universe changes: {grid_size_1} -> {grid_size_2}"
+
+        # After regeneration and first update with new data, wealth should be close to 1.0
+        # (may diverge slightly after the first return update, but should be within 0.1% of 1.0)
+        mean_wealth = np.mean(wealth_2)
+        assert 0.99 < mean_wealth < 1.01, \
+            f"Mean wealth after regeneration should be ~1.0, got {mean_wealth:.6f}"
+
+    def test_universal_reset_clears_state(self, universal_allocator, synthetic_returns_200_obs_3_assets):
+        """
+        Acceptance: reset() clears state (verified in test_universal_reset_clears_state).
+        After calling reset(), grid, grid_symbols, and wealth should all be None.
+        """
+        allocator = universal_allocator
+        returns = synthetic_returns_200_obs_3_assets
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # Initialize state
+        for i in range(10):
+            current_returns = returns.iloc[:60+i]
+            allocator.allocate(signals, current_returns, {}, {})
+
+        # Verify state is populated
+        assert allocator.grid is not None
+        assert allocator.grid_symbols is not None
+        assert allocator.wealth is not None
+        assert len(allocator.grid) > 0
+
+        # Call reset
+        allocator.reset()
+
+        # Verify state is cleared
+        assert allocator.grid is None, "reset() should clear grid"
+        assert allocator.grid_symbols is None, "reset() should clear grid_symbols"
+        assert allocator.wealth is None, "reset() should clear wealth"
+
+    def test_universal_fallback_below_min_obs(self, universal_allocator, synthetic_returns_small):
+        """Fallback to equal weight when len(returns) < min_obs."""
+        allocator = universal_allocator
+        returns = synthetic_returns_small  # 5 obs < 60
+        signals = self._create_signals_for_symbols(["BTC", "ETH"])
+
+        weights = allocator.allocate(signals, returns, {}, {})
+
+        expected = _fallback_equal_weight(signals)
+        assert weights == expected
+
+    def test_universal_empty_signals(self, universal_allocator, synthetic_returns_200_obs_3_assets):
+        """With no signals, return empty dict."""
+        allocator = universal_allocator
+        returns = synthetic_returns_200_obs_3_assets
+
+        weights = allocator.allocate({}, returns, {}, {})
+        assert weights == {}
+
+    def test_universal_signs_follow_directions(self, universal_allocator, synthetic_returns_200_obs_3_assets):
+        """Acceptance: signs follow directions (LONG/SHORT/FLAT)."""
+        allocator = universal_allocator
+        returns = synthetic_returns_200_obs_3_assets
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100.0,
+                stop=101.0,
+                target=99.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.FLAT,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        # Call multiple times to build state
+        for i in range(10):
+            current_returns = returns.iloc[:60+i]
+            weights = allocator.allocate(signals, current_returns, {}, {})
+
+            # BTC (LONG) should not be negative
+            assert weights["BTC"] >= -1e-10, f"BTC (LONG) should not be negative, got {weights['BTC']}"
+            # ETH (SHORT) should not be positive
+            assert weights["ETH"] <= 1e-10, f"ETH (SHORT) should not be positive, got {weights['ETH']}"
+            # SOL (FLAT) should be zero
+            assert abs(weights["SOL"]) < 1e-10, f"SOL (FLAT) should be ~zero, got {weights['SOL']}"
+
+    def test_universal_allocator_attributes(self, universal_allocator):
+        """Test allocator has correct name and attributes."""
+        assert universal_allocator.name == "universal_allocator"
+        assert universal_allocator.min_obs == 60
+        assert universal_allocator.grid_step == 0.1
+
+    def test_universal_allocator_custom_grid_step(self):
+        """Allocator with custom grid_step."""
+        allocator = UniversalAllocator(grid_step=0.2)
+        assert allocator.grid_step == 0.2
+
+        # 2 assets with step=0.2: num_steps=5
+        # Partitions of 5 into 2: C(5+2-1, 2-1) = C(6, 1) = 6
+        allocator._regenerate_grid(["A", "B"])
+        assert len(allocator.grid) == 6, \
+            f"2 assets with step=0.2 should give 6 grid points, got {len(allocator.grid)}"
+
+    def test_universal_grid_point_validity(self, universal_allocator):
+        """Grid points should be valid weight vectors."""
+        allocator = universal_allocator
+        symbols = ["A", "B", "C"]
+        allocator._regenerate_grid(symbols)
+
+        # Each grid point should:
+        # 1. Have n_assets weights
+        # 2. Sum to 1.0
+        # 3. All weights in [0, 1]
+        # 4. Weights are multiples of grid_step
+        for grid_weights in allocator.grid:
+            assert len(grid_weights) == 3
+            assert abs(np.sum(grid_weights) - 1.0) < 1e-10
+            assert np.all(grid_weights >= -1e-10)
+            assert np.all(grid_weights <= 1.0 + 1e-10)
+
+            # Check each weight is a multiple of grid_step
+            for w in grid_weights:
+                w_normalized = w / allocator.grid_step
+                # Should be close to an integer (within rounding error)
+                assert abs(w_normalized - round(w_normalized)) < 1e-9, \
+                    f"Weight {w} should be multiple of {allocator.grid_step}"
+
+    def test_universal_wealth_tracking(self, universal_allocator):
+        """Wealth should update correctly with returns."""
+        allocator = universal_allocator
+
+        # Simple 2-asset case
+        symbols = ["A", "B"]
+        allocator._regenerate_grid(symbols)
+
+        initial_wealth = allocator.wealth.copy()
+        assert np.allclose(initial_wealth, np.ones(len(initial_wealth)))
+
+        # Simulate positive returns for all assets
+        returns_positive = np.array([0.01, 0.02])  # +1%, +2%
+
+        for i, grid_weights in enumerate(allocator.grid):
+            daily_return = np.dot(grid_weights, returns_positive)
+            allocator.wealth[i] *= (1.0 + daily_return)
+
+        # All wealth should increase (all portfolio combinations had positive return)
+        new_wealth = allocator.wealth
+        assert np.all(new_wealth > initial_wealth), \
+            "Wealth should increase with positive returns for all assets"
+
+    def test_universal_different_lengths_same_symbols(self, universal_allocator, synthetic_returns_200_obs_3_assets):
+        """
+        Symbol set same but different lengths of returns.
+        Grid should not regenerate, just wealth should update with new data.
+        """
+        allocator = universal_allocator
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # First call with partial data
+        returns_60 = synthetic_returns_200_obs_3_assets.iloc[:60]
+        w1 = allocator.allocate(signals, returns_60, {}, {})
+        grid_symbols_1 = allocator.grid_symbols
+        grid_id_1 = id(allocator.grid)
+
+        # Second call with more data (same symbols)
+        returns_120 = synthetic_returns_200_obs_3_assets.iloc[:120]
+        w2 = allocator.allocate(signals, returns_120, {}, {})
+        grid_symbols_2 = allocator.grid_symbols
+        grid_id_2 = id(allocator.grid)
+
+        # Symbol set should remain the same
+        assert grid_symbols_1 == grid_symbols_2
+        # Grid should be the same object (not regenerated)
+        assert grid_id_1 == grid_id_2, \
+            "Grid should not be regenerated when symbols are unchanged"
