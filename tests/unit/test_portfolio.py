@@ -34,6 +34,9 @@ from kairos_portfolio import (
     EigenAllocator,
     UniversalAllocator,
     GAAllocator,
+    CVaRAllocator,
+    _scenario_matrix,
+    _compute_cvar,
 )
 from kairos_backtest import Signal, Direction, KairosDistribution
 
@@ -3976,3 +3979,348 @@ class TestGAAllocator:
             assert isinstance(w, (int, float))
             assert not np.isnan(w) and not np.isinf(w), \
                 f"Weight for {sym} should be finite, got {w}"
+
+
+# =============================================================================
+# CVAR ALLOCATOR TESTS
+# =============================================================================
+
+class TestCVaRAllocator:
+    """Test CVaRAllocator: Rockafellar-Uryasev CVaR optimization."""
+
+    def _create_signals_for_symbols(self, symbols, direction_map=None):
+        """Helper: create test signals."""
+        if direction_map is None:
+            direction_map = {sym: Direction.LONG for sym in symbols}
+        signals = {}
+        for sym in symbols:
+            entry_price = {"BTC": 50000, "ETH": 3000, "SOL": 150}.get(sym, 100)
+            signals[sym] = Signal(
+                direction=direction_map.get(sym, Direction.LONG),
+                size=0.1,
+                entry=entry_price,
+                stop=entry_price * 0.98,
+                target=entry_price * 1.02,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=10.0,
+            )
+        return signals
+
+    def _build_stub_dist(self, closes_array, symbol_name="TEST"):
+        """Helper: build KairosDistribution from closes array."""
+        predictions = []
+        for c in closes_array:
+            df = pd.DataFrame({
+                "open": [c * 0.99],
+                "high": [c * 1.01],
+                "low": [c * 0.98],
+                "close": [c],
+                "volume": [1e6],
+            })
+            predictions.append(df)
+        return KairosDistribution(predictions)
+
+    def test_cvar_allocator_init_params(self):
+        """CVaRAllocator should initialize with correct parameters."""
+        allocator = CVaRAllocator(alpha=0.95, target_return=0.01, gross_cap=1.0, max_weight=0.35)
+        assert allocator.alpha == 0.95
+        assert allocator.target_return == 0.01
+        assert allocator.gross_cap == 1.0
+        assert allocator.max_weight == 0.35
+        assert allocator.name == "cvar_allocator"
+
+    def test_scenario_matrix_basic(self):
+        """Test _scenario_matrix extraction from dists."""
+        symbols = ["BTC", "ETH"]
+        # BTC: entry 50000, 30 scenarios around entry
+        btc_closes = np.linspace(48000.0, 52000.0, 30)
+        # ETH: entry 3000, 30 scenarios around entry
+        eth_closes = np.linspace(2900.0, 3100.0, 30)
+
+        signals = self._create_signals_for_symbols(symbols)
+        dists = {
+            "BTC": self._build_stub_dist(btc_closes),
+            "ETH": self._build_stub_dist(eth_closes),
+        }
+
+        R, mu = _scenario_matrix(dists, signals, symbols)
+
+        # R should be (30, 2) scenarios x assets
+        assert R.shape == (30, 2)
+
+        # Expected returns should be near zero (symmetric around entry)
+        np.testing.assert_allclose(mu[0], 0.0, atol=0.02)
+        np.testing.assert_allclose(mu[1], 0.0, atol=0.02)
+
+        # Check first scenario values
+        np.testing.assert_allclose(R[0, 0], (48000.0 / 50000.0) - 1.0, atol=1e-6)
+        np.testing.assert_allclose(R[0, 1], (2900.0 / 3000.0) - 1.0, atol=1e-6)
+
+    def test_scenario_matrix_insufficient_scenarios(self):
+        """_scenario_matrix raises ValueError if < 20 scenarios."""
+        symbols = ["BTC", "ETH"]
+        btc_closes = np.array([48000.0, 50000.0])  # Only 2 scenarios
+        eth_closes = np.array([2900.0, 3000.0])
+
+        signals = self._create_signals_for_symbols(symbols)
+        dists = {
+            "BTC": self._build_stub_dist(btc_closes),
+            "ETH": self._build_stub_dist(eth_closes),
+        }
+
+        with pytest.raises(ValueError, match="Insufficient scenarios"):
+            _scenario_matrix(dists, signals, symbols)
+
+    def test_cvar_allocator_fewer_than_20_scenarios_fallback(self):
+        """CVaRAllocator should fall back to equal weight if < 20 scenarios."""
+        symbols = ["BTC", "ETH"]
+        btc_closes = np.array([48000.0] * 5)
+        eth_closes = np.array([2900.0] * 5)
+
+        signals = self._create_signals_for_symbols(symbols)
+        dists = {
+            "BTC": self._build_stub_dist(btc_closes),
+            "ETH": self._build_stub_dist(eth_closes),
+        }
+
+        allocator = CVaRAllocator()
+        returns = pd.DataFrame(
+            np.random.randn(100, 2) * 0.02,
+            columns=symbols,
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+
+        weights = allocator.allocate(signals, returns, dists, {})
+
+        # Should be equal weight
+        expected = {sym: 0.5 for sym in symbols}
+        for sym in symbols:
+            assert abs(weights[sym] - expected[sym]) < 1e-6
+
+    def test_cvar_better_than_equal_weight(self):
+        """CVaR of chosen weights should be <= CVaR of equal weight."""
+        # Create two assets: one with tail risk, one without
+        np.random.seed(42)
+        symbols = ["SAFE", "RISKY"]
+
+        # SAFE asset: returns centered at entry, tight distribution
+        safe_entry = 100.0
+        safe_closes = np.clip(np.random.normal(safe_entry, 2.0, 50), safe_entry * 0.95, safe_entry * 1.05)
+        safe_closes = np.maximum(safe_closes, safe_entry * 0.01)  # Avoid zero
+
+        # RISKY asset: same mean, but with catastrophic tail scenarios (10 outliers)
+        risky_entry = 100.0
+        risky_closes = np.clip(np.random.normal(risky_entry, 2.0, 40), risky_entry * 0.95, risky_entry * 1.05)
+        # Add 10 catastrophic scenarios (crashes to 10% of entry) to make tail clear
+        risky_catastrophic = np.array([risky_entry * 0.1] * 10)
+        risky_closes = np.concatenate([risky_closes, risky_catastrophic])
+
+        signals = self._create_signals_for_symbols(symbols)
+        dists = {
+            "SAFE": self._build_stub_dist(safe_closes),
+            "RISKY": self._build_stub_dist(risky_closes),
+        }
+
+        # Use alpha=0.80 to focus on worst 20% scenarios
+        allocator = CVaRAllocator(alpha=0.80, target_return=-0.2)
+        returns = pd.DataFrame(
+            np.random.randn(100, 2) * 0.02,
+            columns=symbols,
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+
+        weights_opt = allocator.allocate(signals, returns, dists, {})
+
+        # Compute scenario matrix for CVaR comparison
+        R_opt, mu = _scenario_matrix(dists, signals, symbols)
+        portfolio_returns_opt = R_opt @ np.array([weights_opt["SAFE"], weights_opt["RISKY"]])
+        cvar_opt = _compute_cvar(portfolio_returns_opt, alpha=0.80)
+
+        # Compute CVaR for equal weight
+        equal_weight = np.array([0.5, 0.5])
+        portfolio_returns_eq = R_opt @ equal_weight
+        cvar_eq = _compute_cvar(portfolio_returns_eq, alpha=0.80)
+
+        # Optimized CVaR should be <= equal-weight CVaR (within numerical tolerance)
+        assert cvar_opt <= cvar_eq + 1e-5, \
+            f"Optimized CVaR {cvar_opt} should be <= equal-weight CVaR {cvar_eq}"
+
+    def test_cvar_asset_with_catastrophic_tail_less_weight(self):
+        """Asset with catastrophic tail scenarios should get less weight."""
+        np.random.seed(123)
+        symbols = ["BASE", "CRASH"]
+
+        # BASE: centered at entry, normal returns
+        base_entry = 100.0
+        base_closes = np.clip(
+            np.random.normal(base_entry, 1.0, 50),
+            base_entry * 0.9, base_entry * 1.1
+        )
+
+        # CRASH: same mean initially, but add 10 crash scenarios
+        crash_entry = 100.0
+        crash_normal = np.clip(
+            np.random.normal(crash_entry, 1.0, 40),
+            crash_entry * 0.9, crash_entry * 1.1
+        )
+        crash_catastrophic = np.array([crash_entry * 0.1] * 10)  # 90% drawdown
+        crash_closes = np.concatenate([crash_normal, crash_catastrophic])
+
+        signals = self._create_signals_for_symbols(symbols)
+        dists = {
+            "BASE": self._build_stub_dist(base_closes),
+            "CRASH": self._build_stub_dist(crash_closes),
+        }
+
+        allocator = CVaRAllocator(alpha=0.90, target_return=-0.1)
+        returns = pd.DataFrame(
+            np.random.randn(100, 2) * 0.02,
+            columns=symbols,
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+
+        weights = allocator.allocate(signals, returns, dists, {})
+
+        # BASE should get more weight than CRASH
+        assert weights["BASE"] >= weights["CRASH"], \
+            f"BASE weight {weights['BASE']} should be >= CRASH weight {weights['CRASH']}"
+
+    def test_cvar_infeasible_target_return_fallback(self):
+        """CVaRAllocator should fall back gracefully when target_return is infeasible."""
+        np.random.seed(999)
+        symbols = ["BTC", "ETH"]
+
+        # All returns negative: no way to achieve target_return = 10%
+        btc_closes = np.array([50000.0 - 1000.0 * i for i in range(50)])
+        eth_closes = np.array([3000.0 - 60.0 * i for i in range(50)])
+
+        signals = self._create_signals_for_symbols(symbols)
+        dists = {
+            "BTC": self._build_stub_dist(btc_closes),
+            "ETH": self._build_stub_dist(eth_closes),
+        }
+
+        # Try to achieve impossible target return
+        allocator = CVaRAllocator(alpha=0.95, target_return=0.5)
+        returns = pd.DataFrame(
+            np.random.randn(100, 2) * 0.02,
+            columns=symbols,
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+
+        # Should not crash, should return valid weights (without target constraint)
+        weights = allocator.allocate(signals, returns, dists, {})
+        assert isinstance(weights, dict)
+        assert set(weights.keys()) == set(symbols)
+
+        # Weights should be valid (finite, sum to at most gross_cap)
+        total_abs = sum(abs(w) for w in weights.values())
+        assert total_abs <= 1.0 + 1e-6
+
+    def test_cvar_respects_gross_cap(self):
+        """CVaRAllocator should produce reasonable weights within gross_cap."""
+        np.random.seed(555)
+        symbols = ["BTC", "ETH"]
+
+        closes_list = [
+            np.linspace(50000.0, 51000.0, 50),  # BTC
+            np.linspace(3000.0, 3050.0, 50),    # ETH
+        ]
+
+        signals = self._create_signals_for_symbols(symbols)
+        dists = {}
+        for sym, closes in zip(symbols, closes_list):
+            dists[sym] = self._build_stub_dist(closes)
+
+        allocator = CVaRAllocator(alpha=0.95, gross_cap=1.0, max_weight=0.4)
+        returns = pd.DataFrame(
+            np.random.randn(100, 2) * 0.02,
+            columns=symbols,
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+
+        weights = allocator.allocate(signals, returns, dists, {})
+
+        # Check that weights are reasonable (positive for LONG signals)
+        assert weights["BTC"] >= 0, "BTC should have non-negative weight"
+        assert weights["ETH"] >= 0, "ETH should have non-negative weight"
+
+        # Check that sum of absolute weights is at most gross_cap + small tolerance
+        total_abs = sum(abs(w) for w in weights.values())
+        assert total_abs <= allocator.gross_cap * 1.01, \
+            f"Sum of absolute weights {total_abs} significantly exceeds gross_cap {allocator.gross_cap}"
+
+    def test_cvar_empty_signals_empty_weights(self):
+        """CVaRAllocator with no signals should return empty dict."""
+        allocator = CVaRAllocator()
+        returns = pd.DataFrame(
+            np.random.randn(100, 2) * 0.02,
+            columns=["BTC", "ETH"],
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+        dists = {}
+
+        weights = allocator.allocate({}, returns, dists, {})
+        assert weights == {}
+
+    def test_compute_cvar_basic(self):
+        """_compute_cvar should compute CVaR correctly."""
+        # 100 returns: 95 good (return=1), 5 bad (return=-10)
+        returns = np.concatenate([np.ones(95), np.array([-10.0] * 5)])
+        cvar_95 = _compute_cvar(returns, alpha=0.95)
+
+        # Bottom 5% (5 out of 100) have return -10
+        # CVaR_95 = mean of bottom 5 = -10
+        expected_cvar = -10.0
+        assert abs(cvar_95 - expected_cvar) < 1e-6, \
+            f"CVaR should be {expected_cvar}, got {cvar_95}"
+
+    def test_cvar_allocator_no_signals_fallback(self):
+        """Empty signals should return empty dict, not crash."""
+        allocator = CVaRAllocator()
+        returns = pd.DataFrame(
+            np.random.randn(100, 3) * 0.02,
+            columns=["A", "B", "C"],
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+        dists = {
+            "A": self._build_stub_dist(np.linspace(100, 105, 50)),
+            "B": self._build_stub_dist(np.linspace(100, 105, 50)),
+            "C": self._build_stub_dist(np.linspace(100, 105, 50)),
+        }
+
+        weights = allocator.allocate({}, returns, dists, {})
+        assert weights == {}
+
+    def test_cvar_allocator_preserves_allocation_structure(self):
+        """Weights should always be a dict with each symbol as key."""
+        np.random.seed(777)
+        symbols = ["X", "Y"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # Create valid dists with >= 20 scenarios
+        closes_list = [
+            np.linspace(100, 102, 50),  # X
+            np.linspace(100, 102, 50),  # Y
+        ]
+        dists = {}
+        for sym, closes in zip(symbols, closes_list):
+            dists[sym] = self._build_stub_dist(closes)
+
+        allocator = CVaRAllocator()
+        returns = pd.DataFrame(
+            np.random.randn(100, 2) * 0.02,
+            columns=symbols,
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+
+        weights = allocator.allocate(signals, returns, dists, {})
+
+        # Check structure
+        assert isinstance(weights, dict)
+        assert set(weights.keys()) == set(signals.keys())
+        for sym in symbols:
+            assert isinstance(weights[sym], (int, float))
+            assert not np.isnan(weights[sym])
+            assert not np.isinf(weights[sym])

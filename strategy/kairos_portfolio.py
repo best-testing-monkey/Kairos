@@ -2394,3 +2394,387 @@ class GAAllocator(PortfolioAllocator):
             weights[sym] = w
 
         return weights
+
+
+# =============================================================================
+# CVAR ALLOCATOR (ROCKAFELLAR-URYASEV)
+# =============================================================================
+
+def _scenario_matrix(dists: Dict[str, Any], signals: Dict[str, "Signal"],
+                     symbols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extract scenario matrix and expected returns from Kronos sample paths.
+
+    For each asset i and scenario s:
+        R_s,i = (close_s,i / entry_i) - 1  (predicted return from entry to scenario close)
+
+    Args:
+        dists: Dict[symbol -> KairosDistribution] with .df["close"] per-sample array.
+        signals: Dict[symbol -> Signal] for entry prices.
+        symbols: List of asset symbols (in order).
+
+    Returns:
+        R: Scenario matrix (n_scenarios, n_assets)
+        mu: Expected return vector (n_assets,)
+
+    Raises:
+        ValueError: If insufficient scenarios (< 20), or extraction fails.
+
+    Notes:
+        Defensively tries dists[symbol].df["close"] first. Scenario count is
+        the minimum available across all assets.
+    """
+    n_assets = len(symbols)
+
+    # Extract per-sample closes for each asset
+    scenario_sets = []
+    for sym in symbols:
+        try:
+            dist = dists[sym]
+            # Try to extract close samples
+            if hasattr(dist, 'df') and 'close' in dist.df.columns:
+                closes = dist.df['close'].values.astype(float)
+            else:
+                raise ValueError(f"Cannot extract 'close' samples for {sym}")
+
+            scenario_sets.append(closes)
+        except Exception as e:
+            raise ValueError(f"Failed to extract scenarios for {sym}: {e}")
+
+    # Determine common scenario count (minimum across assets)
+    scenario_counts = [len(s) for s in scenario_sets]
+    n_scenarios = min(scenario_counts)
+
+    if n_scenarios < 20:
+        raise ValueError(f"Insufficient scenarios: {n_scenarios} < 20")
+
+    # Trim all scenario sets to common count
+    scenario_sets = [s[:n_scenarios] for s in scenario_sets]
+
+    # Build scenario matrix: R[s, i] = (close[s, i] / entry[i]) - 1
+    R = np.zeros((n_scenarios, n_assets))
+    for i, sym in enumerate(symbols):
+        entry_price = signals[sym].entry
+        if entry_price <= 0:
+            raise ValueError(f"Invalid entry price for {sym}: {entry_price}")
+        R[:, i] = scenario_sets[i] / entry_price - 1.0
+
+    # Compute expected returns (mean over scenarios)
+    mu = np.mean(R, axis=0)
+
+    return R, mu
+
+
+class CVaRAllocator(PortfolioAllocator):
+    """
+    Conditional Value-at-Risk (CVaR) allocator using Rockafellar-Uryasev LP.
+
+    Minimizes CVaR_alpha subject to expected return constraint, using Kronos
+    sample paths as the scenario set. This is a quantile-based risk measure
+    that captures tail risk more effectively than variance.
+
+    The Rockafellar-Uryasev LP formulation:
+        minimize: zeta + (1 / ((1-alpha) * S)) * sum_s z_s
+        s.t. z_s >= -(R_s · w) - zeta  for all scenarios s
+             w_i = d_i * u_i  (direction-signed magnitude)
+             sum u = gross_cap
+             0 <= u_i <= max_weight
+             mu · w >= target_return  (optional; dropped if infeasible)
+
+    where:
+        - R_s,i = (close_s,i / entry_i) - 1 (predicted return, scenario-by-asset)
+        - mu_i = mean(R[:,i]) (expected return per asset)
+        - d_i = +1 (LONG), -1 (SHORT), 0 (FLAT) from signal direction
+        - S = number of scenarios
+        - CVaR_alpha = expected value of the worst (1-alpha) fraction of returns
+
+    Scenario set: Kronos predicted closes from dists[symbol].df["close"], one
+    row per sample. Common scenario count = min across all assets. If < 20
+    scenarios, falls back to equal-weight.
+
+    Infeasible target_return: retries LP with target_return=-infinity (pure CVaR
+    minimization). If still infeasible or solver fails, returns equal-weight.
+
+    Attributes:
+        name: "cvar_allocator"
+        alpha: CVaR confidence level (default 0.95). Minimizes the worst 5%.
+        target_return: Minimum acceptable portfolio return (default 0.0).
+        gross_cap: Gross leverage cap (sum of |w_i|, default 1.0).
+        max_weight: Individual position cap (default 0.35).
+    """
+
+    name: str = "cvar_allocator"
+
+    def __init__(
+        self,
+        alpha: float = 0.95,
+        target_return: float = 0.0,
+        gross_cap: float = 1.0,
+        max_weight: float = 0.35,
+    ):
+        """
+        Initialize CVaR allocator.
+
+        Args:
+            alpha: Confidence level for CVaR (default 0.95).
+                  CVaR_95 is the expected value of the worst 5% of returns.
+            target_return: Minimum acceptable portfolio return (default 0.0).
+                          If infeasible, constraint is dropped and LP is re-run.
+            gross_cap: Gross leverage cap (sum of absolute values of weights,
+                      default 1.0).
+            max_weight: Individual position cap (default 0.35).
+
+        Examples:
+            >>> allocator = CVaRAllocator(alpha=0.95, target_return=0.0)
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        self.alpha = float(alpha)
+        self.target_return = float(target_return)
+        self.gross_cap = float(gross_cap)
+        self.max_weight = float(max_weight)
+
+    def allocate(
+        self,
+        signals: Dict[str, "Signal"],
+        returns: pd.DataFrame,
+        dists: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Compute CVaR-optimal weights.
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns
+                    (unused; kept for interface compatibility).
+            dists: Dict[symbol -> KairosDistribution] with predicted closes.
+            context: Dict[str, Any] execution context (unused).
+
+        Returns:
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values <= gross_cap.
+            Individual absolute values <= max_weight.
+            Signs match signal directions.
+
+        Fall-back behavior:
+            If < 20 scenarios, returns equal-weight.
+            If scenario extraction fails, returns equal-weight.
+            If LP is infeasible, retries without target_return constraint.
+            If still infeasible, returns equal-weight.
+            If solver fails, returns equal-weight.
+
+        Examples:
+            >>> allocator = CVaRAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, {})
+        """
+        # Extract symbols
+        symbols = list(signals.keys())
+        if not symbols:
+            return {}
+
+        # Extract scenarios
+        try:
+            R, mu = _scenario_matrix(dists, signals, symbols)
+        except ValueError:
+            # Insufficient scenarios or extraction failed
+            return _fallback_equal_weight(signals)
+
+        # Solve CVaR LP with target_return constraint
+        try:
+            weights_dict = self._solve_cvar(
+                symbols, R, mu, signals,
+                with_return_constraint=True
+            )
+            return weights_dict
+        except ValueError:
+            # If infeasible, retry without return constraint
+            try:
+                weights_dict = self._solve_cvar(
+                    symbols, R, mu, signals,
+                    with_return_constraint=False
+                )
+                return weights_dict
+            except ValueError:
+                # If still fails, fall back to equal weight
+                return _fallback_equal_weight(signals)
+
+    def _solve_cvar(
+        self,
+        symbols: List[str],
+        R: np.ndarray,
+        mu: np.ndarray,
+        signals: Dict[str, "Signal"],
+        with_return_constraint: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Solve the Rockafellar-Uryasev CVaR LP.
+
+        Variables:
+            u_i (i=0..n-1): Non-negative magnitudes for each asset
+            zeta: VaR threshold (quantile of returns)
+            z_s (s=0..S-1): Slack variables (excess loss beyond VaR)
+
+        Objective: minimize zeta + (1/((1-alpha)*S)) * sum_s z_s
+
+        Constraints:
+            z_s >= -(R_s · d*u) - zeta  for all s  (tail loss constraint)
+            sum u = gross_cap  (budget constraint)
+            0 <= u_i <= max_weight  for all i  (position bounds)
+            mu · (d*u) >= target_return  if with_return_constraint
+            z_s >= 0  for all s  (slack non-negativity)
+            u_i >= 0, zeta unbounded
+
+        Args:
+            symbols: List of asset symbols (order matching R, mu).
+            R: Scenario matrix (n_scenarios, n_assets).
+            mu: Expected returns (n_assets,).
+            signals: Dict[symbol -> Signal] for direction (d_i).
+            with_return_constraint: If True, include mu·w >= target_return.
+
+        Returns:
+            Dict[symbol -> float] of signed weights.
+
+        Raises:
+            ValueError: If LP is infeasible or solver fails.
+        """
+        from scipy.optimize import linprog
+
+        n_assets = len(symbols)
+        n_scenarios = R.shape[0]
+
+        # Extract direction signs: d_i in {-1, 0, +1}
+        signs = np.zeros(n_assets)
+        for i, sym in enumerate(symbols):
+            direction = signals[sym].direction
+            try:
+                dir_val = direction.value if hasattr(direction, 'value') else direction
+            except:
+                dir_val = direction
+
+            if dir_val == 1:
+                signs[i] = 1.0
+            elif dir_val == -1:
+                signs[i] = -1.0
+            # FLAT stays 0
+
+        # Variables: [u_0, ..., u_{n-1}, zeta, z_0, ..., z_{S-1}]
+        # Total variables: n_assets + 1 + n_scenarios
+        n_vars = n_assets + 1 + n_scenarios
+
+        # Objective: minimize zeta + (1/((1-alpha)*S)) * sum_s z_s
+        # c vector: [0, ..., 0 (n_assets), 1 (zeta), 1/(1-alpha)*S, ..., 1/(1-alpha)*S]
+        c = np.zeros(n_vars)
+        c[n_assets] = 1.0  # Coefficient of zeta
+        if self.alpha < 1.0:
+            slack_coeff = 1.0 / ((1.0 - self.alpha) * n_scenarios)
+            c[n_assets + 1:] = slack_coeff
+
+        # Inequality constraints: A_ub @ x <= b_ub
+        # Constraint: z_s >= -(R_s · (d*u)) - zeta
+        # Rewrite: (R_s · (d*u)) + zeta + z_s >= 0
+        # Or: -(R_s · (d*u)) - zeta - z_s <= 0
+        # In standard form: sum_i R_s,i * d_i * u_i + zeta + z_s <= 0
+
+        A_ub_list = []
+        b_ub_list = []
+
+        # For each scenario s: sum_i R_s,i * d_i * u_i + zeta + z_s <= 0
+        for s in range(n_scenarios):
+            row = np.zeros(n_vars)
+            # Coefficient of u_i: R_s,i * d_i
+            for i in range(n_assets):
+                row[i] = R[s, i] * signs[i]
+            # Coefficient of zeta: 1
+            row[n_assets] = 1.0
+            # Coefficient of z_s: 1
+            row[n_assets + 1 + s] = 1.0
+
+            A_ub_list.append(row)
+            b_ub_list.append(0.0)
+
+        A_ub = np.array(A_ub_list)
+        b_ub = np.array(b_ub_list)
+
+        # Equality constraints: A_eq @ x = b_eq
+        # Constraint 1: sum u = gross_cap
+        A_eq_list = []
+        b_eq_list = []
+
+        row_sum = np.zeros(n_vars)
+        row_sum[:n_assets] = 1.0
+        A_eq_list.append(row_sum)
+        b_eq_list.append(self.gross_cap)
+
+        # Constraint 2 (optional): mu · (d*u) >= target_return
+        # Rewrite: sum_i mu_i * d_i * u_i >= target_return
+        # Or: -sum_i mu_i * d_i * u_i <= -target_return
+        if with_return_constraint:
+            row_return = np.zeros(n_vars)
+            for i in range(n_assets):
+                row_return[i] = -mu[i] * signs[i]
+            A_eq_list.append(row_return)
+            b_eq_list.append(-self.target_return)
+
+        A_eq = np.array(A_eq_list) if A_eq_list else np.empty((0, n_vars))
+        b_eq = np.array(b_eq_list) if b_eq_list else np.array([])
+
+        # Variable bounds
+        bounds = []
+        # u_i: 0 <= u_i <= max_weight
+        for i in range(n_assets):
+            bounds.append((0.0, self.max_weight))
+        # zeta: unbounded
+        bounds.append((None, None))
+        # z_s: z_s >= 0
+        for s in range(n_scenarios):
+            bounds.append((0.0, None))
+
+        # Solve LP
+        try:
+            result = linprog(
+                c,
+                A_ub=A_ub if A_ub.shape[0] > 0 else None,
+                b_ub=b_ub if len(b_ub) > 0 else None,
+                A_eq=A_eq if A_eq.shape[0] > 0 else None,
+                b_eq=b_eq if len(b_eq) > 0 else None,
+                bounds=bounds,
+                method='highs',
+            )
+        except Exception as e:
+            raise ValueError(f"linprog solver error: {e}")
+
+        if not result.success:
+            raise ValueError(f"LP infeasible or failed: {result.message}")
+
+        # Extract weights
+        u = result.x[:n_assets]
+
+        # Apply signs and assemble final weights
+        weights = {}
+        for i, sym in enumerate(symbols):
+            w = float(signs[i] * u[i])
+            if abs(w) < 1e-10:
+                w = 0.0
+            weights[sym] = w
+
+        return weights
+
+
+def _compute_cvar(returns: np.ndarray, alpha: float = 0.95) -> float:
+    """
+    Compute CVaR_alpha for a portfolio over a set of scenarios.
+
+    CVaR_alpha = expected value of the worst (1-alpha) fraction of returns.
+    Equivalently: mean of returns below the alpha-quantile.
+
+    Args:
+        returns: Portfolio returns per scenario (n_scenarios,).
+        alpha: Confidence level (default 0.95).
+
+    Returns:
+        CVaR_alpha as a float. More negative means worse tail risk.
+    """
+    sorted_returns = np.sort(returns)
+    # Use floor to avoid floating-point rounding artifacts (e.g., 5.0000...01 -> 6)
+    k = max(1, int(np.floor((1.0 - alpha) * len(returns) + 1e-10)))
+    return float(np.mean(sorted_returns[:k]))
