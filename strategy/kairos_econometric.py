@@ -6,7 +6,7 @@ No statsmodels dependency. All fits via numpy least squares + scipy optimizers.
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
 from kairos_backtest import Strategy, Signal, Direction, KairosDistribution
 
 
@@ -387,3 +387,347 @@ class VARLeadLagStrategy(Strategy):
             expected_value=ev,
             metadata={"max_abs_t": float(max_abs_t)},
         )
+
+
+# =============================================================================
+# SEASONALITY FILTER
+# =============================================================================
+
+def _newey_west_hac_se(resid: np.ndarray, X: np.ndarray, lag: int = 5) -> np.ndarray:
+    """
+    Compute Newey-West (HAC) standard errors for OLS coefficients.
+
+    Uses Bartlett kernel with the given lag to account for autocorrelation
+    in residuals. Returns the standard errors.
+
+    Parameters
+    ----------
+    resid : np.ndarray, shape (n,)
+        OLS residuals.
+    X : np.ndarray, shape (n, k)
+        Design matrix (should include intercept if needed).
+    lag : int, default 5
+        Maximum lag for Newey-West weighting.
+
+    Returns
+    -------
+    np.ndarray, shape (k,)
+        HAC-adjusted standard errors.
+    """
+    n, k = X.shape
+
+    # Compute (X'X)^-1
+    try:
+        XtX_inv = np.linalg.inv(X.T @ X)
+    except np.linalg.LinAlgError:
+        # Return NaN if singular
+        return np.full(k, np.nan)
+
+    # Compute Newey-West variance matrix
+    # S = sum_{j=-lag}^{lag} w_j * sum_t (ε_t * ε_{t+j} * X_t * X_{t+j}')
+    # where w_j = 1 - |j|/(lag+1) is the Bartlett weight
+
+    S = np.zeros((k, k))
+
+    # Lag 0: E[ε_t^2 * X_t * X_t']
+    eps_X = resid[:, np.newaxis] * X  # Shape (n, k)
+    S += eps_X.T @ eps_X  # Shape (k, k)
+
+    # Positive and negative lags with Bartlett weights
+    for j in range(1, lag + 1):
+        w_j = 1.0 - j / (lag + 1)
+
+        # Lag j: E[ε_t * ε_{t-j} * X_t * X_{t-j}']
+        # When we do element-wise multiply of shifted arrays, we need to align them
+        eps_j = resid[:-j]  # ε_{t-j}, shape (n-j,)
+        X_j = X[:-j, :]      # X_{t-j}, shape (n-j, k)
+        eps_t = resid[j:]    # ε_t, shape (n-j,)
+        X_t = X[j:, :]       # X_t, shape (n-j, k)
+
+        # Element-wise product of eps
+        eps_prod = (eps_t * eps_j)[:, np.newaxis]  # Shape (n-j, 1)
+
+        # (ε_t * ε_{t-j}) * X_t * X_{t-j}'
+        term = eps_prod * X_t  # Shape (n-j, k)
+        term_XtXj = term.T @ X_j  # Shape (k, k)
+
+        # Add both lag j and lag -j (by symmetry)
+        S += w_j * (term_XtXj + term_XtXj.T)
+
+    # Variance: (X'X)^-1 * S * (X'X)^-1
+    cov_hac = XtX_inv @ S @ XtX_inv
+
+    # Standard errors from diagonal
+    se = np.sqrt(np.diag(cov_hac))
+    return se
+
+
+class SeasonalityFilterStrategy(Strategy):
+    """
+    Filter wrapper that vetoes signals fighting significant seasonal effects.
+
+    Estimates day-of-week and month-of-year mean daily return effects over
+    a trailing window using OLS. Computes HAC-adjusted (Newey-West) t-statistics
+    for each effect. If today is predicted to experience a significant seasonal
+    effect that opposes the signal direction, returns None (veto); otherwise
+    passes through.
+
+    Parameters
+    ----------
+    base_strategy : Strategy
+        The wrapped strategy to filter.
+    lookback : int, default 504
+        Number of trailing trading days to use for effect estimation (roughly 2 years).
+    t_threshold : float, default 2.0
+        T-statistic threshold for significance (two-tailed, ~95% CI).
+    """
+    name = "seasonality_filter"
+
+    def __init__(self, base_strategy: Strategy, lookback: int = 504,
+                 t_threshold: float = 2.0):
+        self.base_strategy = base_strategy
+        self.lookback = lookback
+        self.t_threshold = t_threshold
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        """
+        Wrap the base strategy and apply seasonality check.
+
+        Returns None (veto) if a significant seasonal effect opposes the signal.
+        Otherwise passes through the base signal.
+        """
+        # Get the base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+        if base_signal is None:
+            return None
+
+        # Extract history and ensure we have dates
+        if history is None or len(history) < self.lookback:
+            # Not enough history; pass through
+            return base_signal
+
+        # Get datetime index or date column
+        dates = self._extract_dates(history)
+        if dates is None:
+            # No dates available; pass through
+            return base_signal
+
+        # Extract returns from close prices
+        closes = history["close"].values.astype(float)
+        if len(closes) < 2:
+            return base_signal
+
+        returns = np.diff(np.log(closes))  # Log returns
+
+        if len(returns) != len(dates) - 1:
+            # Mismatch; pass through
+            return base_signal
+
+        # Use trailing lookback rows
+        if len(returns) > self.lookback:
+            returns = returns[-self.lookback:]
+            dates = dates[-self.lookback - 1:]  # One extra for alignment with returns
+
+        # Compute seasonality effects
+        dow_effects, month_effects = self._estimate_effects(returns, dates)
+
+        if dow_effects is None or month_effects is None:
+            return base_signal
+
+        # Get today's date (last date + 1 business day)
+        today_date = self._next_business_day(dates[-1])
+        if today_date is None:
+            return base_signal
+
+        # Check day-of-week and month-of-year effects for today
+        veto = self._should_veto(today_date, dow_effects, month_effects, base_signal.direction)
+
+        if veto:
+            return None
+
+        return base_signal
+
+    def _extract_dates(self, history: pd.DataFrame) -> Optional[np.ndarray]:
+        """
+        Extract dates from history DataFrame.
+
+        Handles both DatetimeIndex and a date column.
+
+        Returns
+        -------
+        np.ndarray of pd.Timestamp or None
+            Array of dates, or None if extraction fails.
+        """
+        try:
+            # Try DatetimeIndex first
+            if isinstance(history.index, pd.DatetimeIndex):
+                return history.index.to_numpy()
+
+            # Try a "date" column
+            if "date" in history.columns:
+                dates = pd.to_datetime(history["date"]).values
+                return dates
+
+            # Try to use any DatetimeIndex (even if not the primary index)
+            # For now, we only support the above two cases
+            return None
+        except Exception:
+            return None
+
+    def _next_business_day(self, date: pd.Timestamp) -> Optional[pd.Timestamp]:
+        """
+        Return the next business day after `date`.
+
+        For now, a simple heuristic: add 1 day, skip weekends (5=Sat, 6=Sun).
+
+        Returns
+        -------
+        pd.Timestamp or None
+        """
+        try:
+            next_date = pd.Timestamp(date) + pd.Timedelta(days=1)
+
+            # Skip weekends
+            while next_date.weekday() in [5, 6]:
+                next_date += pd.Timedelta(days=1)
+
+            return next_date
+        except Exception:
+            return None
+
+    def _estimate_effects(self, returns: np.ndarray, dates: np.ndarray) \
+            -> Tuple[Optional[Dict], Optional[Dict]]:
+        """
+        Estimate day-of-week and month-of-year mean daily return effects.
+
+        Runs OLS: return_t = c + sum_d (dow_d * I{dow=d}) + sum_m (month_m * I{month=m}) + e_t
+
+        where I{...} are indicator variables.
+
+        Returns
+        -------
+        (dow_effects, month_effects) where each is a dict {effect_name: t_stat}
+            or (None, None) if estimation fails.
+        """
+        try:
+            n = len(returns)
+            if n < 20:
+                return None, None
+
+            # Convert dates to pandas Timestamps for weekday/month extraction
+            dates_ts = pd.to_datetime(dates)
+
+            # returns[i] = log(close[i+1]/close[i]) is the return realized
+            # ON dates[i+1], so label each return by its realization date.
+            dow_vals = dates_ts[1:].weekday.values
+            month_vals = dates_ts[1:].month.values
+
+            # Estimate each category effect via a contrast regression:
+            #   return_t = a + b * I{category} + e_t
+            # b = (mean return in category) - (mean return outside category),
+            # with a Newey-West HAC standard error. Estimating each category
+            # directly (rather than one reference-category dummy regression)
+            # ensures every day/month gets its own effect and t-stat.
+            dow_names = ["Monday", "Tuesday", "Wednesday", "Thursday",
+                         "Friday", "Saturday", "Sunday"]
+            dow_effects = {}
+            for d in range(7):
+                eff = self._contrast_effect(returns, dow_vals == d)
+                if eff is not None:
+                    dow_effects[dow_names[d]] = eff
+
+            month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            month_effects = {}
+            for m in range(1, 13):
+                eff = self._contrast_effect(returns, month_vals == m)
+                if eff is not None:
+                    month_effects[month_names[m - 1]] = eff
+
+            return dow_effects, month_effects
+
+        except Exception:
+            return None, None
+
+    def _contrast_effect(self, returns: np.ndarray, mask: np.ndarray) -> Optional[Dict]:
+        """
+        Estimate a single category's mean-return effect with a HAC t-stat.
+
+        Regresses returns on [intercept, category dummy]; the dummy coefficient
+        is the category mean minus the non-category mean. The standard error is
+        Newey-West (Bartlett kernel, lag 5), computed in numpy.
+
+        Returns
+        -------
+        dict {"coef": float, "tstat": float} or None if the category is
+        degenerate (never occurs, or occurs on nearly every day).
+        """
+        n = len(returns)
+        count = int(mask.sum())
+        if count < 2 or count > n - 2:
+            return None
+
+        X = np.column_stack([np.ones(n), mask.astype(float)])
+        fit = _lagged_ols(returns, X)
+        se_hac = _newey_west_hac_se(fit["resid"], X, lag=5)
+        if not np.all(np.isfinite(se_hac)):
+            return None
+
+        coef = float(fit["coef"][1])
+        tstat = coef / (float(se_hac[1]) + 1e-10)
+        return {"coef": coef, "tstat": float(tstat)}
+
+    def _should_veto(self, today_date: pd.Timestamp, dow_effects: Dict,
+                     month_effects: Dict, signal_direction: Direction) -> bool:
+        """
+        Check if today's seasonal effects oppose the signal direction significantly.
+
+        Returns True (veto) if:
+        - A significant (|t| > threshold) DOW or month effect exists for today
+        - AND the effect's sign opposes the signal direction
+
+        Returns
+        -------
+        bool
+            True if veto, False otherwise.
+        """
+        try:
+            # Get today's day-of-week and month
+            dow_idx = today_date.weekday()  # 0=Mon, ..., 6=Sun
+            month_idx = today_date.month - 1  # 0-11
+
+            dow_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+            # Determine signal direction sign
+            signal_sign = 1 if signal_direction == Direction.LONG else -1 if signal_direction == Direction.SHORT else 0
+
+            if signal_sign == 0:
+                return False
+
+            # Check day-of-week effect (every day has its own contrast estimate)
+            dow_name = dow_names[dow_idx]
+            if dow_name in dow_effects:
+                dow_info = dow_effects[dow_name]
+                if abs(dow_info["tstat"]) > self.t_threshold:
+                    effect_sign = np.sign(dow_info["coef"])
+                    # Veto if effect sign opposes signal direction
+                    if effect_sign != 0 and effect_sign != signal_sign:
+                        return True
+
+            # Check month-of-year effect
+            month_name = month_names[month_idx]
+            if month_name in month_effects:
+                month_info = month_effects[month_name]
+                if abs(month_info["tstat"]) > self.t_threshold:
+                    effect_sign = np.sign(month_info["coef"])
+                    # Veto if effect sign opposes signal direction
+                    if effect_sign != 0 and effect_sign != signal_sign:
+                        return True
+
+            return False
+
+        except Exception:
+            return False

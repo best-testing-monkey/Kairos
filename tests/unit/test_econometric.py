@@ -10,6 +10,7 @@ from kairos_backtest import (
 )
 from kairos_econometric import (
     _lagged_ols, ARIMADisagreementStrategy, VARLeadLagStrategy,
+    SeasonalityFilterStrategy,
 )
 
 
@@ -725,4 +726,320 @@ class TestVARLeadLagDetection:
         # Should emit LONG signal: positive x yesterday × positive coef = positive implied move,
         # which agrees with Kronos UP
         assert sig is not None, "Expected LONG signal with positive lead-lag agreement"
+        assert sig.direction == Direction.LONG
+
+
+# ============================================================================
+# Tests: SeasonalityFilterStrategy
+# ============================================================================
+
+class TestSeasonalityFilterStrategy:
+    def test_seasonality_friday_effect_detection(self):
+        """Test that a planted -1% Friday effect is detected as a significant negative effect."""
+        np.random.seed(42)
+
+        # Create 505 days of history with planted Friday effect
+        n_days = 505
+        dates = pd.bdate_range("2022-01-03", periods=n_days, freq="B")
+
+        base_returns = np.random.normal(0.0005, 0.01, n_days)
+        dow_vals = dates.weekday.values
+        friday_mask = (dow_vals == 4)  # 4 = Friday
+        returns = base_returns.copy()
+        returns[friday_mask] -= 0.01  # -1% on Fridays
+
+        prices = np.exp(np.cumsum(returns))
+        closes = 100.0 * prices
+
+        # returns[i] as seen by the strategy = log(close[i+1]/close[i]),
+        # labeled by dates[i+1]; check the estimator directly
+        log_returns = np.diff(np.log(closes))
+
+        base = StubStrategy(direction=Direction.LONG, confidence=0.8)
+        seasonality = SeasonalityFilterStrategy(base, lookback=504, t_threshold=2.0)
+
+        dow_effects, month_effects = seasonality._estimate_effects(
+            log_returns, dates.to_numpy())
+
+        assert dow_effects is not None
+        assert "Friday" in dow_effects
+        # The planted -1% Friday effect must be detected: negative coef, |t| > 2
+        assert dow_effects["Friday"]["coef"] < 0
+        assert abs(dow_effects["Friday"]["tstat"]) > 2.0, \
+            f"Expected significant Friday effect, got t={dow_effects['Friday']['tstat']}"
+
+    def test_seasonality_friday_effect_veto_on_friday(self):
+        """Test that Friday veto fires when Friday effect is significant and negative."""
+        np.random.seed(42)
+
+        # Create history with explicit dates
+        # Use a date range that ends on a THURSDAY (so next business day is Friday)
+        n_days = 504
+        start_date = pd.Timestamp("2022-01-03", tz=None)  # Monday
+
+        # Generate business day dates
+        dates = pd.bdate_range(start=start_date, periods=n_days, freq="B")
+
+        # Ensure last date is a Thursday (weekday() == 3)
+        # If not, pad until we get a Thursday
+        while dates[-1].weekday() != 3:
+            dates = pd.bdate_range(start=start_date, periods=n_days + 1, freq="B")
+            n_days += 1
+
+        # Generate returns with planted Friday effect
+        base_returns = np.random.normal(0.0005, 0.01, n_days)
+        returns = base_returns.copy()
+
+        # Add -2.0% effect on Fridays (strong signal to ensure significance)
+        dow_vals = dates.weekday.values
+        friday_mask = (dow_vals == 4)
+        returns[friday_mask] -= 0.02
+
+        # Build history
+        prices = np.exp(np.cumsum(returns))
+        closes = 100.0 * prices
+
+        history = pd.DataFrame({
+            "open": closes * 0.999,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1e6] * n_days,
+        }, index=dates)
+
+        current_price = closes[-1]
+
+        # The last date should be Thursday
+        assert dates[-1].weekday() == 3, "Last date should be Thursday"
+        # Next business day should be Friday
+        assert (dates[-1] + pd.Timedelta(days=1)).weekday() == 4, "Next day should be Friday"
+
+        # Create distribution and base strategy
+        dist = make_dist(np.linspace(current_price, current_price * 1.02, 100))
+        base = StubStrategy(direction=Direction.LONG, confidence=0.8)
+
+        # Wrap with seasonality filter
+        seasonality = SeasonalityFilterStrategy(base, lookback=504, t_threshold=2.0)
+
+        sig = seasonality.generate_signal(dist, current_price, history, {})
+
+        # Should veto: Tomorrow is Friday with -2.0% effect, which is significant and opposes LONG
+        assert sig is None, "Expected veto when next business day (Friday) has significant negative effect"
+
+    def test_seasonality_white_noise_no_veto(self):
+        """Test that white noise returns (no effects) produces no veto."""
+        np.random.seed(42)
+
+        n_days = 504
+        dates = pd.bdate_range(start="2022-01-03", periods=n_days, freq="B")
+
+        # Pure white noise (no seasonal effects)
+        returns = np.random.normal(0.0005, 0.01, n_days)
+
+        # Build history
+        prices = np.exp(np.cumsum(returns))
+        closes = 100.0 * prices
+
+        history = pd.DataFrame({
+            "open": closes * 0.999,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1e6] * n_days,
+        }, index=dates)
+
+        current_price = closes[-1]
+
+        # Create distribution and base strategy
+        dist = make_dist(np.linspace(current_price, current_price * 1.02, 100))
+        base = StubStrategy(direction=Direction.LONG, confidence=0.8)
+
+        # Wrap with seasonality filter
+        seasonality = SeasonalityFilterStrategy(base, lookback=504, t_threshold=2.0)
+
+        sig = seasonality.generate_signal(dist, current_price, history, {})
+
+        # Should NOT veto: white noise has no significant effects
+        # With pure white noise, all |t| should be < 2
+        assert sig is not None, "Expected no veto on white noise"
+        assert sig.direction == Direction.LONG
+
+    def test_seasonality_passthrough_none_base(self):
+        """Test that None from base strategy passes through as None."""
+        np.random.seed(42)
+
+        n_days = 504
+        dates = pd.bdate_range(start="2022-01-03", periods=n_days, freq="B")
+        returns = np.random.normal(0.0005, 0.01, n_days)
+        prices = np.exp(np.cumsum(returns))
+        closes = 100.0 * prices
+
+        history = pd.DataFrame({
+            "open": closes * 0.999,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1e6] * n_days,
+        }, index=dates)
+
+        dist = make_dist(np.linspace(closes[-1], closes[-1] * 1.02, 100))
+
+        # Base strategy that returns None
+        class NoneStrategy(PercentileEntryStrategy):
+            def generate_signal(self, dist, current_price, history, context):
+                return None
+
+        base = NoneStrategy()
+        seasonality = SeasonalityFilterStrategy(base, lookback=504, t_threshold=2.0)
+
+        sig = seasonality.generate_signal(dist, closes[-1], history, {})
+
+        assert sig is None, "Expected None passthrough from base"
+
+    def test_seasonality_passthrough_on_missing_dates(self):
+        """Test that missing dates or non-DatetimeIndex → pass-through unchanged."""
+        np.random.seed(42)
+
+        n_days = 504
+        prices = 100.0 * np.exp(np.cumsum(np.random.normal(0.0005, 0.01, n_days)))
+        closes = prices
+
+        # Create history WITHOUT DatetimeIndex (just integer index)
+        history = pd.DataFrame({
+            "open": closes * 0.999,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1e6] * n_days,
+        })  # No DatetimeIndex
+
+        dist = make_dist(np.linspace(closes[-1], closes[-1] * 1.02, 100))
+        base = StubStrategy(direction=Direction.LONG, confidence=0.8)
+
+        seasonality = SeasonalityFilterStrategy(base, lookback=504, t_threshold=2.0)
+
+        sig = seasonality.generate_signal(dist, closes[-1], history, {})
+
+        # Should pass through unchanged (no dates available)
+        assert sig is not None, "Expected passthrough with missing dates"
+        assert sig.direction == Direction.LONG
+        assert sig.confidence == 0.8
+
+    def test_seasonality_insufficient_history(self):
+        """Test that insufficient history passes through unchanged."""
+        np.random.seed(42)
+
+        # Only 100 days (need 504)
+        n_days = 100
+        dates = pd.bdate_range(start="2022-01-03", periods=n_days, freq="B")
+        prices = 100.0 * np.exp(np.cumsum(np.random.normal(0.0005, 0.01, n_days)))
+        closes = prices
+
+        history = pd.DataFrame({
+            "open": closes * 0.999,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1e6] * n_days,
+        }, index=dates)
+
+        dist = make_dist(np.linspace(closes[-1], closes[-1] * 1.02, 100))
+        base = StubStrategy(direction=Direction.LONG, confidence=0.8)
+
+        seasonality = SeasonalityFilterStrategy(base, lookback=504, t_threshold=2.0)
+
+        sig = seasonality.generate_signal(dist, closes[-1], history, {})
+
+        # Should pass through unchanged (not enough history)
+        assert sig is not None, "Expected passthrough with insufficient history"
+        assert sig.direction == Direction.LONG
+        assert sig.confidence == 0.8
+
+    def test_seasonality_short_signal_veto_on_positive_effect(self):
+        """Test that SHORT signals are vetoed when effect is significantly positive."""
+        np.random.seed(123)
+
+        n_days = 504
+        dates = pd.bdate_range(start="2022-01-03", periods=n_days, freq="B")
+
+        # Ensure last day is Thursday (so next business day is Friday)
+        while dates[-1].weekday() != 3:
+            dates = pd.bdate_range(start="2022-01-03", periods=n_days + 1, freq="B")
+            n_days += 1
+
+        base_returns = np.random.normal(0.0005, 0.01, n_days)
+        returns = base_returns.copy()
+
+        # Add +2.0% effect on Fridays (strong signal)
+        dow_vals = dates.weekday.values
+        friday_mask = (dow_vals == 4)
+        returns[friday_mask] += 0.02
+
+        prices = np.exp(np.cumsum(returns))
+        closes = 100.0 * prices
+
+        history = pd.DataFrame({
+            "open": closes * 0.999,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1e6] * n_days,
+        }, index=dates)
+
+        current_price = closes[-1]
+
+        # Create SHORT signal base
+        dist = make_dist(np.linspace(current_price * 0.98, current_price, 100))
+        base = StubStrategy(direction=Direction.SHORT, confidence=0.8)
+
+        seasonality = SeasonalityFilterStrategy(base, lookback=504, t_threshold=2.0)
+
+        sig = seasonality.generate_signal(dist, current_price, history, {})
+
+        # Should veto: Tomorrow is Friday with +2.0% effect, which opposes SHORT
+        assert sig is None, "Expected veto when next business day (Friday) has significant positive effect for SHORT"
+
+    def test_seasonality_aligned_effect_no_veto(self):
+        """Test that effects aligned with signal direction don't trigger veto."""
+        np.random.seed(124)
+
+        n_days = 504
+        dates = pd.bdate_range(start="2022-01-03", periods=n_days, freq="B")
+
+        # Ensure last day is Thursday (so next business day is Friday)
+        while dates[-1].weekday() != 3:
+            dates = pd.bdate_range(start="2022-01-03", periods=n_days + 1, freq="B")
+            n_days += 1
+
+        base_returns = np.random.normal(0.0005, 0.01, n_days)
+        returns = base_returns.copy()
+
+        # Add +2.0% effect on Fridays (positive = LONG-friendly)
+        dow_vals = dates.weekday.values
+        friday_mask = (dow_vals == 4)
+        returns[friday_mask] += 0.02
+
+        prices = np.exp(np.cumsum(returns))
+        closes = 100.0 * prices
+
+        history = pd.DataFrame({
+            "open": closes * 0.999,
+            "high": closes * 1.005,
+            "low": closes * 0.995,
+            "close": closes,
+            "volume": [1e6] * n_days,
+        }, index=dates)
+
+        current_price = closes[-1]
+
+        # Create LONG signal base
+        dist = make_dist(np.linspace(current_price, current_price * 1.02, 100))
+        base = StubStrategy(direction=Direction.LONG, confidence=0.8)
+
+        seasonality = SeasonalityFilterStrategy(base, lookback=504, t_threshold=2.0)
+
+        sig = seasonality.generate_signal(dist, current_price, history, {})
+
+        # Should NOT veto: Tomorrow is Friday with +2.0% effect, which aligns with LONG
+        assert sig is not None, "Expected no veto when next business day (Friday) has aligned positive effect for LONG"
         assert sig.direction == Direction.LONG

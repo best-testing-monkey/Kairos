@@ -31,7 +31,7 @@
 
 - [x] E4-S01 Lagged OLS and ARIMA Disagreement (docs/tickets/E4-S01-lagged-ols-and-arima-disagreement.md)
 - [x] E4-S02 VAR Lead-Lag (docs/tickets/E4-S02-var-leadlag.md)
-- [ ] E4-S03 Seasonality Filter (docs/tickets/E4-S03-seasonality-filter.md)
+- [x] E4-S03 Seasonality Filter (docs/tickets/E4-S03-seasonality-filter.md)
 - [ ] E4-S04 Changepoint Guard (docs/tickets/E4-S04-changepoint-guard.md)
 - [ ] E4-S05 Granger Pairs (docs/tickets/E4-S05-granger-pairs.md)
 - [ ] E4-S06 Matrix Profile Anomaly (docs/tickets/E4-S06-matrix-profile-anomaly.md)
