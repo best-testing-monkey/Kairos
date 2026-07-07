@@ -1,5 +1,6 @@
 """
-Econometric strategies: ARIMA disagreement filter, VAR lead-lag, seasonality, etc.
+Econometric strategies: ARIMA disagreement filter, VAR lead-lag, seasonality,
+changepoint detection, etc.
 
 No statsmodels dependency. All fits via numpy least squares + scipy optimizers.
 """
@@ -7,6 +8,7 @@ No statsmodels dependency. All fits via numpy least squares + scipy optimizers.
 import numpy as np
 import pandas as pd
 from typing import Dict, Optional, Any, Tuple
+from scipy.special import loggamma
 from kairos_backtest import Strategy, Signal, Direction, KairosDistribution
 
 
@@ -731,3 +733,345 @@ class SeasonalityFilterStrategy(Strategy):
 
         except Exception:
             return False
+
+
+# =============================================================================
+# BAYESIAN ONLINE CHANGEPOINT DETECTION
+# =============================================================================
+
+class ChangepointGuardStrategy(Strategy):
+    """
+    Stateful filter wrapper: Bayesian online changepoint detection on daily returns.
+
+    Implements Adams & MacKay (2007) algorithm with Normal-Inverse-Gamma conjugate
+    prior on log returns. Maintains a run-length posterior; when P(run_length < short_run_len)
+    exceeds prob_threshold (indicating a regime break), vetoes all signals and starts
+    a cooloff counter for cooloff_days.
+
+    Parameters
+    ----------
+    base_strategy : Strategy
+        The wrapped strategy to filter.
+    hazard : float, default 1/60
+        Hazard rate (probability of changepoint per day). Default expects ~60 trading days
+        between regimes.
+    cooloff_days : int, default 3
+        Number of trading days to veto signals after detecting a regime break.
+    short_run_len : int, default 5
+        Threshold for "young" run length; high P(r < short_run_len) indicates fresh break.
+    prob_threshold : float, default 0.5
+        Probability threshold: if P(run_length < short_run_len) > threshold, trigger veto.
+    min_history : int, default 30
+        Minimum number of observations required before changepoint detection activates.
+
+    Stateful:
+        - Maintains run_length posterior (self.run_length_posterior)
+        - Maintains sufficient statistics for Normal-Inverse-Gamma (per run length)
+        - Maintains cooloff counter (self.cooloff_counter)
+        - Must call reset() to clear state before walk-forward folds
+    """
+    name = "changepoint_guard"
+
+    def __init__(self, base_strategy: Strategy, hazard: float = 1/60,
+                 cooloff_days: int = 3, short_run_len: int = 5,
+                 prob_threshold: float = 0.5, min_history: int = 30):
+        self.base_strategy = base_strategy
+        self.hazard = hazard
+        self.cooloff_days = cooloff_days
+        self.short_run_len = short_run_len
+        self.prob_threshold = prob_threshold
+        self.min_history = min_history
+
+        # Stateful: run-length posterior and statistics
+        self.run_length_posterior = np.array([1.0])  # P(r=0) initially
+        self.stats_by_runlength = [self._init_nig_stats()]  # For r=0
+        self.cooloff_counter = 0  # Cooloff countdown
+        self.n_obs = 0  # Number of observations seen
+        self.prev_prob_young = 1.0  # Track previous young probability for change detection
+
+    def reset(self):
+        """
+        Clear state for a new walk-forward fold.
+
+        Resets run-length posterior, statistics, and cooloff counter.
+        """
+        self.run_length_posterior = np.array([1.0])
+        self.stats_by_runlength = [self._init_nig_stats()]
+        self.cooloff_counter = 0
+        self.n_obs = 0
+        self.prev_prob_young = 1.0
+
+    def _init_nig_stats(self) -> Dict[str, Any]:
+        """
+        Initialize Normal-Inverse-Gamma sufficient statistics.
+
+        Priors are scaled to DAILY LOG RETURNS (magnitude ~1%): μ₀=0, κ₀=1,
+        α₀=1, β₀=1e-4. The prior predictive std is then
+        sqrt(β(κ+1)/(ακ)) ≈ 1.4%, matching typical daily volatility.
+
+        IMPORTANT: β₀ must be on the return scale. A generic weak prior
+        (β₀=1) implies a prior predictive std of ~140%, which makes the
+        fresh-run (changepoint) hypothesis catastrophically unlikely versus
+        any fitted run — the detector would never fire.
+
+        Returns
+        -------
+        dict
+            Keys: "kappa", "mu", "alpha", "beta" (sufficient statistics)
+        """
+        return {
+            "kappa": 1.0,     # Precision of prior on mean
+            "mu": 0.0,        # Prior mean
+            "alpha": 1.0,     # Shape parameter of IG on variance
+            "beta": 1e-4,     # Rate parameter of IG on variance (daily-return scale)
+        }
+
+    def _update_nig_stats(self, stats: Dict[str, Any], x: float) -> Dict[str, Any]:
+        """
+        Update Normal-Inverse-Gamma statistics with a new observation.
+
+        Uses the standard Bayesian update for Normal-Inverse-Gamma conjugate prior
+        with one new observation x.
+
+        Parameters
+        ----------
+        stats : dict
+            Current sufficient statistics (kappa, mu, alpha, beta).
+        x : float
+            New observation (log return).
+
+        Returns
+        -------
+        dict
+            Updated statistics.
+        """
+        kappa_0 = stats["kappa"]
+        mu_0 = stats["mu"]
+        alpha_0 = stats["alpha"]
+        beta_0 = stats["beta"]
+
+        # Posterior update
+        kappa_1 = kappa_0 + 1.0
+        mu_1 = (kappa_0 * mu_0 + x) / kappa_1
+        alpha_1 = alpha_0 + 0.5
+
+        # Sum of squared deviations
+        ssd = ((x - mu_0) ** 2 * kappa_0) / kappa_1
+        beta_1 = beta_0 + 0.5 * ssd
+
+        return {
+            "kappa": kappa_1,
+            "mu": mu_1,
+            "alpha": alpha_1,
+            "beta": beta_1,
+        }
+
+    def _predictive_likelihood(self, x: float, stats: Dict[str, Any]) -> float:
+        """
+        Compute predictive likelihood of observation under Normal-Inverse-Gamma.
+
+        The predictive distribution is Student-t with:
+        - Location: mu
+        - Scale: sqrt(beta * (kappa + 1) / (alpha * kappa))
+        - Degrees of freedom: 2 * alpha
+
+        Parameters
+        ----------
+        x : float
+            Observation (log return).
+        stats : dict
+            Sufficient statistics (kappa, mu, alpha, beta).
+
+        Returns
+        -------
+        float
+            Log likelihood (or a very negative number if variance is invalid).
+        """
+        kappa = stats["kappa"]
+        mu = stats["mu"]
+        alpha = stats["alpha"]
+        beta = stats["beta"]
+
+        # Variance of Student-t
+        # Var = beta * (kappa + 1) / (alpha * kappa)
+        var_numerator = beta * (kappa + 1)
+        var_denominator = alpha * kappa
+
+        if var_denominator <= 0 or var_numerator <= 0:
+            return -np.inf
+
+        var_t = var_numerator / var_denominator
+        scale_t = np.sqrt(var_t)
+
+        if scale_t <= 0 or not np.isfinite(scale_t):
+            return -np.inf
+
+        # Student-t PDF: Gamma((df+1)/2) / (Gamma(df/2) * sqrt(df*π*var)) * (1 + (x-mu)^2/(df*var))^(-(df+1)/2)
+        # Simplify using log-scale
+        df = 2 * alpha
+        centered = (x - mu) ** 2
+
+        # Log likelihood (proportional)
+        # log p(x) ≈ -0.5 * (df+1) * log(1 + centered / (df * var))
+        # But for numerical stability, use a different formulation
+        # The Student-t log pdf is:
+        # log p(x) = log Gamma((df+1)/2) - log Gamma(df/2) - 0.5*log(df*π*var) - (df+1)/2*log(1 + (x-mu)^2/(df*var))
+
+        try:
+            # Use scipy for gamma function
+            from scipy.special import loggamma
+            term1 = loggamma((df + 1) / 2.0)
+            term2 = loggamma(df / 2.0)
+            term3 = 0.5 * np.log(df * np.pi * var_t)
+            term4 = (df + 1) / 2.0 * np.log(1.0 + centered / (df * var_t))
+
+            ll = term1 - term2 - term3 - term4
+            return float(ll)
+        except Exception:
+            return -np.inf
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        """
+        Wrap base strategy and apply changepoint detection veto.
+
+        Updates run-length posterior on new log return; if P(r < short_run_len) > threshold,
+        starts cooloff veto. During cooloff, all signals are vetoed. If base is None,
+        passes through None.
+
+        Returns
+        -------
+        Signal or None
+            The base signal (possibly vetoed), or None.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+        if base_signal is None:
+            return None
+
+        # Check if we have enough history
+        if history is None or len(history) < self.min_history:
+            # Pass through; not enough data for changepoint detection
+            return base_signal
+
+        # Extract the latest log return
+        closes = history["close"].values.astype(float)
+        if len(closes) < 2:
+            return base_signal
+
+        log_return = np.log(closes[-1] / closes[-2])
+
+        # Decrement cooloff counter if active
+        if self.cooloff_counter > 0:
+            self.cooloff_counter -= 1
+            # Veto during cooloff
+            return None
+
+        # Update run-length posterior with the new observation
+        self._update_runlength_posterior(log_return)
+
+        # Check if regime break is detected
+        if self._is_regime_break_detected():
+            # Start cooloff and veto this signal
+            self.cooloff_counter = self.cooloff_days - 1  # -1 because we decrement at next call
+            return None
+
+        # No veto; pass through base signal
+        return base_signal
+
+    def _update_runlength_posterior(self, x: float):
+        """
+        Bayesian online changepoint update: given new observation x, update run-length posterior.
+
+        Adams & MacKay algorithm:
+        1. For each current run length r, compute predictive likelihood p(x | r)
+        2. Update: P(r_t | y_{1:t}) ∝ P(y_t | r_{t-1}) * P(r_t | r_{t-1}, data)
+           where r_t ∈ {0, 1, ..., R} (or {0, r_{t-1}+1})
+        3. Normalize
+
+        Parameters
+        ----------
+        x : float
+            Log return.
+        """
+        R = len(self.run_length_posterior)
+        hazard_prob = self.hazard
+
+        # Predictive likelihoods for each run length
+        likelihoods = np.zeros(R)
+        for r in range(R):
+            stats = self.stats_by_runlength[r]
+            lik = self._predictive_likelihood(x, stats)
+            likelihoods[r] = np.exp(lik) if np.isfinite(lik) else 1e-10
+
+        # Posterior grows: new run lengths are r_t ∈ {0, 1, 2, ..., R}
+        # r_t = 0: changepoint happened, fresh start
+        # r_t = r+1: no changepoint, previous run length r continues to r+1
+        posterior_next = np.zeros(R + 1)
+
+        # r_t = 0: all previous runs end, new one starts
+        # P(r_t=0 | data) ∝ P(y_t | data) * hazard = sum_r [P(y_t | r) * P(r_{t-1}) * hazard]
+        posterior_next[0] = hazard_prob * np.sum(self.run_length_posterior * likelihoods)
+
+        # r_t = r+1 (r = 0..R-1): previous run length r continues
+        # P(r_t = r+1 | data) ∝ P(y_t | r) * P(r_{t-1} = r) * (1 - hazard)
+        for r in range(R):
+            posterior_next[r + 1] = (1.0 - hazard_prob) * self.run_length_posterior[r] * likelihoods[r]
+
+        # Normalize
+        total = np.sum(posterior_next)
+        if total > 0:
+            posterior_next /= total
+        else:
+            posterior_next = np.ones(R + 1) / (R + 1)
+
+        # Update statistics: each run length r -> r+1 continues its stats
+        # r=0 (new run) gets fresh stats
+        stats_next = [self._update_nig_stats(self._init_nig_stats(), x)]
+        for r in range(R):
+            stats_next.append(self._update_nig_stats(self.stats_by_runlength[r], x))
+
+        # Update state
+        self.run_length_posterior = posterior_next
+        self.stats_by_runlength = stats_next
+        self.n_obs += 1
+
+    def _is_regime_break_detected(self) -> bool:
+        """
+        Detect regime break using P(run_length < short_run_len) > prob_threshold.
+
+        Strategy:
+        - For initialization (max_run_length < short_run_len): no detection
+        - For normal operation: flag if prob_young > threshold AND we've accumulated
+          enough evidence (max_run_length >= short_run_len or change is large)
+
+        Returns
+        -------
+        bool
+            True if regime break is detected.
+        """
+        max_run_length = len(self.run_length_posterior) - 1
+
+        # Compute current P(r < short_run_len)
+        if max_run_length < self.short_run_len:
+            prob_young = np.sum(self.run_length_posterior)  # All are "young"
+        else:
+            prob_young = np.sum(self.run_length_posterior[:self.short_run_len])
+
+        # For initialization: just track prob, don't flag
+        if max_run_length < self.short_run_len - 1:
+            self.prev_prob_young = prob_young
+            return False
+
+        # Once we have more history, check for significant shift
+        # A regime break is indicated by:
+        # - prob_young > threshold (young run lengths have high probability)
+        # - This represents a shift from the initialization distribution
+        #   (where all run lengths are naturally young, so prev_prob was high)
+        change_in_prob = prob_young - self.prev_prob_young
+
+        # Detect if: threshold exceeded AND either significant change or stable at high level
+        detected = (prob_young > self.prob_threshold) and (max_run_length >= self.short_run_len or change_in_prob > 0.1)
+
+        self.prev_prob_young = prob_young
+        return detected
