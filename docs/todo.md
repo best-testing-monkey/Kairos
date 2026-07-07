@@ -39,7 +39,7 @@
 ## Epic E5 — ML
 
 - [x] E5-S01 Meta-Labeling (docs/tickets/E5-S01-meta-labeling.md)
-- [ ] E5-S02 GBM Direction (docs/tickets/E5-S02-gbm-direction.md)
+- [x] E5-S02 GBM Direction (docs/tickets/E5-S02-gbm-direction.md)
 - [ ] E5-S03 LPPLS Guard (docs/tickets/E5-S03-lppls-guard.md)
 
 ## Epic E6 — Technical Filters
