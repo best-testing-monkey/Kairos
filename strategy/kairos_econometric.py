@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Optional, Any, Tuple
 from scipy.special import loggamma
+from scipy import stats
 from kairos_backtest import Strategy, Signal, Direction, KairosDistribution
 
 
@@ -72,6 +73,106 @@ def _lagged_ols(y: np.ndarray, X: np.ndarray) -> Dict[str, Any]:
         "resid": resid,
         "aic": aic,
     }
+
+
+def granger_f_test(y: np.ndarray, x: np.ndarray, max_lag: int = 3) -> Dict[str, Any]:
+    """
+    Perform rolling Granger F-test between y and x.
+
+    Fits restricted model (y on its own lags 1..L) and unrestricted model
+    (adding x's lags 1..L) for each L in 1..max_lag. Computes F-statistic
+    and p-value for each lag, returns results for the lag with minimum p-value.
+
+    Parameters
+    ----------
+    y : np.ndarray, shape (n,)
+        Dependent variable (follower).
+    x : np.ndarray, shape (n,)
+        Predictor variable (leader).
+    max_lag : int, default 3
+        Maximum lag to evaluate (test lags 1..max_lag).
+
+    Returns
+    -------
+    dict with keys:
+        "f_stat": float, F-statistic at best_lag
+        "p_value": float, p-value via scipy.stats.f.sf
+        "best_lag": int, lag with minimum p-value (1..max_lag)
+        "coef_sign": float, sign of sum of x-lag coefficients at best_lag
+    """
+    n = len(y)
+    best_result = {
+        "f_stat": 0.0,
+        "p_value": 1.0,
+        "best_lag": 1,
+        "coef_sign": 0.0,
+    }
+
+    for lag in range(1, max_lag + 1):
+        # Require at least lag + 1 observations
+        if n <= lag:
+            continue
+
+        # Build restricted model: y_t = c + phi_1*y_{t-1} + ... + phi_L*y_{t-L} + e_t
+        n_reg = n - lag  # Number of observations for regression
+        X_r = np.ones((n_reg, lag + 1))  # Intercept + lag y's
+        y_reg = y[lag:]
+
+        for i in range(1, lag + 1):
+            X_r[:, i] = y[lag - i : -i or None]
+
+        # Fit restricted model
+        try:
+            fit_r = _lagged_ols(y_reg, X_r)
+            rss_r = np.sum(fit_r["resid"] ** 2)
+        except Exception:
+            continue
+
+        # Build unrestricted model: y_t = c + phi_1*y_{t-1} + ... + phi_L*y_{t-L} +
+        #                                  beta_1*x_{t-1} + ... + beta_L*x_{t-L} + e_t
+        X_u = np.ones((n_reg, lag + 1 + lag))  # Intercept + lag y's + lag x's
+        X_u[:, 1 : lag + 1] = X_r[:, 1:]  # Copy lagged y's
+
+        for i in range(1, lag + 1):
+            X_u[:, lag + i] = x[lag - i : -i or None]
+
+        # Fit unrestricted model
+        try:
+            fit_u = _lagged_ols(y_reg, X_u)
+            rss_u = np.sum(fit_u["resid"] ** 2)
+        except Exception:
+            continue
+
+        # Compute F-statistic
+        # F = ((RSS_r - RSS_u) / L) / (RSS_u / (n_reg - 2*lag - 1))
+        numerator = (rss_r - rss_u) / lag
+        denom_dof = n_reg - 2 * lag - 1
+
+        if denom_dof <= 0 or rss_u <= 0:
+            continue
+
+        denominator = rss_u / denom_dof
+        if denominator <= 0:
+            continue
+
+        f_stat = numerator / denominator
+
+        # Compute p-value: P(F > f_stat) with df1=lag, df2=denom_dof
+        p_value = stats.f.sf(f_stat, lag, denom_dof)
+
+        # Track the lag with minimum p-value
+        if p_value < best_result["p_value"]:
+            # Compute coef_sign: sign of sum of x-lag coefficients
+            x_lags_coef = fit_u["coef"][lag + 1 : lag + 1 + lag]
+            coef_sum = np.sum(x_lags_coef)
+            coef_sign = np.sign(coef_sum)
+
+            best_result["f_stat"] = float(f_stat)
+            best_result["p_value"] = float(p_value)
+            best_result["best_lag"] = lag
+            best_result["coef_sign"] = float(coef_sign)
+
+    return best_result
 
 
 # =============================================================================
@@ -388,6 +489,165 @@ class VARLeadLagStrategy(Strategy):
             confidence=confidence,
             expected_value=ev,
             metadata={"max_abs_t": float(max_abs_t)},
+        )
+
+
+# =============================================================================
+# GRANGER CAUSALITY PAIRS STRATEGY
+# =============================================================================
+
+class GrangerPairsStrategy(Strategy):
+    """
+    Standalone strategy detecting Granger causality between asset pairs.
+
+    Performs rolling Granger F-test (lags 1-3) between all asset pairs in the
+    returns panel. For the current symbol i, tests every other column j as a
+    leader. Picks the j with minimum p-value. If p < p_threshold, emits a signal
+    on i in the direction implied by yesterday's j-return × the fitted coefficient
+    sign, gated on Kronos agreement.
+
+    Context requirements:
+        - context["returns_window"]: DataFrame of daily returns (columns=symbols, rows=dates)
+        - context["symbol"]: The target symbol being evaluated
+
+    Parameters
+    ----------
+    p_threshold : float, default 0.05
+        P-value threshold for Granger significance.
+    max_lag : int, default 3
+        Maximum lag to test in Granger F-test (1..max_lag).
+    lookback : int, default 120
+        Minimum number of rows required in returns_window.
+    stop_pct : float, default 15.0
+        Stop-loss percentile (for longs; reversed for shorts).
+    target_pct : float, default 85.0
+        Take-profit percentile (for longs; reversed for shorts).
+    """
+    name = "granger_pairs"
+
+    def __init__(self, p_threshold: float = 0.05, max_lag: int = 3,
+                 lookback: int = 120, stop_pct: float = 15.0,
+                 target_pct: float = 85.0):
+        self.p_threshold = p_threshold
+        self.max_lag = max_lag
+        self.lookback = lookback
+        self.stop_pct = int(stop_pct)
+        self.target_pct = int(target_pct)
+
+    def generate_signal(self, dist: KairosDistribution, current_price: float,
+                        history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
+        """
+        Test all asset pairs for Granger causality and emit signal if leader found.
+
+        Returns Signal if a significant leader j is found and Kronos agrees with
+        the implied direction, else None.
+        """
+        # Validate context
+        if context is None or "returns_window" not in context or "symbol" not in context:
+            return None
+
+        returns_window = context.get("returns_window")
+        symbol = context.get("symbol")
+
+        # Validate returns_window
+        if returns_window is None or len(returns_window) < self.lookback:
+            return None
+
+        # Check that symbol is in the returns window
+        if symbol not in returns_window.columns:
+            return None
+
+        try:
+            # Extract target return series
+            y = returns_window[symbol].values  # Shape (n,)
+
+            if len(y) < self.lookback:
+                return None
+
+            # Get all other symbols (potential leaders)
+            other_symbols = [s for s in returns_window.columns if s != symbol]
+            if not other_symbols:
+                return None
+
+            # Test each leader and find the one with minimum p-value
+            best_leader = None
+            best_p_value = 1.0
+            best_coef_sign = 0.0
+            best_lag = 1
+
+            for leader_symbol in other_symbols:
+                x = returns_window[leader_symbol].values  # Shape (n,)
+
+                # Run Granger F-test
+                test_result = granger_f_test(y, x, max_lag=self.max_lag)
+
+                # Track the leader with minimum p-value
+                if test_result["p_value"] < best_p_value:
+                    best_p_value = test_result["p_value"]
+                    best_leader = leader_symbol
+                    best_coef_sign = test_result["coef_sign"]
+                    best_lag = test_result["best_lag"]
+
+        except Exception:
+            return None
+
+        # If best p-value doesn't meet threshold, no signal
+        if best_p_value > self.p_threshold or best_leader is None:
+            return None
+
+        # Check Kronos agreement
+        kronos_mean = dist.stats["close"]["mean"]
+        kronos_direction = np.sign(kronos_mean - current_price)
+
+        if kronos_direction == 0:
+            return None
+
+        # Compute implied direction: yesterday's leader return × coef_sign
+        yesterday_leader_return = returns_window[best_leader].iloc[-2]
+        implied_move = yesterday_leader_return * best_coef_sign
+        implied_direction = np.sign(implied_move)
+
+        # Check agreement between implied direction and Kronos direction
+        if implied_direction != kronos_direction or implied_direction == 0:
+            return None
+
+        # Emit signal
+        if kronos_direction > 0:
+            # LONG
+            direction = Direction.LONG
+            stop = dist.stats["close"][f"pct_{self.stop_pct}"]
+            target = dist.stats["close"][f"pct_{self.target_pct}"]
+        else:
+            # SHORT
+            direction = Direction.SHORT
+            stop = dist.stats["close"][f"pct_{self.target_pct}"]
+            target = dist.stats["close"][f"pct_{self.stop_pct}"]
+
+        # Calculate expected value and position size
+        ev = dist.expected_value(current_price, target, stop)
+        if ev <= 0:
+            return None
+
+        kelly = dist.kelly_fraction(current_price, target, stop)
+        size = min(kelly * 0.5, 1.0)
+
+        # Confidence: 1 - p_value
+        confidence = min(max(1.0 - best_p_value, 0.0), 1.0)
+
+        return Signal(
+            direction=direction,
+            size=size,
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=confidence,
+            expected_value=ev,
+            metadata={
+                "leader_symbol": best_leader,
+                "p_value": float(best_p_value),
+                "best_lag": int(best_lag),
+            },
         )
 
 

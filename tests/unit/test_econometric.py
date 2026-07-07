@@ -10,7 +10,8 @@ from kairos_backtest import (
 )
 from kairos_econometric import (
     _lagged_ols, ARIMADisagreementStrategy, VARLeadLagStrategy,
-    SeasonalityFilterStrategy, ChangepointGuardStrategy,
+    SeasonalityFilterStrategy, ChangepointGuardStrategy, granger_f_test,
+    GrangerPairsStrategy,
 )
 
 
@@ -1359,3 +1360,390 @@ class TestChangepointWhiteNoiseNoFalsePositive:
 
         assert veto_count <= 6, \
             f"Expected <5% false-positive rate on white noise, got {veto_count} vetoes in 120 days ({100*veto_count/120:.1f}%)"
+
+
+# ============================================================================
+# Tests: granger_f_test
+# ============================================================================
+
+class TestGrangerFTest:
+    def test_granger_f_test_planted_ar_dependence(self):
+        """Test Granger F-test on synthetic y_t = 0.5*x_{t-1} + noise.
+
+        Fixture: Generate 200 obs where y_t = 0.5*x_{t-1} + N(0, 0.01).
+        x_t ~ N(0, 0.01). Assert that:
+        - p-value < 0.01 (significant at 1% level)
+        - coef_sign > 0 (positive dependence detected)
+        - best_lag == 1 (lag-1 is the true lag)
+        """
+        np.random.seed(42)
+        n = 200
+        x = np.random.normal(0, 0.01, n)
+        y = np.zeros(n)
+        y[0] = np.random.normal(0, 0.01)
+        for t in range(1, n):
+            y[t] = 0.5 * x[t - 1] + np.random.normal(0, 0.01)
+
+        result = granger_f_test(y, x, max_lag=3)
+
+        assert result["p_value"] < 0.01, f"Expected p < 0.01, got {result['p_value']}"
+        assert result["coef_sign"] > 0, f"Expected coef_sign > 0, got {result['coef_sign']}"
+        assert result["best_lag"] == 1, f"Expected best_lag == 1, got {result['best_lag']}"
+
+    def test_granger_f_test_independent_white_noise(self):
+        """Test Granger F-test on independent white noise x, y."""
+        np.random.seed(100)
+        n = 200
+        x = np.random.normal(0, 0.01, n)
+        y = np.random.normal(0, 0.01, n)
+
+        result = granger_f_test(y, x, max_lag=3)
+
+        # With white noise, p-value should be high (no significance)
+        assert result["p_value"] > 0.05, \
+            f"Expected p > 0.05 for independent white noise, got {result['p_value']}"
+
+    def test_granger_f_test_hand_verify_f_statistic(self):
+        """Hand-verify F-statistic computation on a simple fixture."""
+        np.random.seed(123)
+        n = 50
+        x = np.random.normal(0, 0.02, n)
+        y = np.zeros(n)
+        y[0] = np.random.normal(0, 0.02)
+        for t in range(1, n):
+            y[t] = 0.6 * x[t - 1] + np.random.normal(0, 0.02)
+
+        result = granger_f_test(y, x, max_lag=1)
+
+        # Manually verify at best_lag
+        lag = result["best_lag"]
+        n_reg = n - lag
+
+        # Restricted model: y_t = c + phi_1*y_{t-1}
+        X_r = np.ones((n_reg, 2))
+        X_r[:, 1] = y[lag - 1 : -1 or None]
+        y_reg = y[lag:]
+        coef_r, _, _, _ = np.linalg.lstsq(X_r, y_reg, rcond=None)
+        resid_r = y_reg - X_r @ coef_r
+        rss_r = np.sum(resid_r ** 2)
+
+        # Unrestricted model: y_t = c + phi_1*y_{t-1} + beta_1*x_{t-1}
+        X_u = np.ones((n_reg, 3))
+        X_u[:, 1] = y[lag - 1 : -1 or None]
+        X_u[:, 2] = x[lag - 1 : -1 or None]
+        coef_u, _, _, _ = np.linalg.lstsq(X_u, y_reg, rcond=None)
+        resid_u = y_reg - X_u @ coef_u
+        rss_u = np.sum(resid_u ** 2)
+
+        # Compute F-statistic
+        numerator = (rss_r - rss_u) / lag
+        denom_dof = n_reg - 2 * lag - 1
+        denominator = rss_u / denom_dof
+        expected_f = numerator / denominator
+
+        # Compare to granger_f_test result
+        assert np.isclose(result["f_stat"], expected_f, atol=1e-9), \
+            f"Expected f_stat={expected_f}, got {result['f_stat']}"
+
+    def test_granger_f_test_negative_dependence(self):
+        """Test Granger F-test on y_t = -0.5*x_{t-1} + noise."""
+        np.random.seed(201)
+        n = 200
+        x = np.random.normal(0, 0.01, n)
+        y = np.zeros(n)
+        y[0] = np.random.normal(0, 0.01)
+        for t in range(1, n):
+            y[t] = -0.5 * x[t - 1] + np.random.normal(0, 0.01)
+
+        result = granger_f_test(y, x, max_lag=3)
+
+        assert result["p_value"] < 0.01, f"Expected p < 0.01, got {result['p_value']}"
+        assert result["coef_sign"] < 0, f"Expected coef_sign < 0, got {result['coef_sign']}"
+
+    def test_granger_f_test_lag2_planted(self):
+        """Test Granger F-test on y_t = 0.4*x_{t-2} + noise."""
+        np.random.seed(202)
+        n = 250
+        x = np.random.normal(0, 0.01, n)
+        y = np.zeros(n)
+        y[0:2] = np.random.normal(0, 0.01, 2)
+        for t in range(2, n):
+            y[t] = 0.4 * x[t - 2] + np.random.normal(0, 0.01)
+
+        result = granger_f_test(y, x, max_lag=3)
+
+        # best_lag should be 2
+        assert result["best_lag"] == 2, \
+            f"Expected best_lag == 2 for lag-2 planted, got {result['best_lag']}"
+        assert result["p_value"] < 0.01, f"Expected p < 0.01, got {result['p_value']}"
+
+
+# ============================================================================
+# Tests: GrangerPairsStrategy
+# ============================================================================
+
+class TestGrangerPairsStrategy:
+    def test_granger_pairs_missing_context_returns_none(self):
+        """Test that missing context keys return None."""
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=120)
+        dist = make_dist(np.linspace(100, 105, 100))
+
+        # Missing returns_window
+        context_missing = {"symbol": "y"}
+        sig = strategy.generate_signal(dist, 100.0, None, context_missing)
+        assert sig is None, "Expected None with missing returns_window"
+
+        # Missing symbol
+        returns_window = pd.DataFrame({
+            "x": np.random.normal(0, 0.01, 100),
+            "y": np.random.normal(0, 0.01, 100),
+        })
+        context_missing_sym = {"returns_window": returns_window}
+        sig = strategy.generate_signal(dist, 100.0, None, context_missing_sym)
+        assert sig is None, "Expected None with missing symbol"
+
+        # None context
+        sig = strategy.generate_signal(dist, 100.0, None, None)
+        assert sig is None, "Expected None with None context"
+
+    def test_granger_pairs_short_window_returns_none(self):
+        """Test that returns_window shorter than lookback returns None."""
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=120)
+        dist = make_dist(np.linspace(100, 105, 100))
+
+        # Only 60 days (need 120)
+        short_returns = pd.DataFrame({
+            "x": np.random.normal(0, 0.01, 60),
+            "y": np.random.normal(0, 0.01, 60),
+        })
+        context = {"returns_window": short_returns, "symbol": "y"}
+
+        sig = strategy.generate_signal(dist, 100.0, None, context)
+        assert sig is None, "Expected None with short returns_window"
+
+    def test_granger_pairs_symbol_not_in_window(self):
+        """Test that missing symbol in returns_window returns None."""
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=120)
+        dist = make_dist(np.linspace(100, 105, 100))
+
+        returns_window = pd.DataFrame({
+            "x": np.random.normal(0, 0.01, 120),
+            "y": np.random.normal(0, 0.01, 120),
+        })
+        context = {"returns_window": returns_window, "symbol": "nonexistent"}
+
+        sig = strategy.generate_signal(dist, 100.0, None, context)
+        assert sig is None, "Expected None with symbol not in returns_window"
+
+    def test_granger_pairs_independent_returns_none(self):
+        """Test that symmetric independent pairs produce no signal."""
+        np.random.seed(300)
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=120)
+
+        # Pure white noise (no Granger causality)
+        n = 120
+        returns_window = pd.DataFrame({
+            "x": np.random.normal(0, 0.01, n),
+            "y": np.random.normal(0, 0.01, n),
+            "z": np.random.normal(0, 0.01, n),
+        })
+
+        current_price = 100.0
+        dist = make_dist(np.linspace(current_price, current_price * 1.02, 100))
+
+        context = {"returns_window": returns_window, "symbol": "y"}
+
+        sig = strategy.generate_signal(dist, current_price, None, context)
+
+        # With white noise, no significant Granger causality
+        assert sig is None, "Expected None on independent white-noise pairs"
+
+    def test_granger_pairs_planted_leader_with_kronos_agreement(self):
+        """Test signal when planted leader agrees with Kronos direction."""
+        np.random.seed(301)
+        n = 130
+
+        # x: independent noise
+        x = np.random.normal(0, 0.01, n)
+
+        # y: depends on lagged x
+        y = np.zeros(n)
+        y[0] = np.random.normal(0, 0.01)
+        for t in range(1, n):
+            y[t] = 0.6 * x[t - 1] + np.random.normal(0, 0.005)
+
+        # z: independent
+        z = np.random.normal(0, 0.01, n)
+
+        returns_window = pd.DataFrame({
+            "x": x,
+            "y": y,
+            "z": z,
+        })
+
+        # Make yesterday's x-return positive to amplify signal
+        returns_window.iloc[-2, 0] = 0.08
+
+        current_price = 100.0
+        # Kronos predicts UP
+        dist = make_dist(np.linspace(current_price, current_price * 1.05, 100))
+
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=60)
+
+        context = {"returns_window": returns_window, "symbol": "y"}
+
+        sig = strategy.generate_signal(dist, current_price, None, context)
+
+        assert sig is not None, \
+            "Expected signal from planted x→y dependence with Kronos agreement"
+        assert sig.direction == Direction.LONG, \
+            "Expected LONG signal when implied direction agrees with Kronos UP"
+        assert sig.confidence > 0.0, "Expected positive confidence"
+        assert sig.metadata["leader_symbol"] == "x", "Expected x as leader"
+
+    def test_granger_pairs_kronos_disagreement_returns_none(self):
+        """Test no signal when implied direction disagrees with Kronos."""
+        np.random.seed(302)
+        n = 130
+
+        x = np.random.normal(0, 0.01, n)
+        y = np.zeros(n)
+        y[0] = np.random.normal(0, 0.01)
+        for t in range(1, n):
+            y[t] = 0.6 * x[t - 1] + np.random.normal(0, 0.005)
+
+        z = np.random.normal(0, 0.01, n)
+
+        returns_window = pd.DataFrame({
+            "x": x,
+            "y": y,
+            "z": z,
+        })
+
+        # Make yesterday's x-return positive
+        returns_window.iloc[-2, 0] = 0.08
+
+        current_price = 100.0
+        # Kronos predicts DOWN (mean < current_price)
+        dist = make_dist(np.linspace(current_price * 0.95, current_price, 100))
+
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=60)
+
+        context = {"returns_window": returns_window, "symbol": "y"}
+
+        sig = strategy.generate_signal(dist, current_price, None, context)
+
+        # Should NOT emit signal: implied direction (UP) disagrees with Kronos (DOWN)
+        assert sig is None, \
+            "Expected no signal when implied direction disagrees with Kronos"
+
+    def test_granger_pairs_confidence_inverse_pvalue(self):
+        """Test that confidence = 1 - p_value."""
+        np.random.seed(304)
+        n = 150
+
+        x = np.random.normal(0, 0.01, n)
+        y = np.zeros(n)
+        y[0] = np.random.normal(0, 0.01)
+        for t in range(1, n):
+            y[t] = 0.6 * x[t - 1] + np.random.normal(0, 0.005)
+
+        z = np.random.normal(0, 0.01, n)
+
+        returns_window = pd.DataFrame({
+            "x": x,
+            "y": y,
+            "z": z,
+        })
+
+        returns_window.iloc[-2, 0] = 0.08
+
+        current_price = 100.0
+        dist = make_dist(np.linspace(current_price, current_price * 1.05, 100))
+
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=60)
+
+        context = {"returns_window": returns_window, "symbol": "y"}
+
+        sig = strategy.generate_signal(dist, current_price, None, context)
+
+        if sig is not None:
+            expected_conf = 1.0 - sig.metadata["p_value"]
+            # Allow small floating-point tolerance
+            assert np.isclose(sig.confidence, expected_conf, atol=1e-9), \
+                f"Expected confidence={expected_conf}, got {sig.confidence}"
+
+    def test_granger_pairs_selects_best_leader(self):
+        """Test that strategy selects the leader with minimum p-value."""
+        np.random.seed(305)
+        n = 150
+
+        x = np.random.normal(0, 0.01, n)
+        z = np.random.normal(0, 0.01, n)
+
+        # Strong x→y
+        y = np.zeros(n)
+        y[0] = np.random.normal(0, 0.01)
+        for t in range(1, n):
+            y[t] = 0.6 * x[t - 1] + 0.1 * z[t - 1] + np.random.normal(0, 0.005)
+
+        returns_window = pd.DataFrame({
+            "x": x,
+            "y": y,
+            "z": z,
+        })
+
+        returns_window.iloc[-2, 0] = 0.08
+        returns_window.iloc[-2, 2] = 0.02
+
+        current_price = 100.0
+        dist = make_dist(np.linspace(current_price, current_price * 1.05, 100))
+
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=60)
+
+        context = {"returns_window": returns_window, "symbol": "y"}
+
+        sig = strategy.generate_signal(dist, current_price, None, context)
+
+        if sig is not None:
+            # x should have lower p-value than z
+            assert sig.metadata["leader_symbol"] == "x", \
+                f"Expected x as leader, got {sig.metadata['leader_symbol']}"
+
+    def test_granger_pairs_negative_coefficient(self):
+        """Test signal direction flips when coef is negative."""
+        np.random.seed(306)
+        n = 150
+
+        x = np.random.normal(0, 0.01, n)
+        y = np.zeros(n)
+        y[0] = np.random.normal(0, 0.01)
+        for t in range(1, n):
+            y[t] = -0.6 * x[t - 1] + np.random.normal(0, 0.005)
+
+        z = np.random.normal(0, 0.01, n)
+
+        returns_window = pd.DataFrame({
+            "x": x,
+            "y": y,
+            "z": z,
+        })
+
+        # Positive x-return yesterday
+        returns_window.iloc[-2, 0] = 0.08
+
+        current_price = 100.0
+        # Kronos predicts DOWN (negative coef, positive x-return → negative implied)
+        dist = make_dist(np.linspace(current_price * 0.95, current_price, 100))
+
+        strategy = GrangerPairsStrategy(p_threshold=0.05, max_lag=3, lookback=60)
+
+        context = {"returns_window": returns_window, "symbol": "y"}
+
+        sig = strategy.generate_signal(dist, current_price, None, context)
+
+        # Should emit SHORT signal: positive x yesterday × negative coef = negative implied
+        if sig is not None:
+            assert sig.direction == Direction.SHORT, \
+                "Expected SHORT signal when negative coef and positive x-return agree with Kronos DOWN"
+
