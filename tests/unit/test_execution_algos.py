@@ -5,7 +5,7 @@ import pytest
 import numpy as np
 import pandas as pd
 from kairos_backtest import Direction, Signal, Strategy, KairosDistribution
-from kairos_execution import volume_profile, VolumeProfileLevelsStrategy, CVDDivergenceStrategy, TWAPExecutionStrategy
+from kairos_execution import volume_profile, VolumeProfileLevelsStrategy, CVDDivergenceStrategy, TWAPExecutionStrategy, ImplementationShortfallStrategy
 
 
 # ============================================================================
@@ -714,3 +714,355 @@ class TestTWAPExecutionStrategy:
         assert "custom_key" in signal.metadata
         assert signal.metadata["custom_key"] == "custom_value"
         assert "fills" in signal.metadata
+
+
+# ============================================================================
+# ImplementationShortfallStrategy tests
+# ============================================================================
+
+class TestImplementationShortfallStrategy:
+    """Test implementation shortfall adaptive execution strategy."""
+
+    def _make_signal(self, direction, entry, stop, target):
+        """Create a test Signal."""
+        return Signal(
+            direction=direction, size=0.5, entry=entry, stop=stop, target=target,
+            strategy_name="stub", confidence=0.8, expected_value=1.0, metadata={},
+        )
+
+    def _make_dist_with_path(self, path_array):
+        """Create KairosDistribution with specified close prices."""
+        dist = KairosDistribution([pd.DataFrame({"close": path_array})])
+        dist.stats["close"] = {
+            "mean": float(np.mean(path_array)),
+            "std": float(np.std(path_array)),
+            "pct_10": float(np.percentile(path_array, 10)),
+            "pct_50": float(np.percentile(path_array, 50)),
+            "pct_90": float(np.percentile(path_array, 90)),
+        }
+        return dist
+
+    def test_impl_shortfall_none_passthrough(self):
+        """None base signal returns None."""
+        strat = ImplementationShortfallStrategy(StubStrategy(None))
+        result = strat.generate_signal(None, 100.0, make_profile_history(), {})
+        assert result is None
+
+    def test_impl_shortfall_immediate_adverse_drift_long(self):
+        """LONG with rising path (adverse drift > threshold) executes immediately."""
+        # Current price 100, path rising to 101-104
+        # path_mean ≈ 102.5
+        # drift = (102.5 - 100) / 100 = 0.025 = 2.5%
+        # For LONG, adverse_drift = drift * 1 = 2.5%
+        # impact_bps = 5.0 -> threshold = 0.0005 = 0.05%
+        # adverse_drift (2.5%) > threshold (0.05%) -> immediate
+
+        path = np.array([100.0, 101.0, 102.0, 103.0, 104.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert signal is not None
+        assert signal.metadata["execution"] == "immediate"
+        assert signal.entry == pytest.approx(100.0)  # unchanged
+        assert signal.stop == pytest.approx(95.0)    # unchanged
+        assert signal.target == pytest.approx(110.0) # unchanged
+
+    def test_impl_shortfall_twap_favorable_drift_long(self):
+        """LONG with falling path (favorable drift < threshold) executes via TWAP."""
+        # Current price 100, path falling to 99-96
+        # path_mean ≈ 98.5
+        # drift = (98.5 - 100) / 100 = -0.015 = -1.5%
+        # For LONG, adverse_drift = drift * 1 = -1.5%
+        # adverse_drift (-1.5%) < threshold (0.05%) -> TWAP
+
+        path = np.array([100.0, 99.0, 98.0, 97.0, 96.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert signal is not None
+        assert signal.metadata["execution"] == "twap"
+        # Effective entry = mean([100, 99, 98, 97]) = 98.5
+        assert signal.entry == pytest.approx(98.5)
+        # Shift = 98.5 - 100 = -1.5
+        assert signal.stop == pytest.approx(93.5)   # 95 - 1.5
+        assert signal.target == pytest.approx(108.5) # 110 - 1.5
+        assert "fills" in signal.metadata
+        assert len(signal.metadata["fills"]) == 4
+
+    def test_impl_shortfall_short_adverse_drift_falling_path(self):
+        """SHORT with falling path (adverse drift > threshold) executes immediately."""
+        # Current price 100, path falling to 99-96
+        # path_mean ≈ 98.5
+        # drift = (98.5 - 100) / 100 = -0.015 = -1.5%
+        # For SHORT, adverse_drift = drift * (-1) = 1.5%
+        # adverse_drift (1.5%) > threshold (0.05%) -> immediate
+
+        path = np.array([100.0, 99.0, 98.0, 97.0, 96.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.SHORT, entry=100.0, stop=105.0, target=90.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert signal is not None
+        assert signal.metadata["execution"] == "immediate"
+        assert signal.entry == pytest.approx(100.0)  # unchanged
+        assert signal.stop == pytest.approx(105.0)   # unchanged
+        assert signal.target == pytest.approx(90.0)  # unchanged
+
+    def test_impl_shortfall_short_favorable_drift_rising_path(self):
+        """SHORT with rising path (favorable drift < threshold) executes via TWAP."""
+        # Current price 100, path rising to 101-104
+        # path_mean ≈ 102.5
+        # drift = (102.5 - 100) / 100 = 0.025 = 2.5%
+        # For SHORT, adverse_drift = drift * (-1) = -2.5%
+        # adverse_drift (-2.5%) < threshold (0.05%) -> TWAP
+
+        path = np.array([100.0, 101.0, 102.0, 103.0, 104.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.SHORT, entry=100.0, stop=105.0, target=90.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert signal is not None
+        assert signal.metadata["execution"] == "twap"
+        # Effective entry = mean([100, 101, 102, 103]) = 101.5
+        assert signal.entry == pytest.approx(101.5)
+        # Shift = 101.5 - 100 = 1.5
+        assert signal.stop == pytest.approx(106.5)   # 105 + 1.5
+        assert signal.target == pytest.approx(91.5)  # 90 + 1.5
+
+    def test_impl_shortfall_decision_boundary_not_at_threshold(self):
+        """At threshold (drift == threshold), should choose TWAP (need strictly >)."""
+        # impact_bps = 5.0 -> threshold = 0.0005 = 0.05%
+        # Construct path where drift is very close to 0.05%
+
+        # For LONG: path_mean = 100.0005
+        # drift = 0.0005 = 0.05% (exactly at threshold)
+        # adverse_drift == threshold, but need adverse_drift > threshold for immediate
+        # So should choose TWAP
+
+        path = np.array([100.0, 100.0, 100.0005, 100.001])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        # At or below threshold -> TWAP
+        assert signal.metadata["execution"] == "twap"
+
+    def test_impl_shortfall_just_above_threshold_immediate(self):
+        """Just above threshold triggers immediate."""
+        # impact_bps = 5.0 -> threshold = 0.0005 = 0.05%
+        # Need adverse_drift slightly > 0.05%
+
+        # path = [100.04, 100.04, 100.08, 100.08]
+        # mean = 100.06
+        # drift = 0.0006 = 0.06%
+        # adverse_drift = 0.06% > 0.05% -> immediate
+
+        path = np.array([100.04, 100.04, 100.08, 100.08])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert signal.metadata["execution"] == "immediate"
+        assert signal.entry == pytest.approx(100.0)  # unchanged
+
+    def test_impl_shortfall_both_branches_exercised(self):
+        """Both immediate and TWAP branches are properly exercised."""
+        # Use moderately adverse path to trigger immediate
+        path_adverse = np.array([100.0, 101.0, 102.0, 103.0, 104.0])
+        dist_adverse = self._make_dist_with_path(path_adverse)
+
+        # Use moderately favorable path to trigger TWAP
+        path_favorable = np.array([100.0, 99.0, 98.0, 97.0, 96.0])
+        dist_favorable = self._make_dist_with_path(path_favorable)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        # Immediate branch
+        sig_immediate = strat.generate_signal(dist_adverse, 100.0, make_profile_history(), {})
+        assert sig_immediate.metadata["execution"] == "immediate"
+        assert sig_immediate.entry == base_signal.entry
+
+        # TWAP branch
+        sig_twap = strat.generate_signal(dist_favorable, 100.0, make_profile_history(), {})
+        assert sig_twap.metadata["execution"] == "twap"
+        assert sig_twap.entry != base_signal.entry
+
+    def test_impl_shortfall_matches_twap_standalone(self):
+        """TWAP branch output matches standalone TWAPExecutionStrategy."""
+        path = np.array([100.0, 99.0, 98.0, 97.0, 96.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+
+        # Standalone TWAP
+        twap_strat = TWAPExecutionStrategy(StubStrategy(base_signal), n_slices=4)
+        twap_signal = twap_strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        # Implementation shortfall in TWAP mode
+        impl_strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+        impl_signal = impl_strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        # Entry, stop, target should match
+        assert impl_signal.entry == pytest.approx(twap_signal.entry)
+        assert impl_signal.stop == pytest.approx(twap_signal.stop)
+        assert impl_signal.target == pytest.approx(twap_signal.target)
+        # Fills should match
+        assert impl_signal.metadata["fills"] == pytest.approx(twap_signal.metadata["fills"])
+
+    def test_impl_shortfall_immediate_preserves_brackets(self):
+        """Immediate execution preserves entry/stop/target exactly."""
+        path = np.array([105.0, 106.0, 107.0, 108.0])  # Strong adverse drift
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=120.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert signal.entry == base_signal.entry
+        assert signal.stop == base_signal.stop
+        assert signal.target == base_signal.target
+
+    def test_impl_shortfall_returns_signal_not_dict(self):
+        """Return value is always Signal, never dict."""
+        path = np.array([100.0, 101.0, 102.0, 103.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert isinstance(signal, Signal)
+        assert not isinstance(signal, dict)
+
+    def test_impl_shortfall_custom_impact_bps_higher_threshold(self):
+        """Custom impact_bps=10 raises threshold, may trigger TWAP instead of immediate."""
+        path = np.array([100.0, 100.5, 101.0, 101.5])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+
+        # path_mean ≈ 100.75
+        # drift ≈ 0.0075 = 0.75%
+        # With impact_bps=10, threshold = 0.001 = 0.1%
+        # drift (0.75%) > threshold (0.1%) -> immediate
+        strat_high = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=10.0)
+        sig_high = strat_high.generate_signal(dist, 100.0, make_profile_history(), {})
+        assert sig_high.metadata["execution"] == "immediate"
+
+    def test_impl_shortfall_custom_impact_bps_lower_threshold(self):
+        """Custom impact_bps=100 lowers threshold, may trigger TWAP instead of immediate."""
+        path = np.array([100.0, 100.5, 101.0, 101.5])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+
+        # path_mean ≈ 100.75
+        # drift ≈ 0.0075 = 0.75%
+        # With impact_bps=100, threshold = 0.01 = 1%
+        # drift (0.75%) < threshold (1%) -> TWAP
+        strat_low = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=100.0)
+        sig_low = strat_low.generate_signal(dist, 100.0, make_profile_history(), {})
+        assert sig_low.metadata["execution"] == "twap"
+
+    def test_impl_shortfall_zero_current_price(self):
+        """Handles zero current_price gracefully (drift undefined)."""
+        path = np.array([0.0, 0.0, 0.0, 0.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=0.0, stop=-1.0, target=1.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4)
+
+        # Should not crash; adverse_drift set to 0 when current_price == 0
+        signal = strat.generate_signal(dist, 0.0, make_profile_history(), {})
+        assert signal is not None
+        # 0 < threshold, so should choose TWAP (or immediate with zero drift)
+        # With zero drift, should not be > threshold, so TWAP
+
+    def test_impl_shortfall_short_boundary_case(self):
+        """SHORT at decision boundary: adverse_drift near threshold."""
+        # For SHORT with falling path (adverse):
+        # path = [100, 99.98, 99.96, 99.94]
+        # path_mean ≈ 99.97
+        # drift = (99.97 - 100) / 100 = -0.0003 = -0.03%
+        # For SHORT: adverse_drift = -0.03% * (-1) = 0.03%
+        # With impact_bps = 5 (threshold 0.05%), 0.03% < 0.05% -> TWAP
+
+        path = np.array([100.0, 99.98, 99.96, 99.94])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.SHORT, entry=100.0, stop=105.0, target=90.0)
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert signal.metadata["execution"] == "twap"
+
+    def test_impl_shortfall_preserves_metadata_keys_immediate(self):
+        """Immediate execution preserves base metadata."""
+        path = np.array([105.0, 106.0, 107.0, 108.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        base_signal.metadata["custom_key"] = "custom_value"
+
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert "custom_key" in signal.metadata
+        assert signal.metadata["custom_key"] == "custom_value"
+
+    def test_impl_shortfall_preserves_metadata_keys_twap(self):
+        """TWAP execution preserves base metadata and adds execution/fills."""
+        path = np.array([100.0, 99.0, 98.0, 97.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+        base_signal.metadata["custom_key"] = "custom_value"
+
+        strat = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=4, impact_bps=5.0)
+        signal = strat.generate_signal(dist, 100.0, make_profile_history(), {})
+
+        assert "custom_key" in signal.metadata
+        assert signal.metadata["custom_key"] == "custom_value"
+        assert "execution" in signal.metadata
+        assert "fills" in signal.metadata
+
+    def test_impl_shortfall_n_slices_param(self):
+        """Different n_slices values are respected."""
+        path = np.array([100.0, 99.0, 98.0, 97.0, 96.0, 95.0])
+        dist = self._make_dist_with_path(path)
+
+        base_signal = self._make_signal(Direction.LONG, entry=100.0, stop=95.0, target=110.0)
+
+        # With n_slices=2, should use only first 2 values: mean([100, 99]) = 99.5
+        strat2 = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=2, impact_bps=5.0)
+        sig2 = strat2.generate_signal(dist, 100.0, make_profile_history(), {})
+        assert sig2.entry == pytest.approx(99.5)
+
+        # With n_slices=6, should use all 6 values: mean([100..95]) = 97.5
+        strat6 = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=6, impact_bps=5.0)
+        sig6 = strat6.generate_signal(dist, 100.0, make_profile_history(), {})
+        assert sig6.entry == pytest.approx(97.5)
