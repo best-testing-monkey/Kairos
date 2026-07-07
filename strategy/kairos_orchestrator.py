@@ -3,12 +3,11 @@ kairos_orchestrator.py
 ======================
 The master orchestrator for the Kairos trading framework.
 
-Wires together all 42 strategies across 5 modules:
-  - kairos_backtest.py    (18 base strategies)
-  - kairos_path.py        (5 path-aware strategies)
-  - kairos_horizon.py     (3 multi-horizon strategies)
-  - kairos_execution.py   (7 execution + volume strategies)
-  - kairos_meta.py        (9 meta + cross-asset + tail strategies)
+Wires together strategies across many modules, including the original 42
+(kairos_backtest/path/horizon/execution/meta), crypto/forex/stocks/universal
+asset-class modules, and 27 awesome-quant strategies added across
+kairos_volatility.py, kairos_econometric.py, kairos_ml.py, kairos_sentiment.py,
+kairos_execution.py, kairos_meta.py, and kairos_backtest.py.
 
 Features:
   - Multi-asset prediction and ranking
@@ -73,6 +72,8 @@ try:
         VaRPositionCapStrategy, DistributionOverlapStrategy,
         ModelDecayMonitorStrategy, OvernightExposureFilter,
         RSIDivergenceStrategy, LeverageCalibrationStrategy,
+        StochasticFilterStrategy, ADXGateStrategy, OBVConfirmationStrategy,
+        MTFConsensusStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_backtest: {e}")
@@ -107,6 +108,8 @@ try:
         AmountFlowStrategy, PredictedVWAPStrategy,
         PartialExitBacktestEngine,
         PyramidingStrategy, TimeBasedStopStrategy,
+        VolumeProfileLevelsStrategy, CVDDivergenceStrategy,
+        TWAPExecutionStrategy, ImplementationShortfallStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_execution: {e}")
@@ -123,6 +126,7 @@ try:
         SellPremiumStrategy, BuyWingsStrategy,
         TailAsymmetryStrategy, PercentileTailStrategy,
         RegimeClusterStrategy, MonteCarloScenarioStrategy,
+        MultiFactorRankStrategy, PCAResidualReversalStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_meta: {e}")
@@ -153,6 +157,37 @@ try:
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_stocks: {e}")
+
+try:
+    from kairos_volatility import (
+        ATRBracketStrategy, GARCHFilterStrategy, VolTargetSizerStrategy,
+        VarianceRiskPremiumStrategy,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_volatility: {e}")
+
+try:
+    from kairos_econometric import (
+        ARIMADisagreementStrategy, VARLeadLagStrategy, SeasonalityFilterStrategy,
+        ChangepointGuardStrategy, GrangerPairsStrategy, MatrixProfileAnomalyStrategy,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_econometric: {e}")
+
+try:
+    from kairos_ml import (
+        MetaLabelStrategy, GBMDirectionStrategy, LPPLSGuardStrategy,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_ml: {e}")
+
+try:
+    from kairos_sentiment import (
+        NewsSentimentFilterStrategy, Institutional13FFilterStrategy,
+        SocialMomentumStrategy, EconCalendarGuardStrategy,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_sentiment: {e}")
 
 try:
     from kairos_universal import (
@@ -269,7 +304,8 @@ class OrchestratorConfig:
 
 class StrategyRegistry:
     """
-    Maintains the full registry of all 42 strategies.
+    Maintains the full registry of all strategies (108 after disabled-strategy
+    filtering; 121 constructed before filtering).
     """
 
     ALL_STRATEGIES: List[Strategy] = []
@@ -294,7 +330,7 @@ class StrategyRegistry:
 
     @classmethod
     def build_all(cls, config: OrchestratorConfig) -> List[Strategy]:
-        """Build all 42 strategies with the given config."""
+        """Build all 108 strategies with the given config."""
         strategies = []
 
         # === BASE STRATEGIES (18) ===
@@ -460,6 +496,67 @@ class StrategyRegistry:
             BSTSDecomposition(),
             ParticleFilter(base_strategy=TrendFollowingStrategy()),
             SpectralClustering(),
+        ])
+
+        # === AWESOME-QUANT STRATEGIES (27) ===
+        # Standalone strategies - default constructor params
+        strategies.extend([
+            VarianceRiskPremiumStrategy(),
+            VARLeadLagStrategy(),
+            GrangerPairsStrategy(),
+            MatrixProfileAnomalyStrategy(),
+            GBMDirectionStrategy(),
+            SocialMomentumStrategy(),
+            CVDDivergenceStrategy(),
+            MultiFactorRankStrategy(),
+            PCAResidualReversalStrategy(),
+        ])
+
+        # Wrappers - paired with a base strategy that complements their intent.
+        stochastic_filter = StochasticFilterStrategy(base_strategy=FadeExtremeStrategy())
+
+        adx_gate_trend = ADXGateStrategy(base_strategy=TrendFollowingStrategy(), kind="trend")
+        adx_gate_trend.name = "adx_gate_trend"
+        adx_gate_reversion = ADXGateStrategy(base_strategy=RangeTradingStrategy(), kind="reversion")
+        adx_gate_reversion.name = "adx_gate_reversion"
+
+        obv_confirmation = OBVConfirmationStrategy(base_strategy=MomentumContinuationStrategy())
+        mtf_consensus = MTFConsensusStrategy(base_strategy=TrendFollowingStrategy())
+        atr_bracket = ATRBracketStrategy(base_strategy=TrendFollowingStrategy())
+        garch_filter = GARCHFilterStrategy(base_strategy=TrendFollowingStrategy())
+        vol_target_sizer = VolTargetSizerStrategy(base_strategy=ExpectedValueStrategy())
+        arima_disagreement = ARIMADisagreementStrategy(base_strategy=TrendFollowingStrategy())
+        seasonality_filter = SeasonalityFilterStrategy(base_strategy=TrendFollowingStrategy())
+        changepoint_guard = ChangepointGuardStrategy(base_strategy=TrendFollowingStrategy())
+        meta_label = MetaLabelStrategy(base_strategy=ExpectedValueStrategy())
+        lppls_guard = LPPLSGuardStrategy(base_strategy=TrendFollowingStrategy())
+        news_sentiment_filter = NewsSentimentFilterStrategy(base_strategy=MomentumContinuationStrategy())
+        institutional_13f_filter = Institutional13FFilterStrategy(base_strategy=TrendFollowingStrategy())
+        econ_calendar_guard = EconCalendarGuardStrategy(base_strategy=TrendFollowingStrategy())
+        volume_profile_levels = VolumeProfileLevelsStrategy(base_strategy=TrendFollowingStrategy())
+        twap_execution = TWAPExecutionStrategy(base_strategy=MomentumContinuationStrategy())
+        implementation_shortfall = ImplementationShortfallStrategy(base_strategy=TrendFollowingStrategy())
+
+        strategies.extend([
+            stochastic_filter,
+            adx_gate_trend,
+            adx_gate_reversion,
+            obv_confirmation,
+            mtf_consensus,
+            atr_bracket,
+            garch_filter,
+            vol_target_sizer,
+            arima_disagreement,
+            seasonality_filter,
+            changepoint_guard,
+            meta_label,
+            lppls_guard,
+            news_sentiment_filter,
+            institutional_13f_filter,
+            econ_calendar_guard,
+            volume_profile_levels,
+            twap_execution,
+            implementation_shortfall,
         ])
 
         # Drop strategies the user has disabled
