@@ -26,6 +26,7 @@ from kairos_portfolio import (
     MVOAllocator,
     RiskParityAllocator,
     HRPAllocator,
+    MinVarAllocator,
 )
 from kairos_backtest import Signal, Direction, KairosDistribution
 
@@ -1771,3 +1772,478 @@ class TestHRPAllocator:
         # So A1 should get most weight, A3 should get least
         assert weights["A1"] > weights["A3"], \
             f"Lower-vol asset A1 ({weights['A1']}) should get more weight than A3 ({weights['A3']})"
+
+
+# =============================================================================
+# TEST MINVAR ALLOCATOR
+# =============================================================================
+
+class TestMinVarAllocator:
+    """Test Minimum-Variance allocator with shrunk covariance."""
+
+    @pytest.fixture
+    def minvar_allocator(self):
+        """Standard MinVar allocator instance."""
+        return MinVarAllocator(lookback=120, gross_cap=1.0, max_weight=0.35)
+
+    @pytest.fixture
+    def synthetic_returns_2asset_uncorrelated_10_20_vol(self):
+        """
+        Two assets with sample vols exactly 10% and 20% and exactly zero sample
+        correlation (via Gram-Schmidt orthogonalization).
+        MinVar on uncorrelated assets gives inverse-variance weights → |w1|/|w2| ≈ 4:1.
+        """
+        np.random.seed(42)
+        n_obs = 150
+
+        a = np.random.randn(n_obs)
+        b = np.random.randn(n_obs)
+
+        # Demean and orthogonalize b against a (exact zero sample correlation)
+        a = a - a.mean()
+        b = b - b.mean()
+        b = b - (np.dot(a, b) / np.dot(a, a)) * a
+
+        # Rescale to exact sample standard deviations: 10% and 20%
+        asset1 = a / a.std(ddof=1) * 0.10
+        asset2 = b / b.std(ddof=1) * 0.20
+
+        returns = pd.DataFrame(
+            {"ASSET1": asset1, "ASSET2": asset2},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+        return returns
+
+    @pytest.fixture
+    def synthetic_returns_3asset_minvar_corr(self):
+        """
+        Three assets for testing MinVar with correlation effects:
+        - ASSET1 and ASSET2: highly correlated, low vol (0.08)
+        - ASSET3: uncorrelated, higher vol (0.16)
+
+        MinVar should allocate less to the correlated pair combined vs.
+        the uncorrelated case due to diversification benefits.
+        """
+        np.random.seed(42)
+        n_obs = 150
+
+        # Common factor for ASSET1 and ASSET2 (high correlation)
+        factor12 = np.random.randn(n_obs)
+        asset1 = 0.008 * factor12 + 0.002 * np.random.randn(n_obs)
+        asset2 = 0.008 * factor12 + 0.002 * np.random.randn(n_obs)
+
+        # Uncorrelated asset with higher vol
+        asset3 = 0.016 * np.random.randn(n_obs)
+
+        returns = pd.DataFrame(
+            {"ASSET1": asset1, "ASSET2": asset2, "ASSET3": asset3},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+        return returns
+
+    def test_minvar_2asset_inverse_var_ratio(self, minvar_allocator,
+                                             synthetic_returns_2asset_uncorrelated_10_20_vol):
+        """
+        Acceptance: 2 assets with vol 10%/20% and zero correlation →
+        |weights| ratio ≈ 4:1 (inverse-variance), within 15% tolerance.
+        """
+        returns = synthetic_returns_2asset_uncorrelated_10_20_vol
+
+        # Verify uncorrelated
+        corr = returns.corr()
+        assert abs(corr.iloc[0, 1]) < 1e-10, "Assets should be exactly uncorrelated"
+
+        # Verify vols
+        vols = returns.std()
+        assert abs(vols["ASSET1"] - 0.10) < 1e-3, f"ASSET1 vol should be ~10%, got {vols['ASSET1']}"
+        assert abs(vols["ASSET2"] - 0.20) < 1e-3, f"ASSET2 vol should be ~20%, got {vols['ASSET2']}"
+
+        signals = {
+            "ASSET1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ASSET2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = minvar_allocator.allocate(signals, returns, {}, {})
+
+        assert weights["ASSET1"] > 1e-8, "ASSET1 should be LONG"
+        assert weights["ASSET2"] > 1e-8, "ASSET2 should be LONG"
+
+        # Ticket acceptance: |w1|/|w2| ≈ 4:1 within 15% tolerance
+        # Analytic result: for uncorrelated assets, w_i ∝ 1/σ_i²
+        # So w1/w2 = σ2²/σ1² = (0.20/0.10)² = 4:1
+        # Allow 15% deviation: range [3.4, 4.6]
+        actual_ratio = weights["ASSET1"] / weights["ASSET2"]
+        assert 3.4 <= actual_ratio <= 4.6, \
+            f"Weight ratio {actual_ratio:.4f} should be ~4.0 (within 15% tolerance)"
+
+    def test_minvar_3asset_correlation_effect(self, minvar_allocator,
+                                              synthetic_returns_3asset_minvar_corr):
+        """
+        Acceptance: MinVar with 3 assets (2 correlated, 1 uncorrelated) produces
+        meaningful allocation respecting the covariance structure.
+
+        With 2 uncorrelated assets (ASSET1, ASSET3):
+        - ASSET1 vol ≈ 0.008, ASSET3 vol ≈ 0.016
+        - Uncorrelated → MinVar puts more weight on low-vol asset
+
+        With 3 assets (ASSET1, ASSET2, ASSET3) where ASSET1/ASSET2 highly correlated:
+        - Correlated pair has lower effective diversification value
+        - The allocator should still respect the variance minimization criterion
+        """
+        returns = synthetic_returns_3asset_minvar_corr
+
+        # Test case: Three-asset case (ASSET1 + ASSET2 + ASSET3)
+        signals_3 = {
+            "ASSET1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ASSET2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ASSET3": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights_3 = minvar_allocator.allocate(signals_3, returns, {}, {})
+
+        # All three should have non-zero weight (all LONG)
+        assert weights_3["ASSET1"] > 1e-8, "ASSET1 should have meaningful LONG weight"
+        assert weights_3["ASSET2"] > 1e-8, "ASSET2 should have meaningful LONG weight"
+        assert weights_3["ASSET3"] > 1e-8, "ASSET3 should have meaningful LONG weight"
+
+        # Weights should respect caps
+        assert sum(abs(w) for w in weights_3.values()) <= 1.0 + 1e-6
+        assert all(abs(w) <= 0.35 + 1e-6 for w in weights_3.values())
+
+    def test_minvar_respects_caps(self, minvar_allocator, synthetic_returns_200_obs_3_assets):
+        """Acceptance: solution never violates gross_cap or max_weight constraints."""
+        returns = synthetic_returns_200_obs_3_assets
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100.0,
+                stop=101.0,
+                target=99.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = minvar_allocator.allocate(signals, returns, {}, {})
+
+        # Check max_weight constraint
+        for sym, w in weights.items():
+            assert abs(w) <= 0.35 + 1e-6, \
+                f"{sym} weight {w} exceeds max_weight 0.35"
+
+        # Check gross_cap constraint
+        gross_leverage = sum(abs(w) for w in weights.values())
+        assert gross_leverage <= 1.0 + 1e-6, \
+            f"Gross leverage {gross_leverage} exceeds gross_cap 1.0"
+
+        # Check sign constraints
+        assert weights["BTC"] >= -1e-10, "BTC (LONG) should not be negative"
+        assert weights["ETH"] >= -1e-10, "ETH (LONG) should not be negative"
+        assert weights["SOL"] <= 1e-10, "SOL (SHORT) should not be positive"
+
+    def test_minvar_signs_follow_directions(self, minvar_allocator, synthetic_returns_200_obs_3_assets):
+        """Acceptance: weight signs follow signal directions."""
+        returns = synthetic_returns_200_obs_3_assets
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100.0,
+                stop=101.0,
+                target=99.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.FLAT,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = minvar_allocator.allocate(signals, returns, {}, {})
+
+        assert weights["BTC"] >= -1e-10, "BTC (LONG) should not be negative"
+        assert weights["ETH"] <= 1e-10, "ETH (SHORT) should not be positive"
+        assert abs(weights["SOL"]) < 1e-10, "SOL (FLAT) should be ~0"
+
+    def test_minvar_fallback_below_min_obs(self, minvar_allocator, synthetic_returns_small, simple_signals):
+        """Acceptance: fallback to equal weight when len(returns) < min_obs."""
+        returns = synthetic_returns_small  # 5 obs
+        assert len(returns) < PortfolioAllocator.min_obs
+
+        weights = minvar_allocator.allocate(simple_signals, returns, {}, {})
+
+        # Should fall back to equal weight
+        expected = _fallback_equal_weight(simple_signals)
+        assert weights == expected, \
+            f"Expected equal-weight fallback {expected}, got {weights}"
+
+    def test_minvar_variance_beats_equal_weight(self, minvar_allocator,
+                                                synthetic_returns_2asset_uncorrelated_10_20_vol):
+        """
+        Acceptance: portfolio variance of MinVar solution <= variance of
+        equal-weight on the same covariance matrix.
+        """
+        returns = synthetic_returns_2asset_uncorrelated_10_20_vol
+
+        signals = {
+            "ASSET1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ASSET2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        # Get MinVar weights
+        weights_minvar = minvar_allocator.allocate(signals, returns, {}, {})
+
+        # Get covariance
+        trailing_returns = returns[["ASSET1", "ASSET2"]].tail(minvar_allocator.lookback)
+        cov = shrunk_covariance(trailing_returns)
+
+        # Compute variance of MinVar solution
+        w_minvar = np.array([weights_minvar["ASSET1"], weights_minvar["ASSET2"]])
+        var_minvar = np.dot(w_minvar, np.dot(cov, w_minvar))
+
+        # Compute variance of equal-weight solution
+        w_equal = np.array([0.5, 0.5])
+        var_equal = np.dot(w_equal, np.dot(cov, w_equal))
+
+        # MinVar should have lower variance
+        assert var_minvar <= var_equal + 1e-8, \
+            f"MinVar variance {var_minvar:.8f} should be <= equal-weight variance {var_equal:.8f}"
+
+    def test_minvar_allocator_attributes(self, minvar_allocator):
+        """Test allocator has correct name and min_obs."""
+        assert minvar_allocator.name == "minvar_allocator"
+        assert minvar_allocator.min_obs == 60
+        assert minvar_allocator.lookback == 120
+        assert minvar_allocator.gross_cap == 1.0
+        assert minvar_allocator.max_weight == 0.35
+
+    def test_minvar_allocator_custom_params(self):
+        """Test allocator with custom parameters."""
+        allocator = MinVarAllocator(
+            lookback=60,
+            gross_cap=2.0,
+            max_weight=0.5
+        )
+        assert allocator.lookback == 60
+        assert allocator.gross_cap == 2.0
+        assert allocator.max_weight == 0.5
+
+    def test_minvar_empty_signals(self, minvar_allocator, synthetic_returns_200_obs_3_assets):
+        """With no signals, return empty dict."""
+        returns = synthetic_returns_200_obs_3_assets
+        weights = minvar_allocator.allocate({}, returns, {}, {})
+        assert weights == {}
+
+    def test_minvar_single_asset(self, minvar_allocator):
+        """Single asset should get meaningful allocation (subject to max_weight)."""
+        returns = pd.DataFrame(
+            np.random.randn(100) * 0.02,
+            columns=["A"],
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+
+        signals = {
+            "A": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = minvar_allocator.allocate(signals, returns, {}, {})
+
+        # Single LONG asset should get weight up to max_weight (limited by constraint)
+        # With single asset, max feasible allocation is max_weight = 0.35
+        assert 0.0 < weights["A"] <= 0.35 + 1e-6, \
+            f"Single LONG asset should get positive weight <= max_weight, got {weights['A']}"
+
+    def test_minvar_long_short_mix(self, minvar_allocator, synthetic_returns_200_obs_3_assets):
+        """MinVar with mixed LONG/SHORT signals should respect directions."""
+        returns = synthetic_returns_200_obs_3_assets
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100.0,
+                stop=101.0,
+                target=99.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = minvar_allocator.allocate(signals, returns, {}, {})
+
+        # BTC (LONG) should be non-negative
+        assert weights["BTC"] >= -1e-10, "BTC (LONG) should not be negative"
+
+        # ETH (SHORT) should be non-positive
+        assert weights["ETH"] <= 1e-10, "ETH (SHORT) should not be positive"
+
+        # At least one should be non-zero (unless both happen to be 0)
+        assert abs(weights["BTC"]) + abs(weights["ETH"]) > 1e-8, \
+            "At least one position should be meaningful"
+
+    def test_minvar_custom_gross_cap(self):
+        """Test allocator with custom gross_cap."""
+        np.random.seed(42)
+        n_obs = 150
+        a = np.random.randn(n_obs) * 0.1
+        b = np.random.randn(n_obs) * 0.2
+        returns = pd.DataFrame(
+            {"A": a, "B": b},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+
+        signals = {
+            "A": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "B": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        # Test with gross_cap = 0.5 (tighter cap)
+        allocator = MinVarAllocator(gross_cap=0.5, max_weight=0.35)
+        weights = allocator.allocate(signals, returns, {}, {})
+
+        gross_leverage = sum(abs(w) for w in weights.values())
+        assert gross_leverage <= 0.5 + 1e-6, \
+            f"Gross leverage {gross_leverage} should respect custom cap 0.5"

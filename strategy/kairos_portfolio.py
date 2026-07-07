@@ -835,6 +835,211 @@ class HRPAllocator(PortfolioAllocator):
 # MVO ALLOCATOR
 # =============================================================================
 
+class MinVarAllocator(PortfolioAllocator):
+    """
+    Minimum-Variance portfolio allocator with Ledoit-Wolf shrinkage.
+
+    Minimizes portfolio variance w'Σw where Σ is a shrunk covariance matrix
+    (Ledoit-Wolf toward scaled identity) over the signaled assets' trailing returns.
+    Uses scipy SLSQP solver.
+
+    Constraints:
+        sum|w| <= gross_cap (gross leverage cap, default 1.0)
+        |w_i| <= max_weight (individual position cap, default 0.35)
+        sign(w_i) matches signal direction (LONG/SHORT/FLAT)
+
+    The allocator falls back to equal-weight allocation when fewer than min_obs
+    (default 60) observations are available, or if the optimizer fails to converge.
+
+    Attributes:
+        name: "minvar_allocator"
+        lookback: Number of days of historical returns to use for covariance estimation.
+        gross_cap: Gross leverage cap (sum of |w_i|).
+        max_weight: Maximum absolute weight for any single asset.
+    """
+
+    name: str = "minvar_allocator"
+
+    def __init__(self, lookback: int = 120, gross_cap: float = 1.0,
+                 max_weight: float = 0.35):
+        """
+        Initialize MinVar allocator.
+
+        Args:
+            lookback: Number of days of historical returns to use for covariance estimation.
+                     Default: 120 (approximately 6 months).
+            gross_cap: Gross leverage cap (sum of absolute values of weights).
+                      Default: 1.0.
+            max_weight: Maximum absolute weight for any single asset.
+                       Default: 0.35.
+
+        Examples:
+            >>> allocator = MinVarAllocator(lookback=120, gross_cap=1.0, max_weight=0.35)
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        self.lookback = lookback
+        self.gross_cap = gross_cap
+        self.max_weight = max_weight
+
+    def allocate(self, signals: Dict[str, "Signal"],
+                 returns: pd.DataFrame,
+                 dists: Dict[str, Any],
+                 context: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Compute minimum-variance optimal weights.
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+                    Index: dates, Columns: asset symbols.
+            dists: Dict[symbol -> KairosDistribution] (unused for MinVar).
+            context: Dict[str, Any] execution context (unused).
+
+        Returns:
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values <= gross_cap.
+            Individual absolute values <= max_weight.
+            Signs match signal directions.
+
+        Fall-back behavior:
+            If len(returns) < self.min_obs (default 60), returns equal-weight allocation.
+            If optimization fails, returns equal-weight allocation.
+
+        Examples:
+            >>> allocator = MinVarAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, {})
+            >>> assert sum(abs(w) for w in weights.values()) <= 1.0
+        """
+        # Check if enough observations
+        if len(returns) < self.min_obs:
+            return _fallback_equal_weight(signals)
+
+        # Extract symbols
+        symbols = list(signals.keys())
+        if not symbols:
+            return {}
+
+        # Get trailing returns for covariance estimation
+        trailing_returns = returns[symbols].tail(self.lookback)
+        if len(trailing_returns) < 2:
+            return _fallback_equal_weight(signals)
+
+        # Compute shrunk covariance
+        try:
+            cov = shrunk_covariance(trailing_returns)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Solve MinVar
+        try:
+            weights_dict = self._solve_minvar(symbols, cov, signals)
+            return weights_dict
+        except Exception:
+            # Fallback to equal weight on solver failure
+            return _fallback_equal_weight(signals)
+
+    def _solve_minvar(self, symbols: list, cov: np.ndarray,
+                      signals: Dict[str, "Signal"]) -> Dict[str, float]:
+        """
+        Solve the minimum-variance problem via scipy.optimize.minimize with SLSQP.
+
+        Minimizes w'Σw subject to:
+        - sum|w| <= gross_cap
+        - |w_i| <= max_weight
+        - sign(w_i) matches signal direction
+
+        The objective includes a small penalty on under-allocation to avoid the
+        trivial zero-weight solution while preserving variance minimization.
+
+        Args:
+            symbols: List of asset symbols (in order matching cov).
+            cov: Shrunk covariance matrix (n_assets, n_assets).
+            signals: Dict[symbol -> Signal] for direction and metadata.
+
+        Returns:
+            Dict[symbol -> float] of optimal weights.
+
+        Raises:
+            ValueError: If optimization fails to converge.
+        """
+        from scipy.optimize import minimize
+
+        n = len(symbols)
+
+        # Build bounds based on signal direction
+        bounds = []
+        for sym in symbols:
+            direction = signals[sym].direction
+            try:
+                dir_val = direction.value if hasattr(direction, 'value') else direction
+            except:
+                dir_val = direction
+
+            # Check if LONG (value=1), SHORT (value=-1), or FLAT (value=0)
+            if dir_val == 1:  # LONG
+                bounds.append((0.0, self.max_weight))
+            elif dir_val == -1:  # SHORT
+                bounds.append((-self.max_weight, 0.0))
+            else:  # FLAT
+                bounds.append((0.0, 0.0))
+
+        # Objective: minimize portfolio variance w'Σw with penalty for under-allocation
+        # penalty discourages trivial zero-weight solution while preserving variance minimization
+        def objective(w):
+            variance = np.dot(w, np.dot(cov, w))
+            # Compute maximum feasible allocation (constrained by bounds)
+            max_alloc = sum(abs(ub) if ub * lb <= 0 else max(abs(ub), abs(lb))
+                           for lb, ub in bounds)
+            # Feasible target: min(gross_cap, max_alloc)
+            target_alloc = min(self.gross_cap, max_alloc)
+            # Penalize under-allocation relative to feasible target
+            # Use modest penalty to encourage meaningful allocation without dominating variance
+            under_alloc = target_alloc - np.sum(np.abs(w))
+            penalty = 1e-4 * max(0, under_alloc) ** 2  if target_alloc > 1e-10 else 0.0
+            return variance + penalty
+
+        # Gradient approximation via finite differences (SLSQP can compute it)
+        # (letting SLSQP use numerical gradient is simpler given the penalty term)
+
+        # Constraint: sum(|w|) <= gross_cap (inequality)
+        def constraint_gross_cap(w):
+            return self.gross_cap - np.sum(np.abs(w))
+
+        constraints = [
+            {'type': 'ineq', 'fun': constraint_gross_cap}
+        ]
+
+        # Initial guess: equal weight scaled to gross_cap, clipped to bounds
+        w0 = np.ones(n) / n * self.gross_cap
+        # Clip to bounds
+        for i, (lb, ub) in enumerate(bounds):
+            w0[i] = np.clip(w0[i], lb, ub)
+
+        # Solve
+        result = minimize(
+            objective,
+            w0,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            options={'ftol': 1e-9, 'maxiter': 1000}
+        )
+
+        if not result.success:
+            raise ValueError(f"MinVar optimization failed: {result.message}")
+
+        # Return as dict
+        weights = {}
+        for i, sym in enumerate(symbols):
+            w = result.x[i]
+            # Zero out very small weights to avoid numerical noise
+            if abs(w) < 1e-10:
+                w = 0.0
+            weights[sym] = float(w)
+
+        return weights
+
+
 class MVOAllocator(PortfolioAllocator):
     """
     Mean-Variance Optimization allocator using Markowitz maximum-Sharpe portfolio.
