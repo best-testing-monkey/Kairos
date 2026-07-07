@@ -59,7 +59,7 @@
 
 ## Epic E8 — Factors
 
-- [ ] E8-S01 Multi-Factor Rank (docs/tickets/E8-S01-multi-factor-rank.md)
+- [x] E8-S01 Multi-Factor Rank (docs/tickets/E8-S01-multi-factor-rank.md)
 - [ ] E8-S02 PCA Residual Reversal (docs/tickets/E8-S02-pca-residual-reversal.md)
 
 ## Epic E9 — Sentiment Scaffolding
