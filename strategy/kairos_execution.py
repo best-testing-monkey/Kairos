@@ -1374,6 +1374,121 @@ class VolumeProfileLevelsStrategy(Strategy):
         return base_signal
 
 
+class CVDDivergenceStrategy(Strategy):
+    """
+    Trades divergence between cumulative volume delta (CVD) and price slope.
+
+    Computes z-normalized slopes over a rolling window:
+    - CVD slope: slope of cumulative volume delta (volume signed by close-vs-open)
+    - Price slope: slope of close prices
+
+    Signals:
+    - Price slope > 0 and CVD slope < 0 → bearish divergence → SHORT
+    - Price slope < 0 and CVD slope > 0 → bullish divergence → LONG
+    - No divergence or insufficient history → None
+
+    Gate on Kronos agreement:
+    - Bearish divergence only fires if dist.mean < current_price
+    - Bullish divergence only fires if dist.mean > current_price
+    """
+    name = "cvd_divergence"
+
+    def __init__(self, slope_window: int = 20, lookback: int = 60):
+        """
+        Args:
+            slope_window: Number of bars to use for slope computation (default 20)
+            lookback: Number of bars to require in history (default 60)
+        """
+        self.slope_window = slope_window
+        self.lookback = lookback
+
+    def generate_signal(self, dist, current_price, history, context):
+        """Generate signal based on CVD/price slope divergence."""
+        # Need at least slope_window+1 bars for slope computation
+        if len(history) < self.slope_window + 1:
+            return None
+
+        # Extract OHLCV
+        closes = history["close"].values.astype(float)
+        volumes = history["volume"].values.astype(float)
+
+        # Compute CVD: cumsum of (volume * sign(close - open))
+        opens = history["open"].values.astype(float)
+        close_minus_open = closes - opens
+        volume_signed = volumes * np.sign(close_minus_open)
+        cvd = np.cumsum(volume_signed)
+
+        # Get the last slope_window bars
+        cvd_window = cvd[-self.slope_window:]
+        close_window = closes[-self.slope_window:]
+
+        # Z-normalize for comparable slopes
+        cvd_z = (cvd_window - np.mean(cvd_window)) / (np.std(cvd_window) + 1e-8)
+        close_z = (close_window - np.mean(close_window)) / (np.std(close_window) + 1e-8)
+
+        # Compute slopes via np.polyfit
+        x = np.arange(len(cvd_z))
+        cvd_slope_coeffs = np.polyfit(x, cvd_z, 1)
+        price_slope_coeffs = np.polyfit(x, close_z, 1)
+
+        cvd_slope = float(cvd_slope_coeffs[0])
+        price_slope = float(price_slope_coeffs[0])
+
+        # Detect divergence
+        dist_mean = dist.stats["close"]["mean"]
+
+        if price_slope > 0 and cvd_slope < 0:
+            # Bearish divergence: prices rising but CVD falling
+            direction = Direction.SHORT
+        elif price_slope < 0 and cvd_slope > 0:
+            # Bullish divergence: prices falling but CVD rising
+            direction = Direction.LONG
+        else:
+            # No divergence
+            return None
+
+        # Gate on Kronos agreement
+        if direction == Direction.SHORT and dist_mean >= current_price:
+            # Kronos predicts up; don't short
+            return None
+        if direction == Direction.LONG and dist_mean <= current_price:
+            # Kronos predicts down; don't go long
+            return None
+
+        # Set brackets
+        if direction == Direction.LONG:
+            stop = dist.stats["low"][f"pct_{int(15)}"]
+            target = dist.stats["high"][f"pct_{int(85)}"]
+        else:  # SHORT
+            stop = dist.stats["high"][f"pct_{int(85)}"]
+            target = dist.stats["low"][f"pct_{int(15)}"]
+
+        # Compute Kelly and size
+        kelly = dist.kelly_fraction(current_price, target, stop)
+        size = min(kelly * 0.5, 1.0)
+
+        # Confidence: sum of absolute slopes, bounded to [0, 1]
+        confidence = min(abs(cvd_slope) + abs(price_slope), 1.0)
+
+        # Expected value
+        ev = dist.expected_value(current_price, target, stop)
+
+        return Signal(
+            direction=direction,
+            size=size,
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=confidence,
+            expected_value=ev,
+            metadata={
+                "cvd_slope": cvd_slope,
+                "price_slope": price_slope,
+            }
+        )
+
+
 # =============================================================================
 # EXAMPLE / TEST
 # =============================================================================
