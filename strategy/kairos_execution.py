@@ -1199,6 +1199,182 @@ class TimeBasedStopStrategy(Strategy):
 
 
 # =============================================================================
+# VOLUME PROFILE LEVELS
+# =============================================================================
+
+def volume_profile(history, lookback=60, bins=20):
+    """
+    Build a volume-at-price histogram from historical OHLCV data.
+
+    Args:
+        history: DataFrame with columns [open, high, low, close, volume]
+        lookback: Number of bars to include (default 60)
+        bins: Number of price bins (default 20)
+
+    Returns:
+        dict with keys:
+        - "poc": Point of control (center of max-volume bin)
+        - "hvn": List of high-volume node centers (bins > mean+1std)
+        - "lvn": List of low-volume node centers (bins < mean-1std)
+        - "edges": Bin edges for the histogram
+    """
+    # Use the last 'lookback' bars
+    window = history.tail(lookback)
+    if len(window) < 2:
+        return {"poc": None, "hvn": [], "lvn": [], "edges": []}
+
+    # Compute typical price (H+L+C)/3 and extract volume
+    typical_prices = (window["high"] + window["low"] + window["close"]) / 3.0
+    volumes = window["volume"]
+
+    # Get price range from the window (use min of lows, max of highs)
+    min_price = window["low"].min()
+    max_price = window["high"].max()
+
+    if min_price == max_price:
+        return {"poc": min_price, "hvn": [], "lvn": [], "edges": []}
+
+    # Create bins and assign volumes
+    edges = np.linspace(min_price, max_price, bins + 1)
+    bin_volumes = np.zeros(bins)
+
+    for tp, vol in zip(typical_prices, volumes):
+        # Find the bin index for this typical price
+        bin_idx = np.searchsorted(edges, tp, side="right") - 1
+        # Clamp to valid range
+        bin_idx = max(0, min(bin_idx, bins - 1))
+        bin_volumes[bin_idx] += vol
+
+    # Compute bin centers
+    bin_centers = (edges[:-1] + edges[1:]) / 2.0
+
+    # Find POC (point of control) - center of highest volume bin
+    poc_idx = np.argmax(bin_volumes)
+    poc = float(bin_centers[poc_idx])
+
+    # Compute mean and std of bin volumes
+    mean_vol = np.mean(bin_volumes)
+    std_vol = np.std(bin_volumes)
+
+    # High-volume nodes: bins > mean + 1*std
+    hvn = [float(bin_centers[i]) for i in range(bins) if bin_volumes[i] > mean_vol + std_vol]
+
+    # Low-volume nodes: bins < mean - 1*std
+    lvn = [float(bin_centers[i]) for i in range(bins) if bin_volumes[i] < mean_vol - std_vol]
+
+    return {
+        "poc": poc,
+        "hvn": sorted(hvn),
+        "lvn": sorted(lvn),
+        "edges": edges.tolist()
+    }
+
+
+class VolumeProfileLevelsStrategy(Strategy):
+    """
+    Wraps a base strategy and snaps stops/targets to volume profile support/resistance levels.
+
+    - Stop snapped to nearest high-volume node (HVN) between current stop and entry,
+      but only if it makes the stop nearer to entry (tightening).
+    - Target snapped to nearest low-volume node (LVN) beyond entry in trade direction,
+      but only if it's nearer than the original target.
+    - Records chosen levels in signal.metadata["volume_profile"].
+    """
+    name = "volume_profile_levels"
+
+    def __init__(self, base_strategy: Strategy, lookback: int = 60, bins: int = 20):
+        """
+        Args:
+            base_strategy: Strategy to wrap
+            lookback: Number of bars for volume profile (default 60)
+            bins: Number of price bins (default 20)
+        """
+        self.base_strategy = base_strategy
+        self.lookback = lookback
+        self.bins = bins
+
+    def generate_signal(self, dist, current_price, history, context):
+        # Get base signal
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Build volume profile
+        vp = volume_profile(history, lookback=self.lookback, bins=self.bins)
+
+        # Initialize metadata tracking
+        metadata_vp = {
+            "poc": vp["poc"],
+            "hvn": vp["hvn"],
+            "lvn": vp["lvn"],
+            "stop_original": base_signal.stop,
+            "target_original": base_signal.target,
+            "stop_snapped": base_signal.stop,
+            "target_snapped": base_signal.target,
+        }
+
+        entry = base_signal.entry
+        original_stop = base_signal.stop
+        original_target = base_signal.target
+        new_stop = original_stop
+        new_target = original_target
+
+        # Determine trade direction
+        if base_signal.direction == Direction.LONG:
+            # LONG trade
+            # Stop: find nearest HVN that is BETWEEN current stop and entry
+            # (i.e., above the current stop but below entry)
+            # Snap only if it tightens the stop (moves it UP toward entry)
+            if vp["hvn"]:
+                hvn_between = [h for h in vp["hvn"] if original_stop < h < entry]
+                if hvn_between:
+                    hvn_nearest = max(hvn_between)  # Highest HVN below entry
+                    if hvn_nearest > original_stop:
+                        new_stop = hvn_nearest
+                        metadata_vp["stop_snapped"] = new_stop
+
+            # Target: find nearest LVN beyond entry (i.e., above entry)
+            # Snap only if it's nearer than original target
+            if vp["lvn"]:
+                lvn_beyond = [l for l in vp["lvn"] if l > entry]
+                if lvn_beyond:
+                    lvn_nearest = min(lvn_beyond)  # Lowest LVN above entry
+                    if abs(lvn_nearest - entry) < abs(original_target - entry):
+                        new_target = lvn_nearest
+                        metadata_vp["target_snapped"] = new_target
+
+        else:  # Direction.SHORT
+            # SHORT trade
+            # Stop: find nearest HVN that is BETWEEN entry and current stop
+            # (i.e., below entry but above the current stop)
+            # Snap only if it tightens the stop (moves it DOWN toward entry)
+            if vp["hvn"]:
+                hvn_between = [h for h in vp["hvn"] if entry < h < original_stop]
+                if hvn_between:
+                    hvn_nearest = min(hvn_between)  # Lowest HVN above entry
+                    if hvn_nearest < original_stop:
+                        new_stop = hvn_nearest
+                        metadata_vp["stop_snapped"] = new_stop
+
+            # Target: find nearest LVN beyond entry (i.e., below entry)
+            # Snap only if it's nearer than original target
+            if vp["lvn"]:
+                lvn_beyond = [l for l in vp["lvn"] if l < entry]
+                if lvn_beyond:
+                    lvn_nearest = max(lvn_beyond)  # Highest LVN below entry
+                    if abs(lvn_nearest - entry) < abs(original_target - entry):
+                        new_target = lvn_nearest
+                        metadata_vp["target_snapped"] = new_target
+
+        # Update signal with snapped levels
+        base_signal.stop = new_stop
+        base_signal.target = new_target
+        base_signal.metadata["volume_profile"] = metadata_vp
+
+        return base_signal
+
+
+# =============================================================================
 # EXAMPLE / TEST
 # =============================================================================
 
