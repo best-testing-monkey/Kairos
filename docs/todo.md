@@ -9,7 +9,7 @@
 ## Epic E2 — Portfolio Allocators
 
 - [x] E2-S01 MVO Allocator (docs/tickets/E2-S01-mvo-allocator.md)
-- [ ] E2-S02 Risk Parity Allocator (docs/tickets/E2-S02-risk-parity-allocator.md)
+- [x] E2-S02 Risk Parity Allocator (docs/tickets/E2-S02-risk-parity-allocator.md)
 - [ ] E2-S03 HRP Allocator (docs/tickets/E2-S03-hrp-allocator.md)
 - [ ] E2-S04 MinVar Allocator (docs/tickets/E2-S04-minvar-allocator.md)
 - [ ] E2-S05 Black-Litterman Allocator (docs/tickets/E2-S05-black-litterman-allocator.md)

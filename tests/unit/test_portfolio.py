@@ -24,6 +24,7 @@ from kairos_portfolio import (
     _fallback_equal_weight,
     _ledoit_wolf_intensity,
     MVOAllocator,
+    RiskParityAllocator,
 )
 from kairos_backtest import Signal, Direction, KairosDistribution
 
@@ -1022,3 +1023,310 @@ class TestMVOAllocator:
         weights = mvo_allocator.allocate(signals, returns, dists, {})
         assert isinstance(weights, dict)
         assert len(weights) > 0  # Should have some allocation
+
+
+# =============================================================================
+# TEST RISK PARITY ALLOCATOR
+# =============================================================================
+
+class TestRiskParityAllocator:
+    """Test Equal Risk Contribution (ERC) allocator."""
+
+    @pytest.fixture
+    def rp_allocator(self):
+        """Standard Risk Parity allocator instance."""
+        return RiskParityAllocator(lookback=120, gross_cap=1.0, max_weight=0.35)
+
+    @pytest.fixture
+    def synthetic_returns_2asset_uncorrelated_10_20_vol(self):
+        """
+        Two assets with sample vols exactly 10% and 20% and exactly zero sample
+        correlation (via Gram-Schmidt orthogonalization).
+        ERC on uncorrelated assets gives inverse-vol weights → |w1|/|w2| = 2:1.
+        """
+        np.random.seed(42)
+        n_obs = 150
+
+        a = np.random.randn(n_obs)
+        b = np.random.randn(n_obs)
+
+        # Demean and orthogonalize b against a (exact zero sample correlation)
+        a = a - a.mean()
+        b = b - b.mean()
+        b = b - (np.dot(a, b) / np.dot(a, a)) * a
+
+        # Rescale to exact sample standard deviations: 10% and 20%
+        asset1 = a / a.std(ddof=1) * 0.10
+        asset2 = b / b.std(ddof=1) * 0.20
+
+        returns = pd.DataFrame(
+            {"ASSET1": asset1, "ASSET2": asset2},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+        return returns
+
+    @pytest.fixture
+    def synthetic_returns_3asset_correlated(self):
+        """
+        Three correlated assets for testing risk contribution convergence.
+        """
+        np.random.seed(42)
+        n_obs = 150
+
+        factor = np.random.randn(n_obs)
+        asset1 = 0.008 * factor + 0.004 * np.random.randn(n_obs)
+        asset2 = 0.010 * factor + 0.008 * np.random.randn(n_obs)
+        asset3 = 0.008 * factor + 0.014 * np.random.randn(n_obs)
+
+        returns = pd.DataFrame(
+            {"ASSET1": asset1, "ASSET2": asset2, "ASSET3": asset3},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+        return returns
+
+    def _compute_risk_contributions(self, weights: np.ndarray, cov: np.ndarray) -> np.ndarray:
+        """Compute risk contributions rc_i = w_i * (Σw)_i."""
+        sigma_w = cov @ weights
+        rc = weights * sigma_w
+        return rc
+
+    def test_risk_parity_2asset_vol_ratio(self, rp_allocator, synthetic_returns_2asset_uncorrelated_10_20_vol):
+        """
+        Acceptance (ticket E2-S02): 2 assets with vol 10%/20% and zero
+        correlation → |weights| ratio ≈ 2:1, within 5% tolerance.
+        """
+        returns = synthetic_returns_2asset_uncorrelated_10_20_vol
+
+        corr = returns.corr()
+        assert abs(corr.iloc[0, 1]) < 1e-10, "Assets should be exactly uncorrelated"
+
+        signals = {
+            "ASSET1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ASSET2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = rp_allocator.allocate(signals, returns, {}, {})
+
+        assert weights["ASSET1"] > 1e-8, "ASSET1 should be LONG"
+        assert weights["ASSET2"] > 1e-8, "ASSET2 should be LONG"
+
+        # Ticket acceptance: |w1|/|w2| ≈ 2:1 within 5% tolerance
+        actual_ratio = weights["ASSET1"] / weights["ASSET2"]
+        assert abs(actual_ratio - 2.0) < 0.1, \
+            f"Weight ratio {actual_ratio:.4f} should be ~2.0 (within 5% tolerance)"
+
+    def test_risk_parity_equal_contributions_3asset(self, rp_allocator, synthetic_returns_3asset_correlated):
+        """
+        Acceptance (ticket E2-S02): risk contributions within 1% of each other
+        at convergence. Tests with 3 correlated assets.
+        """
+        returns = synthetic_returns_3asset_correlated
+
+        signals = {
+            "ASSET1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ASSET2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ASSET3": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = rp_allocator.allocate(signals, returns, {}, {})
+
+        for sym in ["ASSET1", "ASSET2", "ASSET3"]:
+            assert weights[sym] > 1e-8, f"{sym} should have positive weight"
+
+        trailing_returns = returns[["ASSET1", "ASSET2", "ASSET3"]].tail(rp_allocator.lookback)
+        cov = shrunk_covariance(trailing_returns)
+        w_array = np.array([weights["ASSET1"], weights["ASSET2"], weights["ASSET3"]])
+        rc = self._compute_risk_contributions(w_array, cov)
+
+        mean_rc = np.mean(rc)
+        assert mean_rc > 1e-12, "Portfolio should carry non-trivial risk"
+        rc_normalized = rc / mean_rc
+        max_deviation = np.max(np.abs(rc_normalized - 1.0))
+        # Ticket acceptance: risk contributions within 1% of each other
+        assert max_deviation < 0.01, \
+            f"Risk contributions deviate {max_deviation*100:.4f}% from mean " \
+            f"(should be < 1%): {rc_normalized}"
+
+    def test_risk_parity_directions_long_short_mix(self, rp_allocator, synthetic_returns_200_obs_3_assets):
+        """Acceptance: signs follow signal directions (mix LONG/SHORT)."""
+        returns = synthetic_returns_200_obs_3_assets
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100.0,
+                stop=101.0,
+                target=99.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = rp_allocator.allocate(signals, returns, {}, {})
+
+        assert weights["BTC"] >= -1e-10, "BTC (LONG) should not be negative"
+        assert weights["ETH"] >= -1e-10, "ETH (LONG) should not be negative"
+        assert weights["SOL"] <= 1e-10, "SOL (SHORT) should not be positive"
+        assert sum(abs(w) for w in weights.values()) > 1e-8, "Should have non-trivial allocation"
+
+    def test_risk_parity_respects_caps(self, rp_allocator, synthetic_returns_200_obs_3_assets):
+        """Acceptance: solution never violates gross_cap or max_weight constraints."""
+        returns = synthetic_returns_200_obs_3_assets
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = rp_allocator.allocate(signals, returns, {}, {})
+
+        for sym, w in weights.items():
+            assert abs(w) <= 0.35 + 1e-6, \
+                f"{sym} weight {w} exceeds max_weight 0.35"
+
+        gross_leverage = sum(abs(w) for w in weights.values())
+        assert gross_leverage <= 1.0 + 1e-6, \
+            f"Gross leverage {gross_leverage} exceeds gross_cap 1.0"
+
+    def test_risk_parity_fallback_below_min_obs(self, rp_allocator, synthetic_returns_small):
+        """Acceptance: fallback to equal weight when len(returns) < min_obs."""
+        returns = synthetic_returns_small
+        assert len(returns) < PortfolioAllocator.min_obs
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = rp_allocator.allocate(signals, returns, {}, {})
+
+        expected = _fallback_equal_weight(signals)
+        assert weights == expected, \
+            f"Expected equal-weight fallback {expected}, got {weights}"
+
+    def test_risk_parity_allocator_attributes(self, rp_allocator):
+        """Test allocator has correct name and min_obs."""
+        assert rp_allocator.name == "risk_parity_allocator"
+        assert rp_allocator.min_obs == 60
+        assert rp_allocator.lookback == 120
+        assert rp_allocator.gross_cap == 1.0
+        assert rp_allocator.max_weight == 0.35
+
+    def test_risk_parity_empty_signals(self, rp_allocator, synthetic_returns_200_obs_3_assets):
+        """With no signals, return empty dict."""
+        returns = synthetic_returns_200_obs_3_assets
+        weights = rp_allocator.allocate({}, returns, {}, {})
+        assert weights == {}

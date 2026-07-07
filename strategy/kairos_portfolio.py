@@ -255,6 +255,240 @@ def _fallback_equal_weight(signals: Dict[str, "Signal"]) -> Dict[str, float]:
 
 
 # =============================================================================
+# RISK PARITY ALLOCATOR
+# =============================================================================
+
+class RiskParityAllocator(PortfolioAllocator):
+    """
+    Equal Risk Contribution (ERC) allocator using the Spinu (2013) formulation.
+
+    Solves for weights w where each asset contributes equally to portfolio risk:
+    w_i * (Σw)_i equal for all i.
+
+    Optimization (convex, over positive magnitudes y):
+        minimize: 0.5 * y'Σy - c * sum(log(y_i))
+
+    The first-order condition y_i (Σy)_i = c yields exactly equal risk
+    contributions at the optimum. Magnitudes are then normalized to sum to 1,
+    uniformly scaled to respect max_weight/gross_cap (uniform scaling preserves
+    ERC), and signed per each asset's signal direction (LONG/SHORT/FLAT=0).
+
+    Risk contribution of asset i is:
+        rc_i = w_i * (Σw)_i
+
+    Attributes:
+        name: "risk_parity_allocator"
+        lookback: Number of days of historical returns for covariance estimation.
+        gross_cap: Gross leverage cap (sum of |w_i|).
+        max_weight: Maximum absolute weight for any single asset.
+    """
+
+    name: str = "risk_parity_allocator"
+
+    def __init__(self, lookback: int = 120, gross_cap: float = 1.0,
+                 max_weight: float = 0.35):
+        """
+        Initialize Risk Parity allocator.
+
+        Args:
+            lookback: Number of days of historical returns to use for covariance estimation.
+                     Default: 120 (approximately 6 months).
+            gross_cap: Gross leverage cap (sum of absolute values of weights).
+                      Default: 1.0.
+            max_weight: Maximum absolute weight for any single asset.
+                       Default: 0.35.
+
+        Examples:
+            >>> allocator = RiskParityAllocator(lookback=120, gross_cap=1.0, max_weight=0.35)
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        self.lookback = lookback
+        self.gross_cap = gross_cap
+        self.max_weight = max_weight
+
+    def allocate(self, signals: Dict[str, "Signal"],
+                 returns: pd.DataFrame,
+                 dists: Dict[str, Any],
+                 context: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Compute ERC-optimal weights.
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+                    Index: dates, Columns: asset symbols.
+            dists: Dict[symbol -> KairosDistribution] (unused for ERC).
+            context: Dict[str, Any] execution context (unused).
+
+        Returns:
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values <= gross_cap.
+            Individual absolute values <= max_weight.
+            Signs match signal directions.
+
+        Fall-back behavior:
+            If len(returns) < self.min_obs (default 60), returns equal-weight allocation.
+            If optimization fails, returns equal-weight allocation.
+
+        Examples:
+            >>> allocator = RiskParityAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, {})
+            >>> assert sum(abs(w) for w in weights.values()) <= 1.0
+        """
+        # Check if enough observations
+        if len(returns) < self.min_obs:
+            return _fallback_equal_weight(signals)
+
+        # Extract symbols
+        symbols = list(signals.keys())
+        if not symbols:
+            return {}
+
+        # Get trailing returns for covariance estimation
+        trailing_returns = returns[symbols].tail(self.lookback)
+        if len(trailing_returns) < 2:
+            return _fallback_equal_weight(signals)
+
+        # Compute shrunk covariance
+        try:
+            cov = shrunk_covariance(trailing_returns)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Solve ERC
+        try:
+            weights_dict = self._solve_erc(symbols, cov, signals)
+            return weights_dict
+        except Exception:
+            # Fallback to equal weight on solver failure
+            return _fallback_equal_weight(signals)
+
+    def _solve_erc(self, symbols: list, cov: np.ndarray,
+                   signals: Dict[str, "Signal"]) -> Dict[str, float]:
+        """
+        Solve the Equal Risk Contribution problem via the Spinu (2013) formulation.
+
+        Optimizes over unnormalized positive magnitudes y > 0 (active assets only):
+
+            minimize  0.5 * y'Σ*y - c * sum(log(y_i))
+
+        where Σ* is the sign-adjusted covariance (Σ*_ij = s_i s_j Σ_ij with s the
+        signal-direction signs). This problem is strictly convex; its first-order
+        condition (Σ*y)_i = c / y_i implies y_i (Σ*y)_i = c for all i, i.e. exactly
+        equal risk contributions at the optimum. The signed weights w = s ∘ y then
+        satisfy w_i (Σw)_i = c as well.
+
+        Post-processing:
+        - Normalize |w| to sum to 1 (magnitudes from ERC, per ticket).
+        - Scale down uniformly if any |w_i| > max_weight or sum|w| > gross_cap
+          (uniform scaling preserves the ERC property).
+        - Apply signal-direction signs.
+
+        Args:
+            symbols: List of asset symbols (in order matching cov).
+            cov: Shrunk covariance matrix (n_assets, n_assets).
+            signals: Dict[symbol -> Signal] for direction and metadata.
+
+        Returns:
+            Dict[symbol -> float] of optimal weights.
+
+        Raises:
+            ValueError: If optimization fails to converge.
+
+        References:
+            Spinu, F. (2013). "An Algorithm for Computing Risk Parity Weights."
+        """
+        from scipy.optimize import minimize
+
+        n = len(symbols)
+
+        # Extract signal-direction signs; FLAT assets are excluded from the solve
+        signs = np.zeros(n)
+        for i, sym in enumerate(symbols):
+            direction = signals[sym].direction
+            try:
+                dir_val = direction.value if hasattr(direction, 'value') else direction
+            except:
+                dir_val = direction
+            if dir_val == 1:
+                signs[i] = 1.0
+            elif dir_val == -1:
+                signs[i] = -1.0
+            # FLAT stays 0
+
+        active = np.where(signs != 0.0)[0]
+        if len(active) == 0:
+            return {sym: 0.0 for sym in symbols}
+
+        # Sign-adjusted covariance restricted to active assets:
+        # Σ*_ij = s_i s_j Σ_ij, so ERC on y>0 with Σ* equals ERC on signed w with Σ.
+        s_act = signs[active]
+        cov_act = cov[np.ix_(active, active)] * np.outer(s_act, s_act)
+
+        # Rescale covariance to O(1) to avoid numerical underflow in the solver
+        # (daily-return covariances are ~1e-4). Uniform scaling does not change
+        # the ERC solution direction.
+        scale = np.mean(np.diag(cov_act))
+        if scale <= 0:
+            raise ValueError("Non-positive covariance diagonal")
+        cov_s = cov_act / scale
+
+        k = len(active)
+        c = 1.0 / k  # log-barrier weight; any c > 0 gives the same normalized weights
+
+        def objective(y):
+            return 0.5 * np.dot(y, cov_s @ y) - c * np.sum(np.log(y))
+
+        def gradient(y):
+            return cov_s @ y - c / y
+
+        # Initial guess: inverse-volatility magnitudes (near the ERC optimum)
+        vols = np.sqrt(np.diag(cov_s))
+        y0 = (1.0 / vols)
+        y0 = y0 / np.sum(y0)
+
+        result = minimize(
+            objective,
+            y0,
+            jac=gradient,
+            method='SLSQP',
+            bounds=[(1e-8, None)] * k,
+            options={'ftol': 1e-12, 'maxiter': 1000}
+        )
+
+        if not result.success:
+            raise ValueError(f"ERC optimization failed: {result.message}")
+
+        y = result.x
+
+        # Normalize magnitudes to sum to 1
+        total = np.sum(y)
+        if total <= 0:
+            raise ValueError("Degenerate ERC solution")
+        mag = y / total
+
+        # Uniformly scale down to respect max_weight and gross_cap
+        # (uniform scaling preserves relative risk contributions)
+        shrink = 1.0
+        max_mag = np.max(mag)
+        if max_mag > self.max_weight:
+            shrink = min(shrink, self.max_weight / max_mag)
+        if np.sum(mag) > self.gross_cap:
+            shrink = min(shrink, self.gross_cap / np.sum(mag))
+        mag = mag * shrink
+
+        # Assemble signed weights
+        weights = {sym: 0.0 for sym in symbols}
+        for j, idx in enumerate(active):
+            w = float(signs[idx] * mag[j])
+            if abs(w) < 1e-10:
+                w = 0.0
+            weights[symbols[idx]] = w
+
+        return weights
+
+
+# =============================================================================
 # MVO ALLOCATOR
 # =============================================================================
 
