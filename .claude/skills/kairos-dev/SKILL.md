@@ -11,6 +11,14 @@ bare name, so any script/test must `sys.path.insert(0, ".../strategy")` first
 See also repo-root `CLAUDE.md` for calibration gotchas (entropy/kurtosis
 thresholds, percentile key formats) — not duplicated here.
 
+## Verifying allocator integration (E2-S12+)
+`KairosOrchestrator(...).registry.register_allocator(alloc)` before
+`.run_backtest(...)` routes sizing through `apply_allocator` each day.
+Smoke-style probe: reuse `scripts/smoke.py` helpers (exec the file body,
+supply `__file__` in globals), wrap `alloc.allocate` with a counter, assert
+it fires once per backtest day. Zero-size trades appear in the synthetic
+smoke fixture even without an allocator - pre-existing, not a regression.
+
 ## Architecture map (read this instead of re-reading the files)
 
 **`strategy/kairos_backtest.py`** (1967 lines) — core data model, no orchestration:
