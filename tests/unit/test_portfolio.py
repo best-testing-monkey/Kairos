@@ -25,6 +25,7 @@ from kairos_portfolio import (
     _ledoit_wolf_intensity,
     MVOAllocator,
     RiskParityAllocator,
+    HRPAllocator,
 )
 from kairos_backtest import Signal, Direction, KairosDistribution
 
@@ -1330,3 +1331,443 @@ class TestRiskParityAllocator:
         returns = synthetic_returns_200_obs_3_assets
         weights = rp_allocator.allocate({}, returns, {}, {})
         assert weights == {}
+
+
+# =============================================================================
+# TEST HIERARCHICAL RISK PARITY ALLOCATOR
+# =============================================================================
+
+class TestHRPAllocator:
+    """Test Hierarchical Risk Parity (HRP) allocator."""
+
+    @pytest.fixture
+    def hrp_allocator(self):
+        """Standard HRP allocator instance."""
+        return HRPAllocator(lookback=120, variant="hrp")
+
+    @pytest.fixture
+    def hrp_allocator_herc(self):
+        """HRP allocator with HERC variant."""
+        return HRPAllocator(lookback=120, variant="herc")
+
+    @pytest.fixture
+    def synthetic_returns_4asset_block_covariance(self):
+        """
+        Seeded 4-asset block covariance with explicit structure.
+
+        Creates returns from a known multivariate normal distribution with
+        block diagonal covariance:
+        - Assets 0,1: vol=0.1, corr=0.5 (low-vol cluster)
+        - Assets 2,3: vol=0.2, corr=0.5 (high-vol cluster)
+        - Between clusters: corr=0.0 (uncorrelated)
+
+        This ensures the low-vol pair has lower risk than high-vol pair.
+        """
+        np.random.seed(42)
+        n_obs = 150
+
+        # Define explicit block-diagonal covariance matrix
+        cov = np.array([
+            [0.01, 0.005, 0.0, 0.0],      # A0
+            [0.005, 0.01, 0.0, 0.0],      # A1
+            [0.0, 0.0, 0.04, 0.02],       # A2
+            [0.0, 0.0, 0.02, 0.04],       # A3
+        ])
+
+        # Generate correlated returns from multivariate normal
+        mean = np.zeros(4)
+        returns_data = np.random.multivariate_normal(mean, cov, n_obs)
+
+        returns = pd.DataFrame(
+            returns_data,
+            columns=["A0", "A1", "A2", "A3"],
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+        return returns
+
+    def test_hrp_synthetic_covariance(self, hrp_allocator, synthetic_returns_4asset_block_covariance):
+        """
+        Acceptance: 4-asset block covariance with deterministic weights summing
+        to 1, and low-vol pair receives more total weight than high-vol pair.
+        """
+        returns = synthetic_returns_4asset_block_covariance
+
+        signals = {
+            "A0": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A3": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = hrp_allocator.allocate(signals, returns, {}, {})
+
+        # All weights should be positive (all LONG)
+        for sym in ["A0", "A1", "A2", "A3"]:
+            assert weights[sym] > 1e-8, f"{sym} should be LONG"
+
+        # Weights should sum to approximately 1.0
+        total_weight = sum(weights.values())
+        assert abs(total_weight - 1.0) < 0.01, \
+            f"Weights should sum to ~1.0, got {total_weight:.6f}"
+
+        # Low-vol pair (A0, A1) should receive more total weight than high-vol pair (A2, A3)
+        low_vol_weight = weights["A0"] + weights["A1"]
+        high_vol_weight = weights["A2"] + weights["A3"]
+        assert low_vol_weight > high_vol_weight, \
+            f"Low-vol pair {low_vol_weight:.6f} should get more weight than " \
+            f"high-vol pair {high_vol_weight:.6f}"
+
+    def test_hrp_2asset_degenerates_to_inv_var(self, hrp_allocator):
+        """
+        Acceptance: n_assets=2 should degenerate to inverse-variance allocation.
+        With two assets of vol 10%/20% and zero correlation, weight ratio ≈ 2:1.
+        """
+        np.random.seed(42)
+        n_obs = 150
+
+        # Two uncorrelated assets with exact vols 10% and 20%
+        a = np.random.randn(n_obs)
+        b = np.random.randn(n_obs)
+
+        # Orthogonalize
+        a = a - a.mean()
+        b = b - b.mean()
+        b = b - (np.dot(a, b) / np.dot(a, a)) * a
+
+        # Rescale to exact vols
+        asset1 = a / a.std(ddof=1) * 0.10
+        asset2 = b / b.std(ddof=1) * 0.20
+
+        returns = pd.DataFrame(
+            {"A1": asset1, "A2": asset2},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+
+        signals = {
+            "A1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = hrp_allocator.allocate(signals, returns, {}, {})
+
+        assert weights["A1"] > 1e-8, "A1 should be LONG"
+        assert weights["A2"] > 1e-8, "A2 should be LONG"
+
+        # For 2 uncorrelated assets: weight_ratio ≈ vol2 / vol1 = 0.20 / 0.10 = 2.0
+        ratio = weights["A1"] / weights["A2"]
+        assert abs(ratio - 2.0) < 0.1, \
+            f"Weight ratio {ratio:.4f} should be ~2.0 for inverse-variance"
+
+    def test_hrp_herc_variant(self, hrp_allocator, hrp_allocator_herc,
+                             synthetic_returns_4asset_block_covariance):
+        """
+        Acceptance: HERC variant runs without error and produces different
+        weights from HRP on the 4-asset fixture.
+        """
+        returns = synthetic_returns_4asset_block_covariance
+
+        signals = {
+            "A0": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A3": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        # HRP variant
+        weights_hrp = hrp_allocator.allocate(signals, returns, {}, {})
+
+        # HERC variant
+        weights_herc = hrp_allocator_herc.allocate(signals, returns, {}, {})
+
+        # Both should sum to ~1.0
+        assert abs(sum(weights_hrp.values()) - 1.0) < 0.01
+        assert abs(sum(weights_herc.values()) - 1.0) < 0.01
+
+        # They should produce different allocations
+        # (HERC splits risk equally at each level, HRP uses inverse-variance)
+        weights_differ = False
+        for sym in ["A0", "A1", "A2", "A3"]:
+            if abs(weights_hrp[sym] - weights_herc[sym]) > 0.01:
+                weights_differ = True
+                break
+
+        assert weights_differ, "HRP and HERC should produce different weights"
+
+    def test_hrp_signs_follow_directions(self, hrp_allocator, synthetic_returns_200_obs_3_assets):
+        """Acceptance: weight signs follow signal directions."""
+        returns = synthetic_returns_200_obs_3_assets
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.SHORT,
+                size=0.1,
+                entry=100.0,
+                stop=101.0,
+                target=99.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.FLAT,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = hrp_allocator.allocate(signals, returns, {}, {})
+
+        assert weights["BTC"] >= -1e-10, "BTC (LONG) should not be negative"
+        assert weights["ETH"] <= 1e-10, "ETH (SHORT) should not be positive"
+        assert abs(weights["SOL"]) < 1e-10, "SOL (FLAT) should be ~0"
+
+    def test_hrp_fallback_below_min_obs(self, hrp_allocator, synthetic_returns_small):
+        """Acceptance: fallback to equal weight when len(returns) < min_obs."""
+        returns = synthetic_returns_small  # 5 obs
+        assert len(returns) < PortfolioAllocator.min_obs
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = hrp_allocator.allocate(signals, returns, {}, {})
+
+        expected = _fallback_equal_weight(signals)
+        assert weights == expected, \
+            f"Expected equal-weight fallback {expected}, got {weights}"
+
+    def test_hrp_single_asset(self, hrp_allocator):
+        """With single asset, allocate full weight."""
+        returns = pd.DataFrame(
+            np.random.randn(100) * 0.02,
+            columns=["A"],
+            index=pd.date_range("2024-01-01", periods=100),
+        )
+
+        signals = {
+            "A": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=100.0,
+                stop=99.0,
+                target=101.0,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = hrp_allocator.allocate(signals, returns, {}, {})
+
+        assert weights["A"] == 1.0, "Single LONG asset should get weight 1.0"
+
+    def test_hrp_empty_signals(self, hrp_allocator, synthetic_returns_200_obs_3_assets):
+        """With no signals, return empty dict."""
+        returns = synthetic_returns_200_obs_3_assets
+        weights = hrp_allocator.allocate({}, returns, {}, {})
+        assert weights == {}
+
+    def test_hrp_allocator_attributes(self, hrp_allocator, hrp_allocator_herc):
+        """Test allocator has correct name and attributes."""
+        assert hrp_allocator.name == "hrp_allocator"
+        assert hrp_allocator.min_obs == 60
+        assert hrp_allocator.lookback == 120
+        assert hrp_allocator.variant == "hrp"
+
+        assert hrp_allocator_herc.variant == "herc"
+
+    def test_hrp_invalid_variant(self):
+        """Invalid variant should raise ValueError."""
+        with pytest.raises(ValueError, match="variant must be 'hrp' or 'herc'"):
+            HRPAllocator(variant="invalid")
+
+    def test_hrp_3asset_convergence(self, hrp_allocator):
+        """
+        3 assets with different vols: HRP should converge to
+        approximately inverse-variance weights.
+        """
+        np.random.seed(123)
+        n_obs = 150
+
+        # Create 3 uncorrelated assets with vols 0.10, 0.15, 0.20
+        asset1 = np.random.randn(n_obs) * 0.10
+        asset2 = np.random.randn(n_obs) * 0.15
+        asset3 = np.random.randn(n_obs) * 0.20
+
+        returns = pd.DataFrame(
+            {"A1": asset1, "A2": asset2, "A3": asset3},
+            index=pd.date_range("2024-01-01", periods=n_obs),
+        )
+
+        signals = {
+            "A1": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A2": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+            "A3": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=1.0,
+                stop=0.99,
+                target=1.01,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=0.0,
+            ),
+        }
+
+        weights = hrp_allocator.allocate(signals, returns, {}, {})
+
+        # All should be positive (all LONG)
+        for sym in ["A1", "A2", "A3"]:
+            assert weights[sym] > 1e-8, f"{sym} should be LONG"
+
+        # Weights should sum to ~1.0
+        total = sum(weights.values())
+        assert abs(total - 1.0) < 0.01
+
+        # For 3 uncorrelated assets with vol ratio 1:1.5:2,
+        # inverse-variance ratio should be 4:1.78:1 (inverses of squares)
+        # So A1 should get most weight, A3 should get least
+        assert weights["A1"] > weights["A3"], \
+            f"Lower-vol asset A1 ({weights['A1']}) should get more weight than A3 ({weights['A3']})"

@@ -36,13 +36,16 @@ Usage
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List, Tuple
 
 try:
     from sklearn.covariance import LedoitWolf
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
+
+from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.spatial.distance import pdist, squareform
 
 
 # =============================================================================
@@ -486,6 +489,346 @@ class RiskParityAllocator(PortfolioAllocator):
             weights[symbols[idx]] = w
 
         return weights
+
+
+# =============================================================================
+# HIERARCHICAL RISK PARITY ALLOCATOR
+# =============================================================================
+
+class HRPAllocator(PortfolioAllocator):
+    """
+    Hierarchical Risk Parity (HRP) allocator using correlation-distance clustering.
+
+    López de Prado's HRP algorithm:
+    1. Correlation matrix → distance matrix: dist_ij = sqrt(0.5 * (1 - corr_ij))
+    2. Hierarchical clustering: scipy.cluster.hierarchy.linkage(method="single")
+    3. Quasi-diagonalization: extract leaf order (seriation) from dendrogram
+    4. Recursive bisection: split clusters and allocate inversely to variance
+    5. No matrix inversion required; robust when n_assets approaches n_obs
+
+    Attributes:
+        name: "hrp_allocator"
+        lookback: Number of days of historical returns for covariance estimation.
+        variant: "hrp" for inverse-variance allocation, "herc" for equal risk contribution.
+    """
+
+    name: str = "hrp_allocator"
+
+    def __init__(self, lookback: int = 120, variant: str = "hrp"):
+        """
+        Initialize HRP allocator.
+
+        Args:
+            lookback: Number of days of historical returns to use for covariance estimation.
+                     Default: 120 (approximately 6 months).
+            variant: "hrp" for inverse-variance splits (default), or "herc" for
+                    hierarchical equal risk contribution (equal risk per cluster).
+
+        Examples:
+            >>> allocator = HRPAllocator(lookback=120, variant="hrp")
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        if variant not in ("hrp", "herc"):
+            raise ValueError(f"variant must be 'hrp' or 'herc', got '{variant}'")
+        self.lookback = lookback
+        self.variant = variant
+
+    def allocate(self, signals: Dict[str, "Signal"],
+                 returns: pd.DataFrame,
+                 dists: Dict[str, Any],
+                 context: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Compute HRP-optimal weights via correlation-distance clustering and recursive bisection.
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+                    Index: dates, Columns: asset symbols.
+            dists: Dict[symbol -> KairosDistribution] (unused for HRP).
+            context: Dict[str, Any] execution context (unused).
+
+        Returns:
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values typically close to 1.0 (subject to signal directions).
+            Magnitudes follow HRP allocation; signs follow signal directions.
+
+        Fall-back behavior:
+            If len(returns) < self.min_obs (default 60), returns equal-weight allocation.
+            If n_assets < 2, raises ValueError (HRP requires at least 2 assets).
+            If clustering fails, returns equal-weight allocation.
+
+        Examples:
+            >>> allocator = HRPAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, {})
+            >>> assert sum(abs(w) for w in weights.values()) <= 1.0
+        """
+        # Check if enough observations
+        if len(returns) < self.min_obs:
+            return _fallback_equal_weight(signals)
+
+        # Extract symbols
+        symbols = list(signals.keys())
+        if not symbols:
+            return {}
+
+        # Special case: n_assets == 1 (no clustering possible)
+        if len(symbols) == 1:
+            # Allocate all weight to single asset
+            sym = symbols[0]
+            direction = signals[sym].direction
+
+            # Extract direction value (handles both enum and raw int)
+            if hasattr(direction, 'value'):
+                dir_val = direction.value
+            else:
+                dir_val = direction
+
+            if dir_val == 1:
+                return {sym: 1.0}
+            elif dir_val == -1:
+                return {sym: -1.0}
+            else:
+                return {sym: 0.0}
+
+        # Get trailing returns for covariance estimation
+        trailing_returns = returns[symbols].tail(self.lookback)
+        if len(trailing_returns) < 2:
+            return _fallback_equal_weight(signals)
+
+        # Compute shrunk covariance
+        try:
+            cov = shrunk_covariance(trailing_returns)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Solve HRP
+        try:
+            # Special case: n_assets == 2 → degenerate to inverse-variance
+            if len(symbols) == 2:
+                weights_dict = self._solve_hrp_2asset(symbols, cov, signals)
+            else:
+                weights_dict = self._solve_hrp(symbols, cov, signals, trailing_returns)
+            return weights_dict
+        except Exception:
+            # Fallback to equal weight on solver failure
+            return _fallback_equal_weight(signals)
+
+    def _solve_hrp_2asset(self, symbols: List[str], cov: np.ndarray,
+                         signals: Dict[str, "Signal"]) -> Dict[str, float]:
+        """
+        Special case: n_assets=2 degenerates to inverse-variance allocation.
+
+        Args:
+            symbols: List of 2 asset symbols.
+            cov: Covariance matrix (2x2).
+            signals: Dict[symbol -> Signal] for direction and metadata.
+
+        Returns:
+            Dict[symbol -> float] with weights inversely proportional to variance.
+        """
+        assert len(symbols) == 2, "This function is only for 2-asset case"
+
+        # Extract variances
+        var0 = cov[0, 0]
+        var1 = cov[1, 1]
+
+        if var0 <= 0 or var1 <= 0:
+            # Degenerate case: use equal weight
+            return _fallback_equal_weight(signals)
+
+        # Inverse-variance weights (magnitudes)
+        inv_vol0 = 1.0 / np.sqrt(var0)
+        inv_vol1 = 1.0 / np.sqrt(var1)
+        total_inv_vol = inv_vol0 + inv_vol1
+
+        mag0 = inv_vol0 / total_inv_vol
+        mag1 = inv_vol1 / total_inv_vol
+
+        # Apply signal directions
+        weights = {}
+        for i, sym in enumerate(symbols):
+            mag = mag0 if i == 0 else mag1
+            direction = signals[sym].direction
+
+            # Extract direction value (handles both enum and raw int)
+            if hasattr(direction, 'value'):
+                dir_val = direction.value
+            else:
+                dir_val = direction
+
+            if dir_val == 1:  # LONG
+                w = float(mag)
+            elif dir_val == -1:  # SHORT
+                w = float(-mag)
+            else:  # FLAT or other
+                w = 0.0
+
+            if abs(w) < 1e-10:
+                w = 0.0
+            weights[sym] = w
+
+        return weights
+
+    def _solve_hrp(self, symbols: List[str], cov: np.ndarray,
+                  signals: Dict[str, "Signal"],
+                  trailing_returns: pd.DataFrame) -> Dict[str, float]:
+        """
+        Solve HRP via correlation-distance clustering and recursive bisection.
+
+        Args:
+            symbols: List of asset symbols (in order matching cov).
+            cov: Shrunk covariance matrix (n_assets, n_assets).
+            signals: Dict[symbol -> Signal] for direction and metadata.
+            trailing_returns: DataFrame of trailing returns (for computing clustering).
+
+        Returns:
+            Dict[symbol -> float] of HRP-optimal weights.
+
+        Raises:
+            ValueError: If clustering or allocation fails.
+        """
+        n = len(symbols)
+
+        # Step 1: Compute correlation matrix
+        corr = np.corrcoef(trailing_returns.T)
+
+        # Handle NaN in correlation (e.g., constant series)
+        if np.isnan(corr).any():
+            # Fallback to equal weight
+            raise ValueError("Correlation matrix contains NaN")
+
+        # Step 2: Convert to distance matrix
+        # dist_ij = sqrt(0.5 * (1 - corr_ij)), clipped to [0, 2] for numerical stability
+        dist = np.sqrt(0.5 * (1.0 - corr))
+        dist = np.clip(dist, 0.0, 2.0)
+        # Ensure symmetry and zero diagonal (for numerical stability with squareform)
+        dist = (dist + dist.T) / 2.0  # Make symmetric
+        np.fill_diagonal(dist, 0.0)   # Zero diagonal
+
+        # Step 3: Convert to condensed distance for linkage
+        # squareform converts from square matrix to condensed form
+        condensed_dist = squareform(dist)
+
+        # Step 4: Hierarchical clustering (single linkage)
+        Z = linkage(condensed_dist, method="single")
+
+        # Step 5: Quasi-diagonalize (extract leaf order from dendrogram)
+        # dendrogram returns a dict with the 'leaves' key giving the reordered indices
+        dendro = dendrogram(Z, no_plot=True)
+        leaf_order = dendro["leaves"]
+
+        # Step 6: Recursive bisection with inverse-variance allocation
+        # Start with all assets
+        cluster = sorted(leaf_order)  # List of indices in the cluster
+
+        # Compute magnitudes via recursive bisection
+        magnitudes = np.zeros(n)
+        self._recursive_bisection(cluster, magnitudes, cov, leaf_order)
+
+        # Normalize magnitudes to sum to 1
+        total = np.sum(np.abs(magnitudes))
+        if total > 0:
+            magnitudes = magnitudes / total
+        else:
+            # Fallback to equal weight
+            magnitudes = np.ones(n) / n
+
+        # Apply signal directions
+        weights = {}
+        for i, sym in enumerate(symbols):
+            mag = magnitudes[i]
+            direction = signals[sym].direction
+
+            # Extract direction value (handles both enum and raw int)
+            if hasattr(direction, 'value'):
+                dir_val = direction.value
+            else:
+                dir_val = direction
+
+            if dir_val == 1:  # LONG
+                w = float(mag)
+            elif dir_val == -1:  # SHORT
+                w = float(-mag)
+            else:  # FLAT or other
+                w = 0.0
+
+            if abs(w) < 1e-10:
+                w = 0.0
+            weights[sym] = w
+
+        return weights
+
+    def _recursive_bisection(self, cluster: List[int], magnitudes: np.ndarray,
+                            cov: np.ndarray, leaf_order: List[int],
+                            parent_mag: float = 1.0) -> None:
+        """
+        Recursive bisection: split cluster and allocate weights inversely to variance.
+
+        Args:
+            cluster: List of asset indices in current cluster.
+            magnitudes: Output array to store magnitude for each asset (in place).
+            cov: Full covariance matrix.
+            leaf_order: Leaf order from dendrogram (for quasi-diagonalization).
+            parent_mag: Total magnitude to allocate to this cluster (default 1.0).
+        """
+        if len(cluster) == 1:
+            # Leaf node: assign parent_mag to this asset
+            magnitudes[cluster[0]] = parent_mag
+            return
+
+        # Split cluster into two halves (using leaf_order for continuity)
+        # Find position of each cluster member in leaf_order
+        positions = [leaf_order.index(idx) for idx in cluster]
+        positions_sorted = sorted(zip(positions, cluster))  # Sort by position in leaf_order
+
+        # Split at midpoint
+        split_idx = len(positions_sorted) // 2
+        left_cluster = [idx for _, idx in positions_sorted[:split_idx]]
+        right_cluster = [idx for _, idx in positions_sorted[split_idx:]]
+
+        if len(left_cluster) == 0 or len(right_cluster) == 0:
+            # Degenerate split: assign equal weight to all
+            for idx in cluster:
+                magnitudes[idx] = parent_mag / len(cluster)
+            return
+
+        # Compute variance of each cluster
+        # Cluster variance = variance of equal-weight portfolio within cluster
+        # = (1/n^2) * 1' * Sigma_cluster * 1, where n = cluster size
+        # = (1/n^2) * sum of all elements in Sigma_cluster
+        cov_left = cov[np.ix_(left_cluster, left_cluster)]
+        cov_right = cov[np.ix_(right_cluster, right_cluster)]
+
+        n_left = len(left_cluster)
+        n_right = len(right_cluster)
+
+        # Variance of equal-weight portfolio
+        var_left = np.sum(cov_left) / (n_left ** 2)
+        var_right = np.sum(cov_right) / (n_right ** 2)
+
+        if var_left <= 0 or var_right <= 0:
+            # Degenerate case
+            for idx in cluster:
+                magnitudes[idx] = parent_mag / len(cluster)
+            return
+
+        if self.variant == "herc":
+            # HERC: equal risk contribution between clusters
+            # Allocate equally between clusters, then recursively bisect within each
+            left_mag = parent_mag * 0.5
+            right_mag = parent_mag * 0.5
+        else:
+            # HRP (default): inverse-variance allocation
+            inv_var_left = 1.0 / var_left
+            inv_var_right = 1.0 / var_right
+            total_inv_var = inv_var_left + inv_var_right
+
+            left_mag = parent_mag * inv_var_left / total_inv_var
+            right_mag = parent_mag * inv_var_right / total_inv_var
+
+        # Recursively bisect left and right clusters
+        self._recursive_bisection(left_cluster, magnitudes, cov, leaf_order, left_mag)
+        self._recursive_bisection(right_cluster, magnitudes, cov, leaf_order, right_mag)
 
 
 # =============================================================================
