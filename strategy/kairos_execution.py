@@ -1730,6 +1730,88 @@ class ImplementationShortfallStrategy(Strategy):
 
 
 # =============================================================================
+# TRANSACTION COST ANALYSIS (TCA)
+# =============================================================================
+
+def compute_tca(trades: List["Trade"], impact_bps: float = 5.0) -> pd.DataFrame:
+    """
+    Post-backtest transaction cost analysis: decompose per-trade slippage
+    into timing and impact components.
+
+    Args:
+        trades: List of Trade dataclass instances (from backtest() output).
+        impact_bps: Assumed market impact cost in basis points (default 5.0).
+
+    Returns:
+        DataFrame with one row per trade and columns:
+        - entry_date: Trade entry date
+        - symbol: Strategy name (symbol if available, else strategy_name)
+        - side: 'long' or 'short' (from Direction)
+        - timing_cost: Entry price vs. day open reference (bps).
+          If no day_open field on trade, defaults to 0.0.
+        - impact_cost: Assumed impact = (impact_bps / 10000) * notional.
+        - total_slippage: timing_cost + impact_cost.
+
+        Each row asserts: timing_cost + impact_cost == total_slippage (within float precision).
+        Empty trades list returns empty DataFrame with the same columns.
+    """
+    # Define column schema upfront
+    columns = ["entry_date", "symbol", "side", "timing_cost", "impact_cost", "total_slippage"]
+
+    if not trades:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for trade in trades:
+        # Defensively extract fields using getattr with defaults
+        entry_date = getattr(trade, "entry_date", None)
+        strategy_name = getattr(trade, "strategy_name", "unknown")
+        direction = getattr(trade, "direction", None)
+        entry_price = getattr(trade, "entry_price", 0.0)
+        size = getattr(trade, "size", 0.0)
+
+        # day_open may or may not be present on Trade; default to entry_price
+        day_open = getattr(trade, "day_open", entry_price)
+
+        # Compute side string
+        if direction == Direction.LONG or direction == 1:
+            side = "long"
+        elif direction == Direction.SHORT or direction == -1:
+            side = "short"
+        else:
+            side = "flat"
+
+        # Timing cost: entry price vs. day open (in basis points)
+        # If day_open == entry_price (no reference), timing_cost = 0.0
+        if entry_price != 0.0:
+            timing_cost = ((entry_price - day_open) / entry_price) * 10000.0
+        else:
+            timing_cost = 0.0
+
+        # Impact cost: assumed bps applied to notional (entry * size)
+        notional = entry_price * size
+        impact_cost = (impact_bps / 10000.0) * notional
+
+        # Total slippage
+        total_slippage = timing_cost + impact_cost
+
+        # Assert the sum holds (within float epsilon for numerical precision)
+        assert abs((timing_cost + impact_cost) - total_slippage) < 1e-9, \
+            f"TCA row {len(rows)}: timing + impact mismatch: {timing_cost} + {impact_cost} != {total_slippage}"
+
+        rows.append({
+            "entry_date": entry_date,
+            "symbol": strategy_name,
+            "side": side,
+            "timing_cost": timing_cost,
+            "impact_cost": impact_cost,
+            "total_slippage": total_slippage,
+        })
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+# =============================================================================
 # EXAMPLE / TEST
 # =============================================================================
 

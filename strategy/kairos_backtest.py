@@ -1884,7 +1884,7 @@ class BacktestEngine:
         self.daily_pnl: List[Tuple[pd.Timestamp, float]] = []
 
     def run(self, df: pd.DataFrame, router: DecisionTreeRouter,
-            lookback: int = 100) -> Dict:
+            lookback: int = 100, include_tca: bool = False) -> Dict:
         capital = self.initial_capital
         position = None
         current_trade_meta = None
@@ -1958,7 +1958,7 @@ class BacktestEngine:
             self.daily_pnl.append((date, capital - prev_capital))
             prev_capital = capital
 
-        return self._compute_metrics()
+        return self._compute_metrics(include_tca=include_tca)
 
     def _check_exit(self, position: Dict, tomorrow: pd.Series) -> Tuple[Optional[float], Optional[str]]:
         direction = position["direction"]
@@ -1998,7 +1998,7 @@ class BacktestEngine:
         fee = exit_price * position["size"] * self.fee_pct
         return gross - fee
 
-    def _compute_metrics(self) -> Dict:
+    def _compute_metrics(self, include_tca: bool = False) -> Dict:
         if not self.trades:
             return {
                 "total_return": 0.0,
@@ -2028,7 +2028,7 @@ class BacktestEngine:
 
         profit_factor = float(abs(sum(wins) / sum(losses))) if sum(losses) != 0 else float("inf")
 
-        return {
+        metrics = {
             "total_return": float((equity[-1] - self.initial_capital) / self.initial_capital),
             "sharpe": sharpe,
             "max_drawdown": max_dd,
@@ -2039,6 +2039,13 @@ class BacktestEngine:
             "avg_win": float(np.mean(wins)) if wins else 0.0,
             "avg_loss": float(np.mean(losses)) if losses else 0.0,
         }
+
+        # Optionally add TCA report
+        if include_tca and self.trades:
+            from kairos_execution import compute_tca
+            metrics["tca"] = compute_tca(self.trades)
+
+        return metrics
 
     def run_strategy_comparison(self, df: pd.DataFrame, strategies: List[Strategy],
                                 lookback: int = 100) -> pd.DataFrame:

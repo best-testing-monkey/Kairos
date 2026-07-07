@@ -4,8 +4,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy
 import pytest
 import numpy as np
 import pandas as pd
-from kairos_backtest import Direction, Signal, Strategy, KairosDistribution
-from kairos_execution import volume_profile, VolumeProfileLevelsStrategy, CVDDivergenceStrategy, TWAPExecutionStrategy, ImplementationShortfallStrategy
+from kairos_backtest import Direction, Signal, Strategy, KairosDistribution, Trade
+from kairos_execution import volume_profile, VolumeProfileLevelsStrategy, CVDDivergenceStrategy, TWAPExecutionStrategy, ImplementationShortfallStrategy, compute_tca
 
 
 # ============================================================================
@@ -1066,3 +1066,359 @@ class TestImplementationShortfallStrategy:
         strat6 = ImplementationShortfallStrategy(StubStrategy(base_signal), n_slices=6, impact_bps=5.0)
         sig6 = strat6.generate_signal(dist, 100.0, make_profile_history(), {})
         assert sig6.entry == pytest.approx(97.5)
+
+
+# ============================================================================
+# compute_tca() function
+# ============================================================================
+
+class TestComputeTCA:
+    def test_tca_empty_trades_list(self):
+        """Empty trades list returns empty DataFrame with correct columns."""
+        result = compute_tca([])
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 0
+        expected_cols = ["entry_date", "symbol", "side", "timing_cost", "impact_cost", "total_slippage"]
+        assert list(result.columns) == expected_cols
+
+    def test_tca_single_trade_long(self):
+        """Single long trade: columns computed and sum verified."""
+        trade = Trade(
+            entry_date=pd.Timestamp("2024-01-01"),
+            exit_date=pd.Timestamp("2024-01-02"),
+            direction=Direction.LONG,
+            entry_price=100.0,
+            exit_price=105.0,
+            size=1.0,
+            pnl=5.0,
+            pnl_pct=0.05,
+            strategy_name="test_long_strat",
+            exit_reason="target_hit",
+        )
+        result = compute_tca([trade], impact_bps=5.0)
+        assert len(result) == 1
+
+        row = result.iloc[0]
+        assert row["entry_date"] == pd.Timestamp("2024-01-01")
+        assert row["symbol"] == "test_long_strat"
+        assert row["side"] == "long"
+
+        # Timing cost: entry vs. day_open (not on Trade, so defaults to entry)
+        # (entry_price - day_open) / entry_price * 10000 = (100 - 100) / 100 * 10000 = 0
+        assert row["timing_cost"] == pytest.approx(0.0)
+
+        # Impact cost: (impact_bps / 10000) * notional = (5 / 10000) * (100 * 1) = 0.05
+        assert row["impact_cost"] == pytest.approx(0.05)
+
+        # Total slippage: timing_cost + impact_cost = 0 + 0.05 = 0.05
+        assert row["total_slippage"] == pytest.approx(0.05)
+
+        # Verify sum
+        assert abs((row["timing_cost"] + row["impact_cost"]) - row["total_slippage"]) < 1e-9
+
+    def test_tca_single_trade_short(self):
+        """Single short trade: side correctly marked as 'short'."""
+        trade = Trade(
+            entry_date=pd.Timestamp("2024-01-01"),
+            exit_date=pd.Timestamp("2024-01-02"),
+            direction=Direction.SHORT,
+            entry_price=100.0,
+            exit_price=95.0,
+            size=1.0,
+            pnl=5.0,
+            pnl_pct=0.05,
+            strategy_name="test_short_strat",
+            exit_reason="target_hit",
+        )
+        result = compute_tca([trade], impact_bps=5.0)
+        assert len(result) == 1
+
+        row = result.iloc[0]
+        assert row["side"] == "short"
+
+    def test_tca_multiple_trades(self):
+        """Multiple trades: each row correctly computed and verified."""
+        trades = [
+            Trade(
+                entry_date=pd.Timestamp("2024-01-01"),
+                exit_date=pd.Timestamp("2024-01-02"),
+                direction=Direction.LONG,
+                entry_price=100.0,
+                exit_price=105.0,
+                size=1.0,
+                pnl=5.0,
+                pnl_pct=0.05,
+                strategy_name="strat1",
+                exit_reason="target",
+            ),
+            Trade(
+                entry_date=pd.Timestamp("2024-01-03"),
+                exit_date=pd.Timestamp("2024-01-04"),
+                direction=Direction.SHORT,
+                entry_price=50.0,
+                exit_price=45.0,
+                size=2.0,
+                pnl=10.0,
+                pnl_pct=0.1,
+                strategy_name="strat2",
+                exit_reason="stop",
+            ),
+        ]
+        result = compute_tca(trades, impact_bps=10.0)
+        assert len(result) == 2
+
+        # First trade
+        row1 = result.iloc[0]
+        assert row1["side"] == "long"
+        assert row1["symbol"] == "strat1"
+        impact1 = (10.0 / 10000.0) * (100.0 * 1.0)
+        assert row1["impact_cost"] == pytest.approx(impact1)
+        assert abs((row1["timing_cost"] + row1["impact_cost"]) - row1["total_slippage"]) < 1e-9
+
+        # Second trade
+        row2 = result.iloc[1]
+        assert row2["side"] == "short"
+        assert row2["symbol"] == "strat2"
+        impact2 = (10.0 / 10000.0) * (50.0 * 2.0)
+        assert row2["impact_cost"] == pytest.approx(impact2)
+        assert abs((row2["timing_cost"] + row2["impact_cost"]) - row2["total_slippage"]) < 1e-9
+
+    def test_tca_impact_bps_scaling(self):
+        """Impact cost scales correctly with impact_bps parameter."""
+        trade = Trade(
+            entry_date=pd.Timestamp("2024-01-01"),
+            exit_date=pd.Timestamp("2024-01-02"),
+            direction=Direction.LONG,
+            entry_price=100.0,
+            exit_price=105.0,
+            size=1.0,
+            pnl=5.0,
+            pnl_pct=0.05,
+            strategy_name="test",
+            exit_reason="target",
+        )
+
+        # With impact_bps=5
+        result1 = compute_tca([trade], impact_bps=5.0)
+        impact1 = result1.iloc[0]["impact_cost"]
+        assert impact1 == pytest.approx((5.0 / 10000.0) * 100.0)
+
+        # With impact_bps=10 (should double)
+        result2 = compute_tca([trade], impact_bps=10.0)
+        impact2 = result2.iloc[0]["impact_cost"]
+        assert impact2 == pytest.approx(2 * impact1)
+
+    def test_tca_with_day_open_field(self):
+        """When Trade has day_open field, timing_cost uses it (if implemented)."""
+        # Create a Trade-like object with day_open
+        class TradeWithOpen:
+            def __init__(self):
+                self.entry_date = pd.Timestamp("2024-01-01")
+                self.exit_date = pd.Timestamp("2024-01-02")
+                self.direction = Direction.LONG
+                self.entry_price = 105.0
+                self.exit_price = 110.0
+                self.size = 1.0
+                self.pnl = 5.0
+                self.pnl_pct = 0.05
+                self.strategy_name = "test"
+                self.exit_reason = "target"
+                self.day_open = 100.0
+
+        trade = TradeWithOpen()
+        result = compute_tca([trade], impact_bps=5.0)
+        row = result.iloc[0]
+
+        # timing_cost = (105 - 100) / 105 * 10000 ≈ 476.19 bps
+        expected_timing = (105.0 - 100.0) / 105.0 * 10000.0
+        assert row["timing_cost"] == pytest.approx(expected_timing)
+
+        # Impact: (5 / 10000) * (105 * 1) = 0.0525
+        expected_impact = (5.0 / 10000.0) * 105.0
+        assert row["impact_cost"] == pytest.approx(expected_impact)
+
+        # Total: timing + impact
+        expected_total = expected_timing + expected_impact
+        assert row["total_slippage"] == pytest.approx(expected_total)
+
+    def test_tca_zero_entry_price_handles_gracefully(self):
+        """When entry_price is 0, timing_cost is 0 (no division by zero)."""
+        trade = Trade(
+            entry_date=pd.Timestamp("2024-01-01"),
+            exit_date=pd.Timestamp("2024-01-02"),
+            direction=Direction.LONG,
+            entry_price=0.0,
+            exit_price=0.0,
+            size=1.0,
+            pnl=0.0,
+            pnl_pct=0.0,
+            strategy_name="test",
+            exit_reason="error",
+        )
+        result = compute_tca([trade], impact_bps=5.0)
+        row = result.iloc[0]
+
+        # timing_cost should be 0 (default)
+        assert row["timing_cost"] == pytest.approx(0.0)
+        # impact_cost should be 0 (notional = 0 * 1 = 0)
+        assert row["impact_cost"] == pytest.approx(0.0)
+
+    def test_tca_flat_direction(self):
+        """Flat direction is handled (marked as 'flat' side)."""
+        trade = Trade(
+            entry_date=pd.Timestamp("2024-01-01"),
+            exit_date=pd.Timestamp("2024-01-02"),
+            direction=Direction.FLAT,
+            entry_price=100.0,
+            exit_price=100.0,
+            size=0.0,
+            pnl=0.0,
+            pnl_pct=0.0,
+            strategy_name="test",
+            exit_reason="flat",
+        )
+        result = compute_tca([trade])
+        row = result.iloc[0]
+        assert row["side"] == "flat"
+
+    def test_tca_dataframe_structure(self):
+        """Returned DataFrame has correct structure and dtypes."""
+        trades = [
+            Trade(
+                entry_date=pd.Timestamp("2024-01-01"),
+                exit_date=pd.Timestamp("2024-01-02"),
+                direction=Direction.LONG,
+                entry_price=100.0,
+                exit_price=105.0,
+                size=1.0,
+                pnl=5.0,
+                pnl_pct=0.05,
+                strategy_name="test",
+                exit_reason="target",
+            ),
+        ]
+        result = compute_tca(trades)
+
+        # Check columns
+        assert "entry_date" in result.columns
+        assert "symbol" in result.columns
+        assert "side" in result.columns
+        assert "timing_cost" in result.columns
+        assert "impact_cost" in result.columns
+        assert "total_slippage" in result.columns
+
+        # Check values are accessible
+        assert result.iloc[0]["symbol"] == "test"
+        assert isinstance(result.iloc[0]["timing_cost"], (float, np.floating))
+
+
+# ============================================================================
+# BacktestEngine._compute_metrics with include_tca integration
+# ============================================================================
+
+class TestComputeMetricsWithTCA:
+    """Test integration of compute_tca with BacktestEngine._compute_metrics."""
+
+    def _make_dummy_engine(self):
+        """Create a minimal BacktestEngine for testing."""
+        from kairos_backtest import KairosPredictor, BacktestEngine
+
+        def dummy_predictor(history):
+            # Return a dummy distribution
+            samples = [history[["open", "high", "low", "close"]].tail(60).copy()]
+            return KairosDistribution(samples)
+
+        predictor = KairosPredictor(dummy_predictor)
+        engine = BacktestEngine(predictor=predictor, initial_capital=10000.0)
+        return engine
+
+    def test_compute_metrics_include_tca_false_default(self):
+        """By default (include_tca=False), metrics have no 'tca' key."""
+        engine = self._make_dummy_engine()
+        engine.trades = [
+            Trade(
+                entry_date=pd.Timestamp("2024-01-01"),
+                exit_date=pd.Timestamp("2024-01-02"),
+                direction=Direction.LONG,
+                entry_price=100.0,
+                exit_price=105.0,
+                size=1.0,
+                pnl=5.0,
+                pnl_pct=0.05,
+                strategy_name="test",
+                exit_reason="target",
+            ),
+        ]
+        engine.equity_curve = [(pd.Timestamp("2024-01-01"), 10000.0), (pd.Timestamp("2024-01-02"), 10005.0)]
+
+        # Default call
+        metrics = engine._compute_metrics(include_tca=False)
+
+        assert "tca" not in metrics
+        assert metrics["num_trades"] == 1
+
+    def test_compute_metrics_include_tca_true_with_trades(self):
+        """With include_tca=True and trades present, metrics gain 'tca' key."""
+        engine = self._make_dummy_engine()
+        engine.trades = [
+            Trade(
+                entry_date=pd.Timestamp("2024-01-01"),
+                exit_date=pd.Timestamp("2024-01-02"),
+                direction=Direction.LONG,
+                entry_price=100.0,
+                exit_price=105.0,
+                size=1.0,
+                pnl=5.0,
+                pnl_pct=0.05,
+                strategy_name="test1",
+                exit_reason="target",
+            ),
+            Trade(
+                entry_date=pd.Timestamp("2024-01-03"),
+                exit_date=pd.Timestamp("2024-01-04"),
+                direction=Direction.SHORT,
+                entry_price=50.0,
+                exit_price=45.0,
+                size=2.0,
+                pnl=10.0,
+                pnl_pct=0.1,
+                strategy_name="test2",
+                exit_reason="stop",
+            ),
+        ]
+        engine.equity_curve = [
+            (pd.Timestamp("2024-01-01"), 10000.0),
+            (pd.Timestamp("2024-01-02"), 10005.0),
+            (pd.Timestamp("2024-01-03"), 10005.0),
+            (pd.Timestamp("2024-01-04"), 10015.0),
+        ]
+
+        metrics = engine._compute_metrics(include_tca=True)
+
+        assert "tca" in metrics
+        assert isinstance(metrics["tca"], pd.DataFrame)
+        assert len(metrics["tca"]) == 2
+        assert "entry_date" in metrics["tca"].columns
+        assert "timing_cost" in metrics["tca"].columns
+
+    def test_compute_metrics_include_tca_true_no_trades(self):
+        """With include_tca=True but no trades, metrics have no 'tca' key."""
+        engine = self._make_dummy_engine()
+        engine.trades = []
+        engine.equity_curve = [(pd.Timestamp("2024-01-01"), 10000.0)]
+
+        metrics = engine._compute_metrics(include_tca=True)
+
+        # No trades, so tca not added
+        assert "tca" not in metrics
+        assert metrics["num_trades"] == 0
+
+    def test_run_method_accepts_include_tca(self):
+        """BacktestEngine.run() accepts include_tca parameter."""
+        engine = self._make_dummy_engine()
+
+        # Verify the method signature accepts include_tca
+        import inspect
+        sig = inspect.signature(engine.run)
+        assert "include_tca" in sig.parameters
+        assert sig.parameters["include_tca"].default is False
