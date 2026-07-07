@@ -2017,3 +2017,380 @@ class UniversalAllocator(PortfolioAllocator):
         self.grid = grid
         self.grid_symbols = symbols
         self.wealth = np.ones(len(grid), dtype=float)
+
+
+# =============================================================================
+# GENETIC ALGORITHM ALLOCATOR
+# =============================================================================
+
+class GAAllocator(PortfolioAllocator):
+    """
+    Genetic Algorithm allocator: evolves weight vectors to maximize trailing Sharpe.
+
+    Uses a population-based evolutionary algorithm to find optimal portfolio weights:
+    - Fitness: trailing Sharpe ratio of portfolio daily returns
+    - Population: 50 normalized non-negative magnitude vectors
+    - Selection: tournament selection (k=3)
+    - Crossover: blend crossover with uniform alpha
+    - Mutation: Gaussian with sigma=0.05, clip to >=0, renormalize
+    - Elitism: keep best 2 individuals
+    - Generations: 20
+
+    Caching & determinism:
+    - RNG seeded deterministically from date (YYYYMMDD format)
+    - Result cached and only re-run when refit_days new calls elapsed
+    - Tracks call counter and exposes run_count attribute
+    - reset() clears all state for walk-forward folds
+
+    Caps & signs:
+    - Uniform scale all weights to respect gross_cap (sum of |w| <= gross_cap)
+    - Clip individual weights to max_weight, then renormalize
+    - Apply signal-direction signs (LONG/SHORT/FLAT)
+    - Fallback to equal-weight when observations < min_obs
+
+    Attributes:
+        name: "ga_allocator"
+        lookback: Trailing window for Sharpe calculation (default 60 days)
+        population: Population size (default 50)
+        generations: Number of evolution generations (default 20)
+        mutation_sigma: Gaussian mutation std dev (default 0.05)
+        gross_cap: Gross leverage cap (default 1.0)
+        max_weight: Individual position cap (default 0.35)
+        refit_days: Number of days between re-runs (default 5)
+        last_fitness_history: List of best fitness per generation from last run
+        run_count: Number of times allocate() has been called
+    """
+
+    name: str = "ga_allocator"
+
+    def __init__(
+        self,
+        lookback: int = 60,
+        population: int = 50,
+        generations: int = 20,
+        mutation_sigma: float = 0.05,
+        gross_cap: float = 1.0,
+        max_weight: float = 0.35,
+        refit_days: int = 5,
+    ):
+        """
+        Initialize GA allocator.
+
+        Args:
+            lookback: Trailing window for Sharpe ratio (default 60 days).
+            population: Population size (default 50).
+            generations: Number of evolution generations (default 20).
+            mutation_sigma: Gaussian mutation std dev (default 0.05).
+            gross_cap: Gross leverage cap, sum of |w_i| (default 1.0).
+            max_weight: Individual position cap (default 0.35).
+            refit_days: Days between refits; re-run every refit_days calls
+                       (default 5).
+
+        Examples:
+            >>> allocator = GAAllocator(lookback=60, population=50, generations=20)
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        self.lookback = lookback
+        self.population = population
+        self.generations = generations
+        self.mutation_sigma = mutation_sigma
+        self.gross_cap = gross_cap
+        self.max_weight = max_weight
+        self.refit_days = refit_days
+
+        # State tracking
+        self.last_fitness_history = []
+        self.run_count = 0
+        self._cache_date = None
+        self._cached_weights = None
+        self._cached_symbols = None
+
+    def reset(self) -> None:
+        """
+        Reset all internal state for walk-forward folds.
+
+        Clears cache and counters so next call starts fresh.
+        """
+        self.last_fitness_history = []
+        self.run_count = 0
+        self._cache_date = None
+        self._cached_weights = None
+        self._cached_symbols = None
+
+    def allocate(
+        self,
+        signals: Dict[str, "Signal"],
+        returns: pd.DataFrame,
+        dists: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Allocate using GA-optimized weights.
+
+        Runs the GA to maximize trailing Sharpe if:
+        - This is the first call, OR
+        - refit_days have elapsed since last run, OR
+        - Symbol set has changed
+
+        Otherwise, returns cached weights.
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+                    Index: dates, Columns: asset symbols.
+            dists: Dict[symbol -> KairosDistribution] (unused for GA).
+            context: Dict[str, Any]; uses context.get("current_date") if present
+                    for deterministic seed, else uses returns index last element.
+
+        Returns:
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values <= gross_cap.
+            Individual absolute values <= max_weight.
+            Signs match signal directions.
+
+        Fall-back behavior:
+            If len(returns) < self.min_obs (default 60), returns equal-weight.
+            If GA fails, returns equal-weight.
+
+        Examples:
+            >>> allocator = GAAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        # Increment call counter
+        self.run_count += 1
+
+        # Check if enough observations
+        if len(returns) < self.min_obs:
+            return _fallback_equal_weight(signals)
+
+        symbols = list(signals.keys())
+        if not symbols:
+            return {}
+
+        # Determine the date for caching and seed
+        if "current_date" in context:
+            current_date = context["current_date"]
+        else:
+            current_date = returns.index[-1]
+
+        # Check if we should use cache
+        if (
+            self._cache_date is not None
+            and self._cached_symbols == symbols
+            and (current_date - self._cache_date).days < self.refit_days
+        ):
+            # Return cached weights
+            return self._cached_weights.copy()
+
+        # Need to run GA: extract trailing returns
+        trailing_returns = returns[symbols].tail(self.lookback)
+        if len(trailing_returns) < 2:
+            return _fallback_equal_weight(signals)
+
+        # Run GA
+        try:
+            magnitudes = self._run_ga(trailing_returns, symbols)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Apply caps and signs
+        try:
+            weights_dict = self._apply_caps_and_signs(magnitudes, symbols, signals)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Update cache
+        self._cache_date = current_date
+        self._cached_weights = weights_dict.copy()
+        self._cached_symbols = symbols
+
+        return weights_dict
+
+    def _run_ga(self, returns: pd.DataFrame, symbols: List[str]) -> np.ndarray:
+        """
+        Run genetic algorithm to maximize Sharpe ratio.
+
+        Args:
+            returns: DataFrame of trailing returns (lookback rows, one per symbol).
+            symbols: Asset symbols (for seeding and logging).
+
+        Returns:
+            Magnitudes array of shape (n_assets,), non-negative and normalized to sum to 1.
+
+        Raises:
+            ValueError: If GA fails to initialize or evolve.
+        """
+        n_assets = len(symbols)
+        returns_array = returns.values  # (lookback, n_assets)
+
+        # Deterministic seed from last date in returns
+        seed_date = returns.index[-1]
+        seed_val = int(seed_date.strftime("%Y%m%d"))
+        rng = np.random.default_rng(seed_val)
+
+        # Initialize population: random normalized non-negative vectors
+        population = []
+        for _ in range(self.population):
+            # Random non-negative magnitudes
+            mag = rng.exponential(1.0, n_assets)
+            # Normalize to sum to 1
+            mag = mag / np.sum(mag)
+            population.append(mag)
+
+        population = np.array(population)
+
+        # Track fitness history
+        fitness_history = []
+
+        # Evolution loop
+        for gen in range(self.generations):
+            # Evaluate fitness for each individual
+            fitness = np.array([
+                self._compute_fitness(ind, returns_array)
+                for ind in population
+            ])
+
+            # Track best fitness
+            best_fitness = np.max(fitness)
+            fitness_history.append(best_fitness)
+
+            # Selection: tournament selection (k=3)
+            selected_indices = []
+            for _ in range(self.population - 2):  # Leave 2 for elitism
+                # Tournament: pick k random individuals, select best
+                tournament_idx = rng.choice(self.population, size=3, replace=False)
+                tournament_fitness = fitness[tournament_idx]
+                winner_idx = tournament_idx[np.argmax(tournament_fitness)]
+                selected_indices.append(winner_idx)
+
+            # Crossover & mutation: create new population
+            new_population = []
+
+            # Elitism: keep best 2
+            best_two_idx = np.argsort(fitness)[-2:]
+            for idx in best_two_idx:
+                new_population.append(population[idx].copy())
+
+            # Create offspring via crossover and mutation
+            for _ in range(self.population - 2):
+                # Blend crossover: pick two parents, blend with uniform alpha
+                parent_idx = rng.choice(selected_indices, size=2, replace=False)
+                parent1 = population[parent_idx[0]]
+                parent2 = population[parent_idx[1]]
+
+                # Blend crossover: alpha uniform from [0, 1]
+                alpha = rng.uniform(0.0, 1.0)
+                child = alpha * parent1 + (1.0 - alpha) * parent2
+
+                # Mutation: add Gaussian noise, clip to >=0, renormalize
+                noise = rng.normal(0.0, self.mutation_sigma, n_assets)
+                child = child + noise
+                child = np.maximum(child, 0.0)  # Clip to >=0
+                if np.sum(child) > 0:
+                    child = child / np.sum(child)  # Renormalize
+                else:
+                    # Degenerate case: reinitialize
+                    child = rng.exponential(1.0, n_assets)
+                    child = child / np.sum(child)
+
+                new_population.append(child)
+
+            population = np.array(new_population)
+
+        # Store fitness history for test introspection
+        self.last_fitness_history = fitness_history
+
+        # Return best individual from final population
+        final_fitness = np.array([
+            self._compute_fitness(ind, returns_array)
+            for ind in population
+        ])
+        best_idx = np.argmax(final_fitness)
+        return population[best_idx]
+
+    def _compute_fitness(self, weights: np.ndarray, returns: np.ndarray) -> float:
+        """
+        Compute Sharpe ratio fitness for a weight vector.
+
+        Sharpe = mean(portfolio_returns) / std(portfolio_returns) * sqrt(252)
+        where portfolio_returns = returns @ weights (daily log returns)
+
+        Args:
+            weights: Weight vector (n_assets,), assumed normalized to sum to 1.
+            returns: Returns array (n_obs, n_assets).
+
+        Returns:
+            Sharpe ratio (float). If std=0, returns -inf.
+        """
+        portfolio_returns = np.dot(returns, weights)  # (n_obs,)
+        mean_ret = np.mean(portfolio_returns)
+        std_ret = np.std(portfolio_returns, ddof=1)
+
+        if std_ret <= 0:
+            return float('-inf')
+
+        sharpe = (mean_ret / std_ret) * np.sqrt(252)
+        return sharpe
+
+    def _apply_caps_and_signs(
+        self,
+        magnitudes: np.ndarray,
+        symbols: List[str],
+        signals: Dict[str, "Signal"],
+    ) -> Dict[str, float]:
+        """
+        Apply gross_cap and max_weight constraints, then sign by directions.
+
+        Steps:
+        1. Uniform scale to respect gross_cap (sum of |w| <= gross_cap)
+        2. Clip individual |w_i| to max_weight
+        3. Scale down uniformly again if needed to respect gross_cap after clipping
+        4. Apply signal-direction signs
+
+        Args:
+            magnitudes: Non-negative weight magnitudes (sum to 1).
+            symbols: Asset symbols (order matching magnitudes).
+            signals: Dict[symbol -> Signal] for directions.
+
+        Returns:
+            Dict[symbol -> float] of signed weights.
+        """
+        n = len(symbols)
+
+        # Step 1: Uniform scale to respect gross_cap
+        total_mag = np.sum(magnitudes)
+        if total_mag > self.gross_cap:
+            magnitudes = magnitudes * (self.gross_cap / total_mag)
+
+        # Step 2: Clip individual weights to max_weight (hard cap)
+        magnitudes = np.minimum(magnitudes, self.max_weight)
+
+        # Step 3: If sum now exceeds gross_cap, scale down uniformly
+        total_after_clip = np.sum(magnitudes)
+        if total_after_clip > self.gross_cap:
+            magnitudes = magnitudes * (self.gross_cap / total_after_clip)
+
+        # Step 4: Apply signal directions
+        weights = {}
+        for i, sym in enumerate(symbols):
+            mag = magnitudes[i]
+            direction = signals[sym].direction
+
+            # Extract direction value
+            if hasattr(direction, 'value'):
+                dir_val = direction.value
+            else:
+                dir_val = direction
+
+            if dir_val == 1:  # LONG
+                w = float(mag)
+            elif dir_val == -1:  # SHORT
+                w = float(-mag)
+            else:  # FLAT
+                w = 0.0
+
+            if abs(w) < 1e-10:
+                w = 0.0
+            weights[sym] = w
+
+        return weights

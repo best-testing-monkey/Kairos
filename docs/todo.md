@@ -15,7 +15,7 @@
 - [x] E2-S05 Black-Litterman Allocator (docs/tickets/E2-S05-black-litterman-allocator.md)
 - [x] E2-S06 Eigen Allocator (docs/tickets/E2-S06-eigen-allocator.md)
 - [x] E2-S07 Universal Allocator (docs/tickets/E2-S07-universal-allocator.md)
-- [ ] E2-S08 GA Allocator (docs/tickets/E2-S08-ga-allocator.md)
+- [x] E2-S08 GA Allocator (docs/tickets/E2-S08-ga-allocator.md)
 - [ ] E2-S09 CVaR Allocator (docs/tickets/E2-S09-cvar-allocator.md)
 - [ ] E2-S10 Kelly Allocator (docs/tickets/E2-S10-kelly-allocator.md)
 - [ ] E2-S11 Rebalancer (docs/tickets/E2-S11-rebalancer.md)

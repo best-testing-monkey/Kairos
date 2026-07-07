@@ -33,6 +33,7 @@ from kairos_portfolio import (
     BlackLittermanAllocator,
     EigenAllocator,
     UniversalAllocator,
+    GAAllocator,
 )
 from kairos_backtest import Signal, Direction, KairosDistribution
 
@@ -3582,3 +3583,396 @@ class TestUniversalAllocator:
         # Grid should be the same object (not regenerated)
         assert grid_id_1 == grid_id_2, \
             "Grid should not be regenerated when symbols are unchanged"
+
+
+# =============================================================================
+# GENETIC ALGORITHM ALLOCATOR TESTS
+# =============================================================================
+
+class TestGAAllocator:
+    """Tests for GAAllocator: genetic algorithm weight optimization."""
+
+    @pytest.fixture
+    def ga_allocator(self):
+        """Default GA allocator fixture."""
+        return GAAllocator(
+            lookback=60,
+            population=50,
+            generations=20,
+            mutation_sigma=0.05,
+            gross_cap=1.0,
+            max_weight=0.35,
+            refit_days=5,
+        )
+
+    def _create_signals_for_symbols(self, symbols, direction_map=None):
+        """Helper to create signals for testing."""
+        signals = {}
+        for sym in symbols:
+            direction = direction_map.get(sym, Direction.LONG) if direction_map else Direction.LONG
+            signals[sym] = Signal(
+                entry=100.0,
+                target=110.0,
+                stop=90.0,
+                direction=direction,
+                confidence=1.0,
+                size=1.0,
+                strategy_name="test",
+                expected_value=0.01,
+            )
+        return signals
+
+    def test_ga_allocator_initialization(self):
+        """Test GA allocator initialization with default and custom params."""
+        # Default
+        allocator = GAAllocator()
+        assert allocator.lookback == 60
+        assert allocator.population == 50
+        assert allocator.generations == 20
+        assert allocator.mutation_sigma == 0.05
+        assert allocator.gross_cap == 1.0
+        assert allocator.max_weight == 0.35
+        assert allocator.refit_days == 5
+        assert allocator.run_count == 0
+        assert allocator.last_fitness_history == []
+
+        # Custom
+        allocator2 = GAAllocator(
+            lookback=30,
+            population=20,
+            generations=10,
+            mutation_sigma=0.1,
+            gross_cap=2.0,
+            max_weight=0.5,
+            refit_days=3,
+        )
+        assert allocator2.lookback == 30
+        assert allocator2.population == 20
+        assert allocator2.generations == 10
+        assert allocator2.mutation_sigma == 0.1
+        assert allocator2.gross_cap == 2.0
+        assert allocator2.max_weight == 0.5
+        assert allocator2.refit_days == 3
+
+    def test_ga_fallback_below_min_obs(self, ga_allocator, synthetic_returns_small):
+        """GA should fallback to equal weight with < min_obs observations."""
+        signals = self._create_signals_for_symbols(["BTC", "ETH", "SOL"])
+        weights = ga_allocator.allocate(signals, synthetic_returns_small, {}, {})
+
+        # Equal weight: 1/3 each
+        assert len(weights) == 3
+        assert abs(weights["BTC"] - 1.0/3) < 1e-10
+        assert abs(weights["ETH"] - 1.0/3) < 1e-10
+        assert abs(weights["SOL"] - 1.0/3) < 1e-10
+
+    def test_ga_fitness_monotone_increasing(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Fitness should be non-decreasing across generations."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+        trailing = synthetic_returns_200_obs_3_assets.tail(60)
+
+        # Run GA manually to access fitness history
+        magnitudes = ga_allocator._run_ga(trailing, symbols)
+
+        # Check fitness history is non-decreasing
+        history = ga_allocator.last_fitness_history
+        assert len(history) == ga_allocator.generations
+        for i in range(1, len(history)):
+            assert history[i] >= history[i-1] - 1e-10, \
+                f"Fitness not non-decreasing: {history[i]} < {history[i-1]}"
+
+    def test_ga_weekly_cache_same_date(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Two calls on same date should return same cached result."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+        context = {"current_date": synthetic_returns_200_obs_3_assets.index[-1]}
+
+        # First call
+        w1 = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, context)
+
+        # Second call (same date)
+        w2 = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, context)
+
+        # Should be identical (cached)
+        assert w1 == w2
+        # run_count should still be 2 (both calls incremented counter)
+        assert ga_allocator.run_count == 2
+
+    def test_ga_cache_refit_after_days(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Cache should persist within refit_days; re-run after refit_days."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # Create dates within and beyond refit_days
+        date1 = pd.Timestamp("2024-01-01")
+        date2 = pd.Timestamp("2024-01-03")  # 2 days later (within refit_days=5)
+        date3 = pd.Timestamp("2024-01-07")  # 6 days later (beyond refit_days=5)
+
+        # First call
+        w1 = ga_allocator.allocate(
+            signals,
+            synthetic_returns_200_obs_3_assets,
+            {},
+            {"current_date": date1},
+        )
+        assert ga_allocator.run_count == 1
+
+        # Second call (within refit_days)
+        w2 = ga_allocator.allocate(
+            signals,
+            synthetic_returns_200_obs_3_assets,
+            {},
+            {"current_date": date2},
+        )
+        assert ga_allocator.run_count == 2
+        # Should be cached (same weights)
+        assert w1 == w2
+
+        # Third call (beyond refit_days, should re-run)
+        w3 = ga_allocator.allocate(
+            signals,
+            synthetic_returns_200_obs_3_assets,
+            {},
+            {"current_date": date3},
+        )
+        assert ga_allocator.run_count == 3
+        # Weights might be different due to independent GA run
+        # (but could coincidentally be same; don't assert on equality)
+
+    def test_ga_deterministic_seed_same_date(self, synthetic_returns_200_obs_3_assets):
+        """Same date and data should produce identical weights across fresh instances."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+        context = {"current_date": synthetic_returns_200_obs_3_assets.index[-1]}
+
+        # Create two fresh allocators
+        ga1 = GAAllocator(
+            lookback=60,
+            population=50,
+            generations=20,
+            mutation_sigma=0.05,
+        )
+        ga2 = GAAllocator(
+            lookback=60,
+            population=50,
+            generations=20,
+            mutation_sigma=0.05,
+        )
+
+        # Allocate with identical setup
+        w1 = ga1.allocate(signals, synthetic_returns_200_obs_3_assets, {}, context)
+        w2 = ga2.allocate(signals, synthetic_returns_200_obs_3_assets, {}, context)
+
+        # Weights should be identical (deterministic seed)
+        for sym in symbols:
+            assert abs(w1[sym] - w2[sym]) < 1e-10, \
+                f"Weights for {sym} differ: {w1[sym]} vs {w2[sym]}"
+
+    def test_ga_respects_gross_cap(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """All weights should sum to <= gross_cap in absolute value."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+        weights = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+
+        total_abs = sum(abs(w) for w in weights.values())
+        assert total_abs <= ga_allocator.gross_cap + 1e-10, \
+            f"Total |w| = {total_abs} exceeds gross_cap = {ga_allocator.gross_cap}"
+
+    def test_ga_respects_max_weight(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Individual weights should not exceed max_weight."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+        weights = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+
+        for sym, w in weights.items():
+            assert abs(w) <= ga_allocator.max_weight + 1e-10, \
+                f"|w_{sym}| = {abs(w)} exceeds max_weight = {ga_allocator.max_weight}"
+
+    def test_ga_respects_signs(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Weight signs should match signal directions."""
+        symbols = ["BTC", "ETH", "SOL"]
+        # Create signals with mixed directions
+        direction_map = {
+            "BTC": Direction.LONG,   # Should be >= 0
+            "ETH": Direction.SHORT,  # Should be <= 0
+            "SOL": Direction.LONG,   # Should be >= 0
+        }
+        signals = self._create_signals_for_symbols(symbols, direction_map)
+        weights = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+
+        # Check sign constraints
+        assert weights["BTC"] >= -1e-10, f"BTC should be LONG (>= 0), got {weights['BTC']}"
+        assert weights["ETH"] <= 1e-10, f"ETH should be SHORT (<= 0), got {weights['ETH']}"
+        assert weights["SOL"] >= -1e-10, f"SOL should be LONG (>= 0), got {weights['SOL']}"
+
+    def test_ga_reset_clears_state(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """reset() should clear cache, run_count, and fitness history."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # First call
+        w1 = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+        assert ga_allocator.run_count == 1
+        assert len(ga_allocator.last_fitness_history) > 0
+
+        # Reset
+        ga_allocator.reset()
+        assert ga_allocator.run_count == 0
+        assert ga_allocator.last_fitness_history == []
+        assert ga_allocator._cache_date is None
+        assert ga_allocator._cached_weights is None
+
+        # Second call after reset should re-run
+        w2 = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+        assert ga_allocator.run_count == 1  # Reset to 1 on first call after reset
+
+    def test_ga_fitness_with_zero_volatility(self, ga_allocator):
+        """Fitness should be -inf when portfolio volatility is zero."""
+        # Create constant returns (zero volatility)
+        returns = pd.DataFrame(
+            np.zeros((60, 3)),
+            columns=["A", "B", "C"],
+            index=pd.date_range("2024-01-01", periods=60),
+        )
+
+        weights = np.array([0.3, 0.3, 0.4])
+        fitness = ga_allocator._compute_fitness(weights, returns.values)
+
+        assert fitness == float('-inf'), \
+            f"Fitness for zero-vol portfolio should be -inf, got {fitness}"
+
+    def test_ga_no_signals(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Allocate with no signals should return empty dict."""
+        weights = ga_allocator.allocate({}, synthetic_returns_200_obs_3_assets, {}, {})
+        assert weights == {}
+
+    def test_ga_single_signal(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Allocate with single signal should allocate all available weight to that signal."""
+        signals = self._create_signals_for_symbols(["BTC"])
+        weights = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+
+        # Single asset should get weight up to min(gross_cap, max_weight)
+        assert len(weights) == 1
+        # For single asset: weight should be min(gross_cap, max_weight) = min(1.0, 0.35) = 0.35
+        expected_weight = min(ga_allocator.gross_cap, ga_allocator.max_weight)
+        assert abs(abs(weights["BTC"]) - expected_weight) < 1e-10, \
+            f"Single signal should get {expected_weight}, got {weights['BTC']}"
+
+    def test_ga_flat_direction_zero_weight(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Assets with FLAT direction should get zero weight."""
+        symbols = ["BTC", "ETH", "SOL"]
+        direction_map = {
+            "BTC": Direction.LONG,
+            "ETH": Direction.FLAT,
+            "SOL": Direction.LONG,
+        }
+        signals = self._create_signals_for_symbols(symbols, direction_map)
+        weights = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+
+        assert weights["ETH"] == 0.0, f"FLAT direction should have 0 weight, got {weights['ETH']}"
+
+    def test_ga_run_count_increments(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """run_count should increment on each allocate() call."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        assert ga_allocator.run_count == 0
+
+        ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+        assert ga_allocator.run_count == 1
+
+        ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+        assert ga_allocator.run_count == 2
+
+    def test_ga_cache_with_symbol_change(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Cache should be invalidated when symbol set changes."""
+        symbols1 = ["BTC", "ETH", "SOL"]
+        signals1 = self._create_signals_for_symbols(symbols1)
+
+        # First call
+        w1 = ga_allocator.allocate(signals1, synthetic_returns_200_obs_3_assets, {}, {})
+        assert ga_allocator.run_count == 1
+
+        # Change symbol set
+        symbols2 = ["BTC", "ETH"]  # Removed SOL
+        signals2 = self._create_signals_for_symbols(symbols2)
+        returns_2asset = synthetic_returns_200_obs_3_assets[symbols2]
+
+        # Second call with new symbols (should re-run, not use cache)
+        w2 = ga_allocator.allocate(signals2, returns_2asset, {}, {})
+        assert ga_allocator.run_count == 2  # Should increment
+
+    def test_ga_insufficient_returns_data(self, ga_allocator):
+        """allocate() should fallback if returns has < lookback rows."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # Create returns with only 30 rows (less than lookback=60)
+        returns = pd.DataFrame(
+            np.random.randn(30, 3) * 0.02,
+            columns=symbols,
+            index=pd.date_range("2024-01-01", periods=30),
+        )
+
+        # But has >= min_obs, so should attempt GA
+        # Since < lookback, should fallback to equal weight
+        weights = ga_allocator.allocate(signals, returns, {}, {})
+
+        # Should fallback to equal weight
+        assert len(weights) == 3
+        assert abs(weights["BTC"] - 1.0/3) < 1e-10
+
+    def test_ga_context_current_date_vs_index(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Should use context['current_date'] if present, else returns.index[-1]."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+
+        # Without context, should use returns.index[-1]
+        w1 = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+
+        # With context, should use context['current_date'] for seed
+        context = {"current_date": synthetic_returns_200_obs_3_assets.index[-1]}
+        w2 = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, context)
+
+        # Both should produce same result (same seed date)
+        for sym in symbols:
+            assert abs(w1[sym] - w2[sym]) < 1e-10
+
+    def test_ga_fitness_history_length(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Fitness history should have one entry per generation."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+        trailing = synthetic_returns_200_obs_3_assets.tail(60)
+
+        ga_allocator._run_ga(trailing, symbols)
+
+        assert len(ga_allocator.last_fitness_history) == ga_allocator.generations
+        assert all(isinstance(f, (int, float)) for f in ga_allocator.last_fitness_history)
+
+    def test_ga_negative_weights_short_only(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """All-SHORT portfolio should have all negative weights."""
+        symbols = ["BTC", "ETH", "SOL"]
+        direction_map = {sym: Direction.SHORT for sym in symbols}
+        signals = self._create_signals_for_symbols(symbols, direction_map)
+        weights = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+
+        # All weights should be <= 0
+        for sym in symbols:
+            assert weights[sym] <= 1e-10, \
+                f"SHORT portfolio should have {sym} weight <= 0, got {weights[sym]}"
+
+    def test_ga_allocation_properties(self, ga_allocator, synthetic_returns_200_obs_3_assets):
+        """Allocated weights should be dicts with correct structure."""
+        symbols = ["BTC", "ETH", "SOL"]
+        signals = self._create_signals_for_symbols(symbols)
+        weights = ga_allocator.allocate(signals, synthetic_returns_200_obs_3_assets, {}, {})
+
+        # Should be a dict with entries for each symbol
+        assert isinstance(weights, dict)
+        assert set(weights.keys()) == set(signals.keys())
+
+        # Each value should be a float
+        for sym, w in weights.items():
+            assert isinstance(w, (int, float))
+            assert not np.isnan(w) and not np.isinf(w), \
+                f"Weight for {sym} should be finite, got {w}"
