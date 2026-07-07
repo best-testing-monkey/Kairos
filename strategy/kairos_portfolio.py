@@ -1040,6 +1040,114 @@ class MinVarAllocator(PortfolioAllocator):
         return weights
 
 
+# =============================================================================
+# MAX-SHARPE SOLVER (shared by MVO and Black-Litterman)
+# =============================================================================
+
+def _max_sharpe_solve(
+    symbols: list,
+    mu: np.ndarray,
+    cov: np.ndarray,
+    signals: Dict[str, "Signal"],
+    gross_cap: float = 1.0,
+    max_weight: float = 0.35,
+    rf: float = 0.0,
+) -> Dict[str, float]:
+    """
+    Solve the Markowitz max-Sharpe problem via scipy.optimize.minimize with SLSQP.
+
+    Maximizes (w·mu - rf) / sqrt(w'Σw) (Sharpe ratio) subject to:
+    - sum|w| <= gross_cap
+    - |w_i| <= max_weight
+    - sign(w_i) matches signal direction
+
+    This is a module-level helper used by both MVOAllocator and BlackLittermanAllocator.
+
+    Args:
+        symbols: List of asset symbols (in order matching mu and cov).
+        mu: Expected returns array (n_assets,).
+        cov: Shrunk covariance matrix (n_assets, n_assets).
+        signals: Dict[symbol -> Signal] for direction and metadata.
+        gross_cap: Gross leverage cap (sum of |w_i|). Default: 1.0.
+        max_weight: Maximum absolute weight for any single asset. Default: 0.35.
+        rf: Risk-free rate (in same units as expected returns). Default: 0.0.
+
+    Returns:
+        Dict[symbol -> float] of optimal weights.
+
+    Raises:
+        ValueError: If optimization fails to converge.
+    """
+    from scipy.optimize import minimize
+
+    n = len(symbols)
+
+    # Build bounds based on signal direction
+    bounds = []
+    for sym in symbols:
+        direction = signals[sym].direction
+        try:
+            dir_val = direction.value if hasattr(direction, 'value') else direction
+        except:
+            dir_val = direction
+
+        # Check if LONG (value=1), SHORT (value=-1), or FLAT (value=0)
+        if dir_val == 1:  # LONG
+            bounds.append((0.0, max_weight))
+        elif dir_val == -1:  # SHORT
+            bounds.append((-max_weight, 0.0))
+        else:  # FLAT
+            bounds.append((0.0, 0.0))
+
+    # Objective: minimize negative Sharpe ratio
+    def objective(w):
+        # Portfolio return
+        mu_port = np.dot(w, mu) - rf
+        # Portfolio volatility
+        vol_sq = np.dot(w, np.dot(cov, w))
+        vol_port = np.sqrt(vol_sq + 1e-12)  # Add epsilon to avoid division issues
+
+        if vol_port < 1e-10:
+            return 1e10
+        # Minimize negative Sharpe = maximize Sharpe
+        return -mu_port / vol_port
+
+    # Constraint: sum(|w|) <= gross_cap
+    def constraint_gross_cap(w):
+        return gross_cap - np.sum(np.abs(w))
+
+    constraints = [
+        {'type': 'ineq', 'fun': constraint_gross_cap}
+    ]
+
+    # Initial guess: equal weight
+    w0 = np.ones(n) / n
+
+    # Solve
+    result = minimize(
+        objective,
+        w0,
+        method='SLSQP',
+        bounds=bounds,
+        constraints=constraints,
+        options={'ftol': 1e-9, 'maxiter': 1000}
+    )
+
+    if not result.success or result.fun >= 1e9:
+        raise ValueError(f"Max-Sharpe optimization failed: {result.message}")
+
+    # Return as dict
+    weights = {}
+    for i, sym in enumerate(symbols):
+        w = result.x[i]
+        # Zero out very small weights to avoid numerical noise
+        if abs(w) < 1e-10:
+            w = 0.0
+        weights[sym] = float(w)
+
+    return weights
+
+
 class MVOAllocator(PortfolioAllocator):
     """
     Mean-Variance Optimization allocator using Markowitz maximum-Sharpe portfolio.
@@ -1156,111 +1264,322 @@ class MVOAllocator(PortfolioAllocator):
                 mu.append(0.0)
         mu = np.array(mu)
 
-        # Solve MVO
+        # Solve MVO using shared solver
         try:
-            weights_dict = self._solve_mvo(symbols, mu, cov, signals)
+            weights_dict = _max_sharpe_solve(
+                symbols, mu, cov, signals,
+                gross_cap=self.gross_cap,
+                max_weight=self.max_weight,
+                rf=self.rf
+            )
             return weights_dict
         except Exception:
             # Fallback to equal weight on solver failure
             return _fallback_equal_weight(signals)
 
-    def _solve_mvo(self, symbols: list, mu: np.ndarray, cov: np.ndarray,
-                   signals: Dict[str, "Signal"]) -> Dict[str, float]:
-        """
-        Solve the Markowitz MVO problem via scipy.optimize.minimize with SLSQP.
 
-        Maximizes (w·mu - rf) / sqrt(w'Σw) (Sharpe ratio) subject to:
-        - sum|w| <= gross_cap
-        - |w_i| <= max_weight
-        - sign(w_i) matches signal direction
+# =============================================================================
+# BLACK-LITTERMAN POSTERIOR HELPER
+# =============================================================================
+
+def _bl_posterior(
+    pi: np.ndarray,
+    Q: np.ndarray,
+    Sigma: np.ndarray,
+    Omega: np.ndarray,
+    tau: float = 0.05,
+) -> np.ndarray:
+    """
+    Compute Black-Litterman posterior expected returns.
+
+    Given:
+    - Prior equilibrium returns Π (n_assets,)
+    - Views Q (n_assets,) — absolute return expectations per asset
+    - Covariance matrix Σ (n_assets, n_assets)
+    - View uncertainty Ω (n_assets, n_assets) — diagonal matrix
+    - Confidence parameter τ (scalar)
+
+    Returns:
+    - Posterior mu_BL = inv(inv(τΣ) + P'inv(Ω)P) @ (inv(τΣ)Π + P'inv(Ω)Q)
+      where P = I (one absolute view per asset)
+
+    Args:
+        pi: Prior equilibrium returns (n_assets,).
+        Q: Views on returns (n_assets,).
+        Sigma: Covariance matrix (n_assets, n_assets).
+        Omega: View uncertainty (n_assets, n_assets), typically diagonal.
+        tau: Confidence scaling parameter. Default: 0.05.
+
+    Returns:
+        Posterior mean returns (n_assets,).
+
+    Raises:
+        ValueError: If matrix inversion fails.
+    """
+    n = len(pi)
+
+    # Compute inv(τΣ)
+    tau_sigma = tau * Sigma
+    try:
+        inv_tau_sigma = np.linalg.inv(tau_sigma)
+    except np.linalg.LinAlgError:
+        raise ValueError("Failed to invert τΣ")
+
+    # Compute inv(Ω)
+    try:
+        inv_omega = np.linalg.inv(Omega)
+    except np.linalg.LinAlgError:
+        raise ValueError("Failed to invert Ω")
+
+    # With P = I (n x n identity), P'inv(Ω)P = inv(Ω)
+    # Posterior precision: inv(τΣ) + inv(Ω)
+    posterior_precision = inv_tau_sigma + inv_omega
+
+    # Posterior mean: inv(posterior_precision) @ (inv(τΣ)Π + inv(Ω)Q)
+    try:
+        inv_posterior_precision = np.linalg.inv(posterior_precision)
+    except np.linalg.LinAlgError:
+        raise ValueError("Failed to invert posterior precision matrix")
+
+    rhs = inv_tau_sigma @ pi + inv_omega @ Q
+    mu_bl = inv_posterior_precision @ rhs
+
+    return mu_bl
+
+
+# =============================================================================
+# BLACK-LITTERMAN ALLOCATOR
+# =============================================================================
+
+class BlackLittermanAllocator(PortfolioAllocator):
+    """
+    Black-Litterman allocator combining equilibrium prior with Kronos-derived views.
+
+    Prior: equilibrium returns Π = δ Σ w_mkt where w_mkt = inverse-volatility weights
+    Views: one absolute view per signaled asset, Q_i = dists[i].stats["close"]["mean"] / price - 1
+    View uncertainty: Ω_ii ∝ dists[i].entropy() — high-entropy (uncertain) days get weak views
+    Posterior: mu_BL blends prior Π and views Q based on confidence (Ω)
+
+    The posterior expected returns are fed into the same max-Sharpe optimizer as MVOAllocator.
+
+    Attributes:
+        name: "black_litterman_allocator"
+        tau: Confidence scaling parameter (scales prior impact). Default: 0.05.
+        delta: Prior market risk premium parameter. Default: 2.5.
+        lookback: Number of days of historical returns for covariance. Default: 120.
+        gross_cap: Gross leverage cap (sum of |w_i|). Default: 1.0.
+        max_weight: Maximum absolute weight for any single asset. Default: 0.35.
+    """
+
+    name: str = "black_litterman_allocator"
+
+    def __init__(
+        self,
+        tau: float = 0.05,
+        delta: float = 2.5,
+        lookback: int = 120,
+        gross_cap: float = 1.0,
+        max_weight: float = 0.35,
+    ):
+        """
+        Initialize Black-Litterman allocator.
 
         Args:
-            symbols: List of asset symbols (in order matching mu and cov).
-            mu: Expected returns array (n_assets,).
-            cov: Shrunk covariance matrix (n_assets, n_assets).
-            signals: Dict[symbol -> Signal] for direction and metadata.
+            tau: Confidence scaling parameter. Smaller tau makes prior more confident
+                 (smaller Ω), moving posterior toward prior Π. Default: 0.05.
+            delta: Prior market risk premium (multiplier for inverse-vol weights).
+                  Default: 2.5.
+            lookback: Number of days of historical returns for covariance estimation.
+                     Default: 120 (approximately 6 months).
+            gross_cap: Gross leverage cap (sum of absolute values of weights).
+                      Default: 1.0.
+            max_weight: Maximum absolute weight for any single asset.
+                       Default: 0.35.
+
+        Examples:
+            >>> allocator = BlackLittermanAllocator(tau=0.05, delta=2.5, lookback=120)
+            >>> weights = allocator.allocate(signals, returns, dists, context)
+        """
+        self.tau = tau
+        self.delta = delta
+        self.lookback = lookback
+        self.gross_cap = gross_cap
+        self.max_weight = max_weight
+
+    def allocate(
+        self,
+        signals: Dict[str, "Signal"],
+        returns: pd.DataFrame,
+        dists: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Compute Black-Litterman optimal weights.
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+                    Index: dates, Columns: asset symbols.
+            dists: Dict[symbol -> KairosDistribution] predicted distributions per asset.
+            context: Dict[str, Any] execution context (unused).
 
         Returns:
-            Dict[symbol -> float] of optimal weights.
+            Dict[symbol -> float] of target weights, signed (long/short).
+            Sum of absolute values <= gross_cap.
+            Individual absolute values <= max_weight.
+            Signs match signal directions.
 
-        Raises:
-            ValueError: If optimization fails to converge.
+        Fall-back behavior:
+            If len(returns) < self.min_obs (default 60), returns equal-weight allocation.
+            If optimization fails for any reason, returns equal-weight allocation.
+
+        Examples:
+            >>> allocator = BlackLittermanAllocator()
+            >>> weights = allocator.allocate(signals, returns, dists, {})
+            >>> assert sum(abs(w) for w in weights.values()) <= 1.0
         """
-        from scipy.optimize import minimize
+        # Check if enough observations
+        if len(returns) < self.min_obs:
+            return _fallback_equal_weight(signals)
 
-        # Import Direction locally to avoid circular dependency issues
+        # Extract symbols
+        symbols = list(signals.keys())
+        if not symbols:
+            return {}
+
+        # Get trailing returns for covariance estimation
+        trailing_returns = returns[symbols].tail(self.lookback)
+        if len(trailing_returns) < 2:
+            return _fallback_equal_weight(signals)
+
+        # Compute shrunk covariance
         try:
-            from kairos_backtest import Direction
-        except ImportError:
-            # Fallback if kairos_backtest not available
-            class Direction:
-                LONG = 1
-                SHORT = -1
-                FLAT = 0
+            cov = shrunk_covariance(trailing_returns)
+        except Exception:
+            return _fallback_equal_weight(signals)
 
+        # Compute prior: w_mkt = inverse-volatility weights
+        try:
+            w_mkt = self._inverse_vol_weights(cov, signals)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Compute prior equilibrium returns: Π = δ Σ w_mkt
+        try:
+            pi = self.delta * (cov @ w_mkt)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Compute views and view uncertainty
+        try:
+            Q, Omega = self._compute_views_and_uncertainty(symbols, signals, dists, cov)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Compute posterior
+        try:
+            mu_bl = _bl_posterior(pi, Q, cov, Omega, tau=self.tau)
+        except Exception:
+            return _fallback_equal_weight(signals)
+
+        # Solve max-Sharpe using posterior mu
+        try:
+            weights_dict = _max_sharpe_solve(
+                symbols,
+                mu_bl,
+                cov,
+                signals,
+                gross_cap=self.gross_cap,
+                max_weight=self.max_weight,
+                rf=0.0,
+            )
+            return weights_dict
+        except Exception:
+            # Fallback to equal weight on solver failure
+            return _fallback_equal_weight(signals)
+
+    def _inverse_vol_weights(
+        self, cov: np.ndarray, signals: Dict[str, "Signal"]
+    ) -> np.ndarray:
+        """
+        Compute inverse-volatility weights for signaled assets.
+
+        w_mkt_i = (1 / σ_i) / sum_j (1 / σ_j)
+
+        Args:
+            cov: Covariance matrix (n_assets, n_assets).
+            signals: Dict[symbol -> Signal] for filtering active assets.
+
+        Returns:
+            Inverse-vol weight vector (n_assets,), summing to 1.
+        """
+        n = len(signals)
+        vols = np.sqrt(np.diag(cov))
+
+        if np.any(vols <= 0):
+            raise ValueError("Non-positive volatility in covariance diagonal")
+
+        inv_vols = 1.0 / vols
+        w_mkt = inv_vols / np.sum(inv_vols)
+
+        return w_mkt
+
+    def _compute_views_and_uncertainty(
+        self,
+        symbols: List[str],
+        signals: Dict[str, "Signal"],
+        dists: Dict[str, Any],
+        cov: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute views Q and view uncertainty Ω.
+
+        Views: Q_i = dists[symbol].stats["close"]["mean"] / entry_price - 1
+               (absolute return forecast)
+        Uncertainty: Ω_ii = (entropy_i / ln(20)) * τ * σ_i^2
+                   Scaled so max-entropy (ln 20 ≈ 3.0) views are weak (large Ω_ii)
+
+        Args:
+            symbols: List of asset symbols (order matching cov).
+            signals: Dict[symbol -> Signal] for entry prices.
+            dists: Dict[symbol -> KairosDistribution] for stats and entropy.
+            cov: Covariance matrix (n_assets, n_assets).
+
+        Returns:
+            Q: View vector (n_assets,).
+            Ω: View uncertainty matrix (n_assets, n_assets), diagonal.
+        """
         n = len(symbols)
+        Q = np.zeros(n)
+        Omega = np.zeros((n, n))
 
-        # Build bounds based on signal direction
-        bounds = []
-        for sym in symbols:
-            direction = signals[sym].direction
-            try:
-                dir_val = direction.value if hasattr(direction, 'value') else direction
-            except:
-                dir_val = direction
+        ln_20 = np.log(20.0)
 
-            # Check if LONG (value=1), SHORT (value=-1), or FLAT (value=0)
-            if dir_val == 1:  # LONG
-                bounds.append((0.0, self.max_weight))
-            elif dir_val == -1:  # SHORT
-                bounds.append((-self.max_weight, 0.0))
-            else:  # FLAT
-                bounds.append((0.0, 0.0))
-
-        # Objective: minimize negative Sharpe ratio
-        def objective(w):
-            # Portfolio return
-            mu_port = np.dot(w, mu) - self.rf
-            # Portfolio volatility
-            vol_sq = np.dot(w, np.dot(cov, w))
-            vol_port = np.sqrt(vol_sq + 1e-12)  # Add epsilon to avoid division issues
-
-            if vol_port < 1e-10:
-                return 1e10
-            # Minimize negative Sharpe = maximize Sharpe
-            return -mu_port / vol_port
-
-        # Constraint: sum(|w|) <= gross_cap
-        def constraint_gross_cap(w):
-            return self.gross_cap - np.sum(np.abs(w))
-
-        constraints = [
-            {'type': 'ineq', 'fun': constraint_gross_cap}
-        ]
-
-        # Initial guess: equal weight
-        w0 = np.ones(n) / n
-
-        # Solve
-        result = minimize(
-            objective,
-            w0,
-            method='SLSQP',
-            bounds=bounds,
-            constraints=constraints,
-            options={'ftol': 1e-9, 'maxiter': 1000}
-        )
-
-        if not result.success or result.fun >= 1e9:
-            raise ValueError(f"MVO optimization failed: {result.message}")
-
-        # Return as dict
-        weights = {}
         for i, sym in enumerate(symbols):
-            w = result.x[i]
-            # Zero out very small weights to avoid numerical noise
-            if abs(w) < 1e-10:
-                w = 0.0
-            weights[sym] = float(w)
+            signal = signals[sym]
+            dist = dists[sym]
+            current_price = signal.entry
 
-        return weights
+            # View: expected relative return from distribution
+            try:
+                close_mean = dist.stats["close"]["mean"]
+                Q[i] = close_mean / current_price - 1.0
+            except (KeyError, TypeError):
+                Q[i] = 0.0
+
+            # View uncertainty: entropy-scaled
+            try:
+                entropy = dist.entropy()
+            except Exception:
+                entropy = 1.5  # Fallback if entropy unavailable
+
+            # Ω_ii = (entropy / ln(20)) * τ * σ_i^2
+            # When entropy → ln(20), Ω_ii → τ * σ_i^2 (weak view)
+            # When entropy → 0, Ω_ii → 0 (strong/confident view)
+            var_i = cov[i, i]
+            if var_i <= 0:
+                var_i = 1e-6
+            omega_ii = (entropy / ln_20) * self.tau * var_i
+            Omega[i, i] = max(omega_ii, 1e-10)  # Ensure numerical stability
+
+        return Q, Omega
