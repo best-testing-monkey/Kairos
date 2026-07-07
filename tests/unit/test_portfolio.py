@@ -36,6 +36,7 @@ from kairos_portfolio import (
     GAAllocator,
     CVaRAllocator,
     KellyAllocator,
+    Rebalancer,
     _scenario_matrix,
     _compute_cvar,
 )
@@ -4755,3 +4756,514 @@ class TestKellyAllocator:
         # Should not crash, should return valid weights
         assert isinstance(weights, dict)
         assert set(weights.keys()) == set(signals.keys())
+
+
+# =============================================================================
+# TEST REBALANCER
+# =============================================================================
+
+class TestRebalancerBasics:
+    """Test basic Rebalancer initialization and state management."""
+
+    def test_rebalancer_init_threshold_mode(self):
+        """Rebalancer initializes with threshold mode and sensible defaults."""
+        allocator = MVOAllocator()
+        rebalancer = Rebalancer(allocator, mode="threshold", band=0.05)
+
+        assert rebalancer.allocator is allocator
+        assert rebalancer.mode == "threshold"
+        assert rebalancer.band == 0.05
+        assert rebalancer.min_interval_days == 5
+        assert rebalancer.cost_pct == 0.001
+        assert rebalancer.current_weights == {}
+        assert rebalancer.cumulative_turnover == 0.0
+        assert rebalancer.cumulative_cost == 0.0
+
+    def test_rebalancer_init_periodic_mode(self):
+        """Rebalancer initializes with periodic mode."""
+        allocator = MVOAllocator()
+        rebalancer = Rebalancer(allocator, mode="periodic", min_interval_days=3)
+
+        assert rebalancer.mode == "periodic"
+        assert rebalancer.min_interval_days == 3
+
+    def test_rebalancer_init_invalid_mode(self):
+        """Invalid mode raises ValueError."""
+        allocator = MVOAllocator()
+        with pytest.raises(ValueError, match="mode must be"):
+            Rebalancer(allocator, mode="invalid")
+
+    def test_rebalancer_reset(self):
+        """reset() clears all state."""
+        allocator = MVOAllocator()
+        rebalancer = Rebalancer(allocator)
+
+        # Simulate some state
+        rebalancer.current_weights = {"BTC": 0.5, "ETH": 0.3}
+        rebalancer.cumulative_turnover = 1.5
+        rebalancer.cumulative_cost = 0.0015
+        rebalancer._call_count = 10
+        rebalancer._calls_since_rebalance = 5
+
+        # Reset
+        rebalancer.reset()
+
+        assert rebalancer.current_weights == {}
+        assert rebalancer.cumulative_turnover == 0.0
+        assert rebalancer.cumulative_cost == 0.0
+        assert rebalancer._call_count == 0
+        assert rebalancer._calls_since_rebalance == 0
+
+
+class StubAllocator(PortfolioAllocator):
+    """Stub allocator that returns pre-scripted weights (for testing)."""
+
+    def __init__(self):
+        self.target_weights_sequence = []  # List of dicts to return in sequence
+        self.call_count = 0
+
+    def allocate(self, signals, returns, dists, context):
+        """Return next target weights from sequence."""
+        if self.call_count < len(self.target_weights_sequence):
+            result = self.target_weights_sequence[self.call_count]
+        else:
+            # Default: return empty if we've exhausted the sequence
+            result = {}
+        self.call_count += 1
+        return result
+
+
+class TestRebalancerThresholdMode:
+    """Test threshold-mode rebalancing trigger logic."""
+
+    def test_rebalancer_no_trades_within_band(self, synthetic_returns_200_obs_3_assets):
+        """
+        Within-band drift: no trades, current_weights unchanged.
+
+        Acceptance: if max drift < band, step returns empty dict.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        allocator = StubAllocator()
+        rebalancer = Rebalancer(allocator, mode="threshold", band=0.05)
+
+        # Start with some weights
+        rebalancer.current_weights = {"BTC": 0.40, "ETH": 0.30, "SOL": 0.30}
+
+        # Target is slightly different but within band
+        allocator.target_weights_sequence = [
+            {"BTC": 0.42, "ETH": 0.28, "SOL": 0.30}  # Max drift = 0.02 < 0.05
+        ]
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=50000,
+                stop=49000,
+                target=51000,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=100.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=3000,
+                stop=2900,
+                target=3100,
+                strategy_name="test",
+                confidence=0.75,
+                expected_value=50.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=150,
+                stop=145,
+                target=155,
+                strategy_name="test",
+                confidence=0.7,
+                expected_value=5.0,
+            ),
+        }
+
+        deltas = rebalancer.step(signals, returns, {}, {})
+
+        # Should return empty dict
+        assert deltas == {}
+        # Current weights should not change
+        assert rebalancer.current_weights == {"BTC": 0.40, "ETH": 0.30, "SOL": 0.30}
+        # Cumulative stats unchanged
+        assert rebalancer.cumulative_turnover == 0.0
+        assert rebalancer.cumulative_cost == 0.0
+
+    def test_rebalancer_trades_exceed_band(self, synthetic_returns_200_obs_3_assets):
+        """
+        Exceed band: trades triggered, deltas correct, cost charged.
+
+        Acceptance: if max drift > band, step returns deltas = target - current.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        allocator = StubAllocator()
+        rebalancer = Rebalancer(allocator, mode="threshold", band=0.05, cost_pct=0.001)
+
+        # Start with some weights
+        rebalancer.current_weights = {"BTC": 0.40, "ETH": 0.30, "SOL": 0.30}
+
+        # Target differs by more than band
+        allocator.target_weights_sequence = [
+            {"BTC": 0.50, "ETH": 0.25, "SOL": 0.25}  # BTC drift = 0.10 > 0.05
+        ]
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=50000,
+                stop=49000,
+                target=51000,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=100.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=3000,
+                stop=2900,
+                target=3100,
+                strategy_name="test",
+                confidence=0.75,
+                expected_value=50.0,
+            ),
+            "SOL": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=150,
+                stop=145,
+                target=155,
+                strategy_name="test",
+                confidence=0.7,
+                expected_value=5.0,
+            ),
+        }
+
+        deltas = rebalancer.step(signals, returns, {}, {})
+
+        # Should return deltas
+        expected_deltas = {
+            "BTC": 0.50 - 0.40,  # +0.10
+            "ETH": 0.25 - 0.30,  # -0.05
+            "SOL": 0.25 - 0.30,  # -0.05
+        }
+        assert deltas == pytest.approx(expected_deltas, abs=1e-10)
+
+        # Turnover = sum(|deltas|) = 0.10 + 0.05 + 0.05 = 0.20
+        expected_turnover = 0.20
+        assert rebalancer.cumulative_turnover == pytest.approx(expected_turnover)
+
+        # Cost = 0.001 * 0.20 = 0.0002
+        expected_cost = 0.001 * 0.20
+        assert rebalancer.cumulative_cost == pytest.approx(expected_cost)
+
+        # Current weights updated to target
+        assert rebalancer.current_weights == pytest.approx(
+            {"BTC": 0.50, "ETH": 0.25, "SOL": 0.25}
+        )
+
+    def test_rebalancer_empty_to_nonempty_transition(self, synthetic_returns_200_obs_3_assets):
+        """
+        Empty portfolio to nonempty: trigger rebalance.
+
+        Acceptance: if current is empty and target is nonempty, rebalance.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        allocator = StubAllocator()
+        rebalancer = Rebalancer(allocator, mode="threshold", band=0.05)
+
+        # Current is empty
+        assert rebalancer.current_weights == {}
+
+        # Target is nonempty
+        allocator.target_weights_sequence = [
+            {"BTC": 0.50, "ETH": 0.50}
+        ]
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=50000,
+                stop=49000,
+                target=51000,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=100.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=3000,
+                stop=2900,
+                target=3100,
+                strategy_name="test",
+                confidence=0.75,
+                expected_value=50.0,
+            ),
+        }
+
+        deltas = rebalancer.step(signals, returns, {}, {})
+
+        # Should rebalance
+        assert deltas == pytest.approx({"BTC": 0.50, "ETH": 0.50})
+        assert rebalancer.current_weights == pytest.approx({"BTC": 0.50, "ETH": 0.50})
+
+    def test_rebalancer_exit_symbol(self, synthetic_returns_200_obs_3_assets):
+        """
+        Exit a symbol: deltas include -current for symbols not in target.
+
+        Acceptance: if symbol only in current, delta = -current (full exit).
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        allocator = StubAllocator()
+        rebalancer = Rebalancer(allocator, mode="threshold", band=0.05)
+
+        # Current portfolio has 3 assets
+        rebalancer.current_weights = {"BTC": 0.40, "ETH": 0.35, "SOL": 0.25}
+
+        # Target only has 2 assets (SOL exiting)
+        allocator.target_weights_sequence = [
+            {"BTC": 0.50, "ETH": 0.50}  # Max drift > 0.05
+        ]
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=50000,
+                stop=49000,
+                target=51000,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=100.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=3000,
+                stop=2900,
+                target=3100,
+                strategy_name="test",
+                confidence=0.75,
+                expected_value=50.0,
+            ),
+        }
+
+        deltas = rebalancer.step(signals, returns, {}, {})
+
+        # Should rebalance with exit
+        expected_deltas = {
+            "BTC": 0.50 - 0.40,    # +0.10
+            "ETH": 0.50 - 0.35,    # +0.15
+            "SOL": 0.0 - 0.25,     # -0.25 (full exit)
+        }
+        assert deltas == pytest.approx(expected_deltas)
+
+        # Turnover = |0.10| + |0.15| + |-0.25| = 0.50
+        assert rebalancer.cumulative_turnover == pytest.approx(0.50)
+
+
+class TestRebalancerPeriodicMode:
+    """Test periodic-mode rebalancing trigger logic."""
+
+    def test_rebalancer_periodic_fires_every_min_interval(self, synthetic_returns_200_obs_3_assets):
+        """
+        Periodic mode: fires exactly every min_interval_days calls.
+
+        Acceptance: rebalance fires on call #min_interval_days, then resets counter.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        allocator = StubAllocator()
+        rebalancer = Rebalancer(allocator, mode="periodic", min_interval_days=3)
+
+        # Set up sequence of targets
+        allocator.target_weights_sequence = [
+            {"BTC": 0.50, "ETH": 0.50},  # Call 1: no rebalance (counter=1)
+            {"BTC": 0.50, "ETH": 0.50},  # Call 2: no rebalance (counter=2)
+            {"BTC": 0.50, "ETH": 0.50},  # Call 3: rebalance! (counter=3)
+            {"BTC": 0.50, "ETH": 0.50},  # Call 4: no rebalance (counter=1, after reset)
+            {"BTC": 0.50, "ETH": 0.50},  # Call 5: no rebalance (counter=2)
+            {"BTC": 0.50, "ETH": 0.50},  # Call 6: rebalance! (counter=3)
+        ]
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=50000,
+                stop=49000,
+                target=51000,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=100.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=3000,
+                stop=2900,
+                target=3100,
+                strategy_name="test",
+                confidence=0.75,
+                expected_value=50.0,
+            ),
+        }
+
+        # Calls 1-2: should not rebalance
+        deltas1 = rebalancer.step(signals, returns, {}, {})
+        assert deltas1 == {}
+
+        deltas2 = rebalancer.step(signals, returns, {}, {})
+        assert deltas2 == {}
+
+        # Call 3: should rebalance
+        deltas3 = rebalancer.step(signals, returns, {}, {})
+        assert deltas3 == pytest.approx({"BTC": 0.50, "ETH": 0.50})
+        assert rebalancer.current_weights == pytest.approx({"BTC": 0.50, "ETH": 0.50})
+
+        # Calls 4-5: should not rebalance
+        deltas4 = rebalancer.step(signals, returns, {}, {})
+        assert deltas4 == {}
+
+        deltas5 = rebalancer.step(signals, returns, {}, {})
+        assert deltas5 == {}
+
+        # Call 6: should rebalance again
+        deltas6 = rebalancer.step(signals, returns, {}, {})
+        # Since current already equals target, deltas should be all zeros
+        assert deltas6 == pytest.approx({"BTC": 0.0, "ETH": 0.0})
+
+
+class TestRebalancerTurnover:
+    """Test turnover calculations and comparisons."""
+
+    def test_rebalancer_cumulative_cost_calculation(self, synthetic_returns_200_obs_3_assets):
+        """cumulative_cost = cost_pct * cumulative_turnover."""
+        returns = synthetic_returns_200_obs_3_assets
+        allocator = StubAllocator()
+        cost_pct = 0.001
+        rebalancer = Rebalancer(allocator, mode="threshold", band=0.05, cost_pct=cost_pct)
+
+        # Setup: 3 rebalances
+        allocator.target_weights_sequence = [
+            {"BTC": 0.50, "ETH": 0.50},      # Rebalance 1 (empty -> nonempty)
+            {"BTC": 0.40, "ETH": 0.60},      # Rebalance 2 (drift = 0.10 > 0.05)
+            {"BTC": 0.30, "ETH": 0.70},      # Rebalance 3 (drift = 0.10 > 0.05)
+        ]
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=50000,
+                stop=49000,
+                target=51000,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=100.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=3000,
+                stop=2900,
+                target=3100,
+                strategy_name="test",
+                confidence=0.75,
+                expected_value=50.0,
+            ),
+        }
+
+        # Rebalance 1: empty -> [0.5, 0.5], turnover = 1.0
+        rebalancer.step(signals, returns, {}, {})
+        assert rebalancer.cumulative_turnover == pytest.approx(1.0)
+        assert rebalancer.cumulative_cost == pytest.approx(cost_pct * 1.0)
+
+        # Rebalance 2: [0.5, 0.5] -> [0.4, 0.6], turnover = 0.2
+        rebalancer.step(signals, returns, {}, {})
+        assert rebalancer.cumulative_turnover == pytest.approx(1.0 + 0.2)
+        assert rebalancer.cumulative_cost == pytest.approx(cost_pct * (1.0 + 0.2))
+
+        # Rebalance 3: [0.4, 0.6] -> [0.3, 0.7], turnover = 0.2
+        rebalancer.step(signals, returns, {}, {})
+        assert rebalancer.cumulative_turnover == pytest.approx(1.0 + 0.2 + 0.2)
+        assert rebalancer.cumulative_cost == pytest.approx(cost_pct * (1.0 + 0.2 + 0.2))
+
+    def test_rebalancer_turnover_threshold_vs_daily(self, synthetic_returns_200_obs_3_assets):
+        """
+        Threshold mode should have lower turnover than daily full rebalance.
+
+        Acceptance: simulate drifting weights over 20 days.
+        Threshold mode rebalances less frequently -> lower cumulative turnover.
+        """
+        returns = synthetic_returns_200_obs_3_assets
+        cost_pct = 0.001
+
+        # Simulate drifting weights: start at [0.5, 0.5], drift +0.01 per day
+        # After N days: [0.5+0.01*N, 0.5-0.01*N]
+        drifting_targets = [
+            {"BTC": 0.5 + 0.01 * i, "ETH": 0.5 - 0.01 * i}
+            for i in range(20)
+        ]
+
+        signals = {
+            "BTC": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=50000,
+                stop=49000,
+                target=51000,
+                strategy_name="test",
+                confidence=0.8,
+                expected_value=100.0,
+            ),
+            "ETH": Signal(
+                direction=Direction.LONG,
+                size=0.1,
+                entry=3000,
+                stop=2900,
+                target=3100,
+                strategy_name="test",
+                confidence=0.75,
+                expected_value=50.0,
+            ),
+        }
+
+        # Threshold mode: band=0.05, so rebalance when drift > 0.05
+        allocator_threshold = StubAllocator()
+        allocator_threshold.target_weights_sequence = list(drifting_targets)
+        rebalancer_threshold = Rebalancer(
+            allocator_threshold, mode="threshold", band=0.05, cost_pct=cost_pct
+        )
+
+        # Daily full rebalance mode: rebalance every day (min_interval_days=1)
+        allocator_daily = StubAllocator()
+        allocator_daily.target_weights_sequence = list(drifting_targets)
+        rebalancer_daily = Rebalancer(
+            allocator_daily, mode="periodic", min_interval_days=1, cost_pct=cost_pct
+        )
+
+        # Run both through the same weight stream
+        for _ in range(20):
+            rebalancer_threshold.step(signals, returns, {}, {})
+            rebalancer_daily.step(signals, returns, {}, {})
+
+        # Threshold mode should have less turnover
+        assert rebalancer_threshold.cumulative_turnover < rebalancer_daily.cumulative_turnover
+        # Cost should track turnover
+        assert rebalancer_threshold.cumulative_cost == pytest.approx(
+            cost_pct * rebalancer_threshold.cumulative_turnover
+        )
+        assert rebalancer_daily.cumulative_cost == pytest.approx(
+            cost_pct * rebalancer_daily.cumulative_turnover
+        )

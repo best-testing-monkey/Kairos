@@ -3090,3 +3090,199 @@ def _compute_cvar(returns: np.ndarray, alpha: float = 0.95) -> float:
     # Use floor to avoid floating-point rounding artifacts (e.g., 5.0000...01 -> 6)
     k = max(1, int(np.floor((1.0 - alpha) * len(returns) + 1e-10)))
     return float(np.mean(sorted_returns[:k]))
+
+
+# =============================================================================
+# REBALANCER
+# =============================================================================
+
+class Rebalancer:
+    """
+    Stateful rebalancing engine that converts allocator target weights into trade deltas.
+
+    The Rebalancer decides when to rebalance based on either:
+    - Threshold mode: max drift |target_i - current_i| exceeds band, or current is empty
+    - Periodic mode: number of calls since last rebalance >= min_interval_days
+
+    On rebalancing trigger, it computes deltas = target - current (per symbol),
+    including symbols leaving the book (delta = -current). It tracks cumulative
+    turnover and cost, accounting for transaction costs.
+
+    State is held on the instance (following StrategyPerformanceTracker pattern)
+    and can be reset for walk-forward folds via reset().
+
+    Attributes:
+        allocator: PortfolioAllocator instance to generate target weights.
+        mode: "threshold" or "periodic" rebalancing trigger.
+        band: Maximum allowed drift before rebalancing (threshold mode only).
+        min_interval_days: Minimum days between rebalances (periodic mode only).
+        cost_pct: Per-unit transaction cost as a fraction (default 0.001 = 0.1%).
+        current_weights: Dict[symbol -> float], current portfolio weights (starts empty).
+        cumulative_turnover: Sum of absolute deltas across all rebalances.
+        cumulative_cost: Transaction cost accumulated (cost_pct * cumulative_turnover).
+    """
+
+    def __init__(
+        self,
+        allocator: PortfolioAllocator,
+        mode: str = "threshold",
+        band: float = 0.05,
+        min_interval_days: int = 5,
+        cost_pct: float = 0.001,
+    ):
+        """
+        Initialize Rebalancer.
+
+        Args:
+            allocator: PortfolioAllocator instance to generate target weights.
+            mode: "threshold" (default) or "periodic" rebalancing trigger.
+            band: Maximum drift before rebalancing in threshold mode. Default: 0.05.
+            min_interval_days: Minimum calls between rebalances in periodic mode. Default: 5.
+            cost_pct: Per-unit transaction cost fraction. Default: 0.001 (0.1%).
+
+        Raises:
+            ValueError: If mode not in ("threshold", "periodic").
+
+        Examples:
+            >>> allocator = MVOAllocator()
+            >>> rebalancer = Rebalancer(allocator, mode="threshold", band=0.05)
+            >>> deltas = rebalancer.step(signals, returns, dists, context)
+            >>> if deltas:
+            >>>     # Execute trades
+            >>>     pass
+        """
+        if mode not in ("threshold", "periodic"):
+            raise ValueError(f"mode must be 'threshold' or 'periodic', got '{mode}'")
+
+        self.allocator = allocator
+        self.mode = mode
+        self.band = float(band)
+        self.min_interval_days = int(min_interval_days)
+        self.cost_pct = float(cost_pct)
+
+        # State
+        self.current_weights = {}  # Dict[symbol -> float]
+        self.cumulative_turnover = 0.0
+        self.cumulative_cost = 0.0
+        self._call_count = 0  # For periodic mode
+        self._calls_since_rebalance = 0  # For periodic mode
+
+    def reset(self) -> None:
+        """
+        Reset all state to initial conditions.
+
+        Called at the start of walk-forward folds to prevent state leakage.
+        Clears current_weights, cumulative_turnover, cumulative_cost, and call counters.
+
+        Examples:
+            >>> rebalancer.reset()
+            >>> assert rebalancer.current_weights == {}
+            >>> assert rebalancer.cumulative_turnover == 0.0
+        """
+        self.current_weights = {}
+        self.cumulative_turnover = 0.0
+        self.cumulative_cost = 0.0
+        self._call_count = 0
+        self._calls_since_rebalance = 0
+
+    def step(
+        self,
+        signals: Dict[str, "Signal"],
+        returns: pd.DataFrame,
+        dists: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Execute one rebalancing step, returning trade deltas if rebalancing triggers.
+
+        Logic:
+        1. Compute target weights via allocator.allocate()
+        2. Determine if rebalancing should trigger:
+           - Threshold mode: if max |target_i - current_i| > band, OR
+                            if current is empty and target is nonempty
+           - Periodic mode: if calls since last rebalance >= min_interval_days
+        3. If trigger: compute deltas = target - current (all symbols, including exits),
+                       update cumulative_turnover and cumulative_cost,
+                       set current_weights = target, reset interval counter
+        4. If no trigger: return empty dict, leave state unchanged
+
+        Args:
+            signals: Dict[symbol -> Signal] of active signals.
+            returns: pd.DataFrame of (n_obs, n_assets) daily log returns.
+            dists: Dict[symbol -> KairosDistribution] predicted distributions.
+            context: Dict[str, Any] execution context.
+
+        Returns:
+            Dict[symbol -> float] trade deltas (target - current) if rebalancing,
+            else empty dict {} (no trades).
+
+        Examples:
+            >>> deltas = rebalancer.step(signals, returns, dists, context)
+            >>> if deltas:
+            >>>     # Rebalancing triggered; execute trades
+            >>>     for symbol, delta in deltas.items():
+            >>>         print(f"Trade {symbol}: {delta:+.3f}")
+            >>> else:
+            >>>     # No rebalancing; stay put
+            >>>     pass
+        """
+        # Increment call counter
+        self._call_count += 1
+        self._calls_since_rebalance += 1
+
+        # Get target weights from allocator
+        target = self.allocator.allocate(signals, returns, dists, context)
+
+        # Determine if rebalancing should trigger
+        should_rebalance = False
+
+        if self.mode == "threshold":
+            # Threshold mode: trigger if drift > band, OR if empty->nonempty transition
+            if not self.current_weights and target:
+                # Empty to nonempty: rebalance
+                should_rebalance = True
+            else:
+                # Compute max drift over union of symbols
+                all_symbols = set(self.current_weights.keys()) | set(target.keys())
+                max_drift = 0.0
+                for sym in all_symbols:
+                    current_w = self.current_weights.get(sym, 0.0)
+                    target_w = target.get(sym, 0.0)
+                    drift = abs(target_w - current_w)
+                    max_drift = max(max_drift, drift)
+
+                if max_drift > self.band:
+                    should_rebalance = True
+
+        elif self.mode == "periodic":
+            # Periodic mode: trigger if calls since last rebalance >= min_interval_days
+            if self._calls_since_rebalance >= self.min_interval_days:
+                should_rebalance = True
+
+        # If no trigger, return empty dict
+        if not should_rebalance:
+            return {}
+
+        # Rebalancing triggered: compute deltas
+        all_symbols = set(self.current_weights.keys()) | set(target.keys())
+
+        deltas = {}
+        turnover = 0.0
+
+        for sym in all_symbols:
+            current_w = self.current_weights.get(sym, 0.0)
+            target_w = target.get(sym, 0.0)
+            delta = target_w - current_w
+            deltas[sym] = float(delta)
+            turnover += abs(delta)
+
+        # Update cumulative stats
+        self.cumulative_turnover += turnover
+        cost = self.cost_pct * turnover
+        self.cumulative_cost += cost
+
+        # Update state
+        self.current_weights = dict(target)  # Make a copy of target
+        self._calls_since_rebalance = 0  # Reset interval counter
+
+        return deltas
