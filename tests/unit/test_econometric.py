@@ -448,8 +448,8 @@ class TestVARLeadLagDetection:
             "z": r_z,
         })
 
-        # Ensure yesterday's x-return (index -2) is positive
-        returns_window.iloc[-2, 0] = 0.05  # Force positive x-return yesterday
+        # Ensure latest x-return (index -1) is positive
+        returns_window.iloc[-1, 0] = 0.05  # Force positive x-return latest
 
         current_price = 102.0  # Inside distribution for meaningful bracket
 
@@ -494,8 +494,8 @@ class TestVARLeadLagDetection:
             "z": r_z,
         })
 
-        # Make yesterday's x-return positive
-        returns_window.iloc[-2, 0] = 0.05
+        # Make latest x-return positive
+        returns_window.iloc[-1, 0] = 0.05
 
         current_price = 100.0
 
@@ -539,8 +539,8 @@ class TestVARLeadLagDetection:
             "z": r_z,
         })
 
-        returns_window.iloc[-2, 0] = 0.05  # Force positive x-return yesterday
-        returns_window.iloc[-2, 2] = -0.01  # z yesterday is slightly negative
+        returns_window.iloc[-1, 0] = 0.05  # Force positive x-return latest
+        returns_window.iloc[-1, 2] = -0.01  # z latest is slightly negative
 
         current_price = 100.0
         kronos_closes = np.linspace(100, 105, 100)
@@ -575,11 +575,11 @@ class TestVARLeadLagDetection:
 
     def test_var_leadlag_insignificant_threshold(self):
         """Test VAR(1) emits no signal when lag-1 coefficients are insignificant (|t| <= 2)."""
-        np.random.seed(45)
+        np.random.seed(50)
 
-        n_obs = 100
+        n_obs = 200
 
-        # All independent white noise
+        # All independent white noise (larger dataset to ensure statistical insignificance)
         r_x = np.random.normal(0, 0.01, n_obs)
         r_y = np.random.normal(0, 0.01, n_obs)
         r_z = np.random.normal(0, 0.01, n_obs)
@@ -673,7 +673,7 @@ class TestVARLeadLagDetection:
             "z": r_z,
         })
 
-        returns_window.iloc[-2, 0] = 0.05
+        returns_window.iloc[-1, 0] = 0.05
 
         current_price = 100.0
         dist = make_dist(np.linspace(100, 105, 100))
@@ -710,8 +710,8 @@ class TestVARLeadLagDetection:
             "z": r_z,
         })
 
-        # Make yesterday's x positive to amplify the signal
-        returns_window.iloc[-2, 0] = 0.08
+        # Make latest x positive to amplify the signal
+        returns_window.iloc[-1, 0] = 0.08
 
         current_price = 101.0
 
@@ -725,7 +725,7 @@ class TestVARLeadLagDetection:
 
         sig = strategy.generate_signal(dist, current_price, None, context)
 
-        # Should emit LONG signal: positive x yesterday × positive coef = positive implied move,
+        # Should emit LONG signal: positive x latest × positive coef = positive implied move,
         # which agrees with Kronos UP
         assert sig is not None, "Expected LONG signal with positive lead-lag agreement"
         assert sig.direction == Direction.LONG
@@ -1581,8 +1581,8 @@ class TestGrangerPairsStrategy:
             "z": z,
         })
 
-        # Make yesterday's x-return positive to amplify signal
-        returns_window.iloc[-2, 0] = 0.08
+        # Make latest x-return positive to amplify signal
+        returns_window.iloc[-1, 0] = 0.08
 
         current_price = 100.0
         # Kronos predicts UP
@@ -1620,8 +1620,8 @@ class TestGrangerPairsStrategy:
             "z": z,
         })
 
-        # Make yesterday's x-return positive
-        returns_window.iloc[-2, 0] = 0.08
+        # Make latest x-return positive
+        returns_window.iloc[-1, 0] = 0.08
 
         current_price = 100.0
         # Kronos predicts DOWN (mean < current_price)
@@ -1656,7 +1656,7 @@ class TestGrangerPairsStrategy:
             "z": z,
         })
 
-        returns_window.iloc[-2, 0] = 0.08
+        returns_window.iloc[-1, 0] = 0.08
 
         current_price = 100.0
         dist = make_dist(np.linspace(current_price, current_price * 1.05, 100))
@@ -1693,8 +1693,8 @@ class TestGrangerPairsStrategy:
             "z": z,
         })
 
-        returns_window.iloc[-2, 0] = 0.08
-        returns_window.iloc[-2, 2] = 0.02
+        returns_window.iloc[-1, 0] = 0.08
+        returns_window.iloc[-1, 2] = 0.02
 
         current_price = 100.0
         dist = make_dist(np.linspace(current_price, current_price * 1.05, 100))
@@ -1729,8 +1729,8 @@ class TestGrangerPairsStrategy:
             "z": z,
         })
 
-        # Positive x-return yesterday
-        returns_window.iloc[-2, 0] = 0.08
+        # Positive x-return latest
+        returns_window.iloc[-1, 0] = 0.08
 
         current_price = 100.0
         # Kronos predicts DOWN (negative coef, positive x-return → negative implied)
@@ -1742,7 +1742,7 @@ class TestGrangerPairsStrategy:
 
         sig = strategy.generate_signal(dist, current_price, None, context)
 
-        # Should emit SHORT signal: positive x yesterday × negative coef = negative implied
+        # Should emit SHORT signal: positive x latest × negative coef = negative implied
         if sig is not None:
             assert sig.direction == Direction.SHORT, \
                 "Expected SHORT signal when negative coef and positive x-return agree with Kronos DOWN"

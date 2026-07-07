@@ -440,10 +440,10 @@ class VARLeadLagStrategy(Strategy):
             t_stat = tstats[1 + j]  # t-stat for the j-th lagged return coefficient
 
             if abs(t_stat) > self.t_stat_threshold:
-                # Compute implied move: yesterday's j-return × coefficient
-                yesterday_return_j = returns_window.iloc[-2, j]
+                # Compute implied move: latest j-return × coefficient
+                latest_return_j = returns_window.iloc[-1, j]
                 coef_j = coef[1 + j]
-                implied_move = coef_j * yesterday_return_j
+                implied_move = coef_j * latest_return_j
                 implied_direction = np.sign(implied_move)
 
                 # Check if implied direction agrees with Kronos
@@ -602,9 +602,9 @@ class GrangerPairsStrategy(Strategy):
         if kronos_direction == 0:
             return None
 
-        # Compute implied direction: yesterday's leader return × coef_sign
-        yesterday_leader_return = returns_window[best_leader].iloc[-2]
-        implied_move = yesterday_leader_return * best_coef_sign
+        # Compute implied direction: latest leader return × coef_sign
+        latest_leader_return = returns_window[best_leader].iloc[-1]
+        implied_move = latest_leader_return * best_coef_sign
         implied_direction = np.sign(implied_move)
 
         # Check agreement between implied direction and Kronos direction
