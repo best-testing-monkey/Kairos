@@ -210,6 +210,21 @@ environment" without a GPU.
 uv run ./strategy/kairos_pipeline.py --stage base --assets BTC-USD ETH-USD SOL-USD
 ```
 
+### Unattended / overnight runs and GPU recovery
+
+Stages 4/5 (and `--stage auto`) require CUDA by default: `_ensure_model_loaded()`
+calls `kairos_gpu.ensure_cuda()`, which invokes `scripts/gpu_recover.py`'s
+escalation ladder (free GPU processes -> UVM reload -> full module reload ->
+reboot+resume) if torch can't see CUDA. For long overnight discovery runs where
+no one is present to approve a reboot, set `KAIROS_GPU_ALLOW_REBOOT=1` so the
+ladder is allowed to reach L4 and reboot+resume the pipeline automatically; the
+resume unit re-runs the requesting command after the next login (or immediately
+if `loginctl enable-linger` is set for the user). Set `KAIROS_ALLOW_CPU=1` to
+opt back into the old silent CPU fallback instead of invoking recovery. A
+subprocess that exits `75` (EX_TEMPFAIL - GPU was just healed but this
+process's cached torch state is stale) is retried exactly once by
+`run_backtest_subprocess`.
+
 ### Stage 5: `finetuned` (finetuned checkpoint, GPU required)
 
 ```

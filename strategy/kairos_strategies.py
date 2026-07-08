@@ -166,7 +166,10 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
     bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
     bt_model = Kronos.from_pretrained(mdl_src)
 
-    if torch.cuda.is_available():
+    from kairos_gpu import ensure_cuda
+    has_cuda = ensure_cuda()
+
+    if has_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         print("  → GPU mode: autocast FP16, TF32 matmuls enabled")

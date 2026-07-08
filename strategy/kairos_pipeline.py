@@ -642,6 +642,14 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
     print(f"  [subprocess] {' '.join(cmd)}")
     proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
     print(proc.stdout)
+    if proc.returncode == 75:
+        # EX_TEMPFAIL: kairos_gpu.ensure_cuda() healed the GPU but this
+        # subprocess's cached torch state was stale. Retry exactly once -
+        # a fresh subprocess will see the healed GPU.
+        print(proc.stderr)
+        print("  [subprocess] exit 75 (GPU recovered, retrying once in a fresh process)")
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+        print(proc.stdout)
     if proc.returncode != 0:
         print(proc.stderr)
         raise RuntimeError(f"kairos_strategies.py subprocess failed with code {proc.returncode}")
