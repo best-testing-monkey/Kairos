@@ -465,15 +465,30 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataF
     return result_list
 
 
-def _period_to_bars(period: str, interval: str) -> int:
-    """Convert a human period string (e.g. '6m', '1y') to a bar count."""
+def _parse_period(period: str) -> tuple:
+    """Parse a human period string into (count, unit).
+
+    Args:
+        period: Period string, e.g., '6m', '1y', '3m', '2w', '10d'
+
+    Returns:
+        Tuple of (count: int, unit: str)
+
+    Raises:
+        ValueError: If period format is invalid
+    """
     import re as _re
     m = _re.fullmatch(r"(\d+)(d|w|m|y)", period.strip().lower())
     if not m:
         raise ValueError(
             f"Unrecognised backtest_period {period!r}. Use e.g. '6m', '1y', '3m', '2w', '10d'."
         )
-    n, unit = int(m.group(1)), m.group(2)
+    return int(m.group(1)), m.group(2)
+
+
+def _period_to_bars(period: str, interval: str) -> int:
+    """Convert a human period string (e.g. '6m', '1y') to a bar count."""
+    n, unit = _parse_period(period)
     cal_days = {"d": n, "w": n * 7, "m": n * 30, "y": n * 365}[unit]
     bars_per_day = {
         "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
@@ -489,13 +504,7 @@ def _period_to_weeks(period: str) -> float:
     Uses 365.25 days per year and 7 days per week.
     Matches the period parsing from _period_to_bars.
     """
-    import re as _re
-    m = _re.fullmatch(r"(\d+)(d|w|m|y)", period.strip().lower())
-    if not m:
-        raise ValueError(
-            f"Unrecognised backtest_period {period!r}. Use e.g. '6m', '1y', '3m', '2w', '10d'."
-        )
-    n, unit = int(m.group(1)), m.group(2)
+    n, unit = _parse_period(period)
     # Convert to calendar days: use 365.25 days/year, 30.4375 days/month (365.25/12)
     cal_days = {
         "d": n,

@@ -968,6 +968,26 @@ def persist_viability_report(conn, df, run_id):
 
 # ── Auto stage: chained universe → correlation → per-group oracle → base ─────
 
+def _print_report_summary(df, intervals):
+    """Print viability report summary (shared by run_stage_auto and --report_only).
+
+    Args:
+        df: Viability report DataFrame
+        intervals: List of interval strings (e.g., ["1d", "1h"])
+    """
+    viable_count = len(df[df["viable"]])
+    total_count = len(df)
+    interval_breakdown = {}
+    for interval in intervals:
+        interval_df = df[df["interval"] == interval]
+        interval_viable = len(interval_df[interval_df["viable"]])
+        interval_breakdown[interval] = f"{interval_viable}/{len(interval_df)}"
+
+    breakdown_str = ", ".join([f"{i}: {interval_breakdown[i]}" for i in intervals])
+    print(f"Viability report: {total_count} strategies, {viable_count} viable "
+          f"(interval breakdown: {breakdown_str})")
+
+
 def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
                    pred_samples=100, min_sharpe=0.0, min_signals=3, force=False,
                    skip_universe=False):
@@ -998,7 +1018,7 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
         # Step 1: Universe (skip if skip_universe and prior run exists)
         universe_run_id = None
         if skip_universe:
-            # Check if universe/correlation runs exist for this interval
+            # Check if universe run exists for this interval
             existing = conn.execute(
                 "SELECT MAX(run_id) FROM runs WHERE stage='universe' AND interval=?",
                 (interval,),
@@ -1012,7 +1032,19 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
             universe_run_id = run_stage_universe(conn, interval=interval)
 
         # Step 2: Correlation
-        correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter, interval=interval)
+        if skip_universe:
+            # Check if correlation run exists for this interval
+            existing = conn.execute(
+                "SELECT MAX(run_id) FROM runs WHERE stage='correlation' AND interval=?",
+                (interval,),
+            ).fetchone()
+            if existing and existing[0]:
+                print(f"[skip] correlation {interval} (existing run {existing[0]})")
+                correlation_run_id = existing[0]
+            else:
+                correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter, interval=interval)
+        else:
+            correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter, interval=interval)
 
         # Step 3: Fetch suggested_groups for the latest correlation run
         groups = conn.execute(
@@ -1084,20 +1116,10 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
                                 min_signals=min_signals, asset_class_filter=asset_class_filter)
 
     # Persist report to table and CSV
-    persist_viability_report(conn, df, auto_run_id)
+    csv_path = persist_viability_report(conn, df, auto_run_id)
 
     # Summary
-    viable_count = len(df[df["viable"]])
-    total_count = len(df)
-    interval_breakdown = {}
-    for interval in intervals:
-        interval_df = df[df["interval"] == interval]
-        interval_viable = len(interval_df[interval_df["viable"]])
-        interval_breakdown[interval] = f"{interval_viable}/{len(interval_df)}"
-
-    breakdown_str = ", ".join([f"{i}: {interval_breakdown[i]}" for i in intervals])
-    print(f"Viability report: {total_count} strategies, {viable_count} viable "
-          f"(interval breakdown: {breakdown_str})")
+    _print_report_summary(df, intervals)
 
     return df
 
@@ -1178,21 +1200,13 @@ def main(argv=None):
 
         if args.report_only:
             # Skip execution, rebuild report from DB
+            report_run_id = start_run(conn, "auto", ", ".join(intervals),
+                                    {"report_only": True, "asset_class_filter": args.asset_class})
             df = build_viability_report(conn, intervals, args.backtest_period,
                                        min_sharpe=args.min_sharpe, min_signals=args.min_signals,
                                        asset_class_filter=args.asset_class)
-            csv_path = dump_csv("viability_report",
-                              [row.to_dict() for _, row in df.iterrows()], "auto")
-            viable_count = len(df[df["viable"]])
-            total_count = len(df)
-            interval_breakdown = {}
-            for interval in intervals:
-                interval_df = df[df["interval"] == interval]
-                interval_viable = len(interval_df[interval_df["viable"]])
-                interval_breakdown[interval] = f"{interval_viable}/{len(interval_df)}"
-            breakdown_str = ", ".join([f"{i}: {interval_breakdown[i]}" for i in intervals])
-            print(f"Viability report: {total_count} strategies, {viable_count} viable "
-                  f"(interval breakdown: {breakdown_str})")
+            csv_path = persist_viability_report(conn, df, report_run_id)
+            _print_report_summary(df, intervals)
             print(f"CSV: {csv_path}")
         else:
             # Full auto pipeline execution
@@ -1204,7 +1218,7 @@ def main(argv=None):
     elif args.stage == "universe":
         run_stage_universe(conn, interval=args.interval)
     elif args.stage == "correlation":
-        run_stage_correlation(conn, asset_class_filter=args.asset_class)
+        run_stage_correlation(conn, asset_class_filter=args.asset_class, interval=args.interval)
     elif args.stage == "oracle":
         assets = args.assets
         if args.group_id is not None:

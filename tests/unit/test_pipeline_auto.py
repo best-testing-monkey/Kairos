@@ -7,7 +7,7 @@ import os
 import pandas as pd
 import json
 from unittest.mock import patch, MagicMock, call
-from kairos_strategies import _period_to_weeks
+from kairos_strategies import _period_to_weeks, _period_to_bars, _parse_period
 from kairos_pipeline import (
     build_viability_report, get_connection, SCHEMA, insert_oracle_row, insert_model_row,
     run_stage_auto, start_run
@@ -67,6 +67,60 @@ class TestPeriodToWeeks:
         """Test that leading/trailing whitespace is handled."""
         assert _period_to_weeks(" 6m ") == _period_to_weeks("6m")
         assert _period_to_weeks("\t1y\t") == _period_to_weeks("1y")
+
+
+class TestParsePeriod:
+    """Test the shared _parse_period helper."""
+
+    def test_parse_period_returns_tuple(self):
+        """_parse_period returns (count, unit) tuple."""
+        count, unit = _parse_period("6m")
+        assert count == 6
+        assert unit == "m"
+
+        count, unit = _parse_period("1y")
+        assert count == 1
+        assert unit == "y"
+
+    def test_parse_period_case_insensitive(self):
+        """_parse_period handles uppercase period strings."""
+        count, unit = _parse_period("6M")
+        assert count == 6
+        assert unit == "m"
+
+        count, unit = _parse_period("1Y")
+        assert count == 1
+        assert unit == "y"
+
+    def test_parse_period_whitespace_tolerant(self):
+        """_parse_period handles leading/trailing whitespace."""
+        count, unit = _parse_period(" 6m ")
+        assert count == 6
+        assert unit == "m"
+
+    def test_parse_period_invalid(self):
+        """_parse_period raises ValueError for invalid input."""
+        with pytest.raises(ValueError) as exc_info:
+            _parse_period("invalid")
+        assert "Unrecognised backtest_period" in str(exc_info.value)
+
+    def test_parse_period_used_by_period_to_bars(self):
+        """_period_to_bars uses _parse_period for consistent parsing."""
+        # Both should parse correctly and not raise
+        count, unit = _parse_period("6m")
+        bars = _period_to_bars("6m", "1d")
+        # Just verify they both work without exception
+        assert count == 6
+        assert bars > 0
+
+    def test_parse_period_used_by_period_to_weeks(self):
+        """_period_to_weeks uses _parse_period for consistent parsing."""
+        # Both should parse correctly and not raise
+        count, unit = _parse_period("6m")
+        weeks = _period_to_weeks("6m")
+        # Just verify they both work without exception
+        assert count == 6
+        assert weeks > 0
 
 
 @pytest.fixture
@@ -969,6 +1023,52 @@ class TestRunStageAuto:
         # But correlation should still be called
         assert ("correlation",) in call_log
 
+    def test_auto_skip_universe_reuses_correlation(self, temp_db):
+        """skip_universe=True with existing correlation run → correlation NOT called."""
+        call_log = []
+
+        # Pre-insert universe and correlation runs
+        universe_run_id = start_run(temp_db, "universe", "1d", {})
+        correlation_run_id = start_run(temp_db, "correlation", "1d", {})
+
+        # Insert suggested_groups for the existing correlation run
+        temp_db.execute(
+            "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+            "VALUES (?,?,?,?,?)",
+            (correlation_run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+        )
+        temp_db.commit()
+
+        def mock_universe(conn, interval="1d"):
+            call_log.append(("universe", interval))
+            return universe_run_id
+
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+            call_log.append(("correlation",))
+            run_id = start_run(conn, "correlation", interval, {})
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            call_log.append(("oracle",))
+            run_id = start_run(conn, "oracle", interval, {})
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None):
+            call_log.append(("base",))
+            run_id = start_run(conn, stage, interval, {})
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d"], "6m", skip_universe=True)
+
+        # Both universe and correlation should NOT be called when skip_universe=True and prior runs exist
+        assert ("universe", "1d") not in call_log
+        assert ("correlation",) not in call_log
+
 
 class TestCLIFlagExclusivity:
     """Test argparse flag exclusivity constraints."""
@@ -1171,6 +1271,51 @@ class TestCLIReportOnlyDispatch:
         assert call_args[1]["min_sharpe"] == 0.5
         assert call_args[1]["min_signals"] == 5
 
+    def test_report_only_writes_viability_report_table(self, temp_db):
+        """--report_only writes viability_report table rows."""
+        from kairos_pipeline import main, persist_viability_report
+
+        # Pre-insert oracle and base results
+        oracle_row = {
+            "strategy_name": "test_strat",
+            "sharpe": 1.5,
+            "signal_count": 10,
+            "win_rate": 0.6,
+            "avg_pnl_per_trade": 0.02,
+            "assets": "BTC-USD",
+            "interval": "1d",
+            "backtest_period": "6m",
+        }
+        insert_oracle_row(temp_db, 1, oracle_row)
+
+        base_row = {
+            "stage": "base",
+            "strategy_name": "test_strat",
+            "sharpe": 1.2,
+            "signal_count": 8,
+            "win_rate": 0.55,
+            "avg_pnl_per_trade": 0.015,
+            "assets": "BTC-USD",
+            "interval": "1d",
+            "backtest_period": "6m",
+            "model_path": None,
+        }
+        insert_model_row(temp_db, 2, base_row)
+
+        with patch("kairos_pipeline.get_connection", return_value=temp_db), \
+             patch("kairos_pipeline.persist_viability_report", wraps=persist_viability_report) as mock_persist, \
+             patch("kairos_pipeline.dump_csv", return_value="/tmp/test.csv"):
+            main(["--stage", "auto", "--report_only"])
+
+        # Verify persist_viability_report was called
+        mock_persist.assert_called_once()
+        # Get the DataFrame that was passed to persist_viability_report
+        call_args = mock_persist.call_args
+        df = call_args[0][1]  # Second positional argument is the DataFrame
+        # Verify the DataFrame has rows
+        assert len(df) > 0, "No viability_report rows in DataFrame"
+        assert "test_strat" in df["strategy_name"].values
+
 
 class TestCLIFlagsPassedVerbatim:
     """Test that flags are passed verbatim to run_stage_auto."""
@@ -1361,6 +1506,20 @@ class TestSingleStageRegression:
         # Verify run_stage_correlation was called
         mock_corr.assert_called_once()
         call_kwargs = mock_corr.call_args[1]
+        assert call_kwargs["asset_class_filter"] == "crypto"
+
+    def test_correlation_stage_passes_interval(self, temp_db):
+        """--stage correlation --interval passes interval parameter."""
+        from kairos_pipeline import main
+
+        with patch("kairos_pipeline.get_connection", return_value=temp_db), \
+             patch("kairos_pipeline.run_stage_correlation") as mock_corr:
+            main(["--stage", "correlation", "--interval", "1h", "--asset_class", "crypto"])
+
+        # Verify run_stage_correlation was called with interval
+        mock_corr.assert_called_once()
+        call_kwargs = mock_corr.call_args[1]
+        assert call_kwargs["interval"] == "1h"
         assert call_kwargs["asset_class_filter"] == "crypto"
 
 
