@@ -1101,26 +1101,93 @@ def _group_symbols_from_db(conn, group_id):
     return row[0].split(",")
 
 
-def main():
+def _build_parser():
+    """Build and return the argparse parser (extracted for testability)."""
     parser = argparse.ArgumentParser(description="Kairos staged asset-discovery pipeline")
     parser.add_argument("--stage", required=True,
-                         choices=["universe", "correlation", "oracle", "base", "finetuned"])
+                         choices=["universe", "correlation", "oracle", "base", "finetuned", "auto"])
     parser.add_argument("--interval", default="1d")
+    parser.add_argument("--intervals", nargs="+", default=None,
+                         help="Bar intervals for --stage auto (e.g. 1d 1h)")
     parser.add_argument("--backtest_period", default="6m")
     parser.add_argument("--pred_samples", type=int, default=100)
     parser.add_argument("--assets", nargs="+", default=None, metavar="SYM")
     parser.add_argument("--group_id", type=int, default=None)
     parser.add_argument("--asset_class", default=None, choices=["crypto", "equity", "fx_commodity"],
                          help="Restrict --stage correlation to one asset class")
+    parser.add_argument("--min_sharpe", type=float, default=0.0,
+                         help="Minimum Sharpe for viability (--stage auto only)")
+    parser.add_argument("--min_signals", type=int, default=3,
+                         help="Minimum signal count for viability (--stage auto only)")
+    parser.add_argument("--force", action="store_true",
+                         help="Re-run completed stages (--stage auto only)")
+    parser.add_argument("--skip_universe", action="store_true",
+                         help="Reuse existing universe/correlation runs (--stage auto only)")
+    parser.add_argument("--report_only", action="store_true",
+                         help="Skip execution; rebuild report from DB (--stage auto only)")
     # TODO: kairos_strategies.py has no dedicated --model_path flag; it reuses
     # --model for the local checkpoint path, which we forward as model_path here.
     parser.add_argument("--model_path", default=None,
                          help="Finetuned Kronos checkpoint path (stage=finetuned only)")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    # Get the actual argv to check if flags were explicitly passed
+    actual_argv = argv if argv is not None else sys.argv[1:]
+
+    # Enforce flag exclusivity constraints
+    # 1. --stage auto + --interval (singular, not default) → error
+    if args.stage == "auto" and "--interval" in actual_argv:
+        parser.error("--stage auto uses --intervals (plural), not --interval (singular)")
+
+    # 2. --intervals (plural) + non-auto stage → error
+    if args.intervals is not None and args.stage != "auto":
+        parser.error("--intervals is only valid with --stage auto; use --interval for other stages")
+
+    # 3. Auto-specific flags with non-auto stage → error
+    auto_only_flags = ["min_sharpe", "min_signals", "force", "skip_universe", "report_only"]
+    for flag_name in auto_only_flags:
+        # Check both hyphenated and underscored versions
+        flag_hyphen = f"--{flag_name.replace('_', '-')}"
+        flag_underscore = f"--{flag_name}"
+        if args.stage != "auto" and (flag_hyphen in actual_argv or flag_underscore in actual_argv):
+            parser.error(f"{flag_hyphen} is only valid with --stage auto")
 
     conn = get_connection()
 
-    if args.stage == "universe":
+    if args.stage == "auto":
+        intervals = args.intervals if args.intervals else ["1d"]
+
+        if args.report_only:
+            # Skip execution, rebuild report from DB
+            df = build_viability_report(conn, intervals, args.backtest_period,
+                                       min_sharpe=args.min_sharpe, min_signals=args.min_signals,
+                                       asset_class_filter=args.asset_class)
+            csv_path = dump_csv("viability_report",
+                              [row.to_dict() for _, row in df.iterrows()], "auto")
+            viable_count = len(df[df["viable"]])
+            total_count = len(df)
+            interval_breakdown = {}
+            for interval in intervals:
+                interval_df = df[df["interval"] == interval]
+                interval_viable = len(interval_df[interval_df["viable"]])
+                interval_breakdown[interval] = f"{interval_viable}/{len(interval_df)}"
+            breakdown_str = ", ".join([f"{i}: {interval_breakdown[i]}" for i in intervals])
+            print(f"Viability report: {total_count} strategies, {viable_count} viable "
+                  f"(interval breakdown: {breakdown_str})")
+            print(f"CSV: {csv_path}")
+        else:
+            # Full auto pipeline execution
+            run_stage_auto(conn, intervals, args.backtest_period,
+                          asset_class_filter=args.asset_class, pred_samples=args.pred_samples,
+                          min_sharpe=args.min_sharpe, min_signals=args.min_signals,
+                          force=args.force, skip_universe=args.skip_universe)
+
+    elif args.stage == "universe":
         run_stage_universe(conn, interval=args.interval)
     elif args.stage == "correlation":
         run_stage_correlation(conn, asset_class_filter=args.asset_class)
