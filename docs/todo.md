@@ -71,7 +71,7 @@
 
 ## Epic E10 — Pipeline Automation (stages 1-4 + viability report)
 
-- [ ] E10-S01 Period-to-weeks Helper (docs/tickets/E10-S01-period-to-weeks.md)
+- [x] E10-S01 Period-to-weeks Helper (docs/tickets/E10-S01-period-to-weeks.md)
 - [ ] E10-S02 Viability Report Builder (docs/tickets/E10-S02-viability-report.md)
 - [ ] E10-S03 run_stage_auto Chaining (docs/tickets/E10-S03-run-stage-auto.md)
 - [ ] E10-S04 CLI Wiring (docs/tickets/E10-S04-cli-wiring.md)

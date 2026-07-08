@@ -483,6 +483,30 @@ def _period_to_bars(period: str, interval: str) -> int:
     return max(1, int(cal_days * bars_per_day))
 
 
+def _period_to_weeks(period: str) -> float:
+    """Convert a human period string (e.g. '6m', '1y') to weeks.
+
+    Uses 365.25 days per year and 7 days per week.
+    Matches the period parsing from _period_to_bars.
+    """
+    import re as _re
+    m = _re.fullmatch(r"(\d+)(d|w|m|y)", period.strip().lower())
+    if not m:
+        raise ValueError(
+            f"Unrecognised backtest_period {period!r}. Use e.g. '6m', '1y', '3m', '2w', '10d'."
+        )
+    n, unit = int(m.group(1)), m.group(2)
+    # Convert to calendar days: use 365.25 days/year, 30.4375 days/month (365.25/12)
+    cal_days = {
+        "d": n,
+        "w": n * 7,
+        "m": n * 365.25 / 12,
+        "y": n * 365.25,
+    }[unit]
+    # Convert calendar days to weeks (7 days per week)
+    return cal_days / 7
+
+
 # Disabled strategies per (interval, sorted-assets-key) profile.
 # Determined by --no-prediction oracle shadow runs; add new profiles as needed.
 _DISABLED_BY_PROFILE: dict = {
