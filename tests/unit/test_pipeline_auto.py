@@ -585,9 +585,9 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {"interval": interval})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None):
-            call_log.append(("correlation", asset_class_filter))
-            run_id = start_run(conn, "correlation", "1d", {"asset_class_filter": asset_class_filter})
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+            call_log.append(("correlation", asset_class_filter, interval))
+            run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
             # Insert suggested groups
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
@@ -651,7 +651,7 @@ class TestRunStageAuto:
 
         # Verify call order
         assert call_log[0] == ("universe", "1d")
-        assert call_log[1] == ("correlation", None)
+        assert call_log[1] == ("correlation", None, "1d")
         # Oracle and base calls for each group (2 groups)
         assert call_log[2] == ("oracle", ("BTC-USD", "ETH-USD"), "1d")
         assert call_log[3] == ("base", ("BTC-USD", "ETH-USD"), "1d")
@@ -667,9 +667,9 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {"interval": interval})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None):
-            call_log.append(("correlation",))
-            run_id = start_run(conn, "correlation", "1d", {"asset_class_filter": asset_class_filter})
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+            call_log.append(("correlation", interval))
+            run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
                 "VALUES (?,?,?,?,?)",
@@ -737,8 +737,8 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None):
-            run_id = start_run(conn, "correlation", "1d", {})
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+            run_id = start_run(conn, "correlation", interval, {})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
                 "VALUES (?,?,?,?,?)",
@@ -798,8 +798,8 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None):
-            run_id = start_run(conn, "correlation", "1d", {})
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+            run_id = start_run(conn, "correlation", interval, {})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
                 "VALUES (?,?,?,?,?)",
@@ -836,8 +836,8 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None):
-            run_id = start_run(conn, "correlation", "1d", {})
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+            run_id = start_run(conn, "correlation", interval, {})
             # Two groups
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
@@ -887,8 +887,8 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None):
-            run_id = start_run(conn, "correlation", "1d", {})
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+            run_id = start_run(conn, "correlation", interval, {})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
                 "VALUES (?,?,?,?,?)",
@@ -936,9 +936,9 @@ class TestRunStageAuto:
             call_log.append(("universe", interval))
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
             call_log.append(("correlation",))
-            run_id = start_run(conn, "correlation", "1d", {})
+            run_id = start_run(conn, "correlation", interval, {})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
                 "VALUES (?,?,?,?,?)",
@@ -1206,6 +1206,101 @@ class TestCLIFlagsPassedVerbatim:
         assert call_kwargs["min_signals"] == 5
         assert call_kwargs["force"] is True
         assert call_kwargs["skip_universe"] is True
+
+
+class TestCorrelationIntervalThreading:
+    """Test that correlation stage honors the interval parameter."""
+
+    def test_correlation_interval_threading(self, temp_db):
+        """Correlation stage with interval='1h' requests 1h data; default 1d unchanged."""
+        from kairos_pipeline import run_stage_correlation
+        from unittest.mock import patch, MagicMock
+        import pandas as pd
+
+        # Pre-populate universe_screen with passing survivors
+        temp_db.execute(
+            "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+            (1, "BTC-USD", "crypto", 1),
+        )
+        temp_db.execute(
+            "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+            (1, "ETH-USD", "crypto", 1),
+        )
+        temp_db.commit()
+
+        # Track fetch calls
+        fetch_calls = []
+
+        def mock_get_price_data(symbol, start_date, end_date, interval):
+            fetch_calls.append({
+                "symbol": symbol,
+                "start_date": start_date,
+                "end_date": end_date,
+                "interval": interval,
+            })
+            # Return a dummy DataFrame
+            dates = pd.date_range(start=start_date, end=end_date, freq='D' if interval == "1d" else 'H')
+            df = pd.DataFrame({
+                "close": [100.0] * len(dates),
+                "volume": [1000000.0] * len(dates),
+            }, index=dates)
+            return df
+
+        # Test with interval="1h"
+        fetch_calls.clear()
+        with patch("price_cache.get_price_data", side_effect=mock_get_price_data):
+            run_stage_correlation(temp_db, asset_class_filter=None, interval="1h")
+
+        # Verify fetch calls used interval="1h"
+        assert len(fetch_calls) >= 2
+        for call in fetch_calls:
+            assert call["interval"] == "1h", f"Expected interval='1h', got {call['interval']}"
+
+        # Test with default interval="1d" (should be byte-identical to before)
+        temp_db.execute("DELETE FROM runs WHERE stage='correlation'")
+        temp_db.execute("DELETE FROM correlation_pairs")
+        temp_db.execute("DELETE FROM suggested_groups")
+        temp_db.commit()
+
+        fetch_calls.clear()
+        with patch("price_cache.get_price_data", side_effect=mock_get_price_data):
+            run_stage_correlation(temp_db, asset_class_filter=None, interval="1d")
+
+        # Verify fetch calls used interval="1d"
+        assert len(fetch_calls) >= 2
+        for call in fetch_calls:
+            assert call["interval"] == "1d", f"Expected interval='1d', got {call['interval']}"
+
+    def test_correlation_default_interval_unchanged(self, temp_db):
+        """Correlation with no interval param defaults to 1d (byte-identical behavior)."""
+        from kairos_pipeline import run_stage_correlation
+        from unittest.mock import patch
+
+        # Pre-populate universe_screen
+        temp_db.execute(
+            "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+            (1, "BTC-USD", "crypto", 1),
+        )
+        temp_db.commit()
+
+        fetch_calls = []
+
+        def mock_get_price_data(symbol, start_date, end_date, interval):
+            fetch_calls.append({"interval": interval})
+            import pandas as pd
+            dates = pd.date_range(start=start_date, end=end_date, freq='D')
+            return pd.DataFrame({
+                "close": [100.0] * len(dates),
+                "volume": [1000000.0] * len(dates),
+            }, index=dates)
+
+        # Call without interval (uses default)
+        with patch("price_cache.get_price_data", side_effect=mock_get_price_data):
+            run_stage_correlation(temp_db, asset_class_filter=None)
+
+        # Verify default is 1d
+        assert len(fetch_calls) >= 1
+        assert fetch_calls[0]["interval"] == "1d"
 
 
 class TestSingleStageRegression:

@@ -510,8 +510,7 @@ def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
     return result
 
 
-def run_stage_correlation(conn, asset_class_filter=None):
-    interval = "1d"
+def run_stage_correlation(conn, asset_class_filter=None, interval="1d"):
     run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
 
     # Latest passing universe survivors (most recent universe run only).
@@ -530,16 +529,31 @@ def run_stage_correlation(conn, asset_class_filter=None):
         conn.commit()
         return run_id
 
+    from kairos_strategies import calendar_days_for_bars
+
     price_cache.configure(remote=False)
+
+    # Compute calendar window for the bar interval
+    # For 1d, we need 400 days of data; for other intervals, scale accordingly.
+    # bars_per_day for 1d = 1, so 400 bars = 400 days.
+    bars_per_day = {
+        "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
+        "60m": 24, "90m": 16, "1h": 24, "1d": 1, "5d": 0.2,
+        "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
+    }.get(interval, 1)
+
+    bars_needed = 400
+    days_needed = calendar_days_for_bars(bars_needed, bars_per_day, "BTC-USD", buffer_days=0)
+
     end_dt = date.today()
-    start_dt = end_dt - timedelta(days=400)
+    start_dt = end_dt - timedelta(days=days_needed)
 
     closes = {}
     classes = {}
     for symbol, ac in survivors:
         try:
             df = price_cache.get_price_data(
-                symbol, start_date=start_dt.isoformat(), end_date=end_dt.isoformat(), interval="1d"
+                symbol, start_date=start_dt.isoformat(), end_date=end_dt.isoformat(), interval=interval
             )
             if df is None or df.empty:
                 continue
@@ -998,7 +1012,7 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
             universe_run_id = run_stage_universe(conn, interval=interval)
 
         # Step 2: Correlation
-        correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter)
+        correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter, interval=interval)
 
         # Step 3: Fetch suggested_groups for the latest correlation run
         groups = conn.execute(
