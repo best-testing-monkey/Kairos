@@ -46,6 +46,7 @@ import numpy as np
 import pandas as pd
 
 import price_cache
+from kairos_strategies import asset_class_for, _period_to_weeks
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -161,6 +162,28 @@ CREATE TABLE IF NOT EXISTS model_results (
     interval TEXT,
     backtest_period TEXT,
     model_path TEXT
+);
+
+CREATE TABLE IF NOT EXISTS viability_report (
+    run_id INTEGER,
+    strategy_name TEXT,
+    assets TEXT,
+    asset_class TEXT,
+    interval TEXT,
+    backtest_period TEXT,
+    oracle_sharpe REAL,
+    oracle_signals INTEGER,
+    oracle_win_rate REAL,
+    oracle_avg_pnl_per_trade REAL,
+    oracle_run_id INTEGER,
+    base_sharpe REAL,
+    base_signals INTEGER,
+    base_win_rate REAL,
+    base_avg_pnl_per_trade REAL,
+    base_run_id INTEGER,
+    base_model_path TEXT,
+    signals_per_week REAL,
+    viable INTEGER
 );
 """
 
@@ -709,6 +732,222 @@ def run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
     else:
         print(f"\nStage {stage} done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
     return run_id
+
+
+# ── Viability report ─────────────────────────────────────────────────────────
+
+def _get_metric_columns(conn, table_name):
+    """Get metric column names from a results table, excluding identifying columns.
+
+    Identifying columns: run_id, stage, strategy_name, assets, interval, backtest_period
+    Returns a tuple: (actual_db_columns, report_column_names) where report names apply standard renaming
+    (e.g., signal_count → signals for the report).
+    """
+    cursor = conn.execute(f"PRAGMA table_info({table_name})")
+    all_cols = [row[1] for row in cursor.fetchall()]  # row[1] is the column name
+    identifying = {"run_id", "stage", "strategy_name", "assets", "interval", "backtest_period"}
+    metrics = [c for c in all_cols if c not in identifying]
+    # Standard naming: signal_count → signals in the report
+    report_names = [c.replace("signal_count", "signals") if c == "signal_count" else c for c in metrics]
+    return metrics, report_names
+
+
+def build_viability_report(conn, intervals, backtest_period, min_sharpe=0.0, min_signals=3,
+                            asset_class_filter=None):
+    """
+    Build a viability report joining latest oracle and base results.
+
+    For each interval and backtest_period, fetches the latest oracle_results and
+    model_results (stage='base') rows per (strategy_name, assets, interval, backtest_period),
+    performs an outer join on those keys, computes derived columns (asset_class,
+    signals_per_week, viable), and returns a DataFrame with columns:
+      strategy_name, assets, asset_class, interval, backtest_period,
+      [oracle_<metric> for each metric in the results schema],
+      [base_<metric> for each metric in the results schema],
+      signals_per_week, viable
+
+    Columns are ordered with identifying columns first, then per-side metrics (prefixed),
+    then derived columns (signals_per_week, viable).
+
+    Viable = (oracle_sharpe > min_sharpe) & (base_sharpe > min_sharpe) &
+             (min(oracle_signals, base_signals) >= min_signals);
+    NaN on either side → False.
+
+    signals_per_week = base_signals / _period_to_weeks(backtest_period),
+    falling back to oracle_signals if base is NaN.
+
+    Sorted: viable first (descending), then base_sharpe descending.
+    """
+    # Get metric columns from the results tables (generic extraction from schema)
+    oracle_db_cols, oracle_report_cols = _get_metric_columns(conn, "oracle_results")
+    base_db_cols, base_report_cols = _get_metric_columns(conn, "model_results")
+
+    all_rows = []
+
+    for interval in intervals:
+        # Build SELECT clause for oracle: strategy_name, assets, then all metrics (DB names), then run_id
+        oracle_select = "strategy_name, assets, " + ", ".join(oracle_db_cols) + ", run_id"
+        oracle_q = f"""
+            SELECT {oracle_select}
+            FROM oracle_results
+            WHERE interval = ? AND backtest_period = ? AND stage = 'oracle'
+            AND run_id = (
+                SELECT MAX(run_id) FROM oracle_results o2
+                WHERE o2.strategy_name = oracle_results.strategy_name
+                  AND o2.assets = oracle_results.assets
+                  AND o2.interval = oracle_results.interval
+                  AND o2.backtest_period = oracle_results.backtest_period
+                  AND o2.stage = 'oracle'
+            )
+        """
+        oracle_rows = conn.execute(oracle_q, (interval, backtest_period)).fetchall()
+        oracle_dict = {}
+        for row in oracle_rows:
+            key = (row[0], row[1])  # (strategy_name, assets)
+            # Map metrics to prefixed report names, last item is run_id
+            oracle_data = {f"oracle_{oracle_report_cols[i]}": row[2 + i] for i in range(len(oracle_report_cols))}
+            oracle_data["oracle_run_id"] = row[2 + len(oracle_report_cols)]
+            oracle_dict[key] = oracle_data
+
+        # Build SELECT clause for base: strategy_name, assets, then all metrics (DB names), then run_id
+        base_select = "strategy_name, assets, " + ", ".join(base_db_cols) + ", run_id"
+        base_q = f"""
+            SELECT {base_select}
+            FROM model_results
+            WHERE interval = ? AND backtest_period = ? AND stage = 'base'
+            AND run_id = (
+                SELECT MAX(run_id) FROM model_results m2
+                WHERE m2.strategy_name = model_results.strategy_name
+                  AND m2.assets = model_results.assets
+                  AND m2.interval = model_results.interval
+                  AND m2.backtest_period = model_results.backtest_period
+                  AND m2.stage = 'base'
+            )
+        """
+        base_rows = conn.execute(base_q, (interval, backtest_period)).fetchall()
+        base_dict = {}
+        for row in base_rows:
+            key = (row[0], row[1])  # (strategy_name, assets)
+            # Map metrics to prefixed report names, last item is run_id
+            base_data = {f"base_{base_report_cols[i]}": row[2 + i] for i in range(len(base_report_cols))}
+            base_data["base_run_id"] = row[2 + len(base_report_cols)]
+            base_dict[key] = base_data
+
+        # OUTER join: union of all keys
+        all_keys = set(oracle_dict.keys()) | set(base_dict.keys())
+
+        for strategy_name, assets in all_keys:
+            oracle_data = oracle_dict.get((strategy_name, assets), {})
+            base_data = base_dict.get((strategy_name, assets), {})
+
+            # Build row with identifying columns and per-side metrics
+            row = {
+                "strategy_name": strategy_name,
+                "assets": assets,
+                "asset_class": asset_class_for(assets.split(",")),
+                "interval": interval,
+                "backtest_period": backtest_period,
+            }
+            row.update(oracle_data)
+            row.update(base_data)
+
+            # Compute signals_per_week: prefer base_signals, fall back to oracle_signals
+            signals = row.get("base_signals")
+            if pd.isna(signals) or signals is None:
+                signals = row.get("oracle_signals")
+            if pd.notna(signals) and signals is not None:
+                row["signals_per_week"] = float(signals) / _period_to_weeks(backtest_period)
+            else:
+                row["signals_per_week"] = None
+
+            # Compute viable flag
+            oracle_sharpe = row.get("oracle_sharpe")
+            base_sharpe = row.get("base_sharpe")
+            oracle_sig = row.get("oracle_signals")
+            base_sig = row.get("base_signals")
+
+            viable = False
+            if (pd.notna(oracle_sharpe) and oracle_sharpe > min_sharpe and
+                pd.notna(base_sharpe) and base_sharpe > min_sharpe):
+                min_sig_count = min(
+                    oracle_sig if pd.notna(oracle_sig) else float('inf'),
+                    base_sig if pd.notna(base_sig) else float('inf'),
+                )
+                if min_sig_count >= min_signals:
+                    viable = True
+
+            row["viable"] = viable
+
+            # Apply asset_class_filter if provided
+            if asset_class_filter is None or row["asset_class"] == asset_class_filter:
+                all_rows.append(row)
+
+    # Determine column order: identifying, oracle metrics, oracle_run_id, base metrics, base_run_id,
+    # base_model_path (if exists), then derived columns
+    identifying_cols = ["strategy_name", "assets", "asset_class", "interval", "backtest_period"]
+    # Oracle: metrics then run_id
+    oracle_cols = [f"oracle_{m}" for m in oracle_report_cols] + ["oracle_run_id"]
+    # Base: metrics then run_id, then model_path (if exists)
+    base_metric_cols = [f"base_{m}" for m in base_report_cols if m != "model_path"]
+    base_cols = base_metric_cols + ["base_run_id"]
+    if "model_path" in base_report_cols:
+        base_cols.append("base_model_path")
+    derived_cols = ["signals_per_week", "viable"]
+    col_order = identifying_cols + oracle_cols + base_cols + derived_cols
+
+    # Convert to DataFrame
+    if not all_rows:
+        df = pd.DataFrame(columns=col_order)
+    else:
+        df = pd.DataFrame(all_rows)
+        # Reorder columns, keeping only those that exist
+        col_order = [c for c in col_order if c in df.columns]
+        df = df[col_order]
+
+    # Sort: viable first (descending), then base_sharpe descending
+    # Only sort by base_sharpe if it exists in the DataFrame (might not if no base results)
+    if "base_sharpe" in df.columns:
+        df = df.sort_values(
+            by=["viable", "base_sharpe"],
+            ascending=[False, False],
+            na_position="last",
+        )
+    else:
+        df = df.sort_values(
+            by=["viable"],
+            ascending=[False],
+            na_position="last",
+        )
+
+    return df
+
+
+def persist_viability_report(conn, df, run_id):
+    """Persist viability report DataFrame to the viability_report table and CSV."""
+    # Insert rows into table
+    for _, row in df.iterrows():
+        conn.execute(
+            """INSERT INTO viability_report
+               (run_id, strategy_name, assets, asset_class, interval, backtest_period,
+                oracle_sharpe, oracle_signals, oracle_win_rate, oracle_avg_pnl_per_trade, oracle_run_id,
+                base_sharpe, base_signals, base_win_rate, base_avg_pnl_per_trade, base_run_id, base_model_path,
+                signals_per_week, viable)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, row["strategy_name"], row["assets"], row["asset_class"], row["interval"], row["backtest_period"],
+             row["oracle_sharpe"], row["oracle_signals"], row["oracle_win_rate"], row["oracle_avg_pnl_per_trade"], row["oracle_run_id"],
+             row["base_sharpe"], row["base_signals"], row["base_win_rate"], row["base_avg_pnl_per_trade"], row["base_run_id"], row["base_model_path"],
+             row["signals_per_week"], int(row["viable"])),
+        )
+    conn.commit()
+
+    # Write CSV
+    rows_for_csv = []
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        rows_for_csv.append(row_dict)
+
+    csv_path = dump_csv("viability_report", rows_for_csv, "auto")
+    return csv_path
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
