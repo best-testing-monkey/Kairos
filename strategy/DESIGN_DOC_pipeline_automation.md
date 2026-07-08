@@ -100,14 +100,21 @@ Module-level function in `kairos_pipeline.py` (usable standalone via
   Strategies present in only one side appear with the other side's columns NaN
   and `viable=False` (use an outer join, then gate) — the report must show
   *all* strategies that fired anywhere, per the user requirement.
-- **Columns (exact, in order):**
+- **Columns (exact, in order):** the identifying columns, then the FULL set of
+  per-stage metrics from the oracle-stage report (`_rows_from_export` fields),
+  prefixed per side — both sides carried in full, no fallback merging:
   `strategy_name, assets, asset_class, interval, backtest_period,
-  oracle_sharpe, base_sharpe, oracle_signals, base_signals, signals_per_week,
-  win_rate, avg_pnl_per_trade, viable`.
+  oracle_sharpe, oracle_signals, oracle_win_rate, oracle_avg_pnl_per_trade,
+  oracle_run_id,
+  base_sharpe, base_signals, base_win_rate, base_avg_pnl_per_trade,
+  base_run_id, base_model_path,
+  signals_per_week, viable`.
   - `asset_class` via the existing `asset_class_for(assets)` helper in
     `kairos_strategies.py`.
-  - `win_rate` / `avg_pnl_per_trade` from the base row (fall back to oracle row
-    when base side is NaN).
+  - If `_rows_from_export` gains fields later, the report picks them up by
+    prefixing whatever the results tables contain (implement the join
+    column-generically over the table schema rather than a hardcoded list,
+    keeping the identifying + signals_per_week + viable columns fixed).
 - **signals_per_week** = `base_signals / weeks`, where `weeks` is derived from
   `backtest_period` with a shared helper `_period_to_weeks(period: str) -> float`
   implemented on top of the same parsing used by `_period_to_bars` in
@@ -126,10 +133,9 @@ Module-level function in `kairos_pipeline.py` (usable standalone via
 - CSV via the existing `dump_csv` convention:
   `results/auto_viability_report_<YYYYmmdd_HHMMSS>.csv` (keep the
   `<stage>_<name>_<timestamp>` pattern).
-- Also persist to a new SQLite table `viability_report`
-  (`run_id, strategy_name, assets, asset_class, interval, backtest_period,
-  oracle_sharpe, base_sharpe, oracle_signals, base_signals, signals_per_week,
-  win_rate, avg_pnl_per_trade, viable`) so the DB remains the source of truth
+- Also persist to a new SQLite table `viability_report` with `run_id` (of the
+  auto run) plus exactly the report columns from §3.1, so the DB remains the
+  source of truth
   per PIPELINE.md convention. `CREATE TABLE IF NOT EXISTS` alongside the other
   schema statements.
 - Print: `Viability report: N strategies, V viable (interval breakdown: 1d: x/y, 1h: ...)`
