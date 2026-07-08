@@ -5,8 +5,13 @@ import tempfile
 import sqlite3
 import os
 import pandas as pd
+import json
+from unittest.mock import patch, MagicMock, call
 from kairos_strategies import _period_to_weeks
-from kairos_pipeline import build_viability_report, get_connection, SCHEMA, insert_oracle_row, insert_model_row
+from kairos_pipeline import (
+    build_viability_report, get_connection, SCHEMA, insert_oracle_row, insert_model_row,
+    run_stage_auto, start_run
+)
 
 
 class TestPeriodToWeeks:
@@ -545,3 +550,421 @@ class TestViabilityReport:
         # Check row count in table
         table_rows = temp_db.execute("SELECT COUNT(*) FROM viability_report WHERE run_id = ?", (run_id,)).fetchone()[0]
         assert table_rows == len(df)
+
+
+class TestRunStageAuto:
+    """Tests for run_stage_auto chaining orchestration."""
+
+    def _mock_payload(self, strategy_count=2):
+        """Create a canned export_json payload for testing."""
+        shadow = {}
+        for i in range(strategy_count):
+            shadow[f"strat_{i}"] = {
+                "sharpe": 1.5 + i * 0.1,
+                "signal_count": 10 + i,
+                "win_rate": 0.6,
+                "pnl_list": [0.01] * (10 + i),
+            }
+        return {
+            "summary": {},
+            "strategy_rankings": [(k, v["sharpe"]) for k, v in shadow.items()],
+            "shadow_performance": shadow,
+            "strategy_build_stats": {
+                "total_constructed": strategy_count,
+                "disabled_removed": 0,
+                "evaluated": strategy_count,
+            },
+        }
+
+    def test_auto_chaining_order(self, temp_db):
+        """Verify call order: universe → correlation → per-group oracle → per-group base."""
+        call_log = []
+
+        def mock_universe(conn, interval="1d"):
+            call_log.append(("universe", interval))
+            run_id = start_run(conn, "universe", interval, {"interval": interval})
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None):
+            call_log.append(("correlation", asset_class_filter))
+            run_id = start_run(conn, "correlation", "1d", {"asset_class_filter": asset_class_filter})
+            # Insert suggested groups
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 2, "crypto", "SOL-USD,AVAX-USD", 0.6),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            call_log.append(("oracle", tuple(sorted(assets)), interval))
+            run_id = start_run(conn, "oracle", interval,
+                             {"assets": assets, "backtest_period": backtest_period})
+            assets_key = ",".join(sorted(assets))
+            for row in self._mock_payload()["shadow_performance"].items():
+                insert_oracle_row(conn, run_id, {
+                    "strategy_name": row[0],
+                    "sharpe": row[1]["sharpe"],
+                    "signal_count": row[1]["signal_count"],
+                    "win_rate": row[1]["win_rate"],
+                    "avg_pnl_per_trade": 0.01,
+                    "assets": assets_key,
+                    "interval": interval,
+                    "backtest_period": backtest_period,
+                })
+            temp_db.commit()
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None):
+            call_log.append(("base", tuple(sorted(assets)), interval))
+            run_id = start_run(conn, stage, interval,
+                             {"assets": assets, "backtest_period": backtest_period})
+            assets_key = ",".join(sorted(assets))
+            for row in self._mock_payload()["shadow_performance"].items():
+                insert_model_row(conn, run_id, {
+                    "stage": "base",
+                    "strategy_name": row[0],
+                    "sharpe": row[1]["sharpe"],
+                    "signal_count": row[1]["signal_count"],
+                    "win_rate": row[1]["win_rate"],
+                    "avg_pnl_per_trade": 0.01,
+                    "assets": assets_key,
+                    "interval": interval,
+                    "backtest_period": backtest_period,
+                    "model_path": model_path,
+                })
+            temp_db.commit()
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d"], "6m")
+
+        # Verify call order
+        assert call_log[0] == ("universe", "1d")
+        assert call_log[1] == ("correlation", None)
+        # Oracle and base calls for each group (2 groups)
+        assert call_log[2] == ("oracle", ("BTC-USD", "ETH-USD"), "1d")
+        assert call_log[3] == ("base", ("BTC-USD", "ETH-USD"), "1d")
+        assert call_log[4] == ("oracle", ("AVAX-USD", "SOL-USD"), "1d")
+        assert call_log[5] == ("base", ("AVAX-USD", "SOL-USD"), "1d")
+
+    def test_auto_multi_interval(self, temp_db):
+        """Verify chain runs once per interval."""
+        call_log = []
+
+        def mock_universe(conn, interval="1d"):
+            call_log.append(("universe", interval))
+            run_id = start_run(conn, "universe", interval, {"interval": interval})
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None):
+            call_log.append(("correlation",))
+            run_id = start_run(conn, "correlation", "1d", {"asset_class_filter": asset_class_filter})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            call_log.append(("oracle", interval))
+            run_id = start_run(conn, "oracle", interval, {})
+            assets_key = ",".join(sorted(assets))
+            insert_oracle_row(conn, run_id, {
+                "strategy_name": "test", "sharpe": 1.0, "signal_count": 10,
+                "win_rate": 0.5, "avg_pnl_per_trade": 0.01,
+                "assets": assets_key, "interval": interval, "backtest_period": backtest_period,
+            })
+            temp_db.commit()
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None):
+            call_log.append(("base", interval))
+            run_id = start_run(conn, stage, interval, {})
+            assets_key = ",".join(sorted(assets))
+            insert_model_row(conn, run_id, {
+                "stage": "base", "strategy_name": "test", "sharpe": 1.0, "signal_count": 10,
+                "win_rate": 0.5, "avg_pnl_per_trade": 0.01,
+                "assets": assets_key, "interval": interval, "backtest_period": backtest_period,
+                "model_path": None,
+            })
+            temp_db.commit()
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d", "1h"], "6m")
+
+        # Verify universe called twice, once per interval
+        universe_calls = [c for c in call_log if c[0] == "universe"]
+        assert len(universe_calls) == 2
+        assert ("universe", "1d") in universe_calls
+        assert ("universe", "1h") in universe_calls
+
+    def test_auto_resume_skip(self, temp_db):
+        """Pre-inserted oracle_results matching (assets_key, interval, backtest_period) → oracle skipped."""
+        call_log = []
+
+        # Pre-insert oracle result for one group
+        assets_key = "BTC-USD,ETH-USD"
+        insert_oracle_row(temp_db, 1, {
+            "strategy_name": "existing_strat",
+            "sharpe": 1.5,
+            "signal_count": 10,
+            "win_rate": 0.6,
+            "avg_pnl_per_trade": 0.02,
+            "assets": assets_key,
+            "interval": "1d",
+            "backtest_period": "6m",
+        })
+
+        def mock_universe(conn, interval="1d"):
+            run_id = start_run(conn, "universe", interval, {})
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None):
+            run_id = start_run(conn, "correlation", "1d", {})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            call_log.append(("oracle", tuple(sorted(assets))))
+            run_id = start_run(conn, "oracle", interval, {})
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None):
+            call_log.append(("base", tuple(sorted(assets))))
+            run_id = start_run(conn, stage, interval, {})
+            assets_key = ",".join(sorted(assets))
+            insert_model_row(conn, run_id, {
+                "stage": "base", "strategy_name": "test", "sharpe": 1.0, "signal_count": 10,
+                "win_rate": 0.5, "avg_pnl_per_trade": 0.01,
+                "assets": assets_key, "interval": interval, "backtest_period": backtest_period,
+                "model_path": None,
+            })
+            temp_db.commit()
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d"], "6m", force=False)
+
+        # Oracle should NOT be called (skipped due to resumability)
+        assert ("oracle", ("BTC-USD", "ETH-USD")) not in call_log
+        # Base should be called
+        assert ("base", ("BTC-USD", "ETH-USD")) in call_log
+
+    def test_auto_force_reruns(self, temp_db):
+        """force=True → oracle re-executed even with existing results."""
+        call_log = []
+
+        # Pre-insert oracle result
+        assets_key = "BTC-USD,ETH-USD"
+        insert_oracle_row(temp_db, 1, {
+            "strategy_name": "existing_strat",
+            "sharpe": 1.5,
+            "signal_count": 10,
+            "win_rate": 0.6,
+            "avg_pnl_per_trade": 0.02,
+            "assets": assets_key,
+            "interval": "1d",
+            "backtest_period": "6m",
+        })
+
+        def mock_universe(conn, interval="1d"):
+            run_id = start_run(conn, "universe", interval, {})
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None):
+            run_id = start_run(conn, "correlation", "1d", {})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            call_log.append(("oracle", tuple(sorted(assets))))
+            run_id = start_run(conn, "oracle", interval, {})
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None):
+            call_log.append(("base", tuple(sorted(assets))))
+            run_id = start_run(conn, stage, interval, {})
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d"], "6m", force=True)
+
+        # With force=True, oracle should be called even though it exists
+        assert ("oracle", ("BTC-USD", "ETH-USD")) in call_log
+
+    def test_auto_failure_isolation(self, temp_db):
+        """RuntimeError in one group → remaining groups run; failure summary logged."""
+        call_log = []
+
+        def mock_universe(conn, interval="1d"):
+            run_id = start_run(conn, "universe", interval, {})
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None):
+            run_id = start_run(conn, "correlation", "1d", {})
+            # Two groups
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 2, "crypto", "SOL-USD,AVAX-USD", 0.6),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            assets_tuple = tuple(sorted(assets))
+            call_log.append(("oracle", assets_tuple))
+            # Raise error for first group only
+            if assets_tuple == ("BTC-USD", "ETH-USD"):
+                raise RuntimeError("Test oracle failure")
+            run_id = start_run(conn, "oracle", interval, {})
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None):
+            assets_tuple = tuple(sorted(assets))
+            call_log.append(("base", assets_tuple))
+            run_id = start_run(conn, stage, interval, {})
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d"], "6m")
+
+        # First oracle should fail, second oracle should succeed
+        assert call_log.count(("oracle", ("BTC-USD", "ETH-USD"))) == 1
+        assert call_log.count(("oracle", ("AVAX-USD", "SOL-USD"))) == 1
+        # First group's base should NOT run (due to oracle failure), second group's base should
+        assert call_log.count(("base", ("BTC-USD", "ETH-USD"))) == 0
+        assert call_log.count(("base", ("AVAX-USD", "SOL-USD"))) == 1
+
+    def test_auto_runs_bookkeeping(self, temp_db):
+        """One runs row inserted with stage='auto' and params_json."""
+        def mock_universe(conn, interval="1d"):
+            run_id = start_run(conn, "universe", interval, {})
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None):
+            run_id = start_run(conn, "correlation", "1d", {})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            run_id = start_run(conn, "oracle", interval, {})
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None):
+            run_id = start_run(conn, stage, interval, {})
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d"], "6m", min_sharpe=0.5, min_signals=5)
+
+        # Check runs table for auto stage
+        auto_runs = temp_db.execute(
+            "SELECT run_id, params_json FROM runs WHERE stage='auto'"
+        ).fetchall()
+
+        assert len(auto_runs) == 1
+        run_id, params_json = auto_runs[0]
+        params = json.loads(params_json)
+        assert params["intervals"] == ["1d"]
+        assert params["backtest_period"] == "6m"
+        assert params["min_sharpe"] == 0.5
+        assert params["min_signals"] == 5
+
+    def test_auto_skip_universe(self, temp_db):
+        """skip_universe=True with existing runs → universe/correlation NOT called."""
+        call_log = []
+
+        # Pre-insert universe run
+        run_id = start_run(temp_db, "universe", "1d", {})
+
+        def mock_universe(conn, interval="1d"):
+            call_log.append(("universe", interval))
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None):
+            call_log.append(("correlation",))
+            run_id = start_run(conn, "correlation", "1d", {})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            call_log.append(("oracle",))
+            run_id = start_run(conn, "oracle", interval, {})
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None):
+            call_log.append(("base",))
+            run_id = start_run(conn, stage, interval, {})
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d"], "6m", skip_universe=True)
+
+        # Universe should NOT be called when skip_universe=True and prior run exists
+        assert ("universe", "1d") not in call_log
+        # But correlation should still be called
+        assert ("correlation",) in call_log

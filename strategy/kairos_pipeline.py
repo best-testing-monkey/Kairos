@@ -934,9 +934,11 @@ def persist_viability_report(conn, df, run_id):
                 signals_per_week, viable)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (run_id, row["strategy_name"], row["assets"], row["asset_class"], row["interval"], row["backtest_period"],
-             row["oracle_sharpe"], row["oracle_signals"], row["oracle_win_rate"], row["oracle_avg_pnl_per_trade"], row["oracle_run_id"],
-             row["base_sharpe"], row["base_signals"], row["base_win_rate"], row["base_avg_pnl_per_trade"], row["base_run_id"], row["base_model_path"],
-             row["signals_per_week"], int(row["viable"])),
+             row.get("oracle_sharpe"), row.get("oracle_signals"), row.get("oracle_win_rate"),
+             row.get("oracle_avg_pnl_per_trade"), row.get("oracle_run_id"),
+             row.get("base_sharpe"), row.get("base_signals"), row.get("base_win_rate"),
+             row.get("base_avg_pnl_per_trade"), row.get("base_run_id"), row.get("base_model_path"),
+             row.get("signals_per_week"), int(row.get("viable", False))),
         )
     conn.commit()
 
@@ -948,6 +950,142 @@ def persist_viability_report(conn, df, run_id):
 
     csv_path = dump_csv("viability_report", rows_for_csv, "auto")
     return csv_path
+
+
+# ── Auto stage: chained universe → correlation → per-group oracle → base ─────
+
+def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
+                   pred_samples=100, min_sharpe=0.0, min_signals=3, force=False,
+                   skip_universe=False):
+    """
+    Chain universe → correlation → per-group oracle → per-group base for each interval.
+
+    Implements resumability keyed on (assets_key, interval, backtest_period) + stage="base" for model_results.
+    Per-group failure isolation with RuntimeError try/except.
+    Returns DataFrame from build_viability_report.
+    """
+    params = {
+        "intervals": intervals,
+        "backtest_period": backtest_period,
+        "asset_class_filter": asset_class_filter,
+        "pred_samples": pred_samples,
+        "min_sharpe": min_sharpe,
+        "min_signals": min_signals,
+        "force": force,
+        "skip_universe": skip_universe,
+    }
+    auto_run_id = start_run(conn, "auto", None, params)
+
+    failures = []  # Track (group_id, error_msg) for final summary
+
+    for interval in intervals:
+        print(f"\n=== Auto stage for interval {interval} ===")
+
+        # Step 1: Universe (skip if skip_universe and prior run exists)
+        universe_run_id = None
+        if skip_universe:
+            # Check if universe/correlation runs exist for this interval
+            existing = conn.execute(
+                "SELECT MAX(run_id) FROM runs WHERE stage='universe' AND interval=?",
+                (interval,),
+            ).fetchone()
+            if existing and existing[0]:
+                print(f"[skip] universe {interval} (existing run {existing[0]})")
+                universe_run_id = existing[0]
+            else:
+                universe_run_id = run_stage_universe(conn, interval=interval)
+        else:
+            universe_run_id = run_stage_universe(conn, interval=interval)
+
+        # Step 2: Correlation
+        correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter)
+
+        # Step 3: Fetch suggested_groups for the latest correlation run
+        groups = conn.execute(
+            "SELECT group_id, symbols FROM suggested_groups WHERE run_id = ? ORDER BY group_id",
+            (correlation_run_id,),
+        ).fetchall()
+
+        if not groups:
+            print(f"[warn] no suggested groups found for correlation run {correlation_run_id}")
+            continue
+
+        # Step 4: Per group: oracle then base
+        for group_id, symbols_str in groups:
+            assets = symbols_str.split(",")
+            assets_key = ",".join(sorted(assets))
+
+            print(f"\n  [group {group_id}] {assets_key}")
+
+            # Check resumability and run oracle
+            oracle_exists = conn.execute(
+                "SELECT run_id FROM oracle_results WHERE assets=? AND interval=? "
+                "AND backtest_period=? AND stage='oracle' LIMIT 1",
+                (assets_key, interval, backtest_period),
+            ).fetchone()
+
+            if oracle_exists and not force:
+                print(f"    [skip] oracle (run_id={oracle_exists[0]} exists)")
+            else:
+                try:
+                    oracle_run_id = run_stage_oracle(conn, assets, interval=interval,
+                                                     backtest_period=backtest_period,
+                                                     pred_samples=pred_samples)
+                    print(f"    [done] oracle (run_id={oracle_run_id})")
+                except RuntimeError as exc:
+                    failures.append({"group_id": group_id, "assets": assets_key,
+                                   "stage": "oracle", "error": str(exc)})
+                    print(f"    [fail] oracle: {exc}")
+                    continue  # Skip base for this group
+
+            # Check resumability and run base
+            base_exists = conn.execute(
+                "SELECT run_id FROM model_results WHERE assets=? AND interval=? "
+                "AND backtest_period=? AND stage='base' LIMIT 1",
+                (assets_key, interval, backtest_period),
+            ).fetchone()
+
+            if base_exists and not force:
+                print(f"    [skip] base (run_id={base_exists[0]} exists)")
+            else:
+                try:
+                    base_run_id = run_stage_model(conn, "base", assets, interval=interval,
+                                                  backtest_period=backtest_period,
+                                                  pred_samples=pred_samples, model_path=None)
+                    print(f"    [done] base (run_id={base_run_id})")
+                except RuntimeError as exc:
+                    failures.append({"group_id": group_id, "assets": assets_key,
+                                   "stage": "base", "error": str(exc)})
+                    print(f"    [fail] base: {exc}")
+
+    # Failure summary
+    if failures:
+        print(f"\n=== Failure summary ({len(failures)} groups failed) ===")
+        for f in failures:
+            print(f"  {f['stage']} {f['assets']}: {f['error']}")
+
+    # Build and persist viability report
+    print(f"\n=== Building viability report ===")
+    df = build_viability_report(conn, intervals, backtest_period, min_sharpe=min_sharpe,
+                                min_signals=min_signals, asset_class_filter=asset_class_filter)
+
+    # Persist report to table and CSV
+    persist_viability_report(conn, df, auto_run_id)
+
+    # Summary
+    viable_count = len(df[df["viable"]])
+    total_count = len(df)
+    interval_breakdown = {}
+    for interval in intervals:
+        interval_df = df[df["interval"] == interval]
+        interval_viable = len(interval_df[interval_df["viable"]])
+        interval_breakdown[interval] = f"{interval_viable}/{len(interval_df)}"
+
+    breakdown_str = ", ".join([f"{i}: {interval_breakdown[i]}" for i in intervals])
+    print(f"Viability report: {total_count} strategies, {viable_count} viable "
+          f"(interval breakdown: {breakdown_str})")
+
+    return df
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
