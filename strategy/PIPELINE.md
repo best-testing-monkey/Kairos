@@ -233,6 +233,94 @@ uv run ./strategy/kairos_pipeline.py --stage finetuned --assets BTC-USD ETH-USD 
     --model_path /path/to/finetuned_kronos_checkpoint
 ```
 
+## Stage auto: Unified discovery pipeline
+
+For a complete discovery cycle in one command, use `--stage auto` to chain stages 1–4
+in order: universe → correlation → oracle → base for each requested bar interval.
+
+```
+uv run ./strategy/kairos_pipeline.py --stage auto \
+    [--intervals 1d [1h ...]] [--backtest_period 6m] [--asset_class crypto] \
+    [--pred_samples 100] [--min_sharpe 0.0] [--min_signals 3] \
+    [--force] [--skip_universe] [--report_only]
+```
+
+### Flags
+
+| Flag | Type | Default | Purpose |
+|------|------|---------|---------|
+| `--intervals` | `STR [STR ...]` | `["1d"]` | Bar intervals to test (e.g., `1d`, `1h`, `15m`); repeats the full chain once per interval. |
+| `--backtest_period` | `STR` | `"6m"` | Lookback window passed to stages 3–4 (oracle and base). |
+| `--asset_class` | `{crypto, equity, fx_commodity}` | `None` (all) | Optional filter: only test assets in this class. |
+| `--pred_samples` | `INT` | `100` | Number of prediction samples for stochastic inference. |
+| `--min_sharpe` | `FLOAT` | `0.0` | Viability threshold: oracle *and* base Sharpe must exceed this. |
+| `--min_signals` | `INT` | `3` | Viability threshold: both sides must have ≥ this many trade signals. |
+| `--force` | `FLAG` | off | Force re-run of oracle/base, even if results already exist for an (assets, interval, backtest_period) key. |
+| `--skip_universe` | `FLAG` | off | Skip stage 1; reuse the latest existing universe/correlation run per interval. Useful after a crash. |
+| `--report_only` | `FLAG` | off | Skip stages 1–4 entirely; rebuild the viability report from existing DB rows matching the other flags. |
+
+### How stage auto works
+
+For each interval in `--intervals`:
+
+1. **Universe (stage 1):** Screen the candidate universe unless `--skip_universe` and a prior universe run already exists for this interval.
+2. **Correlation (stage 2):** Compute pairwise correlations and greedily cluster symbols into suggested trading groups. Respects `--asset_class` if given.
+3. **Per group:** For each group discovered by stage 2:
+   - Run stage 3 (oracle) with `--no-prediction` to get a ceiling baseline.
+   - Run stage 4 (base) with the real Kronos-base model to get actual performance.
+   - Each stage is skipped if results already exist for that `(assets, interval, backtest_period)` tuple, unless `--force` is passed.
+4. **Viability report:** After all intervals and groups complete, join the latest oracle and base results and build a consolidated report (see below).
+
+### Resumability and `--force`
+
+Before running stage 3 (oracle) or stage 4 (base), the pipeline checks the `oracle_results` or `model_results` table for an existing row with matching `(assets, interval, backtest_period)`. If found and `--force` is off, that stage is logged as skipped and the next stage or group proceeds. This allows long pipelines to resume after a crash without re-running groups that succeeded.
+
+Passing `--force` clears this check and re-runs all stages unconditionally.
+
+### Viability report
+
+After all intervals and groups are processed (or immediately with `--report_only`), a **viability report** is generated:
+
+- **Location:** `results/auto_viability_report_<YYYYmmdd_HHMMSS>.csv` and the `viability_report` SQLite table.
+- **Columns (in order):** strategy_name, assets, asset_class, interval, backtest_period, oracle_sharpe, oracle_signals, oracle_win_rate, oracle_avg_pnl_per_trade, oracle_run_id, base_sharpe, base_signals, base_win_rate, base_avg_pnl_per_trade, base_run_id, base_model_path, signals_per_week, viable.
+- **viability rule:** A strategy is marked `viable=True` only if:
+  - `oracle_sharpe > min_sharpe` **AND**
+  - `base_sharpe > min_sharpe` **AND**
+  - `min(oracle_signals, base_signals) >= min_signals`.
+  
+  Any row with NaN on either side defaults to `viable=False`.
+- **signals_per_week:** Computed as `base_signals / (backtest_period_in_weeks)`, where `6m` ≈ 26.1 weeks, `1m` ≈ 4.35 weeks, etc. Falls back to `oracle_signals` if base is NaN.
+- **Sort:** Viable strategies first, then by `base_sharpe` descending.
+- **Disabled strategies:** The report covers *enabled* strategies only. Disabled strategies (as per `resolve_disabled_strategies` in `kairos_strategies.py`) never appear in the results tables and thus never appear in the report. The printed summary line (e.g., "built 42, disabled 5, evaluating 37") shows the excluded count.
+
+### Example: crypto discovery over 3 months and 1 day
+
+```
+uv run ./strategy/kairos_pipeline.py --stage auto \
+    --intervals 1d \
+    --backtest_period 3m \
+    --asset_class crypto
+```
+
+This chains universe → correlation → oracle → base for all crypto assets, backtesting each discovered group over a 3-month window at daily bars. The viability report is written to `results/auto_viability_report_<timestamp>.csv` and the `viability_report` table.
+
+To add an intraday interval:
+
+```
+uv run ./strategy/kairos_pipeline.py --stage auto \
+    --intervals 1d 1h \
+    --backtest_period 3m \
+    --asset_class crypto
+```
+
+This runs the chain twice: once for daily bars, once for hourly bars. Both intervals appear in the report.
+
+### Stage 5 (finetuned) and future extensions
+
+Stage 5 (finetuned) remains **manual only** — it is not part of the auto chain, as finetuned checkpoints vary per experiment and are not part of the standard discovery flow.
+
+The viability report schema is designed to accept a future `finetuned_sharpe`, `finetuned_signals`, etc. column without schema changes. When a finetuned discovery workflow is established, `persist_viability_report()` can be extended to outer-join on `stage='finetuned'` rows alongside oracle and base, adding those columns to the report while keeping the same database table.
+
 ## 4. Screening criteria (from `kairos_pipeline.py` constants)
 
 ### Liquidity (`liquidity_threshold()`)

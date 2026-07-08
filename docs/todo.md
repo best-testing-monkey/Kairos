@@ -76,4 +76,4 @@
 - [x] E10-S03 run_stage_auto Chaining (docs/tickets/E10-S03-run-stage-auto.md)
 - [x] E10-S04 CLI Wiring (docs/tickets/E10-S04-cli-wiring.md)
 - [x] E10-S05 Interval-aware Correlation (docs/tickets/E10-S05-correlation-interval.md)
-- [ ] E10-S06 PIPELINE.md Docs (docs/tickets/E10-S06-pipeline-docs.md)
+- [x] E10-S06 PIPELINE.md Docs (docs/tickets/E10-S06-pipeline-docs.md)
