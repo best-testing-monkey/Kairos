@@ -310,6 +310,12 @@ class StrategyRegistry:
 
     ALL_STRATEGIES: List[Strategy] = []
 
+    # Populated by build_all() with counts describing the most recent build,
+    # so callers (kairos_strategies.py, kairos_pipeline.py) can print an
+    # honest "built X, disabled Y, evaluating Z" line instead of conflating
+    # "evaluated" with "strategies that happened to fire a signal".
+    LAST_BUILD_STATS: Dict[str, int] = {}
+
     def __init__(self):
         # Instance-level: at most one active allocator per registry.
         self._allocator: Optional["PortfolioAllocator"] = None
@@ -560,8 +566,11 @@ class StrategyRegistry:
         ])
 
         # Drop strategies the user has disabled
+        total_constructed = len(strategies)
         if config.disabled_strategies:
             strategies = [s for s in strategies if s.name not in config.disabled_strategies]
+        disabled_removed = total_constructed - len(strategies)
+        evaluated = len(strategies)
 
         # Apply kurtosis filter to all directional strategies
         if config.kurtosis_action != "none":
@@ -605,6 +614,11 @@ class StrategyRegistry:
             strategies = filtered
 
         cls.ALL_STRATEGIES = strategies
+        cls.LAST_BUILD_STATS = {
+            "total_constructed": total_constructed,
+            "disabled_removed": disabled_removed,
+            "evaluated": evaluated,
+        }
         return strategies
 
 
@@ -1405,6 +1419,8 @@ class KairosOrchestrator:
             "shadow_performance": shadow_perf,
             "daily_logs": self.daily_logs,
             "no_prediction": self.config.no_prediction,
+            "strategy_build_stats": dict(StrategyRegistry.LAST_BUILD_STATS),
+            "signal_firing_count": len(shadow_ranked),
         }
 
     def run_single_asset(self, df: pd.DataFrame, lookback: int = 200) -> Dict:
@@ -1500,6 +1516,15 @@ def print_results(results: Dict, top_strategy_results: Optional[List[Dict]] = No
     print(f"  Best Strategy:    {results['best_strategy']}")
     print(f"  Worst Strategy:   {results['worst_strategy']}")
     print("=" * W)
+    stats = results.get("strategy_build_stats") or {}
+    if stats:
+        print(
+            f"  Strategies: built {stats.get('total_constructed', '?')}, "
+            f"disabled {stats.get('disabled_removed', '?')}, "
+            f"evaluating {stats.get('evaluated', '?')} "
+            f"({results.get('signal_firing_count', 0)} fired at least one signal)"
+        )
+        print("=" * W)
 
     if results["strategy_rankings"]:
         shadow_perf = results.get("shadow_performance", {})

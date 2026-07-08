@@ -658,7 +658,16 @@ def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_sam
     csv_path = dump_csv("oracle_results", [{"run_id": run_id, **r} for r in rows], "oracle")
     rows_sorted = sorted(rows, key=lambda r: (r["sharpe"] if r["sharpe"] is not None else 0.0))
     negative = [r for r in rows_sorted if (r["sharpe"] or 0.0) < 0]
-    print(f"\nStage 3 (oracle) done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
+    build_stats = payload.get("strategy_build_stats") or {}
+    if build_stats:
+        print(
+            f"\nStage 3 (oracle) done: built {build_stats.get('total_constructed', '?')}, "
+            f"disabled {build_stats.get('disabled_removed', '?')}, "
+            f"evaluating {build_stats.get('evaluated', '?')} strategies "
+            f"({len(rows)} fired at least one signal). run_id={run_id}. CSV: {csv_path}"
+        )
+    else:
+        print(f"\nStage 3 (oracle) done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
     print(f"Strategies with negative Sharpe ({len(negative)}):")
     for r in negative:
         print(f"  {r['strategy_name']:<28} sharpe={r['sharpe']:.3f} n={r['signal_count']}")
@@ -689,7 +698,16 @@ def run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
     conn.commit()
 
     csv_path = dump_csv("model_results", [{"run_id": run_id, **r} for r in rows], stage)
-    print(f"\nStage {stage} done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
+    build_stats = payload.get("strategy_build_stats") or {}
+    if build_stats:
+        print(
+            f"\nStage {stage} done: built {build_stats.get('total_constructed', '?')}, "
+            f"disabled {build_stats.get('disabled_removed', '?')}, "
+            f"evaluating {build_stats.get('evaluated', '?')} strategies "
+            f"({len(rows)} fired at least one signal). run_id={run_id}. CSV: {csv_path}"
+        )
+    else:
+        print(f"\nStage {stage} done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
     return run_id
 
 

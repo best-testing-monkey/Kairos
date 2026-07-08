@@ -722,6 +722,8 @@ if __name__ == "__main__":
             "summary": _jsonable(results.get("summary", {})),
             "strategy_rankings": _jsonable(results.get("strategy_rankings", [])),
             "shadow_performance": _jsonable(results.get("shadow_performance", {})),
+            "strategy_build_stats": _jsonable(results.get("strategy_build_stats", {})),
+            "signal_firing_count": _jsonable(results.get("signal_firing_count", 0)),
         }
         with open(args.export_json, "w") as _f:
             json.dump(export_payload, _f, indent=2)
