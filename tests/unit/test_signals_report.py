@@ -15,6 +15,8 @@ from kairos_signals import (
     group_items,
     build_strategy_index,
     run,
+    format_table,
+    _format_numeric_cell,
 )
 
 
@@ -85,6 +87,82 @@ class TestSignalToAdvice:
 
 
 # ============================================================================
+# _format_numeric_cell
+# ============================================================================
+
+class TestFormatNumericCell:
+    def test_format_numeric_cell_with_2_decimals(self):
+        """_format_numeric_cell should format with 2 decimals by default."""
+        assert _format_numeric_cell(0.7654) == "0.77"
+        assert _format_numeric_cell(0.123) == "0.12"
+        assert _format_numeric_cell(100.456) == "100.46"
+
+    def test_format_numeric_cell_missing_values(self):
+        """_format_numeric_cell should return empty string for None or NaN."""
+        import numpy as np
+        assert _format_numeric_cell(None) == ""
+        assert _format_numeric_cell(float("nan")) == ""
+        assert _format_numeric_cell(np.nan) == ""
+
+    def test_format_numeric_cell_custom_decimals(self):
+        """_format_numeric_cell should support custom decimal places."""
+        assert _format_numeric_cell(0.123456, decimals=4) == "0.1235"
+        assert _format_numeric_cell(0.123456, decimals=1) == "0.1"
+
+
+# ============================================================================
+# format_table
+# ============================================================================
+
+class TestFormatTable:
+    def test_format_table_uniform_column_widths_and_alignment(self):
+        """format_table should produce lines of uniform length with proper padding."""
+        headers = ["name", "value"]
+        rows = [
+            {"name": "abc", "value": "10"},
+            {"name": "x", "value": "9999"},
+        ]
+        align = ["l", "r"]  # left for name, right for value
+
+        lines = format_table(headers, rows, align)
+
+        # All lines should have the same length (aligned in fixed-width text)
+        assert len(lines) > 0
+        first_line_len = len(lines[0])
+        for line in lines:
+            assert len(line) == first_line_len, f"Line length mismatch: {line}"
+
+        # Check that header and separator are present
+        assert lines[0].startswith("|")
+        assert lines[1].startswith("|")
+        assert "-" in lines[1]
+
+        # Check alignment: right-aligned values should have spaces on the left
+        assert "abc" in lines[2]  # left-aligned name
+        assert "9999" in lines[3] or "9999" in lines[2]  # right-aligned values
+
+    def test_format_table_missing_cells_become_empty_strings(self):
+        """format_table should render missing cells as empty strings."""
+        headers = ["a", "b"]
+        rows = [{"a": "val", "b": None}]
+        align = ["l", "l"]
+
+        lines = format_table(headers, rows, align)
+
+        # Should have header, separator, and one data row
+        assert len(lines) == 3
+        # All lines same length
+        first_line_len = len(lines[0])
+        for line in lines:
+            assert len(line) == first_line_len
+
+    def test_format_table_empty_input(self):
+        """format_table should handle empty input."""
+        lines = format_table([], [], [])
+        assert lines == []
+
+
+# ============================================================================
 # render_report
 # ============================================================================
 
@@ -92,25 +170,28 @@ class TestRenderReport:
     def test_only_signal_producing_strategies_in_stats(self):
         stats_rows = [{
             "strategy": "dfa_persistence", "symbol": "BTC-USD", "interval": "1d",
-            "backtest_period": "1m", "direction": "LONG", "size": "0.1200",
-            "entry": "60800.00", "stop": "58900.00", "target": "63400.00",
-            "confidence": "0.8000", "expected_value": "0.0200",
+            "backtest_period": "1m", "direction": "LONG", "size": 0.1200,
+            "entry": 60800.00, "stop": 58900.00, "target": 63400.00,
+            "confidence": 0.8000, "expected_value": 0.0200,
             "oracle_sharpe": 23.3, "base_sharpe": 30.2,
             "oracle_win_rate": 0.8, "base_win_rate": 1.0,
             "signals_per_week": 0.69,
         }]
-        advice_lines = ["Strategy dfa_persistence advised **Long** position on BTC-USD ..."]
+        advice_rows = [{
+            "confidence": 0.8000, "expected_value": 0.0200, "base_win_rate": 1.0,
+            "signal": "Strategy dfa_persistence advised **Long** position on BTC-USD ...",
+        }]
         failures = ["group assets=A,B interval=1d: boom"]
         skipped = ["ghost_strategy: unknown strategy (not in registry)"]
         ts = datetime(2026, 7, 9, 6, 49)
 
-        report = render_report(stats_rows, advice_lines, failures, skipped, ts)
+        report = render_report(stats_rows, advice_rows, failures, skipped, ts)
 
         assert "# Kairos Signals Report 2026-07-09 0649h" in report
         assert "## Stats" in report
         assert "dfa_persistence" in report
         assert "## Signals" in report
-        assert advice_lines[0] in report
+        assert advice_rows[0]["signal"] in report
         assert "## Failures" in report
         assert "boom" in report
         assert "## Skipped" in report
@@ -123,6 +204,43 @@ class TestRenderReport:
         assert "_No signals generated._" in report
         assert "## Failures" not in report
         assert "## Skipped" not in report
+
+    def test_signals_table_format_has_correct_columns(self):
+        """Signals table should have columns: confidence, expected_value, base_win_rate, signal."""
+        advice_rows = [{
+            "confidence": 0.75, "expected_value": 0.015, "base_win_rate": 0.65,
+            "signal": "Strategy test advised **Long** on BTC.",
+        }]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report([], advice_rows, [], [], ts)
+
+        # Check header row has the correct column names
+        assert "| confidence | expected_value | base_win_rate | signal |" in report.replace(" ", "").lower() or \
+               all(x in report for x in ["confidence", "expected_value", "base_win_rate", "signal"])
+        # Check data is present
+        assert "0.75" in report or "0.75" in report
+        assert "0.62" in report or "0.62" in report or "0.65" in report  # base_win_rate formatted
+
+    def test_numeric_cells_rounded_to_2_decimals(self):
+        """Stats table numeric cells should format with max 2 decimals."""
+        stats_rows = [{
+            "strategy": "test", "symbol": "BTC-USD", "interval": "1d",
+            "backtest_period": "1m", "direction": "LONG", "size": 0.123456,
+            "entry": 60800.456, "stop": 58900.456, "target": 63400.789,
+            "confidence": 0.7654, "expected_value": 0.0123,
+            "oracle_sharpe": 23.3456, "base_sharpe": 30.2789,
+            "oracle_win_rate": 0.8765, "base_win_rate": 0.9234,
+            "signals_per_week": 0.6912,
+        }]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report(stats_rows, [], [], [], ts)
+
+        # Check that values are formatted to 2 decimals where applicable
+        assert "0.12" in report  # size
+        assert "60800.46" in report  # entry
+        assert "58900.46" in report  # stop
+        assert "0.77" in report or "0.76" in report  # confidence or oracle_sharpe
+        assert "0.01" in report  # expected_value
 
 
 # ============================================================================

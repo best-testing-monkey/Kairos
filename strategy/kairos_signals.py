@@ -87,6 +87,16 @@ def _pct(value, entry):
     return (value - entry) / entry * 100.0
 
 
+def _format_numeric_cell(value, decimals=2):
+    """Format a numeric cell with max `decimals` places. None/missing → empty string."""
+    if _is_missing(value):
+        return ""
+    try:
+        return f"{float(value):.{decimals}f}"
+    except (TypeError, ValueError):
+        return ""
+
+
 def signal_to_advice(strategy_name, symbol, signal) -> str:
     """Render a single Signal into a plain-English advice bullet (no leading '- ')."""
     from kairos_backtest import Direction
@@ -123,6 +133,64 @@ def signal_to_advice(strategy_name, symbol, signal) -> str:
 # Report rendering
 # =============================================================================
 
+def format_table(headers, rows, align):
+    """Render a markdown table with proper column width padding and alignment.
+
+    headers: list of column names
+    rows: list of dicts (each dict has keys matching headers)
+    align: list of "l" or "r" for left/right alignment per column
+
+    Returns list of strings (header, separator, data rows), each padded to
+    match column widths so the table aligns in fixed-width text.
+    """
+    if not headers:
+        return []
+
+    # Format all cells
+    formatted_rows = []
+    for row in rows:
+        formatted_row = {}
+        for col in headers:
+            formatted_row[col] = str(row.get(col, ""))
+        formatted_rows.append(formatted_row)
+
+    # Compute column widths: max of header length and any cell length
+    col_widths = {}
+    for col in headers:
+        col_widths[col] = len(col)
+        for row in formatted_rows:
+            col_widths[col] = max(col_widths[col], len(row.get(col, "")))
+
+    # Build table lines
+    lines = []
+
+    # Header row
+    header_cells = []
+    for col in headers:
+        if align[headers.index(col)] == "r":
+            header_cells.append(col.rjust(col_widths[col]))
+        else:
+            header_cells.append(col.ljust(col_widths[col]))
+    lines.append("| " + " | ".join(header_cells) + " |")
+
+    # Separator row
+    sep_cells = ["-" * col_widths[col] for col in headers]
+    lines.append("| " + " | ".join(sep_cells) + " |")
+
+    # Data rows
+    for row in formatted_rows:
+        row_cells = []
+        for col in headers:
+            cell = row.get(col, "")
+            if align[headers.index(col)] == "r":
+                row_cells.append(cell.rjust(col_widths[col]))
+            else:
+                row_cells.append(cell.ljust(col_widths[col]))
+        lines.append("| " + " | ".join(row_cells) + " |")
+
+    return lines
+
+
 STATS_COLUMNS = [
     "strategy", "symbol", "interval", "backtest_period", "direction", "size",
     "entry", "stop", "target", "confidence", "expected_value",
@@ -131,12 +199,17 @@ STATS_COLUMNS = [
 ]
 
 
-def render_report(stats_rows, advice_lines, failures, skipped, timestamp) -> str:
+def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
     """Assemble the full markdown report from pre-computed pieces.
 
     stats_rows: list of dicts with keys from STATS_COLUMNS (only strategies
         that produced >=1 signal should be included by the caller).
-    advice_lines: list of plain-English bullet strings (no leading '- ').
+    advice_rows: list of dicts with keys:
+        - "confidence": float (2 decimals)
+        - "expected_value": float (2 decimals)
+        - "base_win_rate": float (2 decimals)
+        - "signal": plain-English advice string
+        Can also be a list of plain strings for backward compatibility (treated as signals).
     failures: list of strings describing group-level failures.
     skipped: list of strings describing skipped/unknown or filtered strategies.
     timestamp: datetime used for the header.
@@ -147,21 +220,55 @@ def render_report(stats_rows, advice_lines, failures, skipped, timestamp) -> str
     lines.append("## Stats")
     lines.append("")
     if stats_rows:
-        header = "| " + " | ".join(STATS_COLUMNS) + " |"
-        sep = "| " + " | ".join("---" for _ in STATS_COLUMNS) + " |"
-        lines.append(header)
-        lines.append(sep)
+        # Format numeric cells in stats table with 2 decimals
+        formatted_stats = []
         for row in stats_rows:
-            cells = [str(row.get(col, "")) for col in STATS_COLUMNS]
-            lines.append("| " + " | ".join(cells) + " |")
+            formatted_row = {}
+            for col in STATS_COLUMNS:
+                if col in ("size", "entry", "stop", "target", "confidence", "expected_value",
+                           "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
+                           "signals_per_week"):
+                    formatted_row[col] = _format_numeric_cell(row.get(col), decimals=2)
+                else:
+                    formatted_row[col] = str(row.get(col, ""))
+            formatted_stats.append(formatted_row)
+
+        # Build stats table with alignment (all numeric columns right-aligned)
+        align = []
+        for col in STATS_COLUMNS:
+            if col in ("size", "entry", "stop", "target", "confidence", "expected_value",
+                       "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
+                       "signals_per_week"):
+                align.append("r")
+            else:
+                align.append("l")
+        table_lines = format_table(STATS_COLUMNS, formatted_stats, align)
+        lines.extend(table_lines)
     else:
         lines.append("_No strategies produced a signal in this run._")
     lines.append("")
     lines.append("## Signals")
     lines.append("")
-    if advice_lines:
-        for line in advice_lines:
-            lines.append(f"- {line}")
+    if advice_rows:
+        # Support both new dict format and legacy string format for backward compat
+        if advice_rows and isinstance(advice_rows[0], str):
+            # Legacy: list of plain strings
+            for line in advice_rows:
+                lines.append(f"- {line}")
+        else:
+            # New: list of dicts with confidence, expected_value, base_win_rate, signal
+            signals_table = []
+            for row in advice_rows:
+                signals_table.append({
+                    "confidence": _format_numeric_cell(row.get("confidence"), decimals=2),
+                    "expected_value": _format_numeric_cell(row.get("expected_value"), decimals=2),
+                    "base_win_rate": _format_numeric_cell(row.get("base_win_rate"), decimals=2),
+                    "signal": str(row.get("signal", "")),
+                })
+            signals_headers = ["confidence", "expected_value", "base_win_rate", "signal"]
+            signals_align = ["r", "r", "r", "l"]
+            table_lines = format_table(signals_headers, signals_table, signals_align)
+            lines.extend(table_lines)
     else:
         lines.append("_No signals generated._")
     lines.append("")
@@ -260,7 +367,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     groups = group_items(rows)
 
     stats_rows = []
-    advice_lines = []
+    advice_rows = []
     failures = []
     skipped = []
 
@@ -340,19 +447,24 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                         "interval": interval,
                         "backtest_period": row.get("backtest_period"),
                         "direction": sig.direction.name,
-                        "size": f"{sig.size:.4f}",
-                        "entry": f"{sig.entry:.2f}",
-                        "stop": f"{sig.stop:.2f}" if not _is_missing(sig.stop) else "",
-                        "target": f"{sig.target:.2f}" if not _is_missing(sig.target) else "",
-                        "confidence": f"{sig.confidence:.4f}",
-                        "expected_value": f"{sig.expected_value:.4f}",
+                        "size": sig.size,
+                        "entry": sig.entry,
+                        "stop": sig.stop,
+                        "target": sig.target,
+                        "confidence": sig.confidence,
+                        "expected_value": sig.expected_value,
                         "oracle_sharpe": row.get("oracle_sharpe"),
                         "base_sharpe": row.get("base_sharpe"),
                         "oracle_win_rate": row.get("oracle_win_rate"),
                         "base_win_rate": row.get("base_win_rate"),
                         "signals_per_week": row.get("signals_per_week"),
                     })
-                    advice_lines.append(signal_to_advice(strategy_name, sym, sig))
+                    advice_rows.append({
+                        "confidence": sig.confidence,
+                        "expected_value": sig.expected_value,
+                        "base_win_rate": row.get("base_win_rate"),
+                        "signal": signal_to_advice(strategy_name, sym, sig),
+                    })
         except Exception as e:
             failures.append(f"group assets={assets_str} interval={interval}: {e}")
             continue
@@ -360,7 +472,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     os.makedirs(out_dir, exist_ok=True)
     stamp = now.strftime("%Y%m%d%H%M")
     out_path = os.path.join(out_dir, f"kairos_signals_{stamp}.md")
-    report = render_report(stats_rows, advice_lines, failures, skipped, now)
+    report = render_report(stats_rows, advice_rows, failures, skipped, now)
     with open(out_path, "w") as f:
         f.write(report)
 
