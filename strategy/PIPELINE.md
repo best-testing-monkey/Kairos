@@ -469,3 +469,37 @@ sqlite3 data/pipeline_results.db \
    UNION ALL
    SELECT stage, run_id, sharpe, signal_count FROM model_results WHERE strategy_name='cross_asset_rank';"
 ```
+
+## 7. Current signals report
+
+`strategy/kairos_signals.py` turns the latest `viability_report` run into an
+actionable, human-readable snapshot: for every viable `(strategy, assets,
+interval)` row, it runs one latest-bar prediction per `(assets, interval)`
+group and reports what each strategy would do *right now*.
+
+```bash
+uv run ./strategy/kairos_signals.py \
+    [--db data/pipeline_results.db] [--out results/] \
+    [--intervals 1d ...] [--pred_samples 100] [--all]
+```
+
+- Reads `viability_report` for `run_id = MAX(run_id)`; filters to `viable=1`
+  unless `--all` is passed. `--intervals` filters to a subset of intervals.
+- Groups viable rows by `(assets, interval)` so the GPU/model does one batched
+  prediction (`predict_all_batch`) per group, not one call per strategy.
+- Per group: fetches the latest bars for each symbol, predicts once, builds
+  the same per-symbol context `_run_day` uses (`returns_window`,
+  `realized_vol`, `capital`, etc.), applies the orchestrator's meta-filters,
+  and calls `generate_signal()` for every viable strategy in that group.
+- Per-group failures (fetch/prediction errors) and per-strategy issues
+  (unknown strategy name not in the registry, or a signal blocked by
+  meta-filters) are isolated and reported in `## Failures` / `## Skipped`
+  footers rather than aborting the whole run.
+- Writes `results/kairos_signals_<YYYYmmddHHMM>.md` with:
+  - `## Stats` - a table of every strategy that produced >=1 signal (entry,
+    stop, target, confidence, expected value, plus the oracle/base viability
+    stats carried over from the DB row).
+  - `## Signals` - plain-English bullets, e.g. *"Strategy dfa_persistence
+    advised **Long** position on BTC-USD for 12% liquidity with SL at
+    58,900.00 (-3.1%) and TP at 63,400.00 (+4.2%). Exit by TP/SL."*
+- The report path is printed to stdout when the run finishes.
