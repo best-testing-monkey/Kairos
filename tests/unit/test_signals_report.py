@@ -398,3 +398,102 @@ class TestBuildStrategyIndex:
         assert "unknown strategy" not in report
         assert "inner_x" in report
         assert "**Long**" in report
+
+
+# ============================================================================
+# Zero-size signal gating (matches backtest sig.size > 0 gate)
+# ============================================================================
+
+class _FixedSignalStrategy:
+    """Fake strategy returning a preset Signal."""
+
+    def __init__(self, name, signal):
+        self.name = name
+        self._signal = signal
+
+    def generate_signal(self, dist, current_price, history, context):
+        return self._signal
+
+
+class TestZeroSizeSignalGate:
+    def _run_with_strategy(self, tmp_path, monkeypatch, strategy):
+        import pandas as pd
+        import numpy as np
+
+        db_path = os.path.join(tmp_path, "pipeline_results.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(VIABILITY_SCHEMA)
+        conn.execute(
+            "INSERT INTO viability_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (11, strategy.name, "BTC-USD", "crypto", "1d", "1m",
+             23.3, 5, 0.8, 0.016, 235, 30.2, 3, 1.0, 0.023, 236, None, 0.69, 1),
+        )
+        conn.commit()
+        conn.close()
+
+        idx = pd.date_range("2024-01-01", periods=310, freq="D")
+        fake_history = pd.DataFrame({
+            "open": np.full(310, 100.0), "high": np.full(310, 101.0),
+            "low": np.full(310, 99.0), "close": np.full(310, 100.0),
+            "volume": np.full(310, 1e6),
+        }, index=idx)
+
+        import kairos_strategies
+        monkeypatch.setattr(
+            kairos_strategies, "fetch_data_raw",
+            lambda symbol, lookback, pred_len=0, min_bars=None: fake_history,
+        )
+
+        def fake_predict_fn(assets_dict):
+            from kairos_meta import AssetPrediction, KairosDistribution
+            frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
+            dist = KairosDistribution(frames)
+            return {
+                sym: AssetPrediction(symbol=sym, dist=dist, current_price=100.0, history=fake_history)
+                for sym in assets_dict
+            }
+
+        import kairos_orchestrator
+        monkeypatch.setattr(
+            kairos_orchestrator.StrategyRegistry, "build_all",
+            classmethod(lambda cls, config: [strategy]),
+        )
+        monkeypatch.setattr(
+            kairos_orchestrator.KairosOrchestrator, "_apply_meta_filters",
+            lambda self, dist, current_price: False,
+        )
+
+        out_path = run(
+            db_path=db_path, out_dir=str(tmp_path), intervals=None,
+            pred_samples=5, include_all=False, predict_fn=fake_predict_fn,
+            lookback=300, now=datetime(2026, 7, 9, 8, 0),
+        )
+        return open(out_path).read()
+
+    def test_zero_size_long_dropped_to_skipped(self, tmp_path, monkeypatch):
+        sig = Signal(
+            direction=Direction.LONG, size=0.0, entry=100.0,
+            stop=97.0, target=105.0, strategy_name="zero_kelly",
+            confidence=0.7, expected_value=0.02,
+        )
+        report = self._run_with_strategy(
+            tmp_path, monkeypatch, _FixedSignalStrategy("zero_kelly", sig))
+
+        assert "## Skipped" in report
+        assert "zero_kelly/BTC-USD: zero-size signal dropped (no Kelly edge)" in report
+        # Must not appear as advice or in the stats table.
+        assert "advised" not in report
+        assert "_No strategies produced a signal in this run._" in report
+        assert "_No signals generated._" in report
+
+    def test_flat_zero_size_still_renders_exit_advice(self, tmp_path, monkeypatch):
+        sig = Signal(
+            direction=Direction.FLAT, size=0.0, entry=100.0,
+            stop=0.0, target=0.0, strategy_name="flat_advisor",
+            confidence=0.0, expected_value=0.0,
+        )
+        report = self._run_with_strategy(
+            tmp_path, monkeypatch, _FixedSignalStrategy("flat_advisor", sig))
+
+        assert "Strategy flat_advisor advised **Exit/Flat** on BTC-USD." in report
+        assert "zero-size signal dropped" not in report

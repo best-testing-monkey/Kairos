@@ -240,7 +240,7 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
 def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None):
     """Run the full signals-report flow. Returns the path to the written report."""
-    from kairos_backtest import KairosSettings
+    from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
     from kairos_strategies import fetch_data_raw, resolve_disabled_strategies, LOOKBACK
 
@@ -321,6 +321,17 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                         continue
 
                     if sig is None:
+                        continue
+
+                    # Match the backtest's gate (kairos_orchestrator._run_day:
+                    # `sig.size > 0`): zero-size non-FLAT signals are legit
+                    # strategy output (Kelly fraction clamped at 0) but never
+                    # traded, so they must not appear as advice. FLAT signals
+                    # are exit advice and naturally size 0 — keep them.
+                    if sig.direction != Direction.FLAT and sig.size <= 0:
+                        skipped.append(
+                            f"{strategy_name}/{sym}: zero-size signal dropped (no Kelly edge)"
+                        )
                         continue
 
                     stats_rows.append({
