@@ -13,6 +13,7 @@ from kairos_signals import (
     render_report,
     load_work_items,
     group_items,
+    build_strategy_index,
     run,
 )
 
@@ -283,3 +284,117 @@ class TestLoadWorkItemsAndGrouping:
         assert call_count["n"] == 1
         assert os.path.exists(out_path)
         assert os.path.basename(out_path) == "kairos_signals_202607090649.md"
+
+
+# ============================================================================
+# build_strategy_index (wrapper unwrapping)
+# ============================================================================
+
+class _FakeInner:
+    name = "inner_x"
+
+    def generate_signal(self, dist, current_price, history, context):
+        return Signal(
+            direction=Direction.LONG, size=0.10, entry=current_price,
+            stop=current_price * 0.97, target=current_price * 1.05,
+            strategy_name="inner_x", confidence=0.7, expected_value=0.02,
+        )
+
+
+class _FakeWrapper:
+    name = "fake_wrapper"
+
+    def __init__(self, base_strategy):
+        self.base_strategy = base_strategy
+
+    def generate_signal(self, dist, current_price, history, context):
+        return self.base_strategy.generate_signal(dist, current_price, history, context)
+
+
+class TestBuildStrategyIndex:
+    def test_inner_name_resolves_to_outermost_wrapper(self):
+        inner = _FakeInner()
+        wrapper = _FakeWrapper(inner)
+        index = build_strategy_index([wrapper])
+        assert index["inner_x"] is wrapper
+        assert index["fake_wrapper"] is wrapper
+
+    def test_first_seen_exact_match_not_overwritten(self):
+        # A bare strategy named "inner_x" registered first must keep its slot;
+        # a later wrapper chain containing inner_x must not overwrite it.
+        bare = _FakeInner()
+        wrapper = _FakeWrapper(_FakeInner())
+        index = build_strategy_index([bare, wrapper])
+        assert index["inner_x"] is bare
+
+    def test_real_registry_inner_names_resolve(self):
+        from kairos_orchestrator import StrategyRegistry, OrchestratorConfig
+        # skew is disabled by default; use an empty disabled set so all
+        # constructed strategies (including skew) are present.
+        strategies = StrategyRegistry.build_all(OrchestratorConfig(disabled_strategies=set()))
+        index = build_strategy_index(strategies)
+        for name in ("high_low", "vol_target_sizer", "expected_value", "skew"):
+            assert name in index, f"{name} missing from strategy index"
+
+    def test_run_resolves_inner_strategy_name(self, tmp_path, monkeypatch):
+        """A viability row naming the INNER strategy must produce a signal."""
+        import pandas as pd
+        import numpy as np
+
+        db_path = os.path.join(tmp_path, "pipeline_results.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(VIABILITY_SCHEMA)
+        conn.execute(
+            "INSERT INTO viability_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (9, "inner_x", "BTC-USD", "crypto", "1d", "1m",
+             23.3, 5, 0.8, 0.016, 235, 30.2, 3, 1.0, 0.023, 236, None, 0.69, 1),
+        )
+        conn.commit()
+        conn.close()
+
+        idx = pd.date_range("2024-01-01", periods=310, freq="D")
+        fake_history = pd.DataFrame({
+            "open": np.full(310, 100.0), "high": np.full(310, 101.0),
+            "low": np.full(310, 99.0), "close": np.full(310, 100.0),
+            "volume": np.full(310, 1e6),
+        }, index=idx)
+
+        import kairos_strategies
+        monkeypatch.setattr(
+            kairos_strategies, "fetch_data_raw",
+            lambda symbol, lookback, pred_len=0, min_bars=None: fake_history,
+        )
+
+        def fake_predict_fn(assets_dict):
+            from kairos_meta import AssetPrediction, KairosDistribution
+            frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
+            dist = KairosDistribution(frames)
+            return {
+                sym: AssetPrediction(symbol=sym, dist=dist, current_price=100.0, history=fake_history)
+                for sym in assets_dict
+            }
+
+        # Make the registry return only our fake wrapper so the inner name
+        # must be resolved through the wrapper chain.
+        import kairos_orchestrator
+        wrapper = _FakeWrapper(_FakeInner())
+        monkeypatch.setattr(
+            kairos_orchestrator.StrategyRegistry, "build_all",
+            classmethod(lambda cls, config: [wrapper]),
+        )
+        # Meta filters must not block the synthetic distribution.
+        monkeypatch.setattr(
+            kairos_orchestrator.KairosOrchestrator, "_apply_meta_filters",
+            lambda self, dist, current_price: False,
+        )
+
+        out_path = run(
+            db_path=db_path, out_dir=str(tmp_path), intervals=None,
+            pred_samples=5, include_all=False, predict_fn=fake_predict_fn,
+            lookback=300, now=datetime(2026, 7, 9, 7, 0),
+        )
+
+        report = open(out_path).read()
+        assert "unknown strategy" not in report
+        assert "inner_x" in report
+        assert "**Long**" in report

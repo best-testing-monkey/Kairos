@@ -193,6 +193,30 @@ def _real_predict_fn(assets_dict):
     return predict_all_batch(assets_dict)
 
 
+def build_strategy_index(strategies):
+    """Map every strategy name (wrapper AND inner, down each .base_strategy
+    chain) to the OUTERMOST registered instance.
+
+    Most registry entries are wrapper chains (e.g. LiquidityFilterStrategy
+    around VaRPositionCap around TrendFollowing); viability_report stores the
+    INNER Signal.strategy_name, so the index must resolve inner names.
+    Calling generate_signal on the outermost wrapper preserves backtest gating.
+    First-seen wins: a later name (wrapper or inner) never overwrites an
+    existing exact-match entry.
+    """
+    index = {}
+    for outer in strategies:
+        node = outer
+        seen_ids = set()
+        while node is not None and id(node) not in seen_ids:
+            seen_ids.add(id(node))
+            name = getattr(node, "name", None)
+            if name and name not in index:
+                index[name] = outer
+            node = getattr(node, "base_strategy", None)
+    return index
+
+
 def _build_context(orchestrator, symbol, current_price, multi_preds, history):
     returns_window = orchestrator._compute_returns_window(
         {sym: pred.history for sym, pred in multi_preds.items()}
@@ -262,7 +286,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
             orchestrator = KairosOrchestrator(
                 predict_fn=_dummy_predict, assets=assets, config=config,
             )
-            strategies_by_name = {s.name: s for s in orchestrator.strategies}
+            strategies_by_name = build_strategy_index(orchestrator.strategies)
 
             for row in group_rows:
                 strategy_name = row["strategy_name"]
