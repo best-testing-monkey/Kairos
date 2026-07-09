@@ -463,10 +463,24 @@ def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
     generating a handful of candidate trading baskets per asset class.
 
     `pairs` is a list of dicts with keys: symbol_a, symbol_b, asset_class, full_corr.
+    `asset_class` is the pair's own class, or "cross" for a cross-asset-class
+    pair; per-symbol classes are recovered from same-class pairs (a "cross"
+    pair alone doesn't tell us each side's individual class, so callers should
+    still supply enough same-class pairs, which `run_stage_correlation` does).
     Returns a list of dicts: {asset_class, symbols: [...], mean_intra_corr}.
     """
     strong = [p for p in pairs if p.get("full_corr") is not None and abs(p["full_corr"]) >= min_abs_corr]
     strong.sort(key=lambda p: abs(p["full_corr"]), reverse=True)
+
+    def _mark_if_cross(gi, ac):
+        """Flip a group to 'cross' when a pair joining it straddles asset classes,
+        or when the pair's own class doesn't match the group's established class.
+        Never downgrades an already-"cross" group back to a single class.
+        """
+        if groups[gi]["asset_class"] not in (ac, "cross"):
+            groups[gi]["asset_class"] = "cross"
+        if ac == "cross":
+            groups[gi]["asset_class"] = "cross"
 
     # symbol -> group index (int)
     symbol_to_group = {}
@@ -487,11 +501,13 @@ def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
                 groups[ga]["symbols"].add(b)
                 groups[ga]["corrs"].append(corr)
                 symbol_to_group[b] = ga
+                _mark_if_cross(ga, ac)
         elif gb is not None and ga is None:
             if len(groups[gb]["symbols"]) < max_group_size:
                 groups[gb]["symbols"].add(a)
                 groups[gb]["corrs"].append(corr)
                 symbol_to_group[a] = gb
+                _mark_if_cross(gb, ac)
         else:
             if ga == gb:
                 groups[ga]["corrs"].append(corr)
@@ -572,13 +588,12 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d"):
     for i in range(len(symbols)):
         for j in range(i + 1, len(symbols)):
             a, b = symbols[i], symbols[j]
-            if classes[a] != classes[b]:
-                continue  # only correlate within the same asset class
+            pair_class = classes[a] if classes[a] == classes[b] else "cross"
             full_corr, rolling_median, overlap = compute_pair_correlation(closes[a], closes[b])
             if full_corr is None:
                 continue
             row = {
-                "symbol_a": a, "symbol_b": b, "asset_class": classes[a],
+                "symbol_a": a, "symbol_b": b, "asset_class": pair_class,
                 "full_corr": full_corr, "rolling_corr_median": rolling_median,
                 "overlap_bars": overlap,
             }
@@ -589,13 +604,33 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d"):
     # Greedy clustering per asset class.
     groups = greedy_group_pairs(pairs_for_grouping)
     inserted_groups = []
-    for gid, g in enumerate(groups, start=1):
+    gid = 0
+    grouped_symbols = set()
+    for g in groups:
+        gid += 1
         row = {
             "group_id": gid, "asset_class": g["asset_class"],
             "symbols": ",".join(g["symbols"]), "mean_intra_corr": g["mean_intra_corr"],
         }
         insert_group_row(conn, run_id, row)
         inserted_groups.append({"run_id": run_id, **row})
+        grouped_symbols.update(g["symbols"])
+
+    # Singleton groups: survivors that had price data fetched but did not
+    # land in any multi-symbol group (no peer correlated >= threshold).
+    # This lets --stage auto cover them too, since it iterates suggested_groups.
+    singleton_rows = []
+    for symbol in symbols:
+        if symbol in grouped_symbols:
+            continue
+        gid += 1
+        row = {
+            "group_id": gid, "asset_class": classes[symbol],
+            "symbols": symbol, "mean_intra_corr": None,
+        }
+        insert_group_row(conn, run_id, row)
+        inserted_groups.append({"run_id": run_id, **row})
+        singleton_rows.append(row)
 
     conn.commit()
     csv_pairs = dump_csv("correlation_pairs", inserted_pairs, "correlation")
@@ -603,9 +638,13 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d"):
     print(f"\nStage 2 (correlation) done: {len(inserted_pairs)} pairs, "
           f"{len(inserted_groups)} suggested groups. run_id={run_id}.")
     print(f"CSV: {csv_pairs}, {csv_groups}")
+    singleton_ids = {r["group_id"] for r in singleton_rows}
     for g in inserted_groups:
-        print(f"  group {g['group_id']} [{g['asset_class']}]: {g['symbols']} "
-              f"(mean_corr={g['mean_intra_corr']:.3f})")
+        if g["group_id"] in singleton_ids:
+            print(f"  group {g['group_id']} [{g['asset_class']}] [singleton]: {g['symbols']}")
+        else:
+            print(f"  group {g['group_id']} [{g['asset_class']}]: {g['symbols']} "
+                  f"(mean_corr={g['mean_intra_corr']:.3f})")
     return run_id
 
 

@@ -5,6 +5,7 @@ import tempfile
 import sqlite3
 import os
 import pandas as pd
+import numpy as np
 import json
 from unittest.mock import patch, MagicMock, call
 from kairos_strategies import _period_to_weeks, _period_to_bars, _parse_period
@@ -1569,3 +1570,245 @@ class TestCLIHelpAndSubprocess:
         assert "--skip_universe" in help_output
         assert "--report_only" in help_output
         assert "--stage auto" in help_output or "auto" in help_output
+
+
+class TestGreedyGroupPairsCross:
+    """Tests for cross-asset-class handling in greedy_group_pairs."""
+
+    def test_cross_class_pair_produces_cross_group(self):
+        """A single strong cross-class pair seeds a group with asset_class='cross'."""
+        from kairos_pipeline import greedy_group_pairs
+
+        pairs = [
+            {"symbol_a": "BTC-USD", "symbol_b": "AAPL", "asset_class": "cross", "full_corr": 0.8},
+        ]
+        groups = greedy_group_pairs(pairs)
+        assert len(groups) == 1
+        assert groups[0]["asset_class"] == "cross"
+        assert groups[0]["symbols"] == ["AAPL", "BTC-USD"]
+
+    def test_mixed_join_flips_group_to_cross(self):
+        """A same-class group that gains a member of a different class becomes 'cross'."""
+        from kairos_pipeline import greedy_group_pairs
+
+        pairs = [
+            # Strongest pair first: same-class equity group seeded.
+            {"symbol_a": "AAPL", "symbol_b": "MSFT", "asset_class": "equity", "full_corr": 0.9},
+            # Weaker cross pair: BTC-USD joins the existing equity group via AAPL.
+            {"symbol_a": "AAPL", "symbol_b": "BTC-USD", "asset_class": "cross", "full_corr": 0.7},
+        ]
+        groups = greedy_group_pairs(pairs)
+        assert len(groups) == 1
+        assert groups[0]["asset_class"] == "cross"
+        assert set(groups[0]["symbols"]) == {"AAPL", "MSFT", "BTC-USD"}
+
+    def test_same_class_group_stays_same_class(self):
+        """A pure same-class group is unaffected by unrelated cross pairs elsewhere."""
+        from kairos_pipeline import greedy_group_pairs
+
+        pairs = [
+            {"symbol_a": "AAPL", "symbol_b": "MSFT", "asset_class": "equity", "full_corr": 0.9},
+            {"symbol_a": "ETH-USD", "symbol_b": "SOL-USD", "asset_class": "crypto", "full_corr": 0.85},
+        ]
+        groups = greedy_group_pairs(pairs)
+        by_symbols = {tuple(g["symbols"]): g["asset_class"] for g in groups}
+        assert by_symbols[("AAPL", "MSFT")] == "equity"
+        assert by_symbols[("ETH-USD", "SOL-USD")] == "crypto"
+
+    def test_unrelated_group_not_marked_cross_by_bystander_pair(self):
+        """A cross pair between two symbols in two different existing groups (no merge)
+        must not retroactively mark either existing group as 'cross'."""
+        from kairos_pipeline import greedy_group_pairs
+
+        pairs = [
+            # Two same-class groups formed first (strongest correlations).
+            {"symbol_a": "AAPL", "symbol_b": "MSFT", "asset_class": "equity", "full_corr": 0.95},
+            {"symbol_a": "ETH-USD", "symbol_b": "SOL-USD", "asset_class": "crypto", "full_corr": 0.9},
+            # A weaker cross pair links members of the two different existing
+            # groups; greedy_group_pairs does not merge different groups, so
+            # neither group's asset_class should change.
+            {"symbol_a": "AAPL", "symbol_b": "ETH-USD", "asset_class": "cross", "full_corr": 0.65},
+        ]
+        groups = greedy_group_pairs(pairs)
+        by_symbols = {tuple(sorted(g["symbols"])): g["asset_class"] for g in groups}
+        assert by_symbols[("AAPL", "MSFT")] == "equity"
+        assert by_symbols[("ETH-USD", "SOL-USD")] == "crypto"
+
+
+class TestCorrelationSingletonsAndCross:
+    """Tests for singleton group insertion and cross-asset-class correlation
+    in run_stage_correlation."""
+
+    @staticmethod
+    def _make_series(seed, n, base=100.0, corr_with=None, noise=0.02):
+        """Build a synthetic close-price series; if corr_with is given, derive
+        returns that are strongly correlated with it."""
+        rng = np.random.default_rng(seed)
+        if corr_with is not None:
+            rets = corr_with * 0.9 + rng.normal(0, noise, size=len(corr_with))
+        else:
+            rets = rng.normal(0, 0.01, size=n)
+        prices = base * np.exp(np.cumsum(rets))
+        return rets, prices
+
+    def test_ungrouped_survivor_becomes_singleton(self, temp_db):
+        """A passing survivor with no correlated peer gets a singleton suggested_group row."""
+        from kairos_pipeline import run_stage_correlation
+
+        for sym, ac in [("BTC-USD", "crypto"), ("ETH-USD", "crypto"), ("LONER-USD", "crypto")]:
+            temp_db.execute(
+                "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+                (1, sym, ac, 1),
+            )
+        temp_db.commit()
+
+        n = 200
+        base_rets, base_prices = self._make_series(1, n)
+        _, corr_prices = self._make_series(2, n, corr_with=base_rets, noise=0.002)
+        _, loner_prices = self._make_series(3, n)  # independent, uncorrelated
+
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        price_map = {
+            "BTC-USD": pd.Series(base_prices, index=dates),
+            "ETH-USD": pd.Series(corr_prices, index=dates),
+            "LONER-USD": pd.Series(loner_prices, index=dates),
+        }
+
+        def mock_get_price_data(symbol, start_date, end_date, interval):
+            s = price_map[symbol]
+            return pd.DataFrame({"close": s.values, "volume": [1e6] * len(s)}, index=s.index)
+
+        with patch("price_cache.get_price_data", side_effect=mock_get_price_data):
+            run_id = run_stage_correlation(temp_db, asset_class_filter=None, interval="1d")
+
+        rows = temp_db.execute(
+            "SELECT group_id, asset_class, symbols, mean_intra_corr FROM suggested_groups WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        symbols_by_group = {r[2]: r for r in rows}
+
+        # LONER-USD should appear alone with mean_intra_corr NULL.
+        assert "LONER-USD" in symbols_by_group
+        loner_row = symbols_by_group["LONER-USD"]
+        assert loner_row[1] == "crypto"
+        assert loner_row[3] is None
+
+        # BTC-USD/ETH-USD should NOT get their own singleton rows (they're grouped).
+        assert "BTC-USD" not in symbols_by_group
+        assert "ETH-USD" not in symbols_by_group
+        grouped = [r for r in rows if "BTC-USD" in r[2].split(",") and "ETH-USD" in r[2].split(",")]
+        assert len(grouped) == 1
+
+    def test_cross_class_pair_persisted_with_cross_asset_class(self, temp_db):
+        """Correlation across asset classes is no longer skipped; pair row gets asset_class='cross'."""
+        from kairos_pipeline import run_stage_correlation
+
+        for sym, ac in [("BTC-USD", "crypto"), ("AAPL", "equity")]:
+            temp_db.execute(
+                "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+                (1, sym, ac, 1),
+            )
+        temp_db.commit()
+
+        n = 200
+        base_rets, base_prices = self._make_series(10, n)
+        _, corr_prices = self._make_series(11, n, corr_with=base_rets, noise=0.005)
+
+        dates = pd.date_range("2024-01-01", periods=n, freq="D")
+        price_map = {
+            "BTC-USD": pd.Series(base_prices, index=dates),
+            "AAPL": pd.Series(corr_prices, index=dates),
+        }
+
+        def mock_get_price_data(symbol, start_date, end_date, interval):
+            s = price_map[symbol]
+            return pd.DataFrame({"close": s.values, "volume": [1e6] * len(s)}, index=s.index)
+
+        with patch("price_cache.get_price_data", side_effect=mock_get_price_data):
+            run_id = run_stage_correlation(temp_db, asset_class_filter=None, interval="1d")
+
+        pair_rows = temp_db.execute(
+            "SELECT symbol_a, symbol_b, asset_class FROM correlation_pairs WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        assert len(pair_rows) == 1
+        assert pair_rows[0][2] == "cross"
+
+        group_rows = temp_db.execute(
+            "SELECT asset_class, symbols FROM suggested_groups WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        # Either grouped together as "cross" (if corr >= 0.6), or each a same-class singleton.
+        if len(group_rows) == 1:
+            assert group_rows[0][0] == "cross"
+        else:
+            classes = {r[1]: r[0] for r in group_rows}
+            assert classes.get("BTC-USD") == "crypto"
+            assert classes.get("AAPL") == "equity"
+
+
+class TestRunStageAutoSingletonGroup:
+    """Tests that run_stage_auto handles a 1-symbol suggested group correctly."""
+
+    def _mock_payload(self):
+        return {
+            "summary": {},
+            "strategy_rankings": [("strat_0", 1.5)],
+            "shadow_performance": {
+                "strat_0": {"sharpe": 1.5, "signal_count": 10, "win_rate": 0.6, "pnl_list": [0.01] * 10},
+            },
+            "strategy_build_stats": {"total_constructed": 1, "disabled_removed": 0, "evaluated": 1},
+        }
+
+    def test_singleton_group_generates_one_asset_calls(self, temp_db):
+        """A singleton suggested_group row (1 symbol) drives oracle+base with a 1-element assets list."""
+        call_log = []
+
+        def mock_universe(conn, interval="1d"):
+            run_id = start_run(conn, "universe", interval, {"interval": interval})
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+            run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "LONER-USD", None),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            call_log.append(("oracle", list(assets), interval))
+            run_id = start_run(conn, "oracle", interval, {"assets": assets, "backtest_period": backtest_period})
+            for name, perf in self._mock_payload()["shadow_performance"].items():
+                insert_oracle_row(conn, run_id, {
+                    "strategy_name": name, "sharpe": perf["sharpe"], "signal_count": perf["signal_count"],
+                    "win_rate": perf["win_rate"], "avg_pnl_per_trade": 0.01,
+                    "assets": ",".join(sorted(assets)), "interval": interval, "backtest_period": backtest_period,
+                })
+            temp_db.commit()
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                      pred_samples=100, model_path=None):
+            call_log.append(("base", list(assets), interval))
+            run_id = start_run(conn, stage, interval, {"assets": assets, "backtest_period": backtest_period})
+            for name, perf in self._mock_payload()["shadow_performance"].items():
+                insert_model_row(conn, run_id, {
+                    "stage": "base", "strategy_name": name, "sharpe": perf["sharpe"],
+                    "signal_count": perf["signal_count"], "win_rate": perf["win_rate"],
+                    "avg_pnl_per_trade": 0.01, "assets": ",".join(sorted(assets)),
+                    "interval": interval, "backtest_period": backtest_period, "model_path": model_path,
+                })
+            temp_db.commit()
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            run_stage_auto(temp_db, ["1d"], "6m")
+
+        assert ("oracle", ["LONER-USD"], "1d") in call_log
+        assert ("base", ["LONER-USD"], "1d") in call_log
