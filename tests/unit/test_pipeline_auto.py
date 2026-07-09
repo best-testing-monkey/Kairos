@@ -1615,24 +1615,87 @@ class TestGreedyGroupPairsCross:
         assert by_symbols[("AAPL", "MSFT")] == "equity"
         assert by_symbols[("ETH-USD", "SOL-USD")] == "crypto"
 
-    def test_unrelated_group_not_marked_cross_by_bystander_pair(self):
-        """A cross pair between two symbols in two different existing groups (no merge)
-        must not retroactively mark either existing group as 'cross'."""
+    def test_cross_pair_between_groups_with_capacity_joins_strongest(self):
+        """A cross pair whose symbols sit in two different existing groups with
+        capacity: the missing symbol joins the group with the highest mean |corr|
+        (Rule 2), flipping that group to 'cross'; the other group is unchanged."""
         from kairos_pipeline import greedy_group_pairs
 
         pairs = [
-            # Two same-class groups formed first (strongest correlations).
             {"symbol_a": "AAPL", "symbol_b": "MSFT", "asset_class": "equity", "full_corr": 0.95},
             {"symbol_a": "ETH-USD", "symbol_b": "SOL-USD", "asset_class": "crypto", "full_corr": 0.9},
-            # A weaker cross pair links members of the two different existing
-            # groups; greedy_group_pairs does not merge different groups, so
-            # neither group's asset_class should change.
             {"symbol_a": "AAPL", "symbol_b": "ETH-USD", "asset_class": "cross", "full_corr": 0.65},
         ]
         groups = greedy_group_pairs(pairs)
         by_symbols = {tuple(sorted(g["symbols"])): g["asset_class"] for g in groups}
-        assert by_symbols[("AAPL", "MSFT")] == "equity"
+        # ETH-USD joined the stronger (equity) group, flipping it to cross.
+        assert by_symbols[("AAPL", "ETH-USD", "MSFT")] == "cross"
+        # The crypto group is untouched.
         assert by_symbols[("ETH-USD", "SOL-USD")] == "crypto"
+
+
+class TestGreedyGroupPairsOverlap:
+    """Tests for overlapping group membership: no passing pair is ever dropped."""
+
+    def test_copx_xlb_scenario_new_cross_group_when_groups_full(self):
+        """Two full same-class groups claim COPX and XLB; the weaker-but-passing
+        cross pair must still yield a NEW group containing both (Rule 3)."""
+        from kairos_pipeline import greedy_group_pairs
+
+        pairs = [
+            # Fill a 4-symbol commodity group containing COPX.
+            {"symbol_a": "COPX", "symbol_b": "GDX", "asset_class": "commodity", "full_corr": 0.95},
+            {"symbol_a": "COPX", "symbol_b": "SLV", "asset_class": "commodity", "full_corr": 0.94},
+            {"symbol_a": "COPX", "symbol_b": "GLD", "asset_class": "commodity", "full_corr": 0.93},
+            # Fill a 4-symbol equity group containing XLB.
+            {"symbol_a": "XLB", "symbol_b": "XLI", "asset_class": "equity", "full_corr": 0.92},
+            {"symbol_a": "XLB", "symbol_b": "XLE", "asset_class": "equity", "full_corr": 0.91},
+            {"symbol_a": "XLB", "symbol_b": "XLF", "asset_class": "equity", "full_corr": 0.90},
+            # Weaker cross pair: both symbols already in different FULL groups.
+            {"symbol_a": "COPX", "symbol_b": "XLB", "asset_class": "cross", "full_corr": 0.631},
+        ]
+        groups = greedy_group_pairs(pairs, max_group_size=4)
+        pair_groups = [g for g in groups if set(g["symbols"]) == {"COPX", "XLB"}]
+        assert len(pair_groups) == 1, f"COPX/XLB pair must get its own group; got {groups}"
+        assert pair_groups[0]["asset_class"] == "cross"
+        assert abs(pair_groups[0]["mean_intra_corr"] - 0.631) < 1e-9
+
+    def test_pair_joins_existing_group_with_capacity(self):
+        """A passing pair with one symbol in an existing group with capacity joins it."""
+        from kairos_pipeline import greedy_group_pairs
+
+        pairs = [
+            {"symbol_a": "GLD", "symbol_b": "SLV", "asset_class": "commodity", "full_corr": 0.9},
+            {"symbol_a": "GLD", "symbol_b": "GDX", "asset_class": "commodity", "full_corr": 0.7},
+        ]
+        groups = greedy_group_pairs(pairs)
+        assert len(groups) == 1
+        assert set(groups[0]["symbols"]) == {"GLD", "SLV", "GDX"}
+        assert groups[0]["asset_class"] == "commodity"
+
+    def test_no_passing_pair_unrepresented(self):
+        """Property: every pair with |corr| >= min_abs_corr appears together in
+        at least one output group."""
+        from kairos_pipeline import greedy_group_pairs
+        import itertools
+
+        symbols = ["A1", "A2", "A3", "A4", "B1", "B2", "B3", "C1"]
+        cls = {s: {"A": "equity", "B": "crypto", "C": "commodity"}[s[0]] for s in symbols}
+        rng = np.random.default_rng(42)
+        pairs = []
+        for a, b in itertools.combinations(symbols, 2):
+            pairs.append({
+                "symbol_a": a, "symbol_b": b,
+                "asset_class": cls[a] if cls[a] == cls[b] else "cross",
+                "full_corr": float(rng.uniform(-1, 1)),
+            })
+
+        groups = greedy_group_pairs(pairs, min_abs_corr=0.6, max_group_size=4)
+        group_sets = [set(g["symbols"]) for g in groups]
+        for p in pairs:
+            if abs(p["full_corr"]) >= 0.6:
+                assert any({p["symbol_a"], p["symbol_b"]} <= gs for gs in group_sets), \
+                    f"pair {p['symbol_a']}/{p['symbol_b']} (corr={p['full_corr']:.3f}) unrepresented"
 
 
 class TestCorrelationSingletonsAndCross:

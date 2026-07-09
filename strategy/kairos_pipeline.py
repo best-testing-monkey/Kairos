@@ -453,66 +453,76 @@ def compute_pair_correlation(series_a: pd.Series, series_b: pd.Series, min_overl
 
 def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
     """
-    Greedy adjacency-based clustering.
+    Greedy adjacency-based clustering with overlapping membership.
 
-    Algorithm choice: sort pairs by |corr| descending, then greedily add each
-    pair's two symbols into a shared group as long as (a) both symbols'
-    existing group (if any) allow room, and (b) merging would not exceed
-    max_group_size. This is a simple greedy union-find-like approach - not
-    guaranteed optimal, but deterministic, cheap, and good enough for
-    generating a handful of candidate trading baskets per asset class.
+    Algorithm: sort pairs by |corr| descending, then for each passing pair:
+      1. If some existing group already contains BOTH symbols, just append the
+         corr to that group's corrs (no membership change).
+      2. Elif some existing group contains exactly ONE of the two symbols and
+         has capacity (< max_group_size), add the missing symbol to it and
+         append the corr. If several groups qualify, the one with the highest
+         mean |corr| wins (ties broken by lowest group index, i.e. the group
+         seeded by the strongest pair) - keeps the strongest baskets cohesive
+         and is deterministic.
+      3. Else create a NEW group {a, b}. This guarantees every passing pair is
+         represented in some group; symbols may therefore appear in multiple
+         (overlapping) groups.
+
+    Not guaranteed optimal, but deterministic, cheap, and good enough for
+    generating candidate trading baskets.
 
     `pairs` is a list of dicts with keys: symbol_a, symbol_b, asset_class, full_corr.
     `asset_class` is the pair's own class, or "cross" for a cross-asset-class
-    pair; per-symbol classes are recovered from same-class pairs (a "cross"
-    pair alone doesn't tell us each side's individual class, so callers should
-    still supply enough same-class pairs, which `run_stage_correlation` does).
+    pair. A group's asset_class flips to "cross" when its membership spans
+    classes (a "cross" pair seeds/joins it, or a joining pair's class differs
+    from the group's established class).
     Returns a list of dicts: {asset_class, symbols: [...], mean_intra_corr}.
     """
     strong = [p for p in pairs if p.get("full_corr") is not None and abs(p["full_corr"]) >= min_abs_corr]
     strong.sort(key=lambda p: abs(p["full_corr"]), reverse=True)
+
+    groups = []  # list of dicts: {"asset_class":..., "symbols": set(), "corrs": []}
 
     def _mark_if_cross(gi, ac):
         """Flip a group to 'cross' when a pair joining it straddles asset classes,
         or when the pair's own class doesn't match the group's established class.
         Never downgrades an already-"cross" group back to a single class.
         """
-        if groups[gi]["asset_class"] not in (ac, "cross"):
+        if ac == "cross" or groups[gi]["asset_class"] not in (ac, "cross"):
             groups[gi]["asset_class"] = "cross"
-        if ac == "cross":
-            groups[gi]["asset_class"] = "cross"
-
-    # symbol -> group index (int)
-    symbol_to_group = {}
-    groups = []  # list of dicts: {"asset_class":..., "symbols": set(), "corrs": []}
 
     for p in strong:
         a, b, ac, corr = p["symbol_a"], p["symbol_b"], p["asset_class"], p["full_corr"]
-        ga = symbol_to_group.get(a)
-        gb = symbol_to_group.get(b)
 
-        if ga is None and gb is None:
-            groups.append({"asset_class": ac, "symbols": {a, b}, "corrs": [corr]})
-            gi = len(groups) - 1
-            symbol_to_group[a] = gi
-            symbol_to_group[b] = gi
-        elif ga is not None and gb is None:
-            if len(groups[ga]["symbols"]) < max_group_size:
-                groups[ga]["symbols"].add(b)
-                groups[ga]["corrs"].append(corr)
-                symbol_to_group[b] = ga
-                _mark_if_cross(ga, ac)
-        elif gb is not None and ga is None:
-            if len(groups[gb]["symbols"]) < max_group_size:
-                groups[gb]["symbols"].add(a)
-                groups[gb]["corrs"].append(corr)
-                symbol_to_group[a] = gb
-                _mark_if_cross(gb, ac)
-        else:
-            if ga == gb:
-                groups[ga]["corrs"].append(corr)
-            # Different existing groups: do not merge (keeps algorithm simple
-            # and avoids unbounded group growth / overlap ambiguity).
+        # Rule 1: a group already contains both symbols.
+        both = [gi for gi, g in enumerate(groups) if a in g["symbols"] and b in g["symbols"]]
+        if both:
+            groups[both[0]]["corrs"].append(corr)
+            _mark_if_cross(both[0], ac)
+            continue
+
+        # Rule 2: a group contains exactly one symbol and has capacity.
+        candidates = [
+            gi for gi, g in enumerate(groups)
+            if len({a, b} & g["symbols"]) == 1 and len(g["symbols"]) < max_group_size
+        ]
+        if candidates:
+            gi = max(
+                candidates,
+                key=lambda i: (
+                    float(np.mean([abs(c) for c in groups[i]["corrs"]])) if groups[i]["corrs"] else 0.0,
+                    -i,
+                ),
+            )
+            missing = b if a in groups[gi]["symbols"] else a
+            groups[gi]["symbols"].add(missing)
+            groups[gi]["corrs"].append(corr)
+            _mark_if_cross(gi, ac)
+            continue
+
+        # Rule 3: new group. Happens for a fresh pair, or when both symbols
+        # sit in different full/ineligible groups (never drop a passing pair).
+        groups.append({"asset_class": ac, "symbols": {a, b}, "corrs": [corr]})
 
     result = []
     for g in groups:
