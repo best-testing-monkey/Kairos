@@ -451,6 +451,26 @@ def compute_pair_correlation(series_a: pd.Series, series_b: pd.Series, min_overl
     return full_corr, rolling_corr_median, overlap_bars
 
 
+# Per-asset-class correlation thresholds for greedy_group_pairs. A pair's
+# effective threshold is the STRICTER (max) of its two symbols' class
+# thresholds; "default" is used for any asset_class not otherwise listed.
+MIN_ABS_CORR = {"crypto": 0.75, "default": 0.6}
+
+
+def _resolve_min_abs_corr(min_abs_corr, class_a, class_b) -> float:
+    """Resolve the effective threshold for a pair given its two symbols'
+    asset classes. `min_abs_corr` may be a plain float (uniform threshold,
+    unchanged legacy behavior) or a dict mapping asset_class -> threshold
+    with a "default" key for unlisted classes. The stricter (max) of the two
+    per-class thresholds applies."""
+    if isinstance(min_abs_corr, dict):
+        default = min_abs_corr.get("default", 0.6)
+        t_a = min_abs_corr.get(class_a, default)
+        t_b = min_abs_corr.get(class_b, default)
+        return max(t_a, t_b)
+    return min_abs_corr
+
+
 def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
     """
     Greedy adjacency-based clustering with overlapping membership.
@@ -471,14 +491,32 @@ def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
     Not guaranteed optimal, but deterministic, cheap, and good enough for
     generating candidate trading baskets.
 
-    `pairs` is a list of dicts with keys: symbol_a, symbol_b, asset_class, full_corr.
+    `pairs` is a list of dicts with keys: symbol_a, symbol_b, asset_class, full_corr,
+    and optionally class_a/class_b (the two symbols' own asset classes; for a
+    same-class pair these both equal `asset_class`, for a "cross" pair they
+    hold the two distinct classes). When class_a/class_b are absent, both
+    fall back to `asset_class` (backward compatible with older pair dicts).
     `asset_class` is the pair's own class, or "cross" for a cross-asset-class
     pair. A group's asset_class flips to "cross" when its membership spans
     classes (a "cross" pair seeds/joins it, or a joining pair's class differs
     from the group's established class).
+
+    `min_abs_corr` may be a plain float (uniform threshold, as before) or a
+    dict mapping asset_class -> threshold with a "default" key; a pair's
+    effective threshold is then the stricter (max) of its two symbols' class
+    thresholds (see `_resolve_min_abs_corr`).
+
     Returns a list of dicts: {asset_class, symbols: [...], mean_intra_corr}.
     """
-    strong = [p for p in pairs if p.get("full_corr") is not None and abs(p["full_corr"]) >= min_abs_corr]
+    strong = []
+    for p in pairs:
+        if p.get("full_corr") is None:
+            continue
+        class_a = p.get("class_a", p["asset_class"])
+        class_b = p.get("class_b", p["asset_class"])
+        threshold = _resolve_min_abs_corr(min_abs_corr, class_a, class_b)
+        if abs(p["full_corr"]) >= threshold:
+            strong.append(p)
     strong.sort(key=lambda p: abs(p["full_corr"]), reverse=True)
 
     groups = []  # list of dicts: {"asset_class":..., "symbols": set(), "corrs": []}
@@ -536,7 +574,7 @@ def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
     return result
 
 
-def run_stage_correlation(conn, asset_class_filter=None, interval="1d"):
+def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_corr=None):
     run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
 
     # Latest passing universe survivors (most recent universe run only).
@@ -609,10 +647,15 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d"):
             }
             insert_correlation_row(conn, run_id, row)
             inserted_pairs.append({"run_id": run_id, **row})
-            pairs_for_grouping.append(row)
+            # class_a/class_b carry the two symbols' own classes so
+            # greedy_group_pairs can resolve a per-pair threshold even for
+            # "cross" pairs (whose asset_class alone doesn't say which two
+            # classes are involved). Kept out of the DB row/CSV export.
+            pairs_for_grouping.append({**row, "class_a": classes[a], "class_b": classes[b]})
 
+    effective_threshold = min_abs_corr if min_abs_corr is not None else MIN_ABS_CORR
     # Greedy clustering per asset class.
-    groups = greedy_group_pairs(pairs_for_grouping)
+    groups = greedy_group_pairs(pairs_for_grouping, min_abs_corr=effective_threshold)
     inserted_groups = []
     gid = 0
     grouped_symbols = set()
@@ -645,6 +688,11 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d"):
     conn.commit()
     csv_pairs = dump_csv("correlation_pairs", inserted_pairs, "correlation")
     csv_groups = dump_csv("suggested_groups", inserted_groups, "correlation")
+    if isinstance(effective_threshold, dict):
+        threshold_str = ", ".join(f"{k}={v}" for k, v in effective_threshold.items())
+    else:
+        threshold_str = str(effective_threshold)
+    print(f"Effective min_abs_corr thresholds: {threshold_str}")
     print(f"\nStage 2 (correlation) done: {len(inserted_pairs)} pairs, "
           f"{len(inserted_groups)} suggested groups. run_id={run_id}.")
     print(f"CSV: {csv_pairs}, {csv_groups}")
@@ -661,7 +709,8 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d"):
 # ── Subprocess runner shared by stages 3/4/5 ─────────────────────────────────
 
 def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
-                             no_prediction=False, model_path=None, pred_samples=100):
+                             no_prediction=False, model_path=None, pred_samples=100,
+                             extra_env=None):
     """
     Invoke strategy/kairos_strategies.py as a subprocess and return the parsed
     JSON export (summary, strategy_rankings, shadow_performance).
@@ -688,8 +737,13 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
     if model_path:
         cmd.extend(["--model", model_path])
 
+    env = None
+    if extra_env:
+        env = os.environ.copy()
+        env.update(extra_env)
+
     print(f"  [subprocess] {' '.join(cmd)}")
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, env=env)
     print(proc.stdout)
     if proc.returncode == 75:
         # EX_TEMPFAIL: kairos_gpu.ensure_cuda() healed the GPU but this
@@ -697,7 +751,7 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
         # a fresh subprocess will see the healed GPU.
         print(proc.stderr)
         print("  [subprocess] exit 75 (GPU recovered, retrying once in a fresh process)")
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, env=env)
         print(proc.stdout)
     if proc.returncode != 0:
         print(proc.stderr)
@@ -769,12 +823,16 @@ def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_sam
 
 
 def run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, extra_env=None):
     """
     Shared implementation for stage 4 ('base') and stage 5 ('finetuned').
     Not executed in this environment (needs GPU + downloaded/finetuned Kronos
     weights) but fully wired: parameterizes run_backtest_subprocess with
     no_prediction=False and (for 'finetuned') a --model checkpoint path.
+
+    `extra_env` (e.g. KAIROS_PRED_CACHE_DIR) is passed through to the
+    subprocess so --stage auto's per-run prediction cache is shared across
+    the group subprocesses it spawns.
     """
     assert stage in ("base", "finetuned")
     run_id = start_run(conn, stage, interval, {
@@ -784,6 +842,7 @@ def run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
     payload = run_backtest_subprocess(
         assets, interval=interval, backtest_period=backtest_period,
         no_prediction=False, model_path=model_path, pred_samples=pred_samples,
+        extra_env=extra_env,
     )
     rows = _rows_from_export(payload, assets, interval, backtest_period, stage=stage)
     for row in rows:
@@ -1047,13 +1106,19 @@ def _print_report_summary(df, intervals):
 
 def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
                    pred_samples=100, min_sharpe=0.0, min_signals=3, force=False,
-                   skip_universe=False):
+                   skip_universe=False, min_abs_corr=None):
     """
     Chain universe → correlation → per-group oracle → per-group base for each interval.
 
     Implements resumability keyed on (assets_key, interval, backtest_period) + stage="base" for model_results.
     Per-group failure isolation with RuntimeError try/except.
     Returns DataFrame from build_viability_report.
+
+    A per-run prediction cache directory is created and shared (via
+    KAIROS_PRED_CACHE_DIR) with every base/finetuned subprocess spawned during
+    this auto run, so identical per-bar Kronos predictions computed for one
+    overlapping group are reused by later groups instead of recomputed. The
+    directory is removed when the run finishes (success or failure).
     """
     params = {
         "intervals": intervals,
@@ -1069,6 +1134,22 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
 
     failures = []  # Track (group_id, error_msg) for final summary
 
+    cache_dir = tempfile.mkdtemp(prefix=f"kairos_predcache_run{auto_run_id}_")
+    extra_env = {"KAIROS_PRED_CACHE_DIR": cache_dir}
+    try:
+        return _run_stage_auto_body(
+            conn, intervals, backtest_period, asset_class_filter, pred_samples,
+            min_sharpe, min_signals, force, skip_universe, min_abs_corr,
+            auto_run_id, failures, extra_env,
+        )
+    finally:
+        import shutil
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def _run_stage_auto_body(conn, intervals, backtest_period, asset_class_filter,
+                          pred_samples, min_sharpe, min_signals, force,
+                          skip_universe, min_abs_corr, auto_run_id, failures, extra_env):
     for interval in intervals:
         print(f"\n=== Auto stage for interval {interval} ===")
 
@@ -1099,9 +1180,11 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
                 print(f"[skip] correlation {interval} (existing run {existing[0]})")
                 correlation_run_id = existing[0]
             else:
-                correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter, interval=interval)
+                correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter,
+                                                            interval=interval, min_abs_corr=min_abs_corr)
         else:
-            correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter, interval=interval)
+            correlation_run_id = run_stage_correlation(conn, asset_class_filter=asset_class_filter,
+                                                        interval=interval, min_abs_corr=min_abs_corr)
 
         # Step 3: Fetch suggested_groups for the latest correlation run
         groups = conn.execute(
@@ -1154,7 +1237,8 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
                 try:
                     base_run_id = run_stage_model(conn, "base", assets, interval=interval,
                                                   backtest_period=backtest_period,
-                                                  pred_samples=pred_samples, model_path=None)
+                                                  pred_samples=pred_samples, model_path=None,
+                                                  extra_env=extra_env)
                     print(f"    [done] base (run_id={base_run_id})")
                 except RuntimeError as exc:
                     failures.append({"group_id": group_id, "assets": assets_key,
@@ -1194,6 +1278,36 @@ def _group_symbols_from_db(conn, group_id):
     return row[0].split(",")
 
 
+def _parse_min_abs_corr(raw: list):
+    """Parse --min_abs_corr CLI tokens into a float (uniform threshold) or a
+    dict of {asset_class: threshold} (with "default" key). Raises
+    argparse.ArgumentTypeError-compatible ValueError on malformed input."""
+    if raw is None:
+        return None
+    if len(raw) == 1 and "=" not in raw[0]:
+        try:
+            return float(raw[0])
+        except ValueError:
+            raise ValueError(f"--min_abs_corr: invalid float value: {raw[0]!r}")
+    result = {}
+    for token in raw:
+        if "=" not in token:
+            raise ValueError(
+                f"--min_abs_corr: expected 'class=value' tokens (or a single float), got {token!r}"
+            )
+        key, _, value = token.partition("=")
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--min_abs_corr: empty class name in {token!r}")
+        try:
+            result[key] = float(value)
+        except ValueError:
+            raise ValueError(f"--min_abs_corr: invalid float value in {token!r}")
+    if "default" not in result:
+        result["default"] = 0.6
+    return result
+
+
 def _build_parser():
     """Build and return the argparse parser (extracted for testability)."""
     parser = argparse.ArgumentParser(description="Kairos staged asset-discovery pipeline")
@@ -1208,6 +1322,11 @@ def _build_parser():
     parser.add_argument("--group_id", type=int, default=None)
     parser.add_argument("--asset_class", default=None, choices=["crypto", "equity", "fx_commodity"],
                          help="Restrict --stage correlation to one asset class")
+    parser.add_argument("--min_abs_corr", nargs="+", default=None, metavar="VALUE",
+                         help="Correlation grouping threshold: either a single float "
+                              "(--min_abs_corr 0.7, uniform threshold) or class=value pairs "
+                              "(--min_abs_corr crypto=0.8 equity=0.65 default=0.6). "
+                              "Valid with --stage correlation or --stage auto.")
     parser.add_argument("--min_sharpe", type=float, default=0.0,
                          help="Minimum Sharpe for viability (--stage auto only)")
     parser.add_argument("--min_signals", type=int, default=3,
@@ -1250,6 +1369,14 @@ def main(argv=None):
         if args.stage != "auto" and (flag_hyphen in actual_argv or flag_underscore in actual_argv):
             parser.error(f"{flag_hyphen} is only valid with --stage auto")
 
+    if args.stage not in ("correlation", "auto") and args.min_abs_corr is not None:
+        parser.error("--min_abs_corr is only valid with --stage correlation or --stage auto")
+
+    try:
+        min_abs_corr = _parse_min_abs_corr(args.min_abs_corr)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     conn = get_connection()
 
     if args.stage == "auto":
@@ -1270,12 +1397,14 @@ def main(argv=None):
             run_stage_auto(conn, intervals, args.backtest_period,
                           asset_class_filter=args.asset_class, pred_samples=args.pred_samples,
                           min_sharpe=args.min_sharpe, min_signals=args.min_signals,
-                          force=args.force, skip_universe=args.skip_universe)
+                          force=args.force, skip_universe=args.skip_universe,
+                          min_abs_corr=min_abs_corr)
 
     elif args.stage == "universe":
         run_stage_universe(conn, interval=args.interval)
     elif args.stage == "correlation":
-        run_stage_correlation(conn, asset_class_filter=args.asset_class, interval=args.interval)
+        run_stage_correlation(conn, asset_class_filter=args.asset_class, interval=args.interval,
+                               min_abs_corr=min_abs_corr)
     elif args.stage == "oracle":
         assets = args.assets
         if args.group_id is not None:

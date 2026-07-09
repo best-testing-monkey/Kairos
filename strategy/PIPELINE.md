@@ -286,6 +286,29 @@ For each interval in `--intervals`:
    - Each stage is skipped if results already exist for that `(assets, interval, backtest_period)` tuple, unless `--force` is passed.
 4. **Viability report:** After all intervals and groups complete, join the latest oracle and base results and build a consolidated report (see below).
 
+### Per-run prediction cache (overlapping groups)
+
+With overlapping correlation groups, the same symbol can now show up in
+several groups within one `--stage auto` run. Each group's stage-4/5
+backtest runs as its own subprocess (`run_backtest_subprocess`), so without
+caching, identical per-bar Kronos predictions would be recomputed once per
+group that contains the symbol.
+
+`run_stage_auto()` creates a temporary per-run cache directory and sets
+`KAIROS_PRED_CACHE_DIR` in the environment passed to every group subprocess
+it spawns; `strategy/kairos_predcache.py` implements a disk-backed cache
+(one `.npz` file per key, so it survives across subprocess boundaries) with
+an in-memory LRU on top bounded by a fraction of `/proc/meminfo`'s
+`MemAvailable`. The cache key is `(symbol, interval, bar_timestamp,
+lookback_len, pred_samples, model_id, content_hash)`, where `content_hash`
+is a cheap hash of the lookback window's close prices - so a different or
+stale input window for the "same" symbol/bar never collides with an
+existing cache entry. The cache directory is deleted (`shutil.rmtree`) when
+the auto run finishes, success or failure. Single-stage invocations (e.g.
+`--stage base` on its own) never set `KAIROS_PRED_CACHE_DIR`, so behavior is
+unchanged when caching isn't in play. The oracle stage (`--no-prediction`)
+never calls the prediction path at all, so it is unaffected either way.
+
 ### Resumability and `--force`
 
 Before running stage 3 (oracle) or stage 4 (base), the pipeline checks the `oracle_results` or `model_results` table for an existing row with matching `(assets, interval, backtest_period)`. If found and `--force` is off, that stage is logged as skipped and the next stage or group proceeds. This allows long pipelines to resume after a crash without re-running groups that succeeded.
@@ -375,7 +398,17 @@ also unconstrained, since `fx_commodity`'s `liquidity_threshold()` return is
   `rolling_corr_median` (informational; grouping uses `full_corr`, the
   correlation of full-history log returns, not the rolling median).
 - `min_abs_corr = 0.6` - only pairs with `|full_corr| >= 0.6` are eligible
-  for grouping.
+  for grouping. This can now be a **per-asset-class dict** instead of a
+  single float: the module-level default is
+  `MIN_ABS_CORR = {"crypto": 0.75, "default": 0.6}`, i.e. crypto pairs need a
+  stronger correlation before they're clustered. A pair's effective
+  threshold is the *stricter* (max) of its two symbols' class thresholds, so
+  a "cross" pair (spanning two asset classes) uses
+  `max(threshold(class_a), threshold(class_b))`. Override via
+  `--min_abs_corr 0.7` (uniform float, old behavior) or
+  `--min_abs_corr crypto=0.8 equity=0.65 default=0.6` (per-class) on
+  `--stage correlation` or `--stage auto`; the effective thresholds are
+  printed in the stage-2 summary.
 - `max_group_size = 4` - groups stop absorbing new symbols once they reach
   4 members.
 - Grouping algorithm: sort strong pairs by `|corr|` descending, then

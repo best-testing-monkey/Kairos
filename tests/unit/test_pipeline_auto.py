@@ -640,7 +640,7 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {"interval": interval})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             call_log.append(("correlation", asset_class_filter, interval))
             run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
             # Insert suggested groups
@@ -677,7 +677,7 @@ class TestRunStageAuto:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, **kwargs):
             call_log.append(("base", tuple(sorted(assets)), interval))
             run_id = start_run(conn, stage, interval,
                              {"assets": assets, "backtest_period": backtest_period})
@@ -722,7 +722,7 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {"interval": interval})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             call_log.append(("correlation", interval))
             run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
             temp_db.execute(
@@ -746,7 +746,7 @@ class TestRunStageAuto:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, **kwargs):
             call_log.append(("base", interval))
             run_id = start_run(conn, stage, interval, {})
             assets_key = ",".join(sorted(assets))
@@ -792,7 +792,7 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             run_id = start_run(conn, "correlation", interval, {})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
@@ -808,7 +808,7 @@ class TestRunStageAuto:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, **kwargs):
             call_log.append(("base", tuple(sorted(assets))))
             run_id = start_run(conn, stage, interval, {})
             assets_key = ",".join(sorted(assets))
@@ -853,7 +853,7 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             run_id = start_run(conn, "correlation", interval, {})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
@@ -869,7 +869,7 @@ class TestRunStageAuto:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, **kwargs):
             call_log.append(("base", tuple(sorted(assets))))
             run_id = start_run(conn, stage, interval, {})
             return run_id
@@ -891,7 +891,7 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             run_id = start_run(conn, "correlation", interval, {})
             # Two groups
             temp_db.execute(
@@ -917,7 +917,7 @@ class TestRunStageAuto:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, **kwargs):
             assets_tuple = tuple(sorted(assets))
             call_log.append(("base", assets_tuple))
             run_id = start_run(conn, stage, interval, {})
@@ -942,7 +942,7 @@ class TestRunStageAuto:
             run_id = start_run(conn, "universe", interval, {})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             run_id = start_run(conn, "correlation", interval, {})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
@@ -957,7 +957,7 @@ class TestRunStageAuto:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, **kwargs):
             run_id = start_run(conn, stage, interval, {})
             return run_id
 
@@ -991,7 +991,7 @@ class TestRunStageAuto:
             call_log.append(("universe", interval))
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             call_log.append(("correlation",))
             run_id = start_run(conn, "correlation", interval, {})
             temp_db.execute(
@@ -1008,7 +1008,7 @@ class TestRunStageAuto:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, **kwargs):
             call_log.append(("base",))
             run_id = start_run(conn, stage, interval, {})
             return run_id
@@ -1044,7 +1044,7 @@ class TestRunStageAuto:
             call_log.append(("universe", interval))
             return universe_run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             call_log.append(("correlation",))
             run_id = start_run(conn, "correlation", interval, {})
             return run_id
@@ -1055,7 +1055,7 @@ class TestRunStageAuto:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                     pred_samples=100, model_path=None):
+                     pred_samples=100, model_path=None, **kwargs):
             call_log.append(("base",))
             run_id = start_run(conn, stage, interval, {})
             return run_id
@@ -1316,6 +1316,95 @@ class TestCLIReportOnlyDispatch:
         # Verify the DataFrame has rows
         assert len(df) > 0, "No viability_report rows in DataFrame"
         assert "test_strat" in df["strategy_name"].values
+
+
+class TestRunStageAutoPredCache:
+    """Tests that run_stage_auto creates/cleans up the per-run prediction
+    cache dir and threads KAIROS_PRED_CACHE_DIR through to run_stage_model."""
+
+    def test_cache_dir_created_and_passed_then_cleaned_up(self, temp_db):
+        import os as _os
+        captured_envs = []
+        captured_dirs = []
+
+        def mock_universe(conn, interval="1d", **kwargs):
+            return start_run(conn, "universe", interval, {})
+
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
+            run_id = start_run(conn, "correlation", interval, {})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
+            return start_run(conn, "oracle", interval, {})
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                      pred_samples=100, model_path=None, extra_env=None, **kwargs):
+            captured_envs.append(extra_env)
+            if extra_env and "KAIROS_PRED_CACHE_DIR" in extra_env:
+                cache_dir = extra_env["KAIROS_PRED_CACHE_DIR"]
+                captured_dirs.append(cache_dir)
+                # The directory must exist while the auto run is in progress.
+                assert _os.path.isdir(cache_dir)
+            return start_run(conn, stage, interval, {})
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            run_stage_auto(temp_db, ["1d"], "6m")
+
+        assert len(captured_dirs) == 1
+        cache_dir = captured_dirs[0]
+        # Cache dir must be removed once the auto run finishes.
+        assert not _os.path.isdir(cache_dir)
+
+    def test_cache_dir_cleaned_up_even_on_failure(self, temp_db):
+        import os as _os
+        import tempfile
+
+        def mock_universe(conn, interval="1d", **kwargs):
+            return start_run(conn, "universe", interval, {})
+
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
+            run_id = start_run(conn, "correlation", interval, {})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
+            raise RuntimeError("boom")
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                      pred_samples=100, model_path=None, extra_env=None, **kwargs):
+            raise AssertionError("base should not run when oracle fails")
+
+        before = {
+            d for d in _os.listdir(tempfile.gettempdir())
+            if d.startswith("kairos_predcache_run")
+        }
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            run_stage_auto(temp_db, ["1d"], "6m")
+
+        after = {
+            d for d in _os.listdir(tempfile.gettempdir())
+            if d.startswith("kairos_predcache_run")
+        }
+        # No leftover cache dirs from this run, even though oracle raised.
+        assert after - before == set()
 
 
 class TestCLIFlagsPassedVerbatim:
@@ -1831,7 +1920,7 @@ class TestRunStageAutoSingletonGroup:
             run_id = start_run(conn, "universe", interval, {"interval": interval})
             return run_id
 
-        def mock_correlation(conn, asset_class_filter=None, interval="1d"):
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
             run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
             temp_db.execute(
                 "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
@@ -1854,7 +1943,7 @@ class TestRunStageAutoSingletonGroup:
             return run_id
 
         def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
-                      pred_samples=100, model_path=None):
+                      pred_samples=100, model_path=None, **kwargs):
             call_log.append(("base", list(assets), interval))
             run_id = start_run(conn, stage, interval, {"assets": assets, "backtest_period": backtest_period})
             for name, perf in self._mock_payload()["shadow_performance"].items():

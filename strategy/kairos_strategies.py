@@ -202,8 +202,12 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
 def predict_all_batch(assets: dict) -> dict:
     """Predict all assets in one batched GPU call instead of N sequential calls."""
     from kairos_meta import AssetPrediction, KairosDistribution
+    import kairos_predcache
 
     _ensure_model_loaded()
+
+    shared_cache = kairos_predcache.get_cache()
+    shared_keys = {}  # symbol -> cache key (only computed when shared_cache is active)
 
     df_list, x_ts_list, y_ts_list = [], [], []
     cached_results = {}
@@ -214,6 +218,28 @@ def predict_all_batch(assets: dict) -> dict:
         if cache_key in _prediction_cache:
             cached_results[symbol] = _prediction_cache[cache_key]
             continue
+
+        if shared_cache is not None:
+            lookback_for_hash = min(KairosSettings.lookback, len(df))
+            content_hash = kairos_predcache.content_hash_for_closes(
+                df["close"].iloc[-lookback_for_hash:]
+            )
+            shared_key = kairos_predcache.make_key(
+                symbol=symbol,
+                interval=KairosSettings.interval,
+                bar_timestamp=df.index[-1],
+                lookback_len=lookback_for_hash,
+                pred_samples=KairosSettings.pred_samples,
+                model_id=KairosSettings.model,
+                content_hash=content_hash,
+            )
+            shared_keys[symbol] = shared_key
+            shared_hit = shared_cache.get(shared_key)
+            if shared_hit is not None:
+                _prediction_cache[cache_key] = shared_hit
+                cached_results[symbol] = shared_hit
+                continue
+
         lookback = min(KairosSettings.lookback, len(df))
         x_df, x_ts = to_kronos_frame(df, lookback, amount="auto")
         y_ts = future_timestamps(x_ts.iloc[-1], KairosSettings.interval, 1, _state.calendar, _state.tz)
@@ -241,6 +267,8 @@ def predict_all_batch(assets: dict) -> dict:
                 preds = [preds]
             _prediction_cache[(symbol, assets[symbol].index[-1])] = preds
             cached_results[symbol] = preds
+            if shared_cache is not None and symbol in shared_keys:
+                shared_cache.put(shared_keys[symbol], preds)
 
     result = {}
     for symbol, preds in cached_results.items():

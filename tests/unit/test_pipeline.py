@@ -194,3 +194,96 @@ def test_db_schema_round_trip(tmp_path):
     assert row == ("base", "trend_follow", 0.9, None)
 
     conn.close()
+
+
+# ============================================================================
+# Per-asset-class min_abs_corr (Feature 1)
+# ============================================================================
+
+def test_min_abs_corr_dict_excludes_weak_crypto_pair():
+    # crypto threshold is 0.75; a 0.7 crypto pair should NOT be grouped.
+    pairs = [
+        {"symbol_a": "BTC-USD", "symbol_b": "ETH-USD", "asset_class": "crypto",
+         "class_a": "crypto", "class_b": "crypto", "full_corr": 0.7},
+    ]
+    groups = kp.greedy_group_pairs(pairs, min_abs_corr={"crypto": 0.75, "default": 0.6})
+    assert groups == []
+
+
+def test_min_abs_corr_dict_includes_equity_pair_at_default():
+    # equity falls back to "default" (0.6); 0.65 should pass.
+    pairs = [
+        {"symbol_a": "SPY", "symbol_b": "QQQ", "asset_class": "equity",
+         "class_a": "equity", "class_b": "equity", "full_corr": 0.65},
+    ]
+    groups = kp.greedy_group_pairs(pairs, min_abs_corr={"crypto": 0.75, "default": 0.6})
+    assert len(groups) == 1
+    assert set(groups[0]["symbols"]) == {"SPY", "QQQ"}
+
+
+def test_min_abs_corr_dict_cross_pair_uses_stricter_threshold():
+    # cross pair between crypto (0.75) and equity (default 0.6) -> needs 0.75.
+    pairs = [
+        {"symbol_a": "BTC-USD", "symbol_b": "SPY", "asset_class": "cross",
+         "class_a": "crypto", "class_b": "equity", "full_corr": 0.7},
+    ]
+    groups = kp.greedy_group_pairs(pairs, min_abs_corr={"crypto": 0.75, "default": 0.6})
+    assert groups == []  # 0.7 < 0.75 (stricter of the two)
+
+    pairs2 = [
+        {"symbol_a": "BTC-USD", "symbol_b": "SPY", "asset_class": "cross",
+         "class_a": "crypto", "class_b": "equity", "full_corr": 0.8},
+    ]
+    groups2 = kp.greedy_group_pairs(pairs2, min_abs_corr={"crypto": 0.75, "default": 0.6})
+    assert len(groups2) == 1
+
+
+def test_min_abs_corr_float_behaves_as_before():
+    pairs = [
+        {"symbol_a": "A", "symbol_b": "B", "asset_class": "crypto", "full_corr": 0.65},
+    ]
+    groups = kp.greedy_group_pairs(pairs, min_abs_corr=0.6)
+    assert len(groups) == 1
+
+
+def test_min_abs_corr_dict_missing_class_ab_falls_back_to_asset_class():
+    # No class_a/class_b keys (older pair dict shape) -> falls back to asset_class.
+    pairs = [
+        {"symbol_a": "BTC-USD", "symbol_b": "ETH-USD", "asset_class": "crypto", "full_corr": 0.7},
+    ]
+    groups = kp.greedy_group_pairs(pairs, min_abs_corr={"crypto": 0.75, "default": 0.6})
+    assert groups == []
+
+
+def test_module_default_min_abs_corr():
+    assert kp.MIN_ABS_CORR == {"crypto": 0.75, "default": 0.6}
+
+
+# ============================================================================
+# --min_abs_corr CLI parsing
+# ============================================================================
+
+def test_cli_parses_min_abs_corr_single_float():
+    parser = kp._build_parser()
+    args = parser.parse_args(["--stage", "correlation", "--min_abs_corr", "0.7"])
+    assert kp._parse_min_abs_corr(args.min_abs_corr) == 0.7
+
+
+def test_cli_parses_min_abs_corr_class_pairs():
+    parser = kp._build_parser()
+    args = parser.parse_args([
+        "--stage", "correlation", "--min_abs_corr",
+        "crypto=0.8", "equity=0.65", "default=0.6",
+    ])
+    parsed = kp._parse_min_abs_corr(args.min_abs_corr)
+    assert parsed == {"crypto": 0.8, "equity": 0.65, "default": 0.6}
+
+
+def test_cli_min_abs_corr_dict_without_default_gets_default_added():
+    parsed = kp._parse_min_abs_corr(["crypto=0.8"])
+    assert parsed == {"crypto": 0.8, "default": 0.6}
+
+
+def test_cli_rejects_garbage_min_abs_corr():
+    with pytest.raises(ValueError):
+        kp._parse_min_abs_corr(["not-a-number"])

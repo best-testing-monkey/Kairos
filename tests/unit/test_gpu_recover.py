@@ -277,7 +277,7 @@ class TestPipelineRetryOn75:
 
         calls = {"n": 0}
 
-        def fake_run(cmd, cwd=None, capture_output=None, text=None):
+        def fake_run(cmd, cwd=None, capture_output=None, text=None, env=None):
             calls["n"] += 1
             # kairos_pipeline writes to the tmp_path passed via --export_json;
             # find it in cmd and populate it so json.load succeeds.
