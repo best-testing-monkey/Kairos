@@ -97,6 +97,19 @@ def _format_numeric_cell(value, decimals=2):
         return ""
 
 
+def _format_ev_pct(expected_value, entry):
+    """Format expected value as a percentage of entry price.
+
+    Returns {+/-X.XXX%} format, or empty string if entry <= 0 or missing."""
+    if _is_missing(expected_value) or _is_missing(entry) or entry == 0:
+        return ""
+    try:
+        ev_pct = (float(expected_value) / float(entry)) * 100.0
+        return f"{ev_pct:+.2f}%"
+    except (TypeError, ValueError):
+        return ""
+
+
 def signal_to_advice(strategy_name, symbol, signal) -> str:
     """Render a single Signal into a plain-English advice bullet (no leading '- ')."""
     from kairos_backtest import Direction
@@ -193,7 +206,7 @@ def format_table(headers, rows, align):
 
 STATS_COLUMNS = [
     "strategy", "symbol", "interval", "backtest_period", "direction", "size",
-    "entry", "stop", "target", "confidence", "expected_value",
+    "entry", "stop", "target", "confidence", "expected_value", "ev_pct",
     "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
     "signals_per_week",
 ]
@@ -207,7 +220,10 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
     advice_rows: list of dicts with keys:
         - "confidence": float (2 decimals)
         - "expected_value": float (2 decimals)
+        - "entry": float (for ev_pct calculation)
         - "base_win_rate": float (2 decimals)
+        - "base_signals": int or None (number of signals from backtest)
+        - "oracle_signals": int or None (fallback if base_signals missing)
         - "signal": plain-English advice string
         Can also be a list of plain strings for backward compatibility (treated as signals).
     failures: list of strings describing group-level failures.
@@ -225,7 +241,9 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
         for row in stats_rows:
             formatted_row = {}
             for col in STATS_COLUMNS:
-                if col in ("size", "entry", "stop", "target", "confidence", "expected_value",
+                if col == "ev_pct":
+                    formatted_row[col] = _format_ev_pct(row.get("expected_value"), row.get("entry"))
+                elif col in ("size", "entry", "stop", "target", "confidence", "expected_value",
                            "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
                            "signals_per_week"):
                     formatted_row[col] = _format_numeric_cell(row.get(col), decimals=2)
@@ -236,7 +254,7 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
         # Build stats table with alignment (all numeric columns right-aligned)
         align = []
         for col in STATS_COLUMNS:
-            if col in ("size", "entry", "stop", "target", "confidence", "expected_value",
+            if col in ("size", "entry", "stop", "target", "confidence", "expected_value", "ev_pct",
                        "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
                        "signals_per_week"):
                 align.append("r")
@@ -256,21 +274,38 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
             for line in advice_rows:
                 lines.append(f"- {line}")
         else:
-            # New: list of dicts with confidence, expected_value, base_win_rate, signal
+            # New: list of dicts with confidence, ev_pct, base_win_rate, signals/backtest, signal
             signals_table = []
             for row in advice_rows:
+                ev_pct = _format_ev_pct(row.get("expected_value"), row.get("entry"))
+                # signals/backtest: use base_signals, fallback to oracle_signals, blank if both missing
+                signals_backtest = ""
+                if not _is_missing(row.get("base_signals")):
+                    signals_backtest = str(int(row.get("base_signals")))
+                elif not _is_missing(row.get("oracle_signals")):
+                    signals_backtest = str(int(row.get("oracle_signals")))
                 signals_table.append({
                     "confidence": _format_numeric_cell(row.get("confidence"), decimals=2),
-                    "expected_value": _format_numeric_cell(row.get("expected_value"), decimals=2),
+                    "ev_pct": ev_pct,
                     "base_win_rate": _format_numeric_cell(row.get("base_win_rate"), decimals=2),
+                    "signals/backtest": signals_backtest,
                     "signal": str(row.get("signal", "")),
                 })
-            signals_headers = ["confidence", "expected_value", "base_win_rate", "signal"]
-            signals_align = ["r", "r", "r", "l"]
+            signals_headers = ["confidence", "ev_pct", "base_win_rate", "signals/backtest", "signal"]
+            signals_align = ["r", "r", "r", "r", "l"]
             table_lines = format_table(signals_headers, signals_table, signals_align)
             lines.extend(table_lines)
     else:
         lines.append("_No signals generated._")
+    lines.append("")
+
+    # Add Legend
+    lines.append("### Legend")
+    lines.append("")
+    lines.append("- `confidence` — strategy-specific conviction score, NOT comparable across strategies: probability-like in [0,1] for most strategies, an unbounded ratio (z-score/threshold multiple) for others; higher = stronger conviction, negative = very weak. Used multiplicatively for ranking within a strategy.")
+    lines.append("- `ev_pct` — expected value of the trade per unit, as a percentage of the entry price (probability-weighted over the model's sampled price paths).")
+    lines.append("- `base_win_rate` — fraction of winning trades this strategy had in the last base-model backtest.")
+    lines.append("- `signals/backtest` — number of signals the strategy generated during the last backtest period; low counts mean win rate and Sharpe are statistically weak.")
     lines.append("")
 
     if failures:
@@ -462,7 +497,10 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                     advice_rows.append({
                         "confidence": sig.confidence,
                         "expected_value": sig.expected_value,
+                        "entry": sig.entry,
                         "base_win_rate": row.get("base_win_rate"),
+                        "base_signals": row.get("base_signals"),
+                        "oracle_signals": row.get("oracle_signals"),
                         "signal": signal_to_advice(strategy_name, sym, sig),
                     })
         except Exception as e:

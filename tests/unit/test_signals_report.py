@@ -17,6 +17,7 @@ from kairos_signals import (
     run,
     format_table,
     _format_numeric_cell,
+    _format_ev_pct,
 )
 
 
@@ -110,6 +111,30 @@ class TestFormatNumericCell:
         assert _format_numeric_cell(0.123456, decimals=1) == "0.1"
 
 
+class TestFormatEvPct:
+    def test_format_ev_pct_basic(self):
+        """_format_ev_pct should compute EV as percentage of entry price."""
+        # entry 100, EV 0.9 → 0.9% → +0.90%
+        assert _format_ev_pct(0.9, 100.0) == "+0.90%"
+        # entry 100, EV -2.5 → -2.5% → -2.50%
+        assert _format_ev_pct(-2.5, 100.0) == "-2.50%"
+        # entry 50, EV 5.0 → 10% → +10.00%
+        assert _format_ev_pct(5.0, 50.0) == "+10.00%"
+
+    def test_format_ev_pct_zero_entry(self):
+        """_format_ev_pct should return blank if entry is zero."""
+        assert _format_ev_pct(1.0, 0) == ""
+        assert _format_ev_pct(5.0, 0.0) == ""
+
+    def test_format_ev_pct_missing_values(self):
+        """_format_ev_pct should return blank if expected_value or entry is missing."""
+        import numpy as np
+        assert _format_ev_pct(None, 100.0) == ""
+        assert _format_ev_pct(1.0, None) == ""
+        assert _format_ev_pct(float("nan"), 100.0) == ""
+        assert _format_ev_pct(1.0, np.nan) == ""
+
+
 # ============================================================================
 # format_table
 # ============================================================================
@@ -178,7 +203,8 @@ class TestRenderReport:
             "signals_per_week": 0.69,
         }]
         advice_rows = [{
-            "confidence": 0.8000, "expected_value": 0.0200, "base_win_rate": 1.0,
+            "confidence": 0.8000, "expected_value": 0.0200, "entry": 60800.00, "base_win_rate": 1.0,
+            "base_signals": 3, "oracle_signals": None,
             "signal": "Strategy dfa_persistence advised **Long** position on BTC-USD ...",
         }]
         failures = ["group assets=A,B interval=1d: boom"]
@@ -196,6 +222,7 @@ class TestRenderReport:
         assert "boom" in report
         assert "## Skipped" in report
         assert "ghost_strategy" in report
+        assert "### Legend" in report
 
     def test_no_signals_sections_present(self):
         ts = datetime(2026, 7, 9, 6, 49)
@@ -206,20 +233,21 @@ class TestRenderReport:
         assert "## Skipped" not in report
 
     def test_signals_table_format_has_correct_columns(self):
-        """Signals table should have columns: confidence, expected_value, base_win_rate, signal."""
+        """Signals table should have columns: confidence, ev_pct, base_win_rate, signals/backtest, signal."""
         advice_rows = [{
-            "confidence": 0.75, "expected_value": 0.015, "base_win_rate": 0.65,
+            "confidence": 0.75, "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.65,
+            "base_signals": 5, "oracle_signals": None,
             "signal": "Strategy test advised **Long** on BTC.",
         }]
         ts = datetime(2026, 7, 9, 6, 49)
         report = render_report([], advice_rows, [], [], ts)
 
         # Check header row has the correct column names
-        assert "| confidence | expected_value | base_win_rate | signal |" in report.replace(" ", "").lower() or \
-               all(x in report for x in ["confidence", "expected_value", "base_win_rate", "signal"])
+        assert all(x in report for x in ["confidence", "ev_pct", "base_win_rate", "signals/backtest", "signal"])
         # Check data is present
-        assert "0.75" in report or "0.75" in report
-        assert "0.62" in report or "0.62" in report or "0.65" in report  # base_win_rate formatted
+        assert "0.75" in report  # confidence
+        assert "+0.90%" in report  # ev_pct (0.9/100 * 100 = 0.90%)
+        assert "5" in report  # signals/backtest
 
     def test_numeric_cells_rounded_to_2_decimals(self):
         """Stats table numeric cells should format with max 2 decimals."""
@@ -241,6 +269,81 @@ class TestRenderReport:
         assert "58900.46" in report  # stop
         assert "0.77" in report or "0.76" in report  # confidence or oracle_sharpe
         assert "0.01" in report  # expected_value
+
+    def test_signals_table_ev_pct_computed_correctly(self):
+        """Signals table should show ev_pct as percentage of entry price."""
+        advice_rows = [{
+            "confidence": 0.8, "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
+            "base_signals": 10, "oracle_signals": None,
+            "signal": "Test signal",
+        }]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report([], advice_rows, [], [], ts)
+
+        # 0.9 / 100 * 100 = 0.90%
+        assert "+0.90%" in report
+
+    def test_signals_table_signals_backtest_fallback_to_oracle(self):
+        """signals/backtest should use base_signals, fallback to oracle_signals."""
+        advice_rows = [
+            {
+                "confidence": 0.8, "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
+                "base_signals": 5, "oracle_signals": 10,
+                "signal": "Test with base",
+            },
+            {
+                "confidence": 0.7, "expected_value": 0.5, "entry": 100.0, "base_win_rate": 0.65,
+                "base_signals": None, "oracle_signals": 8,
+                "signal": "Test fallback",
+            },
+            {
+                "confidence": 0.6, "expected_value": 0.3, "entry": 100.0, "base_win_rate": 0.55,
+                "base_signals": None, "oracle_signals": None,
+                "signal": "Test blank",
+            },
+        ]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report([], advice_rows, [], [], ts)
+
+        # Verify values appear in the report
+        lines = report.split("\n")
+        signals_section = False
+        row_count = 0
+        for line in lines:
+            if "## Signals" in line:
+                signals_section = True
+            if signals_section and "|" in line and "Test" in line:
+                row_count += 1
+                if "Test with base" in line:
+                    assert "5" in line
+                elif "Test fallback" in line:
+                    assert "8" in line
+                elif "Test blank" in line:
+                    # Should have blank for signals/backtest
+                    pass
+
+    def test_render_report_legend_section_present(self):
+        """Report should have Legend section with all four column descriptions."""
+        advice_rows = [{
+            "confidence": 0.8, "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
+            "base_signals": 5, "oracle_signals": None,
+            "signal": "Test signal",
+        }]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report([], advice_rows, [], [], ts)
+
+        # Check Legend section exists
+        assert "### Legend" in report
+        # Check all four column descriptions are present
+        assert "confidence" in report.lower()
+        assert "ev_pct" in report
+        assert "base_win_rate" in report
+        assert "signals/backtest" in report
+        # Check key descriptions
+        assert "strategy-specific conviction score" in report
+        assert "expected value of the trade per unit" in report
+        assert "fraction of winning trades" in report
+        assert "number of signals the strategy generated" in report
 
 
 # ============================================================================
