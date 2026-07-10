@@ -346,6 +346,63 @@ class TestRenderReport:
         assert "fraction of winning trades" in report
         assert "number of signals the strategy generated" in report
 
+    def test_signals_table_sorted_by_ev_pct_descending(self):
+        """Signals rows must render sorted by ev_pct descending (2%, 1%, 0.5%)."""
+        advice_rows = [
+            {"expected_value": 0.5, "entry": 100.0, "base_win_rate": 0.5,
+             "base_signals": 1, "oracle_signals": None, "signal": "Row half"},
+            {"expected_value": 2.0, "entry": 100.0, "base_win_rate": 0.5,
+             "base_signals": 1, "oracle_signals": None, "signal": "Row two"},
+            {"expected_value": 1.0, "entry": 100.0, "base_win_rate": 0.5,
+             "base_signals": 1, "oracle_signals": None, "signal": "Row one"},
+        ]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report([], advice_rows, [], [], ts)
+
+        assert report.index("Row two") < report.index("Row one") < report.index("Row half")
+        assert "+2.00%" in report and "+1.00%" in report and "+0.50%" in report
+
+    def test_signals_table_flat_row_sorts_last(self):
+        """FLAT rows (no computable ev_pct) must sort after all ev_pct rows."""
+        advice_rows = [
+            {"expected_value": None, "entry": None, "base_win_rate": None,
+             "base_signals": None, "oracle_signals": None,
+             "signal": "Strategy flat advised **Exit/Flat** on BTC-USD."},
+            {"expected_value": 0.5, "entry": 100.0, "base_win_rate": 0.5,
+             "base_signals": 1, "oracle_signals": None, "signal": "Row half"},
+            {"expected_value": 2.0, "entry": 100.0, "base_win_rate": 0.5,
+             "base_signals": 1, "oracle_signals": None, "signal": "Row two"},
+        ]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report([], advice_rows, [], [], ts)
+
+        assert (report.index("Row two") < report.index("Row half")
+                < report.index("**Exit/Flat**"))
+
+    def test_stats_table_sorted_by_ev_pct_descending(self):
+        """Stats rows must also render sorted by ev_pct descending, missing last."""
+        def stat(strategy, ev, entry):
+            return {
+                "strategy": strategy, "symbol": "BTC-USD", "interval": "1d",
+                "backtest_period": "1m", "direction": "LONG", "size": 0.1,
+                "entry": entry, "stop": 97.0, "target": 105.0,
+                "expected_value": ev,
+                "oracle_sharpe": 1.0, "base_sharpe": 1.0,
+                "oracle_win_rate": 0.5, "base_win_rate": 0.5,
+                "signals_per_week": 1.0,
+            }
+        stats_rows = [
+            stat("strat_half", 0.5, 100.0),
+            stat("strat_missing", None, None),
+            stat("strat_two", 2.0, 100.0),
+            stat("strat_one", 1.0, 100.0),
+        ]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report(stats_rows, [], [], [], ts)
+
+        assert (report.index("strat_two") < report.index("strat_one")
+                < report.index("strat_half") < report.index("strat_missing"))
+
 
 # ============================================================================
 # load_work_items / group_items

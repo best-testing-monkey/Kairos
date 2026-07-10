@@ -220,6 +220,17 @@ STATS_COLUMNS = [
 ]
 
 
+def _sort_by_ev_pct_desc(rows):
+    """Sort row dicts by ev_pct (expected_value as percent of entry) descending.
+
+    Rows with no computable ev_pct (e.g. FLAT signals) go last. Stable sort:
+    ties and missing-value rows keep their insertion order."""
+    def key(row):
+        ev = _ev_pct_value(row.get("expected_value"), row.get("entry"))
+        return (ev is None, -ev if ev is not None else 0.0)
+    return sorted(rows, key=key)
+
+
 def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
                   min_ev_pct=0.10) -> str:
     """Assemble the full markdown report from pre-computed pieces.
@@ -246,9 +257,10 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
     lines.append("## Stats")
     lines.append("")
     if stats_rows:
-        # Format numeric cells in stats table with 2 decimals
+        # Format numeric cells in stats table with 2 decimals,
+        # rows sorted by ev_pct descending (missing ev_pct last)
         formatted_stats = []
-        for row in stats_rows:
+        for row in _sort_by_ev_pct_desc(stats_rows):
             formatted_row = {}
             for col in STATS_COLUMNS:
                 if col == "ev_pct":
@@ -284,9 +296,10 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
             for line in advice_rows:
                 lines.append(f"- {line}")
         else:
-            # New: list of dicts with ev_pct, base_win_rate, signals/backtest, signal
+            # New: list of dicts with ev_pct, base_win_rate, signals/backtest, signal,
+            # rows sorted by ev_pct descending (FLAT/missing ev_pct last)
             signals_table = []
-            for row in advice_rows:
+            for row in _sort_by_ev_pct_desc(advice_rows):
                 ev_pct = _format_ev_pct(row.get("expected_value"), row.get("entry"))
                 # signals/backtest: use base_signals, fallback to oracle_signals, blank if both missing
                 signals_backtest = ""
