@@ -97,17 +97,25 @@ def _format_numeric_cell(value, decimals=2):
         return ""
 
 
+def _ev_pct_value(expected_value, entry):
+    """Expected value as a percentage of entry price, or None if not computable
+    (entry <= 0 or either value missing)."""
+    if _is_missing(expected_value) or _is_missing(entry) or entry <= 0:
+        return None
+    try:
+        return (float(expected_value) / float(entry)) * 100.0
+    except (TypeError, ValueError):
+        return None
+
+
 def _format_ev_pct(expected_value, entry):
     """Format expected value as a percentage of entry price.
 
-    Returns {+/-X.XXX%} format, or empty string if entry <= 0 or missing."""
-    if _is_missing(expected_value) or _is_missing(entry) or entry == 0:
+    Returns {+/-X.XX%} format, or empty string if entry <= 0 or missing."""
+    ev_pct = _ev_pct_value(expected_value, entry)
+    if ev_pct is None:
         return ""
-    try:
-        ev_pct = (float(expected_value) / float(entry)) * 100.0
-        return f"{ev_pct:+.2f}%"
-    except (TypeError, ValueError):
-        return ""
+    return f"{ev_pct:+.2f}%"
 
 
 def signal_to_advice(strategy_name, symbol, signal) -> str:
@@ -212,7 +220,8 @@ STATS_COLUMNS = [
 ]
 
 
-def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
+def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
+                  min_ev_pct=0.10) -> str:
     """Assemble the full markdown report from pre-computed pieces.
 
     stats_rows: list of dicts with keys from STATS_COLUMNS (only strategies
@@ -231,6 +240,8 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
     """
     lines = []
     lines.append(f"# Kairos Signals Report {timestamp.strftime('%Y-%m-%d %H%Mh')}")
+    lines.append("")
+    lines.append(f"_Filters: min ev_pct {min_ev_pct:.2f}%_")
     lines.append("")
     lines.append("## Stats")
     lines.append("")
@@ -377,8 +388,14 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
 
 
 def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
-        include_all=False, predict_fn=None, lookback=None, now=None):
-    """Run the full signals-report flow. Returns the path to the written report."""
+        include_all=False, predict_fn=None, lookback=None, now=None,
+        min_ev_pct=0.10):
+    """Run the full signals-report flow. Returns the path to the written report.
+
+    min_ev_pct: minimum expected value (as percent of entry price) for a
+        non-FLAT signal to be reported; lower-EV signals go to the Skipped
+        footer. FLAT/exit signals are never filtered. Set 0 to disable.
+    """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
     from kairos_strategies import fetch_data_raw, resolve_disabled_strategies, LOOKBACK
@@ -473,6 +490,20 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                         )
                         continue
 
+                    # Minimum-EV filter: non-FLAT signals must clear
+                    # min_ev_pct (expected value as percent of entry).
+                    # FLAT/exit signals are never filtered by this.
+                    if sig.direction != Direction.FLAT and min_ev_pct > 0:
+                        ev_pct_val = _ev_pct_value(sig.expected_value, sig.entry)
+                        if ev_pct_val is None or ev_pct_val < min_ev_pct:
+                            ev_str = (f"{ev_pct_val:.2f}%" if ev_pct_val is not None
+                                      else "n/a")
+                            skipped.append(
+                                f"{strategy_name}/{sym}: ev_pct below threshold "
+                                f"({ev_str} < {min_ev_pct:.2f}%)"
+                            )
+                            continue
+
                     stats_rows.append({
                         "strategy": strategy_name,
                         "symbol": sym,
@@ -505,7 +536,8 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     os.makedirs(out_dir, exist_ok=True)
     stamp = now.strftime("%Y%m%d%H%M")
     out_path = os.path.join(out_dir, f"kairos_signals_{stamp}.md")
-    report = render_report(stats_rows, advice_rows, failures, skipped, now)
+    report = render_report(stats_rows, advice_rows, failures, skipped, now,
+                           min_ev_pct=min_ev_pct)
     with open(out_path, "w") as f:
         f.write(report)
 
@@ -520,11 +552,16 @@ def main(argv=None):
     parser.add_argument("--pred_samples", type=int, default=100, help="Prediction sample count")
     parser.add_argument("--all", dest="include_all", action="store_true", default=False,
                         help="Include non-viable rows too (default: viable-only)")
+    parser.add_argument("--min_ev_pct", type=float, default=0.10,
+                        help="Minimum expected value for a signal, in percent of entry "
+                             "price (default: 0.10). Non-FLAT signals below this go to "
+                             "the Skipped footer; set 0 to disable.")
     args = parser.parse_args(argv)
 
     out_path = run(
         db_path=args.db, out_dir=args.out, intervals=args.intervals,
         pred_samples=args.pred_samples, include_all=args.include_all,
+        min_ev_pct=args.min_ev_pct,
     )
     print(out_path)
     return out_path
