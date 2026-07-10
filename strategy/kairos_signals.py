@@ -206,7 +206,7 @@ def format_table(headers, rows, align):
 
 STATS_COLUMNS = [
     "strategy", "symbol", "interval", "backtest_period", "direction", "size",
-    "entry", "stop", "target", "confidence", "expected_value", "ev_pct",
+    "entry", "stop", "target", "expected_value", "ev_pct",
     "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
     "signals_per_week",
 ]
@@ -218,7 +218,6 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
     stats_rows: list of dicts with keys from STATS_COLUMNS (only strategies
         that produced >=1 signal should be included by the caller).
     advice_rows: list of dicts with keys:
-        - "confidence": float (2 decimals)
         - "expected_value": float (2 decimals)
         - "entry": float (for ev_pct calculation)
         - "base_win_rate": float (2 decimals)
@@ -243,7 +242,7 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
             for col in STATS_COLUMNS:
                 if col == "ev_pct":
                     formatted_row[col] = _format_ev_pct(row.get("expected_value"), row.get("entry"))
-                elif col in ("size", "entry", "stop", "target", "confidence", "expected_value",
+                elif col in ("size", "entry", "stop", "target", "expected_value",
                            "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
                            "signals_per_week"):
                     formatted_row[col] = _format_numeric_cell(row.get(col), decimals=2)
@@ -254,7 +253,7 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
         # Build stats table with alignment (all numeric columns right-aligned)
         align = []
         for col in STATS_COLUMNS:
-            if col in ("size", "entry", "stop", "target", "confidence", "expected_value", "ev_pct",
+            if col in ("size", "entry", "stop", "target", "expected_value", "ev_pct",
                        "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
                        "signals_per_week"):
                 align.append("r")
@@ -274,7 +273,7 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
             for line in advice_rows:
                 lines.append(f"- {line}")
         else:
-            # New: list of dicts with confidence, ev_pct, base_win_rate, signals/backtest, signal
+            # New: list of dicts with ev_pct, base_win_rate, signals/backtest, signal
             signals_table = []
             for row in advice_rows:
                 ev_pct = _format_ev_pct(row.get("expected_value"), row.get("entry"))
@@ -285,14 +284,13 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
                 elif not _is_missing(row.get("oracle_signals")):
                     signals_backtest = str(int(row.get("oracle_signals")))
                 signals_table.append({
-                    "confidence": _format_numeric_cell(row.get("confidence"), decimals=2),
                     "ev_pct": ev_pct,
                     "base_win_rate": _format_numeric_cell(row.get("base_win_rate"), decimals=2),
                     "signals/backtest": signals_backtest,
                     "signal": str(row.get("signal", "")),
                 })
-            signals_headers = ["confidence", "ev_pct", "base_win_rate", "signals/backtest", "signal"]
-            signals_align = ["r", "r", "r", "r", "l"]
+            signals_headers = ["ev_pct", "base_win_rate", "signals/backtest", "signal"]
+            signals_align = ["r", "r", "r", "l"]
             table_lines = format_table(signals_headers, signals_table, signals_align)
             lines.extend(table_lines)
     else:
@@ -302,7 +300,6 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp) -> str:
     # Add Legend
     lines.append("### Legend")
     lines.append("")
-    lines.append("- `confidence` — strategy-specific conviction score, NOT comparable across strategies: probability-like in [0,1] for most strategies, an unbounded ratio (z-score/threshold multiple) for others; higher = stronger conviction, negative = very weak. Used multiplicatively for ranking within a strategy.")
     lines.append("- `ev_pct` — expected value of the trade per unit, as a percentage of the entry price (probability-weighted over the model's sampled price paths).")
     lines.append("- `base_win_rate` — fraction of winning trades this strategy had in the last base-model backtest.")
     lines.append("- `signals/backtest` — number of signals the strategy generated during the last backtest period; low counts mean win rate and Sharpe are statistically weak.")
@@ -486,7 +483,6 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                         "entry": sig.entry,
                         "stop": sig.stop,
                         "target": sig.target,
-                        "confidence": sig.confidence,
                         "expected_value": sig.expected_value,
                         "oracle_sharpe": row.get("oracle_sharpe"),
                         "base_sharpe": row.get("base_sharpe"),
@@ -495,7 +491,6 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                         "signals_per_week": row.get("signals_per_week"),
                     })
                     advice_rows.append({
-                        "confidence": sig.confidence,
                         "expected_value": sig.expected_value,
                         "entry": sig.entry,
                         "base_win_rate": row.get("base_win_rate"),

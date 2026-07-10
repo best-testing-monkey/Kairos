@@ -197,13 +197,13 @@ class TestRenderReport:
             "strategy": "dfa_persistence", "symbol": "BTC-USD", "interval": "1d",
             "backtest_period": "1m", "direction": "LONG", "size": 0.1200,
             "entry": 60800.00, "stop": 58900.00, "target": 63400.00,
-            "confidence": 0.8000, "expected_value": 0.0200,
+            "expected_value": 0.0200,
             "oracle_sharpe": 23.3, "base_sharpe": 30.2,
             "oracle_win_rate": 0.8, "base_win_rate": 1.0,
             "signals_per_week": 0.69,
         }]
         advice_rows = [{
-            "confidence": 0.8000, "expected_value": 0.0200, "entry": 60800.00, "base_win_rate": 1.0,
+            "expected_value": 0.0200, "entry": 60800.00, "base_win_rate": 1.0,
             "base_signals": 3, "oracle_signals": None,
             "signal": "Strategy dfa_persistence advised **Long** position on BTC-USD ...",
         }]
@@ -223,6 +223,7 @@ class TestRenderReport:
         assert "## Skipped" in report
         assert "ghost_strategy" in report
         assert "### Legend" in report
+        assert "confidence" not in report
 
     def test_no_signals_sections_present(self):
         ts = datetime(2026, 7, 9, 6, 49)
@@ -233,9 +234,9 @@ class TestRenderReport:
         assert "## Skipped" not in report
 
     def test_signals_table_format_has_correct_columns(self):
-        """Signals table should have columns: confidence, ev_pct, base_win_rate, signals/backtest, signal."""
+        """Signals table should have columns: ev_pct, base_win_rate, signals/backtest, signal."""
         advice_rows = [{
-            "confidence": 0.75, "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.65,
+            "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.65,
             "base_signals": 5, "oracle_signals": None,
             "signal": "Strategy test advised **Long** on BTC.",
         }]
@@ -243,9 +244,10 @@ class TestRenderReport:
         report = render_report([], advice_rows, [], [], ts)
 
         # Check header row has the correct column names
-        assert all(x in report for x in ["confidence", "ev_pct", "base_win_rate", "signals/backtest", "signal"])
+        assert all(x in report for x in ["ev_pct", "base_win_rate", "signals/backtest", "signal"])
+        # confidence column removed from the report entirely
+        assert "confidence" not in report
         # Check data is present
-        assert "0.75" in report  # confidence
         assert "+0.90%" in report  # ev_pct (0.9/100 * 100 = 0.90%)
         assert "5" in report  # signals/backtest
 
@@ -255,7 +257,7 @@ class TestRenderReport:
             "strategy": "test", "symbol": "BTC-USD", "interval": "1d",
             "backtest_period": "1m", "direction": "LONG", "size": 0.123456,
             "entry": 60800.456, "stop": 58900.456, "target": 63400.789,
-            "confidence": 0.7654, "expected_value": 0.0123,
+            "expected_value": 0.0123,
             "oracle_sharpe": 23.3456, "base_sharpe": 30.2789,
             "oracle_win_rate": 0.8765, "base_win_rate": 0.9234,
             "signals_per_week": 0.6912,
@@ -267,13 +269,12 @@ class TestRenderReport:
         assert "0.12" in report  # size
         assert "60800.46" in report  # entry
         assert "58900.46" in report  # stop
-        assert "0.77" in report or "0.76" in report  # confidence or oracle_sharpe
         assert "0.01" in report  # expected_value
 
     def test_signals_table_ev_pct_computed_correctly(self):
         """Signals table should show ev_pct as percentage of entry price."""
         advice_rows = [{
-            "confidence": 0.8, "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
+            "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
             "base_signals": 10, "oracle_signals": None,
             "signal": "Test signal",
         }]
@@ -287,17 +288,17 @@ class TestRenderReport:
         """signals/backtest should use base_signals, fallback to oracle_signals."""
         advice_rows = [
             {
-                "confidence": 0.8, "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
+                "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
                 "base_signals": 5, "oracle_signals": 10,
                 "signal": "Test with base",
             },
             {
-                "confidence": 0.7, "expected_value": 0.5, "entry": 100.0, "base_win_rate": 0.65,
+                "expected_value": 0.5, "entry": 100.0, "base_win_rate": 0.65,
                 "base_signals": None, "oracle_signals": 8,
                 "signal": "Test fallback",
             },
             {
-                "confidence": 0.6, "expected_value": 0.3, "entry": 100.0, "base_win_rate": 0.55,
+                "expected_value": 0.3, "entry": 100.0, "base_win_rate": 0.55,
                 "base_signals": None, "oracle_signals": None,
                 "signal": "Test blank",
             },
@@ -323,9 +324,9 @@ class TestRenderReport:
                     pass
 
     def test_render_report_legend_section_present(self):
-        """Report should have Legend section with all four column descriptions."""
+        """Report should have Legend section with all three column descriptions."""
         advice_rows = [{
-            "confidence": 0.8, "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
+            "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.75,
             "base_signals": 5, "oracle_signals": None,
             "signal": "Test signal",
         }]
@@ -334,13 +335,13 @@ class TestRenderReport:
 
         # Check Legend section exists
         assert "### Legend" in report
-        # Check all four column descriptions are present
-        assert "confidence" in report.lower()
+        # Check all three column descriptions are present
         assert "ev_pct" in report
         assert "base_win_rate" in report
         assert "signals/backtest" in report
+        # confidence removed from table headers and legend
+        assert "confidence" not in report
         # Check key descriptions
-        assert "strategy-specific conviction score" in report
         assert "expected value of the trade per unit" in report
         assert "fraction of winning trades" in report
         assert "number of signals the strategy generated" in report
