@@ -6,7 +6,7 @@ fixtures that mirror the exact dict shapes from kairos_signals.py run().
 
 import math
 import pytest
-from allocation import Candidate, fetch_signals, validate_candidate
+from allocation import Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived
 
 
 class TestCandidateDataclass:
@@ -1147,3 +1147,425 @@ class TestValidateCandidate:
             advised_liquidity_pct=10.0,
         )
         assert validate_candidate(c) == "SCHEMA_ERROR"
+
+
+class TestAllocationConfig:
+    """Test AllocationConfig dataclass and defaults."""
+
+    def test_config_defaults(self):
+        """AllocationConfig has all fields with RFC §3.1 defaults."""
+        config = AllocationConfig()
+        assert config.n0 == 100
+        assert config.min_n == 50
+        assert config.round_trip_cost_pct == 0.15
+        assert config.kelly_mult == 0.35
+        assert config.top_k == 12
+        assert config.max_pos_pct == 15
+        assert config.max_cluster_pct == 25
+        assert config.gross_cap_pct == 100
+        assert config.dust_min_pct == 1.0
+        assert config.equity is None
+        assert config.cluster_map == {}
+
+    def test_config_custom_values(self):
+        """AllocationConfig can be initialized with custom values."""
+        config = AllocationConfig(
+            n0=200,
+            min_n=75,
+            round_trip_cost_pct=0.20,
+            kelly_mult=0.25,
+            top_k=8,
+            equity=100000.0,
+            cluster_map={"BTC": "crypto", "AAPL": "tech"},
+        )
+        assert config.n0 == 200
+        assert config.min_n == 75
+        assert config.round_trip_cost_pct == 0.20
+        assert config.kelly_mult == 0.25
+        assert config.top_k == 8
+        assert config.equity == 100000.0
+        assert config.cluster_map == {"BTC": "crypto", "AAPL": "tech"}
+
+    def test_config_cluster_map_independence(self):
+        """Cluster map dicts are independent across instances."""
+        config1 = AllocationConfig()
+        config2 = AllocationConfig()
+        config1.cluster_map["BTC"] = "crypto"
+        assert "BTC" not in config2.cluster_map
+
+
+class TestComputeDerived:
+    """Test compute_derived() per-row formula implementation."""
+
+    def test_compute_derived_geometry_fallback_path(self):
+        """Geometry-fallback path (avg_win/avg_loss both None) computed correctly.
+
+        Hand-computed example from RFC §4.2 worked example (NG=F close_direction):
+        - risk=0.6, reward=6.7, b=11.2 (geometry), n=109, shrink=0.52
+        - ev_pct=1.45%, ev_net=0.61% (after cost), Kelly=13.9%
+        """
+        c = Candidate(
+            strategy="close_direction",
+            ticker="NG=F",
+            direction="long",
+            entry=2.95,
+            stop=2.97,
+            target=3.14,
+            ev_pct=1.45,
+            base_win_rate=0.538,  # Approximate to match shrunk EV
+            n=109,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=0.0,
+            avg_win_pct=None,  # Fallback branch
+            avg_loss_pct=None,
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # Check risk and reward (geometry-based)
+        assert abs(result["risk_pct"] - 0.677) < 0.01  # abs(2.97 - 2.95) / 2.95 * 100
+        assert abs(result["reward_pct"] - 6.441) < 0.01  # abs(3.14 - 2.95) / 2.95 * 100
+
+        # Check b (geometry fallback)
+        assert abs(result["b"] - (result["reward_pct"] / result["risk_pct"])) < 0.001
+        assert result["b"] > 0
+
+        # Check shrink: 109 / (109 + 100) = 0.52147...
+        assert abs(result["shrink"] - 0.521) < 0.001
+
+        # Check ev_shrunk: 1.45 * 0.521 = 0.755
+        assert abs(result["ev_shrunk"] - 0.755) < 0.01
+
+        # Check ev_net: 0.755 - 0.15 = 0.605
+        assert abs(result["ev_net"] - 0.605) < 0.01
+
+        # Check kelly_frac (positive)
+        assert result["kelly_frac"] > 0
+        assert result["kelly_frac"] < 0.25  # Capped by kelly_mult=0.35
+
+    def test_compute_derived_empirical_path(self):
+        """Empirical path (avg_win/avg_loss both populated) uses actual payoff ratio.
+
+        Hand-computed example from RFC §4.2 worked example (REMX):
+        - risk=6.0, reward=7.6, n=161, shrink=0.617, ev_pct=4.04%
+        - With avg_win=7.6, avg_loss=6.0, b=1.27
+        """
+        c = Candidate(
+            strategy="path_execution",
+            ticker="REMX",
+            direction="short",
+            entry=79.73,
+            stop=84.51,
+            target=73.71,
+            ev_pct=4.04,
+            base_win_rate=0.47,
+            n=161,
+            backtest_period="test",
+            sharpe=1.23,
+            advised_liquidity_pct=11.0,
+            avg_win_pct=7.6,  # Empirical branch
+            avg_loss_pct=6.0,
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # Check risk and reward
+        assert abs(result["risk_pct"] - 5.995) < 0.03  # abs(84.51 - 79.73) / 79.73 * 100
+        assert abs(result["reward_pct"] - 7.533) < 0.03  # abs(73.71 - 79.73) / 79.73 * 100
+
+        # Check b (empirical): 7.6 / 6.0 = 1.267
+        assert abs(result["b"] - 1.267) < 0.01
+
+        # Check loss_pct uses avg_loss_pct (not risk_pct)
+        assert result["loss_pct"] == 6.0
+
+        # Check shrink: 161 / (161 + 100) = 0.617
+        assert abs(result["shrink"] - 0.617) < 0.001
+
+        # Check ev_shrunk: 4.04 * 0.617 = 2.493
+        assert abs(result["ev_shrunk"] - 2.493) < 0.01
+
+        # Check ev_net: 2.493 - 0.15 = 2.343
+        assert abs(result["ev_net"] - 2.343) < 0.01
+
+        # Check score: ev_net / loss_pct = 2.343 / 6.0 = 0.39
+        assert abs(result["score"] - 0.391) < 0.01
+
+    def test_compute_derived_shrink_at_boundary_n_zero(self):
+        """Shrink at boundary n=0 should be 0 (no confidence in zero trades)."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=0,  # Boundary: no trades
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # shrink = 0 / (0 + 100) = 0
+        assert result["shrink"] == 0.0
+        # ev_shrunk = 5.0 * 0 = 0
+        assert result["ev_shrunk"] == 0.0
+        # ev_net = 0 - 0.15 = -0.15
+        assert result["ev_net"] == -0.15
+        # p_shrunk = 0.5 + (0.55 - 0.5) * 0 = 0.5 (no update)
+        assert result["p_shrunk"] == 0.5
+        # With b=reward/risk=10/5=2, kelly_raw = 0.5 - 0.5/2 = 0.25
+        # kelly_frac = 0.25 * 0.35 = 0.0875 (positive, good ratio)
+        assert abs(result["kelly_frac"] - 0.0875) < 0.001
+
+    def test_compute_derived_shrink_at_large_n(self):
+        """Shrink at large n approaches 1 (full confidence in many trades)."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=10000,  # Large: many trades
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # shrink = 10000 / (10000 + 100) ≈ 0.9901
+        assert abs(result["shrink"] - 0.9901) < 0.001
+        assert result["shrink"] < 1.0  # Never quite reaches 1
+        # ev_shrunk approaches ev_pct
+        assert abs(result["ev_shrunk"] - (5.0 * result["shrink"])) < 0.001
+        # p_shrunk approaches base_win_rate
+        assert abs(result["p_shrunk"] - 0.55) < 0.001
+
+    def test_compute_derived_no_division_by_zero(self):
+        """All divisions are safe; denominators are never zero."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=50,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+            avg_win_pct=None,
+            avg_loss_pct=None,
+        )
+        config = AllocationConfig()
+
+        # Should not raise ZeroDivisionError
+        result = compute_derived(c, config)
+
+        # All results should be finite
+        for key, value in result.items():
+            assert math.isfinite(value), f"{key}={value} is not finite"
+
+    def test_compute_derived_kelly_raw_can_be_negative(self):
+        """Kelly raw can be negative; kelly_frac clamps to 0."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward (2:1 ratio)
+            ev_pct=-10.0,  # Negative edge, but geometry is still 2:1
+            base_win_rate=0.1,  # Very low win rate (10%)
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # With shrink = 100/(100+100) = 0.5
+        # p_shrunk = 0.5 + (0.1 - 0.5) * 0.5 = 0.5 - 0.2 = 0.3
+        # b = 10/5 = 2
+        # kelly_raw = 0.3 - (1 - 0.3) / 2 = 0.3 - 0.35 = -0.05
+        assert result["kelly_raw"] < 0
+        # kelly_frac should be 0 (clamped by max)
+        assert result["kelly_frac"] == 0.0
+
+    def test_compute_derived_consistent_with_worked_example_v_stock(self):
+        """Test with V (Visa) stock from RFC §4.2 worked example.
+
+        V: risk=1.6%, reward=1.8%, n=319, shrink=0.761, ev_pct=0.68%
+        """
+        c = Candidate(
+            strategy="strategy1",
+            ticker="V",
+            direction="long",
+            entry=200.0,
+            stop=196.8,  # 1.6% below entry
+            target=203.6,  # 1.8% above entry
+            ev_pct=0.68,
+            base_win_rate=0.52,
+            n=319,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+            avg_win_pct=None,
+            avg_loss_pct=None,
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # Verify shrink: 319 / (319 + 100) ≈ 0.761
+        assert abs(result["shrink"] - 0.761) < 0.001
+
+        # Verify risk/reward geometry
+        assert abs(result["risk_pct"] - 1.6) < 0.01
+        assert abs(result["reward_pct"] - 1.8) < 0.01
+        assert abs(result["b"] - 1.125) < 0.01
+
+    def test_compute_derived_output_keys(self):
+        """compute_derived returns dict with all required keys."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        required_keys = {
+            "risk_pct", "reward_pct", "b", "loss_pct", "shrink", "ev_shrunk",
+            "ev_net", "p_shrunk", "kelly_raw", "kelly_frac", "score"
+        }
+        assert set(result.keys()) == required_keys
+
+    def test_compute_derived_with_custom_config(self):
+        """compute_derived respects custom AllocationConfig values."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig(
+            n0=200,  # Custom shrinkage constant
+            round_trip_cost_pct=0.20,  # Custom cost
+            kelly_mult=0.25,  # Custom kelly multiplier
+        )
+        result = compute_derived(c, config)
+
+        # shrink should use custom n0: 100 / (100 + 200) = 0.333...
+        assert abs(result["shrink"] - 0.333) < 0.01
+
+        # ev_net should use custom cost
+        expected_ev_net = 5.0 * result["shrink"] - 0.20
+        assert abs(result["ev_net"] - expected_ev_net) < 0.001
+
+        # kelly_frac should use custom multiplier
+        assert result["kelly_frac"] < 0.25  # Capped by kelly_mult
+
+    def test_compute_derived_short_position(self):
+        """compute_derived handles short positions correctly (abs values)."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="short",
+            entry=100.0,
+            stop=105.0,  # Higher than entry (stop for short)
+            target=90.0,  # Lower than entry (target for short)
+            ev_pct=3.5,
+            base_win_rate=0.52,
+            n=80,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # risk_pct = abs(105 - 100) / 100 * 100 = 5
+        assert abs(result["risk_pct"] - 5.0) < 0.01
+        # reward_pct = abs(90 - 100) / 100 * 100 = 10
+        assert abs(result["reward_pct"] - 10.0) < 0.01
+        # b = 10 / 5 = 2
+        assert abs(result["b"] - 2.0) < 0.01
+
+    def test_compute_derived_empirical_only_avg_win(self):
+        """When only avg_win_pct is present, fallback to geometry."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+            avg_win_pct=5.5,  # Provided
+            avg_loss_pct=None,  # Missing
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # Should use geometry fallback (both not present)
+        assert abs(result["b"] - (result["reward_pct"] / result["risk_pct"])) < 0.001
+        assert result["loss_pct"] == result["risk_pct"]
+
+    def test_compute_derived_empirical_only_avg_loss(self):
+        """When only avg_loss_pct is present, fallback to geometry."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+            avg_win_pct=None,  # Missing
+            avg_loss_pct=4.5,  # Provided
+        )
+        config = AllocationConfig()
+        result = compute_derived(c, config)
+
+        # Should use geometry fallback (both not present)
+        assert abs(result["b"] - (result["reward_pct"] / result["risk_pct"])) < 0.001
+        assert result["loss_pct"] == result["risk_pct"]

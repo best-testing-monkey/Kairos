@@ -2,10 +2,12 @@
 
 Adapts the existing signals-report row data (stats_rows, advice_rows from kairos_signals.py)
 into structured Candidate objects matching RFC allocation_sheet.md §3.
+
+Implements AllocationConfig (RFC §3.1 defaults) and compute_derived (RFC §4.2 per-row formulas).
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from kairos_signals import _ev_pct_value
@@ -33,6 +35,81 @@ class Candidate:
     avg_win_pct: Optional[float] = None
     avg_loss_pct: Optional[float] = None
     avg_holding_days: Optional[float] = None
+
+
+@dataclass
+class AllocationConfig:
+    """Configuration for portfolio allocation sizing and gating.
+
+    Per RFC allocation_sheet.md §3.1, defaults are deliberately round numbers
+    swept in Phantom Ledger. Do not ship precise-looking fitted values.
+    """
+    n0: int = 100  # Shrinkage constant; weight of the "no edge" prior
+    min_n: int = 50  # Reject signals with fewer backtest trades
+    round_trip_cost_pct: float = 0.15  # Assumed total cost per round trip
+    kelly_mult: float = 0.35  # Fractional Kelly multiplier
+    top_k: int = 12  # Max number of positions
+    max_pos_pct: float = 15  # Cap per position, % of equity
+    max_cluster_pct: float = 25  # Cap per correlation cluster, % of equity
+    gross_cap_pct: float = 100  # Total gross exposure cap
+    dust_min_pct: float = 1.0  # Zero out final allocations below this, % of equity
+    equity: Optional[float] = None  # Optional account equity for currency-amount column
+    cluster_map: dict = field(default_factory=dict)  # ticker -> cluster name, static mapping
+
+
+def compute_derived(c: Candidate, config: AllocationConfig) -> dict:
+    """Compute per-row derived columns per RFC allocation_sheet.md §4.2.
+
+    Implements the exact formulas for derived allocation metrics, including the two branches:
+    - Empirical branch: when avg_win_pct and avg_loss_pct are both present
+    - Geometry-fallback branch: when either is None, use TP/SL geometry
+
+    Args:
+        c: Candidate object with all required fields
+        config: AllocationConfig with n0, round_trip_cost_pct, kelly_mult
+
+    Returns:
+        dict with keys: risk_pct, reward_pct, b, loss_pct, shrink, ev_shrunk,
+        ev_net, p_shrunk, kelly_raw, kelly_frac, score
+
+    Note: No division-by-zero checks needed. risk_pct and loss_pct are guaranteed
+    positive (stop/target placement validated in schema), and shrink is in [0,1).
+    """
+    # Per-row derived columns, per RFC §4.2
+    risk_pct = abs(c.stop - c.entry) / c.entry * 100
+    reward_pct = abs(c.target - c.entry) / c.entry * 100
+
+    # Payoff ratio: empirical when available, geometry as fallback
+    if c.avg_win_pct is not None and c.avg_loss_pct is not None:
+        b = c.avg_win_pct / c.avg_loss_pct
+        loss_pct = c.avg_loss_pct
+    else:
+        b = reward_pct / risk_pct
+        loss_pct = risk_pct
+
+    shrink = c.n / (c.n + config.n0)
+    ev_shrunk = c.ev_pct * shrink
+    ev_net = ev_shrunk - config.round_trip_cost_pct
+
+    p_shrunk = 0.5 + (c.base_win_rate - 0.5) * shrink
+    kelly_raw = p_shrunk - (1 - p_shrunk) / b
+    kelly_frac = max(kelly_raw, 0) * config.kelly_mult
+
+    score = ev_net / loss_pct
+
+    return {
+        "risk_pct": risk_pct,
+        "reward_pct": reward_pct,
+        "b": b,
+        "loss_pct": loss_pct,
+        "shrink": shrink,
+        "ev_shrunk": ev_shrunk,
+        "ev_net": ev_net,
+        "p_shrunk": p_shrunk,
+        "kelly_raw": kelly_raw,
+        "kelly_frac": kelly_frac,
+        "score": score,
+    }
 
 
 def validate_candidate(c: Candidate) -> Optional[str]:
