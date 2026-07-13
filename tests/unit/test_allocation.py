@@ -6,7 +6,7 @@ fixtures that mirror the exact dict shapes from kairos_signals.py run().
 
 import math
 import pytest
-from allocation import Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived
+from allocation import Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived, compute_ev_ratio
 
 
 class TestCandidateDataclass:
@@ -1569,3 +1569,267 @@ class TestComputeDerived:
         # Should use geometry fallback (both not present)
         assert abs(result["b"] - (result["reward_pct"] / result["risk_pct"])) < 0.001
         assert result["loss_pct"] == result["risk_pct"]
+
+
+class TestComputeEvRatio:
+    """Test compute_ev_ratio() data-quality check per RFC §4.3."""
+
+    def test_ev_ratio_inside_band_no_mismatch(self):
+        """EV ratio inside [0.5, 2.0] band is not mismatched."""
+        c = Candidate(
+            strategy="path_execution",
+            ticker="REMX",
+            direction="short",
+            entry=79.73,
+            stop=84.51,
+            target=73.71,
+            ev_pct=4.04,
+            base_win_rate=0.47,
+            n=161,
+            backtest_period="test",
+            sharpe=1.23,
+            advised_liquidity_pct=11.0,
+        )
+        # Compute derived to get risk_pct and reward_pct
+        config = AllocationConfig()
+        derived = compute_derived(c, config)
+
+        # ev_implied = 0.47 * 7.533 - (1 - 0.47) * 5.995
+        #            = 0.47 * 7.533 - 0.53 * 5.995
+        #            = 3.540 - 3.177
+        #            = 0.363
+        # ev_ratio = 4.04 / 0.363 ≈ 11.1 (outside band, so this is actually a mismatch)
+        # Let's instead construct a case where ev_pct matches geometry well
+        c2 = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=2.5,  # Conservative estimate, inside band
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        derived2 = compute_derived(c2, config)
+
+        # ev_implied = 0.55 * 10.0 - 0.45 * 5.0
+        #            = 5.5 - 2.25
+        #            = 3.25
+        # ev_ratio = 2.5 / 3.25 ≈ 0.769 (inside [0.5, 2.0])
+        ev_ratio, is_mismatch = compute_ev_ratio(c2, derived2)
+
+        assert abs(ev_ratio - 0.769) < 0.01
+        assert is_mismatch is False
+
+    def test_ev_ratio_above_2_0_is_mismatch(self):
+        """EV ratio > 2.0 is flagged as mismatched."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=7.0,  # Much higher than geometry implies
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        derived = compute_derived(c, config)
+
+        # ev_implied = 0.55 * 10.0 - 0.45 * 5.0
+        #            = 5.5 - 2.25
+        #            = 3.25
+        # ev_ratio = 7.0 / 3.25 ≈ 2.15 (above 2.0)
+        ev_ratio, is_mismatch = compute_ev_ratio(c, derived)
+
+        assert ev_ratio > 2.0
+        assert is_mismatch is True
+
+    def test_ev_ratio_below_0_5_is_mismatch(self):
+        """EV ratio < 0.5 is flagged as mismatched."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=1.0,  # Much lower than geometry implies
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        derived = compute_derived(c, config)
+
+        # ev_implied = 0.55 * 10.0 - 0.45 * 5.0
+        #            = 5.5 - 2.25
+        #            = 3.25
+        # ev_ratio = 1.0 / 3.25 ≈ 0.308 (below 0.5)
+        ev_ratio, is_mismatch = compute_ev_ratio(c, derived)
+
+        assert ev_ratio < 0.5
+        assert is_mismatch is True
+
+    def test_ev_ratio_near_zero_ev_implied_no_mismatch(self):
+        """When ev_implied is near zero, ratio is undefined; treat as not-mismatched."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=10.0,  # Arbitrary positive EV
+            base_win_rate=0.5,  # 50% win rate
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        derived = compute_derived(c, config)
+
+        # ev_implied = 0.5 * 10.0 - 0.5 * 5.0
+        #            = 5.0 - 2.5
+        #            = 2.5 (not near zero)
+        # Let's pick a case where ev_implied is actually near zero
+        c2 = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=99.0,  # 1% risk
+            target=101.0,  # 1% reward (symmetric, exactly fair at 50%)
+            ev_pct=100.0,  # Arbitrarily large but ev_implied will be ~0
+            base_win_rate=0.5,  # Exactly 50%
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        derived2 = compute_derived(c2, config)
+
+        # ev_implied = 0.5 * 1.0 - 0.5 * 1.0
+        #            = 0.5 - 0.5
+        #            = 0.0 (near zero guard triggers)
+        ev_ratio, is_mismatch = compute_ev_ratio(c2, derived2)
+
+        assert ev_ratio == 0.0
+        assert is_mismatch is False
+
+    def test_ev_ratio_boundary_0_5_exact(self):
+        """EV ratio exactly at 0.5 (lower boundary) is not mismatched."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=1.625,  # Computed to give exactly 0.5 ratio
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        derived = compute_derived(c, config)
+
+        # ev_implied = 0.55 * 10.0 - 0.45 * 5.0 = 3.25
+        # ev_ratio = 1.625 / 3.25 = 0.5 (exactly at boundary)
+        ev_ratio, is_mismatch = compute_ev_ratio(c, derived)
+
+        assert abs(ev_ratio - 0.5) < 1e-6
+        assert is_mismatch is False
+
+    def test_ev_ratio_boundary_2_0_exact(self):
+        """EV ratio exactly at 2.0 (upper boundary) is not mismatched."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=6.5,  # Computed to give exactly 2.0 ratio
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        derived = compute_derived(c, config)
+
+        # ev_implied = 0.55 * 10.0 - 0.45 * 5.0 = 3.25
+        # ev_ratio = 6.5 / 3.25 = 2.0 (exactly at boundary)
+        ev_ratio, is_mismatch = compute_ev_ratio(c, derived)
+
+        assert abs(ev_ratio - 2.0) < 1e-6
+        assert is_mismatch is False
+
+    def test_ev_ratio_negative_ev_pct(self):
+        """Negative ev_pct (edge case) is handled correctly."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=-2.0,  # Negative EV
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        derived = compute_derived(c, config)
+
+        # ev_implied = 0.55 * 10.0 - 0.45 * 5.0 = 3.25
+        # ev_ratio = -2.0 / 3.25 ≈ -0.615 (negative ratio)
+        ev_ratio, is_mismatch = compute_ev_ratio(c, derived)
+
+        assert ev_ratio < 0
+        assert is_mismatch is True  # Outside [0.5, 2.0] band
+
+    def test_ev_ratio_negative_ev_implied(self):
+        """Negative ev_implied (low win rate, unfavorable geometry)."""
+        c = Candidate(
+            strategy="test",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=102.0,  # 2% reward (bad ratio for 30% win rate)
+            ev_pct=1.0,
+            base_win_rate=0.30,  # Low win rate
+            n=100,
+            backtest_period="test",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        derived = compute_derived(c, config)
+
+        # ev_implied = 0.30 * 2.0 - 0.70 * 5.0
+        #            = 0.6 - 3.5
+        #            = -2.9 (negative, terrible geometry)
+        # ev_ratio = 1.0 / -2.9 ≈ -0.345 (negative ratio)
+        ev_ratio, is_mismatch = compute_ev_ratio(c, derived)
+
+        assert ev_ratio < 0
+        assert is_mismatch is True

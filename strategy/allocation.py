@@ -57,6 +57,44 @@ class AllocationConfig:
     cluster_map: dict = field(default_factory=dict)  # ticker -> cluster name, static mapping
 
 
+def compute_ev_ratio(c: Candidate, derived: dict) -> tuple[float, bool]:
+    """Compute ev_ratio and DATA_MISMATCH flag per RFC allocation_sheet.md §4.3.
+
+    Implements the data-quality check comparing empirical EV (from backtest) against
+    EV implied by geometry (base_win_rate, risk_pct, reward_pct). Flags significant
+    divergence.
+
+    Args:
+        c: Candidate object with ev_pct and base_win_rate
+        derived: dict from compute_derived() with keys risk_pct, reward_pct
+
+    Returns:
+        (ev_ratio, is_mismatch) tuple where:
+        - ev_ratio: float, the ratio ev_pct / ev_implied (or 0.0 if ev_implied near zero)
+        - is_mismatch: bool, True iff ev_ratio is outside [0.5, 2.0] and ev_implied is not near zero.
+                       If ev_implied is near zero (< 1e-9 in absolute value), treat as not-mismatched
+                       since the ratio is undefined, not a data problem.
+    """
+    risk_pct = derived["risk_pct"]
+    reward_pct = derived["reward_pct"]
+
+    # Compute ev_implied per RFC §4.3
+    ev_implied = c.base_win_rate * reward_pct - (1 - c.base_win_rate) * risk_pct
+
+    # Guard against near-zero denominator
+    if abs(ev_implied) < 1e-9:
+        # Not mismatched when ev_implied is too small to define a meaningful ratio
+        return 0.0, False
+
+    # Compute ev_ratio
+    ev_ratio = c.ev_pct / ev_implied
+
+    # Check if ratio is outside the band [0.5, 2.0]
+    is_mismatch = ev_ratio < 0.5 or ev_ratio > 2.0
+
+    return ev_ratio, is_mismatch
+
+
 def compute_derived(c: Candidate, config: AllocationConfig) -> dict:
     """Compute per-row derived columns per RFC allocation_sheet.md §4.2.
 
