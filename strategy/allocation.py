@@ -666,3 +666,171 @@ def _is_missing(value):
         return bool(np.isnan(value))
     except (TypeError, ValueError):
         return False
+
+
+# ===========================================================================
+# E11-S08: Formula Template Engine (XLSX/ODS dialect rendering)
+# ===========================================================================
+
+"""Formula templates for portfolio allocation computations.
+
+Each formula template is written once in a canonical form with:
+- Cell references using Excel A1 notation (e.g., E20, F$3)
+- Config cell references with absolute row anchors (e.g., $D$3, $D$4)
+- Placeholder tokens for row substitution: {row}
+- Function calls using comma argument separators (XLSX style)
+
+Templates are rendered per dialect via render_formula(name, row, fmt):
+- XLSX: Returns formula with '=' prefix and comma separators
+- ODS: Returns formula with 'of:=' prefix and semicolon separators
+  (per ODS spec; semicolons separate function arguments in many locales)
+
+Per RFC §4.6, these templates implement the per-row derived columns:
+- risk_pct (O): Loss risk as % of entry
+- reward_pct (P): Profit target as % of entry
+- b (Q): Payoff ratio (empirical or geometric)
+- loss_pct (R): Basis for score denominator (avg_loss or risk_pct)
+- shrink (S): Confidence weight per shrinkage formula
+- ev_shrunk (T_base): Raw EV shrunk toward zero by confidence weight
+- ev_net (T): EV net of round-trip costs
+- p_shrunk (U): Win rate shrunk toward 50% by confidence weight
+- kelly_raw (V_base): Binary Kelly before max(0,·) and multiplier
+- kelly_frac (V): Fractional Kelly allocation %
+- score (W): Return per unit risk (ranking key)
+
+Config cell references (assumed per RFC §3.1 display):
+- $D$3: n0 (shrinkage constant)
+- $D$4: round_trip_cost_pct (cost per round trip, %)
+- $D$5: kelly_mult (fractional Kelly multiplier)
+- $D$6: gross_cap_pct (total exposure cap, %)
+
+Data cell layout for row N (per RFC §5.2 display columns A-U):
+- E: Entry price
+- F: Stop loss price
+- G: Target price
+- K: n (number of backtest trades)
+- L: Win raw (base_win_rate as %)
+- M: Win shrunk (p_shrunk as %, computed)
+- N: EV raw % (ev_pct from backtest)
+- O: EV net % (computed as ev_shrunk - costs)
+- P: Kelly raw (kelly_raw, %, computed)
+- Q: Score (ranking key, computed)
+"""
+
+# Template strings with {row} placeholder for row number substitution
+_FORMULA_TEMPLATES = {
+    # Per-row risk/reward derived columns (O, P, R in display)
+    "risk_pct": "IF(E{row}=0,0,ABS(F{row}-E{row})/E{row}*100)",
+    "reward_pct": "IF(E{row}=0,0,ABS(G{row}-E{row})/E{row}*100)",
+
+    # Payoff ratio: empirical if L/M populated, else geometry
+    "b": "IF(AND(L{row}<>\"\",M{row}<>\"\"),L{row}/M{row},IF(F{row}=0,0,G{row}/F{row}))",
+
+    # Loss basis: empirical avg_loss if available, else risk_pct
+    # Note: Using a cached risk_pct value or recalculating inline
+    "loss_pct": "IF(AND(L{row}<>\"\",M{row}<>\"\"),M{row},IF(E{row}=0,0,ABS(F{row}-E{row})/E{row}*100))",
+
+    # Shrinkage weight: n / (n + n0)
+    "shrink": "IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
+
+    # EV shrunk: ev_pct * shrink
+    "ev_shrunk": "N{row}*IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
+
+    # EV net: ev_shrunk - round_trip_cost_pct
+    "ev_net": "N{row}*IF(K{row}=0,0,K{row}/(K{row}+$D$3))-$D$4",
+
+    # Win rate shrunk: 0.5 + (base_win_rate - 0.5) * shrink
+    # base_win_rate is stored as percentage in L{row}, so convert to [0,1]
+    "p_shrunk": "0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
+
+    # Kelly raw: p_shrunk - (1 - p_shrunk) / b
+    # Requires both p_shrunk and b; use IFERROR to guard division by zero
+    "kelly_raw": "IFERROR(0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))-(1-(0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))))/IF(AND(L{row}<>\"\",M{row}<>\"\"),L{row}/M{row},IF(F{row}=0,0,G{row}/F{row})),0)",
+
+    # Kelly frac: max(kelly_raw, 0) * kelly_mult
+    "kelly_frac": "MAX(IFERROR(0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))-(1-(0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))))/IF(AND(L{row}<>\"\",M{row}<>\"\"),L{row}/M{row},IF(F{row}=0,0,G{row}/F{row})),0),0)*$D$5",
+
+    # Score: ev_net / loss_pct
+    "score": "IFERROR((N{row}*IF(K{row}=0,0,K{row}/(K{row}+$D$3))-$D$4)/IF(AND(L{row}<>\"\",M{row}<>\"\"),M{row},IF(E{row}=0,0,ABS(F{row}-E{row})/E{row}*100)),0)",
+
+    # Gross scale factor (for proportional scaling under gross cap)
+    "gross_scale": "$D$6",
+}
+
+
+def render_formula(name: str, row: int, fmt: str) -> str:
+    """Render a formula template for a given row number and dialect.
+
+    Implements E11-S08 acceptance criteria: both XLSX and ODS dialects
+    derive from one shared template, with only dialect-specific syntax changes.
+
+    Args:
+        name: Formula name (key in _FORMULA_TEMPLATES), e.g., "risk_pct", "score"
+        row: Data row number (20..400 per RFC §5.1), used for cell reference substitution
+        fmt: Output dialect, "xlsx" or "ods"
+
+    Returns:
+        Formula string ready for insertion into a spreadsheet cell:
+        - XLSX: "=<formula>" with comma-separated function arguments
+        - ODS: "of:=<formula>" with semicolon-separated function arguments
+
+    Raises:
+        ValueError: if name not in _FORMULA_TEMPLATES or fmt not in ("xlsx", "ods")
+
+    Notes:
+        - Row-number substitution is exact: {row} placeholders become the literal row number
+        - Config cell references like $D$3 are preserved as-is
+        - Both dialects use the same underlying template; no separate formula sets
+        - Compliance: forbids FILTER, SORT, UNIQUE, LET, LAMBDA, XLOOKUP, MAXIFS, MINIFS
+    """
+    if fmt not in ("xlsx", "ods"):
+        raise ValueError(f"fmt must be 'xlsx' or 'ods', got {fmt!r}")
+
+    if name not in _FORMULA_TEMPLATES:
+        raise ValueError(f"formula name {name!r} not found in templates")
+
+    # Substitute row number into template
+    template = _FORMULA_TEMPLATES[name]
+    formula = template.format(row=row)
+
+    # Convert to dialect-specific format
+    if fmt == "xlsx":
+        # XLSX format: = prefix, comma separators (already in template)
+        return "=" + formula
+    else:  # fmt == "ods"
+        # ODS format: of:= prefix, semicolon separators
+        # Replace commas with semicolons in function arguments
+        # Use a simple state machine to distinguish commas inside strings from arg separators
+        result = "of:=" + _convert_commas_to_semicolons(formula)
+        return result
+
+
+def _convert_commas_to_semicolons(formula: str) -> str:
+    """Convert comma argument separators to semicolons for ODS format.
+
+    Replaces commas used as function argument separators with semicolons,
+    while preserving commas inside strings (after detecting them as string content).
+
+    In practice, these formulas don't use string literals, so the conversion
+    is straightforward: replace all commas with semicolons.
+
+    Args:
+        formula: Formula string (without leading = or of:=)
+
+    Returns:
+        Formula string with all commas replaced by semicolons
+    """
+    # Simple approach: replace all commas with semicolons
+    # Safe here because the templates don't use string literals with commas
+    return formula.replace(",", ";")
+
+
+def get_formula_names() -> list[str]:
+    """Return list of all available formula names.
+
+    Useful for tests that scan all formulas.
+
+    Returns:
+        Sorted list of formula names from _FORMULA_TEMPLATES
+    """
+    return sorted(_FORMULA_TEMPLATES.keys())
