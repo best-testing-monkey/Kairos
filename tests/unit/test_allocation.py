@@ -4,9 +4,16 @@ Tests the schema and fetch adapter without GPU/network, using hand-constructed
 fixtures that mirror the exact dict shapes from kairos_signals.py run().
 """
 
+import csv
 import math
 import pytest
-from allocation import Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived, compute_ev_ratio, select_candidates, size_selected
+import tempfile
+import os
+from allocation import (
+    Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived,
+    compute_ev_ratio, select_candidates, size_selected, allocate, load_cluster_map,
+    AllocationResult
+)
 
 
 class TestCandidateDataclass:
@@ -2794,3 +2801,459 @@ class TestSizeSelected:
         assert survivor == original_survivor
         assert "alloc" not in survivor  # Original has no alloc
         assert "alloc" in result[0]  # Result has alloc
+
+
+class TestAllocationResult:
+    """Test AllocationResult dataclass."""
+
+    def test_allocation_result_fields(self):
+        """AllocationResult has all required fields."""
+        result = AllocationResult(
+            rows=[],
+            selected_count=5,
+            gross_exposure_pct=75.3,
+            rejection_counts={"LOW_N": 10, "NEG_EV_NET": 5},
+        )
+        assert result.rows == []
+        assert result.selected_count == 5
+        assert result.gross_exposure_pct == 75.3
+        assert result.rejection_counts == {"LOW_N": 10, "NEG_EV_NET": 5}
+
+    def test_allocation_result_defaults(self):
+        """AllocationResult has sensible defaults."""
+        result = AllocationResult()
+        assert result.rows == []
+        assert result.selected_count == 0
+        assert result.gross_exposure_pct == 0.0
+        assert result.rejection_counts == {}
+
+
+class TestAllocate:
+    """Test allocate() orchestration function per RFC allocation_sheet.md §8."""
+
+    def test_allocate_end_to_end_simple(self):
+        """Simple end-to-end: one good candidate -> SELECTED."""
+        candidates = [
+            Candidate(
+                strategy="s1",
+                ticker="TEST",
+                direction="long",
+                entry=100.0,
+                stop=95.0,
+                target=110.0,
+                ev_pct=5.0,
+                base_win_rate=0.55,
+                n=100,
+                backtest_period="p",
+                sharpe=1.0,
+                advised_liquidity_pct=5.0,
+            ),
+        ]
+        config = AllocationConfig()
+        result = allocate(candidates, config)
+
+        assert isinstance(result, AllocationResult)
+        assert result.selected_count == 1
+        assert len(result.rows) == 1
+        assert result.rows[0]["status"] == "SELECTED"
+        assert result.rows[0]["alloc"] > 0
+        assert result.gross_exposure_pct == result.rows[0]["alloc"]
+
+    def test_allocate_determinism(self):
+        """Same input twice produces byte-identical rows per RFC §4.4."""
+        candidates = [
+            Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0),
+            Candidate("s1", "B", "short", 100.0, 105.0, 90.0, 4.0, 0.52, 80, "p", 0.9, 5.0),
+        ]
+        config = AllocationConfig(top_k=2)
+
+        result1 = allocate(candidates, config)
+        result2 = allocate(candidates, config)
+
+        # Both should have same rows in same order with same values
+        assert len(result1.rows) == len(result2.rows)
+        for r1, r2 in zip(result1.rows, result2.rows):
+            assert r1["ticker"] == r2["ticker"]
+            assert r1["status"] == r2["status"]
+            assert r1["alloc"] == r2["alloc"]
+            assert r1["derived"]["score"] == r2["derived"]["score"]
+
+    def test_allocate_enabled_mask_defaults_to_all_enabled(self):
+        """enabled_mask=None or empty dict defaults to all candidates enabled."""
+        candidates = [
+            Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0),
+        ]
+        config = AllocationConfig()
+
+        # No enabled_mask (None)
+        result1 = allocate(candidates, config)
+        # Empty enabled_mask
+        result2 = allocate(candidates, config, enabled_mask={})
+
+        # Both should allow the candidate
+        assert result1.rows[0]["status"] == "SELECTED"
+        assert result2.rows[0]["status"] == "SELECTED"
+
+    def test_allocate_enabled_mask_can_disable_ticker(self):
+        """enabled_mask[ticker]=False disables that ticker."""
+        candidates = [
+            Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0),
+        ]
+        config = AllocationConfig()
+        enabled_mask = {"A": False}
+
+        result = allocate(candidates, config, enabled_mask)
+
+        assert result.rows[0]["status"] == "DISABLED"
+        assert result.selected_count == 0
+        assert result.rejection_counts["DISABLED"] == 1
+
+    def test_allocate_rejection_counts(self):
+        """rejection_counts correctly aggregates all non-selected statuses."""
+        candidates = [
+            Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0),
+            Candidate("s1", "B", "long", 100.0, 95.0, 110.0, 0.1, 0.55, 100, "p", 1.0, 5.0),
+            Candidate("s1", "C", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 25, "p", 1.0, 5.0),
+        ]
+        config = AllocationConfig(top_k=1, min_n=50)
+
+        result = allocate(candidates, config)
+
+        # A: SELECTED, B: NEG_EV_NET, C: LOW_N
+        assert result.selected_count == 1
+        assert result.rejection_counts.get("NEG_EV_NET", 0) == 1
+        assert result.rejection_counts.get("LOW_N", 0) == 1
+        assert "SELECTED" not in result.rejection_counts  # SELECTED not in rejection_counts
+
+    def test_allocate_gross_exposure_calculation(self):
+        """gross_exposure_pct is sum of alloc for SELECTED rows."""
+        candidates = [
+            Candidate("s1", f"T{i}", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0)
+            for i in range(3)
+        ]
+        config = AllocationConfig(top_k=3)
+        config.cluster_map = {}
+
+        result = allocate(candidates, config)
+
+        # All three should be SELECTED with some allocation
+        selected_allocs = [row["alloc"] for row in result.rows if row["status"] == "SELECTED"]
+        expected_gross = sum(selected_allocs)
+        assert abs(result.gross_exposure_pct - expected_gross) < 0.001
+
+    def test_allocate_rfc_section_7_worked_example(self):
+        """End-to-end test with RFC §7 worked example rows.
+
+        Verifies:
+        - NG=F close_direction wins DUP_ASSET collapse over NG=F open_gap
+        - REMX carries DATA_MISMATCH flag
+        - Score ranking: NG=F > REMX > V > CRM (only in selected, top_k limits)
+        """
+        # RFC §7 worked example (all with default config: n0=100, cost=0.15, kelly_mult=0.35)
+        # NG=F close_direction: risk=0.6, reward=6.7, b=11.2, n=109, shrink=0.52, EV net=0.61%, Kelly=13.9%, Score=1.01
+        # NG=F open_gap: risk=1.0, reward=5.4, b=5.4, n=79, shrink=0.44, EV net=0.56%, Kelly=12.1%, Score=0.56
+        # REMX: risk=6.0, reward=7.6, b=1.27, n=161, shrink=0.62, EV net=2.34%, Kelly=2.5%, Score=0.39, DATA_MISMATCH
+        # V: risk=1.6, reward=1.8, b=1.13, n=319, shrink=0.76, EV net=0.68%, Kelly=2.4%, Score=0.43
+        # CRM: risk=1.5, reward=2.3, b=1.53, n=79, shrink=0.44, EV net=0.27%, Kelly=9.1%, Score=0.18
+
+        candidates = [
+            # NG=F close_direction: risk=0.6%, reward=6.7%
+            # For long: stop = entry - entry*risk%, target = entry + entry*reward%
+            Candidate(
+                strategy="close_direction",
+                ticker="NG=F",
+                direction="long",
+                entry=2.95,
+                stop=2.95 - 2.95 * 0.006,  # risk 0.6% = 2.9323
+                target=2.95 + 2.95 * 0.067,  # reward 6.7% = 3.14765
+                ev_pct=1.45,  # Reported EV (will be shrunk to 0.755, then minus cost = 0.605)
+                base_win_rate=0.538,
+                n=109,
+                backtest_period="test",
+                sharpe=1.0,
+                advised_liquidity_pct=0.0,
+            ),
+            # NG=F open_gap: risk=1.0%, reward=5.4% (duplicate ticker, lower score)
+            Candidate(
+                strategy="open_gap",
+                ticker="NG=F",
+                direction="long",
+                entry=2.95,
+                stop=2.95 - 2.95 * 0.01,  # risk 1.0% = 2.9205
+                target=2.95 + 2.95 * 0.054,  # reward 5.4% = 3.109
+                ev_pct=1.20,
+                base_win_rate=0.505,
+                n=79,
+                backtest_period="test",
+                sharpe=1.0,
+                advised_liquidity_pct=0.0,
+            ),
+            # REMX
+            Candidate(
+                strategy="path_execution",
+                ticker="REMX",
+                direction="short",
+                entry=79.73,
+                stop=84.51,  # abs(84.51 - 79.73) / 79.73 * 100 ≈ 5.995% ≈ 6.0%
+                target=73.71,  # abs(73.71 - 79.73) / 79.73 * 100 ≈ 7.533% ≈ 7.6%
+                ev_pct=4.04,
+                base_win_rate=0.47,
+                n=161,
+                backtest_period="test",
+                sharpe=1.23,
+                advised_liquidity_pct=11.0,
+            ),
+            # V: n=319, shrink=0.76, EV net=0.68%
+            # Working backwards: ev_pct = (ev_net + cost) / shrink = (0.68 + 0.15) / 0.761 = 1.09%
+            Candidate(
+                strategy="strategy1",
+                ticker="V",
+                direction="long",
+                entry=200.0,
+                stop=196.8,  # 1.6%
+                target=203.6,  # 1.8%
+                ev_pct=1.09,
+                base_win_rate=0.52,
+                n=319,
+                backtest_period="test",
+                sharpe=1.0,
+                advised_liquidity_pct=5.0,
+            ),
+            # CRM: n=79, shrink=0.44, EV net=0.27%
+            # Working backwards: ev_pct = (ev_net + cost) / shrink = (0.27 + 0.15) / 0.44 = 0.955%
+            Candidate(
+                strategy="strategy2",
+                ticker="CRM",
+                direction="long",
+                entry=250.0,
+                stop=246.25,  # 1.5%
+                target=255.75,  # 2.3%
+                ev_pct=0.955,
+                base_win_rate=0.48,
+                n=79,
+                backtest_period="test",
+                sharpe=0.95,
+                advised_liquidity_pct=5.0,
+            ),
+        ]
+
+        config = AllocationConfig(top_k=12)  # All 5 can fit in top_k
+        config.cluster_map = {}
+
+        result = allocate(candidates, config)
+
+        # Verify results
+        assert len(result.rows) == 5
+
+        # Find rows by ticker for easier verification
+        rows_by_ticker = {row["ticker"]: row for row in result.rows}
+
+        # NG=F close_direction should be SELECTED (wins collapse)
+        ng_close = [r for r in result.rows if r["ticker"] == "NG=F" and r["strategy"] == "close_direction"][0]
+        assert ng_close["status"] == "SELECTED", "NG=F close_direction should be SELECTED"
+
+        # NG=F open_gap should be DUP_ASSET (loses to close_direction)
+        ng_open = [r for r in result.rows if r["ticker"] == "NG=F" and r["strategy"] == "open_gap"][0]
+        assert ng_open["status"] == "DUP_ASSET", "NG=F open_gap should be DUP_ASSET"
+
+        # REMX should have DATA_MISMATCH flag
+        remx = rows_by_ticker["REMX"]
+        assert "DATA_MISMATCH" in remx["flags"], "REMX should have DATA_MISMATCH flag"
+        assert remx["status"] == "SELECTED"
+
+        # V should be SELECTED
+        v = rows_by_ticker["V"]
+        assert v["status"] == "SELECTED"
+
+        # CRM should be SELECTED
+        crm = rows_by_ticker["CRM"]
+        assert crm["status"] == "SELECTED"
+
+        # Verify score ordering (should win out NG=F > REMX > V > CRM)
+        ng_close_score = ng_close["derived"]["score"]
+        remx_score = remx["derived"]["score"]
+        v_score = v["derived"]["score"]
+        crm_score = crm["derived"]["score"]
+
+        # Score ranking per RFC §7: NG=F close (1.01) > NG=F open (0.56) > V (0.43) > REMX (0.39) > CRM (0.18)
+        # Note: REMX has higher raw EV but lower score due to high loss_pct (6.0% risk)
+        assert ng_close_score > remx_score, f"NG=F score {ng_close_score} should exceed REMX {remx_score}"
+        assert v_score > remx_score, f"V score {v_score} should exceed REMX {remx_score}"
+        assert v_score > crm_score, f"V score {v_score} should exceed CRM {crm_score}"
+
+        # Verify selected_count
+        assert result.selected_count == 4  # NG=F close, REMX, V, CRM
+        assert result.rejection_counts.get("DUP_ASSET", 0) == 1  # NG=F open_gap
+
+
+class TestLoadClusterMap:
+    """Test load_cluster_map() CSV file loader."""
+
+    def test_load_cluster_map_basic(self):
+        """Load simple CSV with two tickers."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.write("BTC,crypto\n")
+            f.write("AAPL,tech\n")
+            f.flush()
+            temp_path = f.name
+
+        try:
+            result = load_cluster_map(temp_path)
+            assert result == {"BTC": "crypto", "AAPL": "tech"}
+        finally:
+            os.unlink(temp_path)
+
+    def test_load_cluster_map_empty_file(self):
+        """Load empty CSV returns empty dict."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.flush()
+            temp_path = f.name
+
+        try:
+            result = load_cluster_map(temp_path)
+            assert result == {}
+        finally:
+            os.unlink(temp_path)
+
+    def test_load_cluster_map_with_whitespace(self):
+        """Whitespace around ticker/cluster is stripped."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.write("  BTC  ,  crypto  \n")
+            f.write("AAPL,tech\n")
+            f.flush()
+            temp_path = f.name
+
+        try:
+            result = load_cluster_map(temp_path)
+            assert result == {"BTC": "crypto", "AAPL": "tech"}
+        finally:
+            os.unlink(temp_path)
+
+    def test_load_cluster_map_skips_empty_ticker_lines(self):
+        """Empty ticker lines (blank lines) are skipped."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.write("BTC,crypto\n")
+            f.write("  ,energy\n")  # Empty ticker
+            f.write("AAPL,tech\n")
+            f.flush()
+            temp_path = f.name
+
+        try:
+            result = load_cluster_map(temp_path)
+            assert result == {"BTC": "crypto", "AAPL": "tech"}
+        finally:
+            os.unlink(temp_path)
+
+    def test_load_cluster_map_too_few_columns_raises(self):
+        """Line with fewer than 2 columns raises ValueError."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.write("BTC,crypto\n")
+            f.write("AAPL\n")  # Missing cluster column
+            f.flush()
+            temp_path = f.name
+
+        try:
+            with pytest.raises(ValueError, match="fewer than 2 columns"):
+                load_cluster_map(temp_path)
+        finally:
+            os.unlink(temp_path)
+
+    def test_load_cluster_map_file_not_found_raises(self):
+        """Non-existent file raises FileNotFoundError."""
+        with pytest.raises(FileNotFoundError):
+            load_cluster_map("/nonexistent/path/to/file.csv")
+
+    def test_load_cluster_map_multiple_rows(self):
+        """Load CSV with multiple tickers and clusters."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.write("BTC,crypto\n")
+            f.write("ETH,crypto\n")
+            f.write("AAPL,tech\n")
+            f.write("MSFT,tech\n")
+            f.write("XOM,energy\n")
+            f.flush()
+            temp_path = f.name
+
+        try:
+            result = load_cluster_map(temp_path)
+            assert result == {
+                "BTC": "crypto",
+                "ETH": "crypto",
+                "AAPL": "tech",
+                "MSFT": "tech",
+                "XOM": "energy",
+            }
+        finally:
+            os.unlink(temp_path)
+
+    def test_load_cluster_map_duplicates_last_wins(self):
+        """Duplicate ticker entries, last one wins."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.write("BTC,crypto\n")
+            f.write("BTC,asset_class_old\n")  # Duplicate, should be overwritten
+            f.flush()
+            temp_path = f.name
+
+        try:
+            result = load_cluster_map(temp_path)
+            assert result == {"BTC": "asset_class_old"}  # Last entry wins
+        finally:
+            os.unlink(temp_path)
+
+    def test_load_cluster_map_extra_columns_ignored(self):
+        """Extra columns beyond the first two are ignored."""
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.write("BTC,crypto,extra1,extra2\n")
+            f.write("AAPL,tech,metadata\n")
+            f.flush()
+            temp_path = f.name
+
+        try:
+            result = load_cluster_map(temp_path)
+            assert result == {"BTC": "crypto", "AAPL": "tech"}
+        finally:
+            os.unlink(temp_path)
+
+    def test_allocate_with_loaded_cluster_map(self):
+        """Integration test: load_cluster_map used in allocate() sizing."""
+        # Create cluster map file
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+            f.write("A,tech\n")
+            f.write("B,tech\n")
+            f.write("C,energy\n")
+            f.flush()
+            temp_path = f.name
+
+        try:
+            cluster_map = load_cluster_map(temp_path)
+
+            candidates = [
+                Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0),
+                Candidate("s1", "B", "long", 100.0, 95.0, 110.0, 4.5, 0.55, 100, "p", 1.0, 5.0),
+                Candidate("s1", "C", "long", 100.0, 95.0, 110.0, 4.0, 0.55, 100, "p", 1.0, 5.0),
+            ]
+
+            config = AllocationConfig(
+                top_k=3,
+                max_pos_pct=15.0,
+                max_cluster_pct=20.0,  # Tech cluster: A+B will exceed this
+                gross_cap_pct=100.0,
+            )
+            config.cluster_map = cluster_map
+
+            result = allocate(candidates, config)
+
+            # All three should be in top_k
+            assert result.selected_count == 3
+
+            # Tech cluster should be capped; A and B should have CLUSTER_CAPPED flags
+            a = [r for r in result.rows if r["ticker"] == "A"][0]
+            b = [r for r in result.rows if r["ticker"] == "B"][0]
+            c = [r for r in result.rows if r["ticker"] == "C"][0]
+
+            assert "CLUSTER_CAPPED" in a["flags"]
+            assert "CLUSTER_CAPPED" in b["flags"]
+            assert "CLUSTER_CAPPED" not in c["flags"]  # Energy cluster not capped
+
+        finally:
+            os.unlink(temp_path)

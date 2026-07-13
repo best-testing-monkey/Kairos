@@ -6,6 +6,7 @@ into structured Candidate objects matching RFC allocation_sheet.md §3.
 Implements AllocationConfig (RFC §3.1 defaults) and compute_derived (RFC §4.2 per-row formulas).
 """
 
+import csv
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -55,6 +56,19 @@ class AllocationConfig:
     dust_min_pct: float = 1.0  # Zero out final allocations below this, % of equity
     equity: Optional[float] = None  # Optional account equity for currency-amount column
     cluster_map: dict = field(default_factory=dict)  # ticker -> cluster name, static mapping
+
+
+@dataclass
+class AllocationResult:
+    """Result of allocate() orchestration per RFC allocation_sheet.md §4.4.
+
+    The top-level output dataclass carrying the full allocation decision, including
+    all rows (selected and rejected), summary statistics, and rejection counts.
+    """
+    rows: list[dict] = field(default_factory=list)  # One per input candidate with all fields + derived/status/flags/alloc
+    selected_count: int = 0  # Number of rows with status == "SELECTED"
+    gross_exposure_pct: float = 0.0  # Sum of alloc across status == "SELECTED" rows
+    rejection_counts: dict[str, int] = field(default_factory=dict)  # status -> count for all non-selected rows
 
 
 def compute_ev_ratio(c: Candidate, derived: dict) -> tuple[float, bool]:
@@ -548,6 +562,95 @@ def size_selected(survivors: list[dict], config: AllocationConfig) -> list[dict]
             row["status"] = "SELECTED"
 
     return result
+
+
+def allocate(candidates: list[Candidate], config: AllocationConfig, enabled_mask: dict = None) -> AllocationResult:
+    """Top-level allocation orchestration per RFC allocation_sheet.md §8.
+
+    Implements the complete selection and sizing pipeline:
+    1. validate_candidate (E11-S02): schema validation
+    2. compute_derived (E11-S03): per-row derived metrics
+    3. compute_ev_ratio (E11-S04): data quality check
+    4. select_candidates (E11-S05): gating, collapse, top-K ranking
+    5. size_selected (E11-S06): position/cluster/gross caps + dust filter
+
+    This is the reference oracle per RFC §4 and §8 ("pure function of (candidates, config)").
+
+    Args:
+        candidates: list of Candidate objects
+        config: AllocationConfig with all sizing/gating parameters
+        enabled_mask: dict mapping ticker -> bool; defaults to all-enabled (empty dict
+                     since select_candidates defaults missing tickers to enabled).
+                     Pass None to use default.
+
+    Returns:
+        AllocationResult with:
+        - rows: full output from size_selected (all candidates, both selected and rejected)
+        - selected_count: number of rows with status == "SELECTED"
+        - gross_exposure_pct: sum of alloc for status == "SELECTED" rows
+        - rejection_counts: dict mapping rejection status -> count for all non-selected rows
+    """
+    if enabled_mask is None:
+        enabled_mask = {}
+
+    # Run the full pipeline: validate -> derive -> collapse -> size
+    result_rows = select_candidates(candidates, config, enabled_mask)
+    result_rows = size_selected(result_rows, config)
+
+    # Compute summary statistics
+    selected_rows = [row for row in result_rows if row.get("status") == "SELECTED"]
+    selected_count = len(selected_rows)
+
+    gross_exposure_pct = sum(row.get("alloc", 0.0) for row in selected_rows)
+
+    # Rejection counts: all non-SELECTED rows
+    rejection_counts = {}
+    for row in result_rows:
+        status = row.get("status")
+        if status != "SELECTED":
+            rejection_counts[status] = rejection_counts.get(status, 0) + 1
+
+    return AllocationResult(
+        rows=result_rows,
+        selected_count=selected_count,
+        gross_exposure_pct=gross_exposure_pct,
+        rejection_counts=rejection_counts,
+    )
+
+
+def load_cluster_map(path: str) -> dict:
+    """Load ticker-to-cluster mapping from a CSV file.
+
+    Reads a two-column CSV file (no header) with format:
+        ticker,cluster_name
+
+    Missing tickers in the map should NOT crash size_selected(). The clustering
+    logic in size_selected() implements a fallback: unmapped tickers form their
+    own singleton cluster (using ticker name as cluster key).
+
+    Args:
+        path: file path to CSV file
+
+    Returns:
+        dict[str, str] mapping ticker -> cluster_name
+
+    Raises:
+        FileNotFoundError: if path does not exist
+        ValueError: if CSV parsing fails (e.g., missing columns)
+    """
+    cluster_map = {}
+
+    with open(path, 'r') as f:
+        reader = csv.reader(f)
+        for row_num, row in enumerate(reader, start=1):
+            if len(row) < 2:
+                raise ValueError(f"Line {row_num} has fewer than 2 columns")
+            ticker = row[0].strip()
+            cluster_name = row[1].strip()
+            if ticker:  # Skip empty ticker lines
+                cluster_map[ticker] = cluster_name
+
+    return cluster_map
 
 
 def _is_missing(value):
