@@ -86,7 +86,7 @@
 - [x] E11-S04 ev_implied Data Quality Check (docs/tickets/E11-S04-data-quality-check.md)
 - [x] E11-S05 Selection: Gate, Collapse, Top-K (docs/tickets/E11-S05-selection-gate-collapse-topk.md)
 - [x] E11-S06 Sizing: Kelly Cap, Cluster Caps, Dust (docs/tickets/E11-S06-sizing-caps-dust.md)
-- [ ] E11-S07 allocate() Orchestration + Cluster Map (docs/tickets/E11-S07-allocate-orchestration.md)
+- [x] E11-S07 allocate() Orchestration + Cluster Map (docs/tickets/E11-S07-allocate-orchestration.md)
 - [ ] E11-S08 Formula Template Engine (docs/tickets/E11-S08-formula-template-engine.md)
 - [ ] E11-S09 XLSX Sheet Writer (docs/tickets/E11-S09-xlsx-sheet-writer.md)
 - [ ] E11-S10 ODS Sheet Writer (docs/tickets/E11-S10-ods-sheet-writer.md)
