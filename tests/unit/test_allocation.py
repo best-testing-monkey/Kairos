@@ -6,9 +6,12 @@ fixtures that mirror the exact dict shapes from kairos_signals.py run().
 
 import csv
 import math
-import pytest
-import tempfile
 import os
+import random
+import tempfile
+
+import pytest
+
 from allocation import (
     Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived,
     compute_ev_ratio, select_candidates, size_selected, allocate, load_cluster_map,
@@ -3257,3 +3260,190 @@ class TestLoadClusterMap:
 
         finally:
             os.unlink(temp_path)
+
+
+class TestAllocateGoldenFile:
+    """Golden-file tests using the RFC §7 worked-example rows.
+
+    The candidates are constructed from the published risk/reward/n values.
+    Expected derived metrics are computed deterministically with
+    ``compute_derived`` and then asserted against ``allocate()`` output, so the
+    test acts as a regression guard on the full pipeline while staying
+    independent of hand-tuned base_win_rate values.
+    """
+
+    def _make_candidate(self, ticker, strategy, direction, entry, stop, target,
+                        ev_pct, base_win_rate, n):
+        return Candidate(
+            strategy=strategy,
+            ticker=ticker,
+            direction=direction,
+            entry=entry,
+            stop=stop,
+            target=target,
+            ev_pct=ev_pct,
+            base_win_rate=base_win_rate,
+            n=n,
+            backtest_period="RFC§7",
+            sharpe=1.0,
+            advised_liquidity_pct=0.0,
+        )
+
+    def test_rfc_section_7_derived_values_preserved_by_allocate(self):
+        """Fixed RFC §7 fixture rows produce deterministic derived values.
+
+        Expected values are the direct output of compute_derived() for the same
+        inputs; allocate() must not alter them.  This is the golden-file guard.
+        """
+        candidates = [
+            self._make_candidate(
+                "NG=F", "close_direction", "long", 2.95, 2.9323, 3.14765,
+                1.45, 0.538, 109,
+            ),
+            self._make_candidate(
+                "NG=F", "open_gap", "long", 2.95, 2.9205, 3.1093,
+                1.20, 0.505, 79,
+            ),
+            self._make_candidate(
+                "REMX", "path_execution", "short", 79.73, 84.51, 73.71,
+                4.04, 0.47, 161,
+            ),
+            self._make_candidate(
+                "V", "path_execution", "long", 200.0, 196.8, 203.6,
+                1.09, 0.52, 319,
+            ),
+            self._make_candidate(
+                "CRM", "path_execution", "long", 250.0, 246.25, 255.75,
+                0.955, 0.48, 79,
+            ),
+        ]
+
+        config = AllocationConfig(top_k=12, cluster_map={})
+        result = allocate(candidates, config)
+
+        expected = {
+            (c.ticker, c.strategy): compute_derived(c, config) for c in candidates
+        }
+
+        for row in result.rows:
+            key = (row["ticker"], row["strategy"])
+            exp = expected[key]
+            d = row["derived"]
+            for name in ["risk_pct", "reward_pct", "b", "loss_pct", "shrink",
+                         "ev_shrunk", "ev_net", "p_shrunk", "kelly_raw",
+                         "kelly_frac", "score"]:
+                assert abs(d[name] - exp[name]) <= 1e-12, (
+                    f"{key}.{name}: expected {exp[name]}, got {d[name]}"
+                )
+
+        # Selection outcomes described in RFC §7.
+        ng_close = [r for r in result.rows
+                    if r["ticker"] == "NG=F" and r["strategy"] == "close_direction"][0]
+        ng_open = [r for r in result.rows
+                   if r["ticker"] == "NG=F" and r["strategy"] == "open_gap"][0]
+        remx = [r for r in result.rows if r["ticker"] == "REMX"][0]
+
+        assert ng_close["status"] == "SELECTED"
+        assert ng_open["status"] == "DUP_ASSET"
+        assert "DATA_MISMATCH" in remx["flags"]
+
+class TestAllocatePropertyCaps:
+    """Property-style tests: allocation caps are always respected."""
+
+    def _random_candidate(self, rng, ticker):
+        """Generate a single random Candidate with realistic ranges."""
+        direction = rng.choice(["long", "short"])
+        entry = rng.uniform(10.0, 500.0)
+        risk_pct = rng.uniform(0.5, 8.0)
+        reward_pct = rng.uniform(0.5, 10.0)
+
+        if direction == "long":
+            stop = entry * (1 - risk_pct / 100)
+            target = entry * (1 + reward_pct / 100)
+        else:
+            stop = entry * (1 + risk_pct / 100)
+            target = entry * (1 - reward_pct / 100)
+
+        return Candidate(
+            strategy="random",
+            ticker=ticker,
+            direction=direction,
+            entry=entry,
+            stop=stop,
+            target=target,
+            ev_pct=rng.uniform(0.5, 5.0),
+            base_win_rate=rng.uniform(0.40, 0.60),
+            n=rng.randint(50, 500),
+            backtest_period="random",
+            sharpe=rng.uniform(0.5, 1.5),
+            advised_liquidity_pct=rng.uniform(1.0, 20.0),
+        )
+
+    def test_random_candidates_respect_caps(self):
+        """50 seeded random candidate sets respect all caps."""
+        rng = random.Random(2024)
+        clusters = {"A": "c1", "B": "c1", "C": "c2", "D": "c2", "E": "c3"}
+
+        for _ in range(50):
+            tickers = rng.sample(list(clusters.keys()), k=rng.randint(2, 5))
+            candidates = [self._random_candidate(rng, t) for t in tickers]
+            config = AllocationConfig(
+                top_k=rng.randint(2, 4),
+                max_pos_pct=rng.uniform(10.0, 20.0),
+                max_cluster_pct=rng.uniform(20.0, 40.0),
+                gross_cap_pct=rng.uniform(80.0, 120.0),
+                cluster_map={t: clusters[t] for t in tickers},
+            )
+            enabled_mask = {t: rng.choice([True, False]) for t in tickers}
+
+            result = allocate(candidates, config, enabled_mask)
+            selected = [r for r in result.rows if r.get("status") == "SELECTED"]
+
+            assert len(selected) <= config.top_k
+
+            for r in selected:
+                assert r["alloc"] <= config.max_pos_pct + 1e-9, (
+                    f"Row {r['ticker']} alloc {r['alloc']} exceeds max_pos_pct {config.max_pos_pct}"
+                )
+
+            cluster_sums = {}
+            for r in selected:
+                cluster = config.cluster_map.get(r["ticker"], r["ticker"])
+                cluster_sums[cluster] = cluster_sums.get(cluster, 0.0) + r["alloc"]
+            for cluster, total in cluster_sums.items():
+                assert total <= config.max_cluster_pct + 1e-9, (
+                    f"Cluster {cluster} sum {total} exceeds max_cluster_pct {config.max_cluster_pct}"
+                )
+
+            gross = sum(r["alloc"] for r in selected)
+            assert gross <= config.gross_cap_pct + 1e-9, (
+                f"Gross exposure {gross} exceeds gross_cap_pct {config.gross_cap_pct}"
+            )
+
+    def test_random_enabled_masks_respect_caps(self):
+        """100 seeded random enabled masks on a fixed candidate set."""
+        rng = random.Random(42)
+        clusters = {"A": "c1", "B": "c1", "C": "c2", "D": "c2", "E": "c3"}
+        candidates = [self._random_candidate(rng, t) for t in clusters]
+        config = AllocationConfig(
+            top_k=3,
+            max_pos_pct=15.0,
+            max_cluster_pct=25.0,
+            gross_cap_pct=100.0,
+            cluster_map=clusters,
+        )
+
+        for _ in range(100):
+            enabled_mask = {t: rng.choice([True, False]) for t in clusters}
+            result = allocate(candidates, config, enabled_mask)
+            selected = [r for r in result.rows if r.get("status") == "SELECTED"]
+
+            assert len(selected) <= config.top_k
+            assert sum(r["alloc"] for r in selected) <= config.gross_cap_pct + 1e-9
+
+            cluster_sums = {}
+            for r in selected:
+                cluster = config.cluster_map.get(r["ticker"], r["ticker"])
+                cluster_sums[cluster] = cluster_sums.get(cluster, 0.0) + r["alloc"]
+            for total in cluster_sums.values():
+                assert total <= config.max_cluster_pct + 1e-9
