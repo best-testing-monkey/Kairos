@@ -315,6 +315,24 @@ Before running stage 3 (oracle) or stage 4 (base), the pipeline checks the `orac
 
 Passing `--force` clears this check and re-runs all stages unconditionally.
 
+A single group's oracle or base failure (any exception type) is caught,
+logged in the failure summary, and does not abort the run — remaining
+groups are still processed and the viability report is still built at the
+end.
+
+### Recovering from a crashed run
+
+If `--stage auto` was killed or crashed partway through (e.g. the CSV shows
+oracle stats but no base stats for some groups), no manual cleanup is
+needed:
+
+1. **Just rerun the same command** (no `--force`): already-completed
+   groups' oracle/base results are detected via the resumability check above
+   and skipped; only groups that never finished are (re)processed.
+2. **To regenerate the CSV immediately from whatever is already in the DB**,
+   without re-running any backtests: add `--report_only`. This is safe to
+   run at any time, including mid-crash-recovery, to check current progress.
+
 ### Viability report
 
 After all intervals and groups are processed (or immediately with `--report_only`), a **viability report** is generated:

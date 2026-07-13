@@ -18,7 +18,17 @@ from kairos_signals import (
     format_table,
     _format_numeric_cell,
     _format_ev_pct,
+    build_stats_table,
+    build_signals_table,
+    upload_to_gsheets,
+    write_spreadsheet,
+    STATS_COLUMNS,
+    SIGNALS_COLUMNS,
+    _interval_to_timedelta,
+    run_bars_backtest,
 )
+from datetime import timedelta
+import pandas as pd
 
 
 # ============================================================================
@@ -532,7 +542,7 @@ class TestLoadWorkItemsAndGrouping:
             "volume": np.full(310, 1e6),
         }, index=idx)
 
-        def fake_fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None):
+        def fake_fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None, as_of=None):
             return fake_history
 
         call_count = {"n": 0}
@@ -641,7 +651,7 @@ class TestBuildStrategyIndex:
         import kairos_strategies
         monkeypatch.setattr(
             kairos_strategies, "fetch_data_raw",
-            lambda symbol, lookback, pred_len=0, min_bars=None: fake_history,
+            lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
         )
 
         def fake_predict_fn(assets_dict):
@@ -720,7 +730,7 @@ class TestZeroSizeSignalGate:
         import kairos_strategies
         monkeypatch.setattr(
             kairos_strategies, "fetch_data_raw",
-            lambda symbol, lookback, pred_len=0, min_bars=None: fake_history,
+            lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
         )
 
         def fake_predict_fn(assets_dict):
@@ -808,7 +818,7 @@ class TestMinEvPctFilter:
         import kairos_strategies
         monkeypatch.setattr(
             kairos_strategies, "fetch_data_raw",
-            lambda symbol, lookback, pred_len=0, min_bars=None: fake_history,
+            lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
         )
 
         def fake_predict_fn(assets_dict):
@@ -907,3 +917,396 @@ class TestMinEvPctFilter:
         monkeypatch.setattr(kairos_signals, "run", fake_run)
         kairos_signals.main(["--db", "unused.db", "--out", "/tmp", "--min_ev_pct", "0.2"])
         assert captured["min_ev_pct"] == 0.2
+
+    def test_cli_parser_accepts_effective_per(self, monkeypatch):
+        """--effective_per "YYYYMMDD HHnn" must be parsed into a datetime and
+        forwarded to run() as `now`."""
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main(["--db", "unused.db", "--out", "/tmp",
+                             "--effective_per", "20260615 1430"])
+        assert captured["now"] == datetime(2026, 6, 15, 14, 30)
+
+    def test_cli_parser_effective_per_date_only_defaults_time_to_midnight(self, monkeypatch):
+        """--effective_per "YYYYMMDD" (no time) must default the time to 0000."""
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main(["--db", "unused.db", "--out", "/tmp",
+                             "--effective_per", "20260615"])
+        assert captured["now"] == datetime(2026, 6, 15, 0, 0)
+
+    def test_cli_parser_effective_per_defaults_to_none(self, monkeypatch):
+        """Without --effective_per, `now` is not forced (real time is used)."""
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main(["--db", "unused.db", "--out", "/tmp"])
+        assert captured["now"] is None
+
+
+# ============================================================================
+# build_stats_table / build_signals_table
+# ============================================================================
+
+class TestBuildStatsTable:
+    def test_headers_and_columns_match_stats_columns(self):
+        stats_rows = [{
+            "strategy": "dfa_persistence", "symbol": "BTC-USD", "interval": "1d",
+            "backtest_period": "1m", "direction": "LONG", "size": 0.1200,
+            "entry": 60800.00, "stop": 58900.00, "target": 63400.00,
+            "expected_value": 0.0200,
+            "oracle_sharpe": 23.3, "base_sharpe": 30.2,
+            "oracle_win_rate": 0.8, "base_win_rate": 1.0,
+            "signals_per_week": 0.69,
+        }]
+        headers, align, rows = build_stats_table(stats_rows)
+        assert headers == STATS_COLUMNS
+        assert len(align) == len(headers)
+        assert len(rows) == 1
+        assert rows[0]["strategy"] == "dfa_persistence"
+        assert rows[0]["ev_pct"] == "+0.00%"
+
+    def test_sorted_by_ev_pct_descending(self):
+        stats_rows = [
+            {"strategy": "low", "symbol": "A", "interval": "1d", "backtest_period": "1m",
+             "direction": "LONG", "size": 0.1, "entry": 100.0, "stop": 90.0, "target": 110.0,
+             "expected_value": 0.1, "oracle_sharpe": 1, "base_sharpe": 1,
+             "oracle_win_rate": 0.5, "base_win_rate": 0.5, "signals_per_week": 1},
+            {"strategy": "high", "symbol": "B", "interval": "1d", "backtest_period": "1m",
+             "direction": "LONG", "size": 0.1, "entry": 100.0, "stop": 90.0, "target": 110.0,
+             "expected_value": 2.0, "oracle_sharpe": 1, "base_sharpe": 1,
+             "oracle_win_rate": 0.5, "base_win_rate": 0.5, "signals_per_week": 1},
+        ]
+        _, _, rows = build_stats_table(stats_rows)
+        assert [r["strategy"] for r in rows] == ["high", "low"]
+
+    def test_matches_render_report_output(self):
+        """The helper's formatted values must be exactly what render_report embeds."""
+        stats_rows = [{
+            "strategy": "test", "symbol": "BTC-USD", "interval": "1d",
+            "backtest_period": "1m", "direction": "LONG", "size": 0.123456,
+            "entry": 100.0, "stop": 90.0, "target": 110.0,
+            "expected_value": 1.0, "oracle_sharpe": 1.0, "base_sharpe": 1.0,
+            "oracle_win_rate": 0.5, "base_win_rate": 0.5, "signals_per_week": 1.0,
+        }]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report(stats_rows, [], [], [], ts)
+        headers, align, rows = build_stats_table(stats_rows)
+        table_lines = format_table(headers, rows, align)
+        for line in table_lines:
+            assert line in report
+
+
+class TestBuildSignalsTable:
+    def test_headers_and_columns(self):
+        advice_rows = [{
+            "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.65,
+            "base_signals": 5, "oracle_signals": None,
+            "signal": "Strategy test advised **Long** on BTC.",
+        }]
+        headers, align, rows = build_signals_table(advice_rows)
+        assert headers == SIGNALS_COLUMNS
+        assert len(rows) == 1
+        assert rows[0]["ev_pct"] == "+0.90%"
+        assert rows[0]["signals/backtest"] == "5"
+
+    def test_matches_render_report_output(self):
+        advice_rows = [{
+            "expected_value": 0.9, "entry": 100.0, "base_win_rate": 0.65,
+            "base_signals": 5, "oracle_signals": None,
+            "signal": "Strategy test advised **Long** on BTC.",
+        }]
+        ts = datetime(2026, 7, 9, 6, 49)
+        report = render_report([], advice_rows, [], [], ts)
+        headers, align, rows = build_signals_table(advice_rows)
+        table_lines = format_table(headers, rows, align)
+        for line in table_lines:
+            assert line in report
+
+
+# ============================================================================
+# upload_to_gsheets (mocked gspread/OAuth — no live network/credentials)
+# ============================================================================
+
+class _FakeWorksheet:
+    def __init__(self, title):
+        self.title = title
+        self.updates = []
+
+    def update_title(self, title):
+        self.title = title
+
+    def update(self, values):
+        self.updates.append(values)
+
+
+class _FakeSpreadsheet:
+    def __init__(self, title):
+        self.title = title
+        self.url = f"https://docs.google.com/spreadsheets/fake/{title}"
+        self.sheet1 = _FakeWorksheet("Sheet1")
+        self.worksheets_added = []
+
+    def add_worksheet(self, title, rows, cols):
+        ws = _FakeWorksheet(title)
+        self.worksheets_added.append(ws)
+        return ws
+
+
+class _FakeGspreadClient:
+    def __init__(self):
+        self.created = []
+
+    def create(self, title):
+        ss = _FakeSpreadsheet(title)
+        self.created.append(ss)
+        return ss
+
+
+class TestUploadToGsheets:
+    def test_creates_strategies_and_signals_tabs(self, monkeypatch):
+        import kairos_signals
+
+        fake_client = _FakeGspreadClient()
+        monkeypatch.setattr(kairos_signals, "_get_gsheets_credentials", lambda c, t: object())
+
+        import gspread
+        monkeypatch.setattr(gspread, "authorize", lambda creds: fake_client)
+
+        stats_rows = [{
+            "strategy": "test", "symbol": "BTC-USD", "interval": "1d",
+            "backtest_period": "1m", "direction": "LONG", "size": 0.1,
+            "entry": 100.0, "stop": 90.0, "target": 110.0,
+            "expected_value": 1.0, "oracle_sharpe": 1.0, "base_sharpe": 1.0,
+            "oracle_win_rate": 0.5, "base_win_rate": 0.5, "signals_per_week": 1.0,
+        }]
+        advice_rows = [{
+            "expected_value": 1.0, "entry": 100.0, "base_win_rate": 0.5,
+            "base_signals": 3, "oracle_signals": None,
+            "signal": "Strategy test advised **Long** on BTC-USD.",
+        }]
+        ts = datetime(2026, 7, 9, 6, 49)
+
+        url = upload_to_gsheets(stats_rows, advice_rows, ts)
+
+        assert url.startswith("https://docs.google.com/spreadsheets/fake/")
+        assert len(fake_client.created) == 1
+        spreadsheet = fake_client.created[0]
+        assert spreadsheet.sheet1.title == "strategies"
+        assert spreadsheet.sheet1.updates[0][0] == STATS_COLUMNS
+        assert len(spreadsheet.worksheets_added) == 1
+        signals_ws = spreadsheet.worksheets_added[0]
+        assert signals_ws.title == "signals"
+        assert signals_ws.updates[0][0] == SIGNALS_COLUMNS
+
+    def test_missing_credentials_raises_actionable_error(self, tmp_path, monkeypatch):
+        import kairos_signals
+        missing = str(tmp_path / "nope.json")
+        monkeypatch.setattr(kairos_signals, "DEFAULT_GSHEETS_TOKEN", str(tmp_path / "token.json"))
+        with pytest.raises(FileNotFoundError, match="README"):
+            kairos_signals._get_gsheets_credentials(missing, str(tmp_path / "token.json"))
+
+
+# ============================================================================
+# write_spreadsheet (.xlsx / .ods)
+# ============================================================================
+
+class TestWriteSpreadsheet:
+    STATS_ROWS = [{
+        "strategy": "test", "symbol": "BTC-USD", "interval": "1d",
+        "backtest_period": "1m", "direction": "LONG", "size": 0.1,
+        "entry": 100.0, "stop": 90.0, "target": 110.0,
+        "expected_value": 1.0, "oracle_sharpe": 1.0, "base_sharpe": 1.0,
+        "oracle_win_rate": 0.5, "base_win_rate": 0.5, "signals_per_week": 1.0,
+    }]
+    ADVICE_ROWS = [{
+        "expected_value": 1.0, "entry": 100.0, "base_win_rate": 0.5,
+        "base_signals": 3, "oracle_signals": None,
+        "signal": "Strategy test advised **Long** on BTC-USD.",
+    }]
+
+    @pytest.mark.parametrize("fmt", ["xlsx", "ods"])
+    def test_writes_two_tabs_with_correct_data(self, tmp_path, fmt):
+        out_path = str(tmp_path / f"report.{fmt}")
+        result = write_spreadsheet(self.STATS_ROWS, self.ADVICE_ROWS, out_path, fmt)
+
+        assert result == out_path
+        assert os.path.exists(out_path)
+
+        sheets = pd.read_excel(out_path, sheet_name=None)
+        assert list(sheets.keys()) == ["strategies", "signals"]
+        assert list(sheets["strategies"].columns) == STATS_COLUMNS
+        assert sheets["strategies"].iloc[0]["strategy"] == "test"
+        assert list(sheets["signals"].columns) == SIGNALS_COLUMNS
+        assert sheets["signals"].iloc[0]["ev_pct"] == "+1.00%"
+
+    @pytest.mark.parametrize("fmt", ["xlsx", "ods"])
+    def test_empty_rows_writes_placeholder(self, tmp_path, fmt):
+        out_path = str(tmp_path / f"empty.{fmt}")
+        write_spreadsheet([], [], out_path, fmt)
+
+        sheets = pd.read_excel(out_path, sheet_name=None)
+        assert sheets["strategies"].iloc[0]["message"] == "No strategies produced a signal in this run."
+        assert sheets["signals"].iloc[0]["message"] == "No signals generated."
+
+    def test_cli_parser_forwards_xlsx_and_ods(self, monkeypatch):
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main(["--db", "unused.db", "--out", "/tmp", "--xlsx", "--ods"])
+        assert captured["xlsx"] is True
+        assert captured["ods"] is True
+
+
+# ============================================================================
+# _interval_to_timedelta
+# ============================================================================
+
+class TestIntervalToTimedelta:
+    def test_days(self):
+        assert _interval_to_timedelta("1d") == timedelta(days=1)
+        assert _interval_to_timedelta("5d") == timedelta(days=5)
+
+    def test_hours(self):
+        assert _interval_to_timedelta("1h") == timedelta(hours=1)
+
+    def test_minutes(self):
+        assert _interval_to_timedelta("60m") == timedelta(minutes=60)
+        assert _interval_to_timedelta("30m") == timedelta(minutes=30)
+        assert _interval_to_timedelta("15m") == timedelta(minutes=15)
+        assert _interval_to_timedelta("5m") == timedelta(minutes=5)
+
+    def test_weeks(self):
+        assert _interval_to_timedelta("1wk") == timedelta(weeks=1)
+
+    def test_calendar_month_unsupported(self):
+        with pytest.raises(ValueError):
+            _interval_to_timedelta("1mo")
+        with pytest.raises(ValueError):
+            _interval_to_timedelta("3mo")
+
+    def test_unrecognized_string_raises(self):
+        with pytest.raises(ValueError):
+            _interval_to_timedelta("bogus")
+
+
+# ============================================================================
+# run_bars_backtest
+# ============================================================================
+
+class TestRunBarsBacktest:
+    def test_steps_backward_one_bar_at_a_time(self, monkeypatch):
+        import kairos_signals
+
+        calls = []
+
+        def fake_run(**kwargs):
+            calls.append(kwargs)
+            return f"/tmp/report_{len(calls)}.md"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+
+        base_now = datetime(2026, 7, 1, 0, 0)
+        out_paths = run_bars_backtest(base_now, "1d", 3, db_path="x.db", out_dir="/tmp")
+
+        assert len(calls) == 3
+        assert calls[0]["now"] == datetime(2026, 7, 1, 0, 0)
+        assert calls[1]["now"] == datetime(2026, 6, 30, 0, 0)
+        assert calls[2]["now"] == datetime(2026, 6, 29, 0, 0)
+        # Most-recent-first ordering preserved in the returned list
+        assert out_paths == ["/tmp/report_1.md", "/tmp/report_2.md", "/tmp/report_3.md"]
+
+    def test_forces_single_interval_and_forwards_kwargs(self, monkeypatch):
+        import kairos_signals
+
+        calls = []
+        monkeypatch.setattr(kairos_signals, "run", lambda **kw: calls.append(kw) or "/dev/null")
+
+        run_bars_backtest(datetime(2026, 7, 1), "1h", 2,
+                          db_path="x.db", min_ev_pct=0.5, gsheets=True)
+
+        for call in calls:
+            assert call["intervals"] == ["1h"]
+            assert call["db_path"] == "x.db"
+            assert call["min_ev_pct"] == 0.5
+            assert call["gsheets"] is True
+
+    def test_hourly_step_size(self, monkeypatch):
+        import kairos_signals
+
+        calls = []
+        monkeypatch.setattr(kairos_signals, "run", lambda **kw: calls.append(kw) or "/dev/null")
+
+        base_now = datetime(2026, 7, 1, 10, 0)
+        run_bars_backtest(base_now, "1h", 3, db_path="x.db")
+
+        assert calls[0]["now"] == datetime(2026, 7, 1, 10, 0)
+        assert calls[1]["now"] == datetime(2026, 7, 1, 9, 0)
+        assert calls[2]["now"] == datetime(2026, 7, 1, 8, 0)
+
+
+class TestCLIBarsBacktest:
+    def test_requires_single_interval(self):
+        import kairos_signals
+
+        with pytest.raises(SystemExit):
+            kairos_signals.main(["--db", "unused.db", "--out", "/tmp",
+                                 "--bars_backtest", "5",
+                                 "--intervals", "1d", "1h"])
+
+    def test_requires_intervals_at_all(self):
+        import kairos_signals
+
+        with pytest.raises(SystemExit):
+            kairos_signals.main(["--db", "unused.db", "--out", "/tmp",
+                                 "--bars_backtest", "5"])
+
+    def test_dispatches_to_run_bars_backtest(self, monkeypatch):
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run_bars_backtest(base_now, interval, bars_backtest, **kwargs):
+            captured["base_now"] = base_now
+            captured["interval"] = interval
+            captured["bars_backtest"] = bars_backtest
+            captured.update(kwargs)
+            return ["/tmp/a.md", "/tmp/b.md"]
+
+        monkeypatch.setattr(kairos_signals, "run_bars_backtest", fake_run_bars_backtest)
+        result = kairos_signals.main([
+            "--db", "unused.db", "--out", "/tmp",
+            "--intervals", "1d", "--bars_backtest", "7",
+            "--effective_per", "20260701",
+        ])
+
+        assert captured["interval"] == "1d"
+        assert captured["bars_backtest"] == 7
+        assert captured["base_now"] == datetime(2026, 7, 1, 0, 0)
+        assert result == ["/tmp/a.md", "/tmp/b.md"]

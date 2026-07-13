@@ -338,6 +338,87 @@ populate `_DISABLED_BY_PROFILE`.
 
 ---
 
+## Google Sheets export
+
+`kairos_signals.py --gsheets` uploads the current-signals report's Stats and
+Signals tables to a new Google Sheet (tabs `strategies` and `signals`),
+in addition to the usual markdown file under `results/`.
+
+### One-time setup
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create
+   (or select) a project, then enable the **Google Sheets API** and the
+   **Google Drive API** (APIs & Services → Enable APIs and services).
+2. Configure the OAuth consent screen (APIs & Services → OAuth consent
+   screen). "External" + "Testing" mode is fine for personal use — add your
+   own Google account as a test user.
+3. Create OAuth client credentials (APIs & Services → Credentials → Create
+   Credentials → OAuth client ID) of type **Desktop app**. Download the
+   resulting JSON and save it as `strategy/credentials.json`.
+4. Run:
+   ```bash
+   uv run ./strategy/kairos_signals.py --gsheets
+   ```
+   The first run opens a browser window to authorize access; the
+   authorization is cached to `strategy/token.json` so subsequent runs are
+   non-interactive (the token auto-refreshes; only revoked/deleted tokens
+   require re-authorizing).
+
+`strategy/credentials.json` and `strategy/token.json` are secrets — they are
+already excluded via `.gitignore` and must never be committed.
+
+---
+
+## Local spreadsheet export (.xlsx / .ods)
+
+For a Google-account-free alternative, `kairos_signals.py --xlsx` and/or
+`--ods` write the same Stats/Signals tables to a local spreadsheet file —
+`results/kairos_signals_<timestamp>.xlsx` and/or `.ods` — with tabs
+`strategies` and `signals`, alongside the usual markdown report. No setup
+required; both flags can be combined with each other and with `--gsheets`.
+
+```bash
+uv run ./strategy/kairos_signals.py --xlsx --ods
+```
+
+---
+
+## Simulating an earlier "now" (`--effective_per`)
+
+`--effective_per "YYYYMMDD [HHnn]"` (e.g. `"20260615 1430"` or just
+`"20260615"`, which defaults the time to `0000`) treats that moment as "now"
+instead of the real current time — useful for backtesting/QA of the report
+itself:
+
+- No bar timestamped after that moment is fetched (rounded down to the
+  nearest bar, so this works correctly for daily and future intraday
+  intervals — h12, h6, 1h, 30m, 15m, 5m).
+- The output filenames and report/Google-Sheets timestamps use that moment
+  instead of the real current time.
+
+```bash
+uv run ./strategy/kairos_signals.py --effective_per "20260615 1430"
+uv run ./strategy/kairos_signals.py --effective_per "20260615"   # time defaults to 0000
+```
+
+### Generating a series of historical reports (`--bars_backtest`)
+
+`--bars_backtest N` generates N reports, one per bar of `--intervals`,
+stepping backward one bar at a time from `--effective_per` (or now, if
+omitted) as the most recent report. Since a single report can span multiple
+`--intervals` with different bar sizes, `--bars_backtest` requires
+`--intervals` to name exactly **one** interval.
+
+```bash
+# 28 daily reports for the past 28 days, ending now
+uv run ./strategy/kairos_signals.py --intervals 1d --bars_backtest 28
+
+# 28 daily reports ending 2026-07-01 00:00, stepping backward from there
+uv run ./strategy/kairos_signals.py --intervals 1d --effective_per "20260701" --bars_backtest 28
+```
+
+---
+
 ## License
 
 Use at your own risk. This is research code, not production trading software.

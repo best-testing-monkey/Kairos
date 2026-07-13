@@ -11,7 +11,7 @@ from unittest.mock import patch, MagicMock, call
 from kairos_strategies import _period_to_weeks, _period_to_bars, _parse_period
 from kairos_pipeline import (
     build_viability_report, get_connection, SCHEMA, insert_oracle_row, insert_model_row,
-    run_stage_auto, start_run
+    run_stage_auto, start_run, dump_csv
 )
 
 
@@ -122,6 +122,42 @@ class TestParsePeriod:
         # Just verify they both work without exception
         assert count == 6
         assert weeks > 0
+
+
+class TestDumpCsv:
+    """Regression test for a real crash: universe-screen rows for symbols with
+    no data omit bars/atr_pct/dollar_volume/ann_vol/liquidity_note entirely,
+    so a fixed fieldnames=list(rows[0].keys()) blows up on a later, fuller
+    row with csv.DictWriter's 'dict contains fields not in fieldnames'."""
+
+    def test_heterogeneous_row_keys_do_not_raise(self, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "RESULTS_DIR", str(tmp_path))
+
+        rows = [
+            {"run_id": 1, "symbol": "CPER", "asset_class": "fx_commodity",
+             "passed": False, "fail_reason": "no_data_returned",
+             "interval_probe_ok": False},
+            {"run_id": 1, "symbol": "REMX", "asset_class": "fx_commodity",
+             "passed": True, "fail_reason": None, "interval_probe_ok": True,
+             "bars": 274, "dollar_volume": 68502310.15, "ann_vol": 0.3,
+             "atr_pct": 3.51, "liquidity_note": None},
+        ]
+
+        path = dump_csv("universe_screen", rows, "universe")
+
+        assert path is not None
+        assert os.path.exists(path)
+        with open(path) as f:
+            content = f.read()
+        assert "CPER" in content
+        assert "REMX" in content
+        assert "bars" in content  # union of keys includes the fuller row's fields
+
+    def test_no_rows_returns_none(self, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "RESULTS_DIR", str(tmp_path))
+        assert dump_csv("universe_screen", [], "universe") is None
 
 
 @pytest.fixture
@@ -935,6 +971,62 @@ class TestRunStageAuto:
         # First group's base should NOT run (due to oracle failure), second group's base should
         assert call_log.count(("base", ("BTC-USD", "ETH-USD"))) == 0
         assert call_log.count(("base", ("AVAX-USD", "SOL-USD"))) == 1
+
+    def test_auto_failure_isolation_non_runtime_error(self, temp_db):
+        """A non-RuntimeError exception in one group's base stage must not abort
+        the whole run — remaining groups still run and the report still builds."""
+        call_log = []
+
+        def mock_universe(conn, interval="1d"):
+            run_id = start_run(conn, "universe", interval, {})
+            return run_id
+
+        def mock_correlation(conn, asset_class_filter=None, interval="1d", **kwargs):
+            run_id = start_run(conn, "correlation", interval, {})
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 1, "crypto", "BTC-USD,ETH-USD", 0.7),
+            )
+            temp_db.execute(
+                "INSERT INTO suggested_groups (run_id, group_id, asset_class, symbols, mean_intra_corr) "
+                "VALUES (?,?,?,?,?)",
+                (run_id, 2, "crypto", "SOL-USD,AVAX-USD", 0.6),
+            )
+            temp_db.commit()
+            return run_id
+
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+            call_log.append(("oracle", tuple(sorted(assets))))
+            run_id = start_run(conn, "oracle", interval, {})
+            return run_id
+
+        def mock_base(conn, stage, assets, interval="1d", backtest_period="6m",
+                     pred_samples=100, model_path=None, **kwargs):
+            assets_tuple = tuple(sorted(assets))
+            call_log.append(("base", assets_tuple))
+            # Simulate a crash that is NOT a RuntimeError (e.g. a subprocess
+            # OSError or malformed-data ValueError) on the first group only.
+            if assets_tuple == ("BTC-USD", "ETH-USD"):
+                raise ValueError("Test base failure (non-RuntimeError)")
+            run_id = start_run(conn, stage, interval, {})
+            return run_id
+
+        with patch("kairos_pipeline.run_stage_universe", side_effect=mock_universe), \
+             patch("kairos_pipeline.run_stage_correlation", side_effect=mock_correlation), \
+             patch("kairos_pipeline.run_stage_oracle", side_effect=mock_oracle), \
+             patch("kairos_pipeline.run_stage_model", side_effect=mock_base):
+            df = run_stage_auto(temp_db, ["1d"], "6m")
+
+        # Both groups' oracle should have run (oracle itself never fails here)
+        assert call_log.count(("oracle", ("BTC-USD", "ETH-USD"))) == 1
+        assert call_log.count(("oracle", ("AVAX-USD", "SOL-USD"))) == 1
+        # First group's base raises ValueError but must be caught, isolated,
+        # and NOT abort processing of the second group.
+        assert call_log.count(("base", ("BTC-USD", "ETH-USD"))) == 1
+        assert call_log.count(("base", ("AVAX-USD", "SOL-USD"))) == 1
+        # The report must still be built (function returned normally).
+        assert df is not None
 
     def test_auto_runs_bookkeeping(self, temp_db):
         """One runs row inserted with stage='auto' and params_json."""

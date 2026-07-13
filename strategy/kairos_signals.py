@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """kairos_signals.py — Current-signals report generator.
 
 Reads the latest viability_report run from data/pipeline_results.db, groups
@@ -17,9 +18,10 @@ Structured so the heavy lifting is testable without GPU/network:
 
 import argparse
 import os
+import re
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -231,6 +233,73 @@ def _sort_by_ev_pct_desc(rows):
     return sorted(rows, key=key)
 
 
+def build_stats_table(stats_rows):
+    """Format stats_rows into (headers, align, formatted_rows) for STATS_COLUMNS.
+
+    stats_rows: list of dicts with keys from STATS_COLUMNS (only strategies
+        that produced >=1 signal should be included by the caller).
+    Rows are sorted by ev_pct descending (missing ev_pct last), numeric cells
+    formatted to 2 decimals.
+    """
+    formatted_stats = []
+    for row in _sort_by_ev_pct_desc(stats_rows):
+        formatted_row = {}
+        for col in STATS_COLUMNS:
+            if col == "ev_pct":
+                formatted_row[col] = _format_ev_pct(row.get("expected_value"), row.get("entry"))
+            elif col in ("size", "entry", "stop", "target", "expected_value",
+                       "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
+                       "signals_per_week"):
+                formatted_row[col] = _format_numeric_cell(row.get(col), decimals=2)
+            else:
+                formatted_row[col] = str(row.get(col, ""))
+        formatted_stats.append(formatted_row)
+
+    align = []
+    for col in STATS_COLUMNS:
+        if col in ("size", "entry", "stop", "target", "expected_value", "ev_pct",
+                   "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
+                   "signals_per_week"):
+            align.append("r")
+        else:
+            align.append("l")
+    return STATS_COLUMNS, align, formatted_stats
+
+
+SIGNALS_COLUMNS = ["ev_pct", "base_win_rate", "signals/backtest", "signal"]
+SIGNALS_ALIGN = ["r", "r", "r", "l"]
+
+
+def build_signals_table(advice_rows):
+    """Format advice_rows into (headers, align, formatted_rows) for the Signals table.
+
+    advice_rows: list of dicts with keys:
+        - "expected_value": float
+        - "entry": float (for ev_pct calculation)
+        - "base_win_rate": float
+        - "base_signals": int or None (number of signals from backtest)
+        - "oracle_signals": int or None (fallback if base_signals missing)
+        - "signal": plain-English advice string
+    Rows are sorted by ev_pct descending (FLAT/missing ev_pct last).
+    """
+    signals_table = []
+    for row in _sort_by_ev_pct_desc(advice_rows):
+        ev_pct = _format_ev_pct(row.get("expected_value"), row.get("entry"))
+        # signals/backtest: use base_signals, fallback to oracle_signals, blank if both missing
+        signals_backtest = ""
+        if not _is_missing(row.get("base_signals")):
+            signals_backtest = str(int(row.get("base_signals")))
+        elif not _is_missing(row.get("oracle_signals")):
+            signals_backtest = str(int(row.get("oracle_signals")))
+        signals_table.append({
+            "ev_pct": ev_pct,
+            "base_win_rate": _format_numeric_cell(row.get("base_win_rate"), decimals=2),
+            "signals/backtest": signals_backtest,
+            "signal": str(row.get("signal", "")),
+        })
+    return SIGNALS_COLUMNS, SIGNALS_ALIGN, signals_table
+
+
 def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
                   min_ev_pct=0.10) -> str:
     """Assemble the full markdown report from pre-computed pieces.
@@ -257,32 +326,8 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
     lines.append("## Stats")
     lines.append("")
     if stats_rows:
-        # Format numeric cells in stats table with 2 decimals,
-        # rows sorted by ev_pct descending (missing ev_pct last)
-        formatted_stats = []
-        for row in _sort_by_ev_pct_desc(stats_rows):
-            formatted_row = {}
-            for col in STATS_COLUMNS:
-                if col == "ev_pct":
-                    formatted_row[col] = _format_ev_pct(row.get("expected_value"), row.get("entry"))
-                elif col in ("size", "entry", "stop", "target", "expected_value",
-                           "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
-                           "signals_per_week"):
-                    formatted_row[col] = _format_numeric_cell(row.get(col), decimals=2)
-                else:
-                    formatted_row[col] = str(row.get(col, ""))
-            formatted_stats.append(formatted_row)
-
-        # Build stats table with alignment (all numeric columns right-aligned)
-        align = []
-        for col in STATS_COLUMNS:
-            if col in ("size", "entry", "stop", "target", "expected_value", "ev_pct",
-                       "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
-                       "signals_per_week"):
-                align.append("r")
-            else:
-                align.append("l")
-        table_lines = format_table(STATS_COLUMNS, formatted_stats, align)
+        headers, align, formatted_stats = build_stats_table(stats_rows)
+        table_lines = format_table(headers, formatted_stats, align)
         lines.extend(table_lines)
     else:
         lines.append("_No strategies produced a signal in this run._")
@@ -296,26 +341,8 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
             for line in advice_rows:
                 lines.append(f"- {line}")
         else:
-            # New: list of dicts with ev_pct, base_win_rate, signals/backtest, signal,
-            # rows sorted by ev_pct descending (FLAT/missing ev_pct last)
-            signals_table = []
-            for row in _sort_by_ev_pct_desc(advice_rows):
-                ev_pct = _format_ev_pct(row.get("expected_value"), row.get("entry"))
-                # signals/backtest: use base_signals, fallback to oracle_signals, blank if both missing
-                signals_backtest = ""
-                if not _is_missing(row.get("base_signals")):
-                    signals_backtest = str(int(row.get("base_signals")))
-                elif not _is_missing(row.get("oracle_signals")):
-                    signals_backtest = str(int(row.get("oracle_signals")))
-                signals_table.append({
-                    "ev_pct": ev_pct,
-                    "base_win_rate": _format_numeric_cell(row.get("base_win_rate"), decimals=2),
-                    "signals/backtest": signals_backtest,
-                    "signal": str(row.get("signal", "")),
-                })
-            signals_headers = ["ev_pct", "base_win_rate", "signals/backtest", "signal"]
-            signals_align = ["r", "r", "r", "l"]
-            table_lines = format_table(signals_headers, signals_table, signals_align)
+            headers, align, signals_table = build_signals_table(advice_rows)
+            table_lines = format_table(headers, signals_table, align)
             lines.extend(table_lines)
     else:
         lines.append("_No signals generated._")
@@ -344,6 +371,122 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
         lines.append("")
 
     return "\n".join(lines)
+
+
+# =============================================================================
+# Google Sheets export
+# =============================================================================
+
+GSHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
+DEFAULT_GSHEETS_CREDENTIALS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
+DEFAULT_GSHEETS_TOKEN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
+
+
+def _get_gsheets_credentials(credentials_path, token_path):
+    """Load cached OAuth credentials, refreshing or running the first-run
+    browser consent flow as needed. Returns a google.oauth2.credentials.Credentials."""
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    creds = None
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, GSHEETS_SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(credentials_path):
+                raise FileNotFoundError(
+                    f"Google OAuth client secrets not found at {credentials_path}. "
+                    "See strategy/README.md 'Google Sheets export' section for setup steps."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, GSHEETS_SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+
+    return creds
+
+
+def upload_to_gsheets(stats_rows, advice_rows, timestamp,
+                      credentials_path=None, token_path=None) -> str:
+    """Create a new Google Sheet with 'strategies' and 'signals' tabs mirroring
+    the markdown report's Stats and Signals tables. Returns the spreadsheet URL.
+
+    First run (or no cached token) opens a browser window for OAuth consent;
+    the resulting token is cached to `token_path` for subsequent non-interactive
+    runs. See strategy/README.md for one-time Google Cloud setup steps.
+    """
+    import gspread
+
+    if credentials_path is None:
+        credentials_path = DEFAULT_GSHEETS_CREDENTIALS
+    if token_path is None:
+        token_path = DEFAULT_GSHEETS_TOKEN
+
+    creds = _get_gsheets_credentials(credentials_path, token_path)
+    client = gspread.authorize(creds)
+
+    title = f"Kairos Signals {timestamp.strftime('%Y-%m-%d %H%Mh')}"
+    spreadsheet = client.create(title)
+
+    strategies_ws = spreadsheet.sheet1
+    strategies_ws.update_title("strategies")
+    if stats_rows:
+        headers, _, rows = build_stats_table(stats_rows)
+        strategies_ws.update([headers] + [[row.get(h, "") for h in headers] for row in rows])
+    else:
+        strategies_ws.update([["No strategies produced a signal in this run."]])
+
+    signals_ws = spreadsheet.add_worksheet(title="signals", rows=max(len(advice_rows) + 1, 2), cols=4)
+    if advice_rows:
+        headers, _, rows = build_signals_table(advice_rows)
+        signals_ws.update([headers] + [[row.get(h, "") for h in headers] for row in rows])
+    else:
+        signals_ws.update([["No signals generated."]])
+
+    return spreadsheet.url
+
+
+# =============================================================================
+# Local spreadsheet export (.xlsx / .ods)
+# =============================================================================
+
+SPREADSHEET_ENGINES = {"xlsx": "openpyxl", "ods": "odf"}
+
+
+def write_spreadsheet(stats_rows, advice_rows, out_path, fmt) -> str:
+    """Write a 2-tab spreadsheet ('strategies', 'signals') to out_path.
+
+    fmt: 'xlsx' or 'ods'. Mirrors the Stats/Signals tables from the markdown
+    report and the Google Sheets export (same build_stats_table /
+    build_signals_table helpers). Returns out_path.
+    """
+    engine = SPREADSHEET_ENGINES[fmt]
+
+    if stats_rows:
+        headers, _, rows = build_stats_table(stats_rows)
+        strategies_df = pd.DataFrame(rows, columns=headers)
+    else:
+        strategies_df = pd.DataFrame(
+            [["No strategies produced a signal in this run."]], columns=["message"])
+
+    if advice_rows:
+        headers, _, rows = build_signals_table(advice_rows)
+        signals_df = pd.DataFrame(rows, columns=headers)
+    else:
+        signals_df = pd.DataFrame([["No signals generated."]], columns=["message"])
+
+    with pd.ExcelWriter(out_path, engine=engine) as writer:
+        strategies_df.to_excel(writer, sheet_name="strategies", index=False)
+        signals_df.to_excel(writer, sheet_name="signals", index=False)
+
+    return out_path
 
 
 # =============================================================================
@@ -402,12 +545,21 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
 
 def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None,
-        min_ev_pct=0.10):
+        min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False):
     """Run the full signals-report flow. Returns the path to the written report.
 
+    now: the moment treated as "now" — stamps output filenames/report
+        headers and caps fetched bars to this moment (rounded down to the
+        nearest bar; see fetch_data_raw's `as_of`). Defaults to the real
+        current time when not given.
     min_ev_pct: minimum expected value (as percent of entry price) for a
         non-FLAT signal to be reported; lower-EV signals go to the Skipped
         footer. FLAT/exit signals are never filtered. Set 0 to disable.
+    gsheets: if True, also upload the Stats/Signals tables to a new Google
+        Sheet (see upload_to_gsheets); the sheet URL is printed to stdout.
+    xlsx / ods: if True, also write the Stats/Signals tables to a local
+        kairos_signals_<stamp>.xlsx / .ods file in out_dir (see
+        write_spreadsheet); the path is printed to stdout.
     """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
@@ -440,7 +592,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
             KairosSettings.pred_samples = pred_samples
 
             data = {
-                sym: fetch_data_raw(sym, lookback).tail(lookback)
+                sym: fetch_data_raw(sym, lookback, as_of=now).tail(lookback)
                 for sym in assets
             }
 
@@ -554,7 +706,53 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     with open(out_path, "w") as f:
         f.write(report)
 
+    if gsheets:
+        sheet_url = upload_to_gsheets(stats_rows, advice_rows, now)
+        print(sheet_url)
+
+    for fmt, enabled in (("xlsx", xlsx), ("ods", ods)):
+        if enabled:
+            sheet_path = os.path.join(out_dir, f"kairos_signals_{stamp}.{fmt}")
+            write_spreadsheet(stats_rows, advice_rows, sheet_path, fmt)
+            print(sheet_path)
+
     return out_path
+
+
+_INTERVAL_UNIT_TIMEDELTA = {
+    "m": lambda n: timedelta(minutes=n),
+    "h": lambda n: timedelta(hours=n),
+    "d": lambda n: timedelta(days=n),
+    "wk": lambda n: timedelta(weeks=n),
+}
+
+
+def _interval_to_timedelta(interval: str) -> timedelta:
+    """Convert an interval string (e.g. "1d", "1h", "60m", "30m", "1wk") to a
+    fixed timedelta bar size. Calendar-based units ("1mo", "3mo") have no
+    fixed duration and are not supported."""
+    match = re.fullmatch(r"(\d+)(mo|wk|d|h|m)", interval)
+    if not match or match.group(2) == "mo":
+        raise ValueError(f"Cannot convert interval {interval!r} to a fixed timedelta step")
+    count, unit = int(match.group(1)), match.group(2)
+    return _INTERVAL_UNIT_TIMEDELTA[unit](count)
+
+
+def run_bars_backtest(base_now, interval, bars_backtest, **run_kwargs) -> list:
+    """Generate `bars_backtest` signals reports, one per bar of `interval`,
+    stepping backward from `base_now` (the most recent report) to
+    `base_now - (bars_backtest - 1) * bar_size` (the oldest).
+
+    `run_kwargs` is forwarded to each `run()` call unchanged (db_path,
+    out_dir, pred_samples, include_all, predict_fn, lookback, min_ev_pct,
+    gsheets, xlsx, ods); `now` and `intervals` are set per iteration.
+    """
+    step = _interval_to_timedelta(interval)
+    out_paths = []
+    for i in range(bars_backtest):
+        iter_now = base_now - i * step
+        out_paths.append(run(now=iter_now, intervals=[interval], **run_kwargs))
+    return out_paths
 
 
 def main(argv=None):
@@ -569,12 +767,57 @@ def main(argv=None):
                         help="Minimum expected value for a signal, in percent of entry "
                              "price (default: 0.10). Non-FLAT signals below this go to "
                              "the Skipped footer; set 0 to disable.")
+    parser.add_argument("--gsheets", action="store_true", default=False,
+                        help="Also upload the Stats/Signals tables to a new Google Sheet "
+                             "(tabs 'strategies' and 'signals'). First run requires "
+                             "one-time OAuth setup, see strategy/README.md.")
+    parser.add_argument("--xlsx", action="store_true", default=False,
+                        help="Also write the Stats/Signals tables to a local "
+                             "kairos_signals_<stamp>.xlsx file (no setup required).")
+    parser.add_argument("--ods", action="store_true", default=False,
+                        help="Also write the Stats/Signals tables to a local "
+                             "kairos_signals_<stamp>.ods file (no setup required).")
+    parser.add_argument("--effective_per", default=None,
+                        help='Treat this moment as "now": \'YYYYMMDD [HHnn]\' '
+                             '(e.g. "20260615 1430" or "20260615"; time '
+                             'defaults to 0000). Caps fetched bars to this '
+                             'moment (rounded down to the nearest bar) and stamps '
+                             'report/filenames with it, instead of the real '
+                             'current time. Useful for backtesting/QA the report.')
+    parser.add_argument("--bars_backtest", type=int, default=None,
+                        help='Generate N reports, one per bar of --intervals '
+                             '(required to be a single interval), stepping '
+                             'backward from --effective_per (or now) as the '
+                             'most recent report. E.g. "--bars_backtest 28" '
+                             '-> 28 reports for the past 28 bars.')
     args = parser.parse_args(argv)
+
+    if args.bars_backtest is not None and (not args.intervals or len(args.intervals) != 1):
+        parser.error("--bars_backtest requires --intervals to name exactly one interval")
+
+    now = None
+    if args.effective_per is not None:
+        fmt = "%Y%m%d %H%M" if " " in args.effective_per else "%Y%m%d"
+        now = datetime.strptime(args.effective_per, fmt)
+
+    if args.bars_backtest is not None:
+        base_now = now if now is not None else datetime.now()
+        out_paths = run_bars_backtest(
+            base_now, args.intervals[0], args.bars_backtest,
+            db_path=args.db, out_dir=args.out,
+            pred_samples=args.pred_samples, include_all=args.include_all,
+            min_ev_pct=args.min_ev_pct, gsheets=args.gsheets,
+            xlsx=args.xlsx, ods=args.ods,
+        )
+        for p in out_paths:
+            print(p)
+        return out_paths
 
     out_path = run(
         db_path=args.db, out_dir=args.out, intervals=args.intervals,
         pred_samples=args.pred_samples, include_all=args.include_all,
-        min_ev_pct=args.min_ev_pct,
+        min_ev_pct=args.min_ev_pct, gsheets=args.gsheets,
+        xlsx=args.xlsx, ods=args.ods, now=now,
     )
     print(out_path)
     return out_path

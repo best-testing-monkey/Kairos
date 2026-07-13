@@ -8,10 +8,15 @@ bar count (e.g. "need 300 bars, got 287").
 """
 import sys
 import os
+from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
-from kairos_strategies import is_24_7_crypto_symbol, calendar_days_for_bars
+import pandas as pd
+
+from kairos_strategies import (
+    is_24_7_crypto_symbol, calendar_days_for_bars, fetch_data_raw, KairosSettings,
+)
 
 
 def test_crypto_symbols_are_24_7():
@@ -68,3 +73,57 @@ def test_padding_covers_previously_failing_case():
     days_equity = calendar_days_for_bars(bars_needed=300, bars_per_day=1, symbol="SPY", buffer_days=30)
     approx_trading_days = days_equity * (5 / 7)
     assert approx_trading_days >= 300
+
+
+def test_as_of_caps_fetch_window_end_date(monkeypatch):
+    """as_of should replace date.today() as the fetch window's end date."""
+    import kairos_strategies
+
+    captured = {}
+
+    def fake_get_price_data(symbol, start_date, end_date, interval):
+        captured["end_date"] = end_date
+        idx = pd.date_range("2026-01-01", periods=10, freq="D")
+        return pd.DataFrame({"Close": range(10)}, index=idx)
+
+    monkeypatch.setattr(kairos_strategies.price_cache, "get_price_data", fake_get_price_data)
+    monkeypatch.setattr(KairosSettings, "interval", "1d")
+
+    as_of = datetime(2026, 1, 5, 12, 0)
+    fetch_data_raw("BTC-USD", lookback=3, as_of=as_of)
+
+    assert captured["end_date"] == "2026-01-05"
+
+
+def test_as_of_drops_bars_after_cutoff(monkeypatch):
+    """Bars timestamped after as_of must be dropped (round down to nearest bar)."""
+    import kairos_strategies
+
+    def fake_get_price_data(symbol, start_date, end_date, interval):
+        idx = pd.date_range("2026-01-01", periods=10, freq="D")
+        return pd.DataFrame({"Close": range(10)}, index=idx)
+
+    monkeypatch.setattr(kairos_strategies.price_cache, "get_price_data", fake_get_price_data)
+    monkeypatch.setattr(KairosSettings, "interval", "1d")
+
+    as_of = datetime(2026, 1, 5, 12, 0)
+    raw = fetch_data_raw("BTC-USD", lookback=3, as_of=as_of)
+
+    assert raw.index.max() <= as_of
+    assert raw.index.max() == datetime(2026, 1, 5)
+
+
+def test_no_as_of_preserves_existing_behavior(monkeypatch):
+    """Without as_of, no post-fetch filtering is applied (existing behavior)."""
+    import kairos_strategies
+
+    def fake_get_price_data(symbol, start_date, end_date, interval):
+        idx = pd.date_range("2026-01-01", periods=10, freq="D")
+        return pd.DataFrame({"Close": range(10)}, index=idx)
+
+    monkeypatch.setattr(kairos_strategies.price_cache, "get_price_data", fake_get_price_data)
+    monkeypatch.setattr(KairosSettings, "interval", "1d")
+
+    raw = fetch_data_raw("BTC-USD", lookback=3)
+
+    assert len(raw) == 10

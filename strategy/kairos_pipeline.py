@@ -274,7 +274,17 @@ def dump_csv(table: str, rows: list, stage: str):
     fname = os.path.join(
         RESULTS_DIR, f"{stage}_{table}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     )
-    fieldnames = list(rows[0].keys())
+    # Rows may have heterogeneous keys (e.g. universe-screen rows for symbols
+    # with no data omit bars/atr_pct/dollar_volume/ann_vol/liquidity_note) —
+    # use the union of keys across all rows, in first-seen order, so
+    # DictWriter never chokes on a later row with extra fields.
+    fieldnames = []
+    seen = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
     with open(fname, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -1218,7 +1228,7 @@ def _run_stage_auto_body(conn, intervals, backtest_period, asset_class_filter,
                                                      backtest_period=backtest_period,
                                                      pred_samples=pred_samples)
                     print(f"    [done] oracle (run_id={oracle_run_id})")
-                except RuntimeError as exc:
+                except Exception as exc:
                     failures.append({"group_id": group_id, "assets": assets_key,
                                    "stage": "oracle", "error": str(exc)})
                     print(f"    [fail] oracle: {exc}")
@@ -1240,7 +1250,7 @@ def _run_stage_auto_body(conn, intervals, backtest_period, asset_class_filter,
                                                   pred_samples=pred_samples, model_path=None,
                                                   extra_env=extra_env)
                     print(f"    [done] base (run_id={base_run_id})")
-                except RuntimeError as exc:
+                except Exception as exc:
                     failures.append({"group_id": group_id, "assets": assets_key,
                                    "stage": "base", "error": str(exc)})
                     print(f"    [fail] base: {exc}")

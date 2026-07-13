@@ -113,7 +113,7 @@ def calendar_days_for_bars(bars_needed: float, bars_per_day: float, symbol: str,
     return int(raw_days) + buffer_days
 
 
-def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
+def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None, as_of=None) -> DataFrame:
     price_cache.configure(remote=False)
 
     from datetime import date, timedelta
@@ -131,7 +131,7 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
     bars_needed = max(min_bars or 0, lookback + pred_len)
     days_needed = min(calendar_days_for_bars(bars_needed, bars_per_day, symbol), yf_max_days)
 
-    end_dt = date.today()
+    end_dt = as_of.date() if as_of is not None else date.today()
     start_dt = end_dt - timedelta(days=days_needed)
     end_str, start_str = end_dt.isoformat(), start_dt.isoformat()
 
@@ -143,6 +143,12 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
     raw.columns = [c.lower() for c in raw.columns]
     idx = pd.to_datetime(raw.index)
     raw.index = idx.tz_convert(None) if idx.tz is not None else idx
+
+    if as_of is not None:
+        # Round down to the nearest bar: drop anything timestamped after
+        # the simulated "now", so intraday intervals (h12/h6/1h/30m/15m/5m)
+        # never leak a bar the caller couldn't actually have seen yet.
+        raw = raw[raw.index <= as_of]
 
     if len(raw) < lookback + pred_len:
         raise RuntimeError(
