@@ -500,7 +500,10 @@ def size_selected(survivors: list[dict], config: AllocationConfig) -> list[dict]
             continue
 
         ticker = row["ticker"]
-        cluster = config.cluster_map.get(ticker, "default")
+        # Unmapped tickers form their own singleton cluster (their own ticker
+        # name as cluster key), so unrelated unmapped tickers never get
+        # cluster-capped together under one shared bucket.
+        cluster = config.cluster_map.get(ticker, ticker)
         cluster_groups[cluster].append(row)
 
     for cluster, cluster_rows in cluster_groups.items():

@@ -2738,15 +2738,19 @@ class TestSizeSelected:
         assert "alloc" not in result[0]
         assert "alloc" not in result[1]
 
-    def test_cluster_map_default_cluster_for_unmapped_tickers(self):
-        """Tickers not in cluster_map default to 'default' cluster and are still subject to cluster cap."""
+    def test_unmapped_tickers_form_singleton_clusters_not_shared_default(self):
+        """Tickers not in cluster_map form their OWN singleton cluster (their ticker
+        name), so unrelated unmapped tickers are never cluster-capped together."""
         survivors = [
             self._make_survivor("A", kelly_frac=0.08),  # Not in cluster_map
             self._make_survivor("B", kelly_frac=0.09),  # Not in cluster_map
         ]
-        # Both should fall into "default" cluster; sum 17% < 20% cluster cap, no capping
+        # If A and B were incorrectly lumped into one shared "default" cluster,
+        # their combined 17% would exceed a 10% cluster cap and get scaled down.
+        # With correct singleton-cluster behavior, each is its own cluster and
+        # neither individually exceeds the cap, so neither gets capped.
         config = AllocationConfig(
-            max_pos_pct=15.0, max_cluster_pct=20.0, gross_cap_pct=100.0
+            max_pos_pct=15.0, max_cluster_pct=10.0, gross_cap_pct=100.0
         )
         config.cluster_map = {}  # Empty map
 
@@ -2755,8 +2759,8 @@ class TestSizeSelected:
         assert len(result) == 2
         assert result[0]["alloc"] == 8.0
         assert result[1]["alloc"] == 9.0
-        # No cluster capping should occur (default cluster sum < cap)
         assert "CLUSTER_CAPPED" not in result[0]["flags"]
+        assert "CLUSTER_CAPPED" not in result[1]["flags"]
         assert "CLUSTER_CAPPED" not in result[1]["flags"]
 
     def test_dust_at_exactly_threshold(self):
