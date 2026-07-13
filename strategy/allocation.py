@@ -442,6 +442,111 @@ def _candidate_to_dict(c: Candidate) -> dict:
     }
 
 
+def size_selected(survivors: list[dict], config: AllocationConfig) -> list[dict]:
+    """Apply position cap, cluster caps, gross cap, and dust filter to top-K survivors.
+
+    Implements RFC §4.4 sizing pipeline (position cap → cluster caps → gross cap → dust filter)
+    on the survivors from select_candidates(). Returns the full row set (all candidates, both
+    selected and rejected) with final sizing applied to rows with status=None (top-K).
+
+    Args:
+        survivors: Full output list from select_candidates(), containing both rejected rows
+                  (with status set) and top-K survivors (with status=None)
+        config: AllocationConfig with sizing parameters (max_pos_pct, max_cluster_pct,
+               gross_cap_pct, dust_min_pct, cluster_map)
+
+    Returns:
+        List of dicts with the same rows as input, each top-K survivor now having:
+        - alloc: final allocation % after all caps and dust filter
+        - status: "SELECTED" or "DUST" (for survivors); unchanged for rejected rows
+        - flags: may include "POS_CAPPED" and/or "CLUSTER_CAPPED" (for survivors)
+        Rejected rows pass through unchanged.
+
+    Per RFC §4.6, dust filter is single-pass: zeroed allocations are not redistributed.
+    """
+    from collections import defaultdict
+
+    # Deep copy to avoid mutating input
+    result = [dict(row) for row in survivors]
+
+    # =========================================================================
+    # Stage 1: POSITION CAP (per-row, on survivors only)
+    # =========================================================================
+    # alloc = min(kelly_frac * 100, max_pos_pct)
+    for row in result:
+        if row["status"] is not None:
+            # Rejected row; skip sizing
+            continue
+
+        kelly_frac = row["derived"]["kelly_frac"]
+        alloc_raw = min(kelly_frac * 100, config.max_pos_pct)
+
+        # Flag if capped
+        if kelly_frac * 100 > config.max_pos_pct:
+            if "POS_CAPPED" not in row["flags"]:
+                row["flags"].append("POS_CAPPED")
+
+        row["alloc"] = alloc_raw
+
+    # =========================================================================
+    # Stage 2: CLUSTER CAPS (proportional scale-down within over-cap clusters)
+    # =========================================================================
+    # Group post-cap allocations by cluster; if cluster sum > max_cluster_pct,
+    # scale that cluster's allocations proportionally
+    cluster_groups = defaultdict(list)
+    for row in result:
+        if row["status"] is not None:
+            # Rejected row; skip
+            continue
+
+        ticker = row["ticker"]
+        cluster = config.cluster_map.get(ticker, "default")
+        cluster_groups[cluster].append(row)
+
+    for cluster, cluster_rows in cluster_groups.items():
+        cluster_sum = sum(row["alloc"] for row in cluster_rows)
+
+        if cluster_sum > config.max_cluster_pct:
+            # Scale factor: new_sum / old_sum
+            scale_factor = config.max_cluster_pct / cluster_sum
+
+            for row in cluster_rows:
+                row["alloc"] *= scale_factor
+
+                # Add CLUSTER_CAPPED flag if not already present
+                if "CLUSTER_CAPPED" not in row["flags"]:
+                    row["flags"].append("CLUSTER_CAPPED")
+
+    # =========================================================================
+    # Stage 3: GROSS CAP (proportional scale-down if total > gross_cap_pct)
+    # =========================================================================
+    survivors_with_status_none = [row for row in result if row["status"] is None]
+    gross_sum = sum(row["alloc"] for row in survivors_with_status_none)
+
+    if gross_sum > config.gross_cap_pct:
+        scale_factor = config.gross_cap_pct / gross_sum
+
+        for row in survivors_with_status_none:
+            row["alloc"] *= scale_factor
+
+    # =========================================================================
+    # Stage 4: DUST FILTER (single-pass, no redistribution)
+    # =========================================================================
+    # Any row with final alloc < dust_min_pct gets alloc=0 and status="DUST"
+    for row in result:
+        if row["status"] is not None:
+            # Rejected row; skip
+            continue
+
+        if row["alloc"] < config.dust_min_pct:
+            row["alloc"] = 0.0
+            row["status"] = "DUST"
+        else:
+            row["status"] = "SELECTED"
+
+    return result
+
+
 def _is_missing(value):
     """Check if a value is missing (None or NaN).
 

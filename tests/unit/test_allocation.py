@@ -6,7 +6,7 @@ fixtures that mirror the exact dict shapes from kairos_signals.py run().
 
 import math
 import pytest
-from allocation import Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived, compute_ev_ratio, select_candidates
+from allocation import Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived, compute_ev_ratio, select_candidates, size_selected
 
 
 class TestCandidateDataclass:
@@ -2424,3 +2424,369 @@ class TestSelectCandidates:
         # A duplicate should be DUP_ASSET
         assert result[2]["ticker"] == "A"
         assert result[2]["status"] == "DUP_ASSET"
+
+
+class TestSizeSelected:
+    """Test size_selected() sizing pipeline (position cap → cluster caps → gross cap → dust)."""
+
+    def _make_survivor(self, ticker, kelly_frac, cluster="default", ev_net=2.0, status=None):
+        """Helper to create a survivor row with minimal fields."""
+        return {
+            "ticker": ticker,
+            "strategy": "s1",
+            "direction": "long",
+            "entry": 100.0,
+            "stop": 95.0,
+            "target": 110.0,
+            "ev_pct": 5.0,
+            "base_win_rate": 0.55,
+            "n": 100,
+            "backtest_period": "p",
+            "sharpe": 1.0,
+            "advised_liquidity_pct": 5.0,
+            "avg_win_pct": None,
+            "avg_loss_pct": None,
+            "avg_holding_days": None,
+            "derived": {
+                "kelly_frac": kelly_frac,
+                "risk_pct": 5.0,
+                "reward_pct": 10.0,
+                "b": 2.0,
+                "loss_pct": 5.0,
+                "shrink": 0.5,
+                "ev_shrunk": 2.5,
+                "ev_net": ev_net,
+                "p_shrunk": 0.55,
+                "kelly_raw": 0.2,
+                "score": 0.4,
+            },
+            "status": status,
+            "flags": [],
+        }
+
+    def test_happy_path_no_caps_triggered(self):
+        """No caps triggered; all survivors remain as-is with status=SELECTED."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.10),  # 10% alloc, no cap
+            self._make_survivor("B", kelly_frac=0.08),  # 8% alloc, no cap
+        ]
+        config = AllocationConfig(max_pos_pct=15.0, max_cluster_pct=25.0, gross_cap_pct=100.0)
+        config.cluster_map = {}
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 2
+        # Both should have been sized
+        assert result[0]["alloc"] == 10.0  # kelly_frac * 100
+        assert result[0]["status"] == "SELECTED"
+        assert result[0]["flags"] == []
+
+        assert result[1]["alloc"] == 8.0
+        assert result[1]["status"] == "SELECTED"
+        assert result[1]["flags"] == []
+
+    def test_position_cap_triggered(self):
+        """Position cap triggered; kelly_frac * 100 clamped to max_pos_pct."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.20),  # 20% kelly, capped to 15%
+        ]
+        config = AllocationConfig(max_pos_pct=15.0, max_cluster_pct=25.0, gross_cap_pct=100.0)
+        config.cluster_map = {}
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 1
+        assert result[0]["alloc"] == 15.0  # Capped to max_pos_pct
+        assert result[0]["status"] == "SELECTED"
+        assert "POS_CAPPED" in result[0]["flags"]
+
+    def test_cluster_cap_triggered(self):
+        """Cluster cap triggered; cluster allocations scaled proportionally."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.10, cluster="tech"),  # 10%
+            self._make_survivor("B", kelly_frac=0.12, cluster="tech"),  # 12%
+            self._make_survivor("C", kelly_frac=0.08, cluster="energy"),  # 8%
+        ]
+        # tech cluster: 10 + 12 = 22% > 20% cap, needs scaling
+        config = AllocationConfig(
+            max_pos_pct=15.0, max_cluster_pct=20.0, gross_cap_pct=100.0
+        )
+        config.cluster_map = {"A": "tech", "B": "tech", "C": "energy"}
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 3
+        # Tech cluster sum before: 10 + 12 = 22
+        # Scale factor: 20 / 22 = 0.909...
+        # A: 10 * 0.909 = 9.09, B: 12 * 0.909 = 10.909, C: 8 (unchanged)
+        assert abs(result[0]["alloc"] - (10.0 * 20.0 / 22.0)) < 0.01
+        assert abs(result[1]["alloc"] - (12.0 * 20.0 / 22.0)) < 0.01
+        assert abs(result[2]["alloc"] - 8.0) < 0.01
+
+        # Tech positions should have CLUSTER_CAPPED flag
+        assert "CLUSTER_CAPPED" in result[0]["flags"]
+        assert "CLUSTER_CAPPED" in result[1]["flags"]
+        assert "CLUSTER_CAPPED" not in result[2]["flags"]
+
+        # All should be SELECTED
+        for r in result:
+            assert r["status"] == "SELECTED"
+
+    def test_gross_cap_triggered(self):
+        """Gross cap triggered; all allocations scaled by single factor."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.08),  # 8%
+            self._make_survivor("B", kelly_frac=0.07),  # 7%
+            self._make_survivor("C", kelly_frac=0.06),  # 6%
+        ]
+        # Total: 8 + 7 + 6 = 21% > 20% cap
+        config = AllocationConfig(
+            max_pos_pct=15.0, max_cluster_pct=25.0, gross_cap_pct=20.0
+        )
+        config.cluster_map = {}
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 3
+        # Scale factor: 20 / 21 = 0.952...
+        scale_factor = 20.0 / 21.0
+        assert abs(result[0]["alloc"] - (8.0 * scale_factor)) < 0.01
+        assert abs(result[1]["alloc"] - (7.0 * scale_factor)) < 0.01
+        assert abs(result[2]["alloc"] - (6.0 * scale_factor)) < 0.01
+
+        # All should be SELECTED
+        for r in result:
+            assert r["status"] == "SELECTED"
+
+    def test_dust_filter_zeroes_small_allocation(self):
+        """Dust filter; allocation < dust_min_pct zeroed and marked DUST."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.05),  # 5%
+            self._make_survivor("B", kelly_frac=0.003),  # 0.3%, below 1% dust threshold
+        ]
+        config = AllocationConfig(
+            max_pos_pct=15.0, max_cluster_pct=25.0, gross_cap_pct=100.0, dust_min_pct=1.0
+        )
+        config.cluster_map = {}
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 2
+        assert result[0]["alloc"] == 5.0
+        assert result[0]["status"] == "SELECTED"
+
+        assert result[1]["alloc"] == 0.0  # Zeroed
+        assert result[1]["status"] == "DUST"
+
+    def test_rejected_rows_pass_through_unchanged(self):
+        """Rejected rows (status != None) pass through unchanged."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.10, status=None),  # Top-K
+            {
+                **self._make_survivor("B", kelly_frac=0.05),
+                "status": "BELOW_TOPK",  # Rejected
+            },
+            {
+                **self._make_survivor("C", kelly_frac=0.07),
+                "status": "LOW_N",  # Rejected
+            },
+        ]
+        config = AllocationConfig(max_pos_pct=15.0, max_cluster_pct=25.0, gross_cap_pct=100.0)
+        config.cluster_map = {}
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 3
+        # A should be sized
+        assert result[0]["status"] == "SELECTED"
+        assert result[0]["alloc"] == 10.0
+
+        # B and C should be unchanged
+        assert result[1]["status"] == "BELOW_TOPK"
+        assert "alloc" not in result[1]  # No alloc field added to rejected rows
+
+        assert result[2]["status"] == "LOW_N"
+        assert "alloc" not in result[2]
+
+    def test_combined_cluster_gross_dust_cascade(self):
+        """Combined scenario: cluster cap → gross cap → dust in sequence."""
+        # Setup: 3 clusters, each with 2 positions
+        # tech: A (10%), B (12%) -> cluster sum 22% > 20% cluster cap
+        # energy: C (8%), D (9%) -> cluster sum 17% < 20% cluster cap
+        # healthcare: E (0.5%), F (1%) -> cluster sum 1.5% < 20% cluster cap
+        # After cluster caps: tech scaled to 20%, energy stays 17%, healthcare stays 1.5%
+        # Total after cluster: 38.5% > 30% gross cap -> scale by 30/38.5
+        # E: 0.5 * scale < 1.0% dust threshold -> zeroed to DUST
+        # F: 1 * scale may still be < 1.0% depending on scale -> check
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.10, cluster="tech"),
+            self._make_survivor("B", kelly_frac=0.12, cluster="tech"),
+            self._make_survivor("C", kelly_frac=0.08, cluster="energy"),
+            self._make_survivor("D", kelly_frac=0.09, cluster="energy"),
+            self._make_survivor("E", kelly_frac=0.005, cluster="healthcare"),
+            self._make_survivor("F", kelly_frac=0.01, cluster="healthcare"),
+        ]
+        config = AllocationConfig(
+            max_pos_pct=15.0,
+            max_cluster_pct=20.0,
+            gross_cap_pct=30.0,
+            dust_min_pct=1.0,
+        )
+        config.cluster_map = {
+            "A": "tech",
+            "B": "tech",
+            "C": "energy",
+            "D": "energy",
+            "E": "healthcare",
+            "F": "healthcare",
+        }
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 6
+
+        # After cluster cap, before gross cap:
+        # Tech: (10 + 12) * (20/22) = 20
+        # Energy: 8 + 9 = 17 (unchanged)
+        # Healthcare: 0.5 + 1 = 1.5 (unchanged)
+        # Total: 38.5
+
+        # After gross cap: scale by 30/38.5 = 0.7792
+        gross_scale = 30.0 / 38.5
+        cluster_tech_scale = 20.0 / 22.0
+
+        # A, B: tech cluster scaled, then gross scaled
+        a_expected = 10.0 * cluster_tech_scale * gross_scale
+        b_expected = 12.0 * cluster_tech_scale * gross_scale
+        c_expected = 8.0 * gross_scale
+        d_expected = 9.0 * gross_scale
+        e_expected = 0.5 * gross_scale  # Likely < 1.0 dust threshold
+        f_expected = 1.0 * gross_scale  # Likely < 1.0 dust threshold
+
+        assert abs(result[0]["alloc"] - a_expected) < 0.01
+        assert abs(result[1]["alloc"] - b_expected) < 0.01
+        assert abs(result[2]["alloc"] - c_expected) < 0.01
+        assert abs(result[3]["alloc"] - d_expected) < 0.01
+
+        # Check dust filter results
+        if e_expected < config.dust_min_pct:
+            assert result[4]["alloc"] == 0.0
+            assert result[4]["status"] == "DUST"
+        else:
+            assert result[4]["status"] == "SELECTED"
+
+        if f_expected < config.dust_min_pct:
+            assert result[5]["alloc"] == 0.0
+            assert result[5]["status"] == "DUST"
+        else:
+            assert result[5]["status"] == "SELECTED"
+
+        # C and D should be SELECTED (above dust)
+        assert result[2]["status"] == "SELECTED"
+        assert result[3]["status"] == "SELECTED"
+
+    def test_position_cap_and_cluster_cap_combined(self):
+        """Position cap clamping happens before cluster cap scaling."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.20, cluster="tech"),  # Clamped to 15%
+            self._make_survivor("B", kelly_frac=0.12, cluster="tech"),  # 12%
+        ]
+        # Tech cluster after pos cap: 15% + 12% = 27% > 20% cluster cap
+        config = AllocationConfig(
+            max_pos_pct=15.0, max_cluster_pct=20.0, gross_cap_pct=100.0
+        )
+        config.cluster_map = {"A": "tech", "B": "tech"}
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 2
+
+        # A: clamped to 15% (pos cap), then scaled by 20/27
+        a_expected = 15.0 * (20.0 / 27.0)
+        # B: 12%, scaled by 20/27
+        b_expected = 12.0 * (20.0 / 27.0)
+
+        assert abs(result[0]["alloc"] - a_expected) < 0.01
+        assert abs(result[1]["alloc"] - b_expected) < 0.01
+
+        # Both should have POS_CAPPED and CLUSTER_CAPPED flags
+        assert "POS_CAPPED" in result[0]["flags"]
+        assert "CLUSTER_CAPPED" in result[0]["flags"]
+        assert "POS_CAPPED" not in result[1]["flags"]
+        assert "CLUSTER_CAPPED" in result[1]["flags"]
+
+    def test_empty_survivors_list(self):
+        """Empty input returns empty output."""
+        config = AllocationConfig()
+        result = size_selected([], config)
+        assert result == []
+
+    def test_all_rejected_rows(self):
+        """All rejected rows pass through unchanged."""
+        survivors = [
+            {**self._make_survivor("A", kelly_frac=0.10), "status": "LOW_N"},
+            {**self._make_survivor("B", kelly_frac=0.05), "status": "NEG_EV_NET"},
+        ]
+        config = AllocationConfig()
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 2
+        assert result[0]["status"] == "LOW_N"
+        assert result[1]["status"] == "NEG_EV_NET"
+        # No alloc added to rejected rows
+        assert "alloc" not in result[0]
+        assert "alloc" not in result[1]
+
+    def test_cluster_map_default_cluster_for_unmapped_tickers(self):
+        """Tickers not in cluster_map default to 'default' cluster and are still subject to cluster cap."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.08),  # Not in cluster_map
+            self._make_survivor("B", kelly_frac=0.09),  # Not in cluster_map
+        ]
+        # Both should fall into "default" cluster; sum 17% < 20% cluster cap, no capping
+        config = AllocationConfig(
+            max_pos_pct=15.0, max_cluster_pct=20.0, gross_cap_pct=100.0
+        )
+        config.cluster_map = {}  # Empty map
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 2
+        assert result[0]["alloc"] == 8.0
+        assert result[1]["alloc"] == 9.0
+        # No cluster capping should occur (default cluster sum < cap)
+        assert "CLUSTER_CAPPED" not in result[0]["flags"]
+        assert "CLUSTER_CAPPED" not in result[1]["flags"]
+
+    def test_dust_at_exactly_threshold(self):
+        """Allocation exactly at dust_min_pct is NOT zeroed (>= check)."""
+        survivors = [
+            self._make_survivor("A", kelly_frac=0.01),  # Exactly 1.0%
+        ]
+        config = AllocationConfig(dust_min_pct=1.0)
+        config.cluster_map = {}
+
+        result = size_selected(survivors, config)
+
+        assert len(result) == 1
+        assert result[0]["alloc"] == 1.0
+        assert result[0]["status"] == "SELECTED"  # Not DUST
+
+    def test_input_not_mutated(self):
+        """Original input list is not mutated."""
+        survivor = self._make_survivor("A", kelly_frac=0.10, status=None)
+        survivors = [survivor]
+
+        # Make a copy to compare
+        original_survivor = dict(survivor)
+
+        config = AllocationConfig(max_pos_pct=15.0, max_cluster_pct=25.0, gross_cap_pct=100.0)
+        config.cluster_map = {}
+
+        result = size_selected(survivors, config)
+
+        # Original should be unchanged
+        assert survivor == original_survivor
+        assert "alloc" not in survivor  # Original has no alloc
+        assert "alloc" in result[0]  # Result has alloc
