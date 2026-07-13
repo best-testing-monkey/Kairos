@@ -13,7 +13,7 @@ from typing import Optional
 
 from openpyxl.styles import Protection
 
-from kairos_signals import _ev_pct_value
+from kairos_signals import _ev_pct_value, format_table
 
 
 @dataclass
@@ -1407,3 +1407,104 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
                 r.get("status", ""),
             ],
         )
+
+
+# =============================================================================
+# E11-S11: Markdown Section Writer
+# =============================================================================
+
+def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
+    """Render the RFC §6 Markdown "Portfolio Allocation" section.
+
+    Returns a static snapshot of ``result`` as a markdown string, including the
+    config summary, selection summary, selected-position table, cluster
+    exposure line, and compact rejection-count summary.
+
+    Args:
+        result: AllocationResult from ``allocate()``.
+        config: AllocationConfig used to produce ``result``.
+
+    Returns:
+        Markdown string ready to append to a signals report.
+    """
+    # Heading
+    lines = ["## Portfolio Allocation", ""]
+
+    # Config summary line (RFC §6 example format)
+    lines.append(
+        f"Config: n0={config.n0:g} min_n={config.min_n:g} "
+        f"cost={config.round_trip_cost_pct:g}% kelly_mult={config.kelly_mult:g} "
+        f"top_k={config.top_k:g} max_pos={config.max_pos_pct:g}% "
+        f"max_cluster={config.max_cluster_pct:g}% gross_cap={config.gross_cap_pct:g}%"
+    )
+    lines.append("")
+
+    # Selection summary
+    total_signals = len(result.rows)
+    lines.append(
+        f"Selected {result.selected_count} of {total_signals} signals. "
+        f"Gross exposure: {result.gross_exposure_pct:.1f}%."
+    )
+    lines.append("")
+
+    # Selected-position table via kairos_signals.format_table
+    headers = ["Ticker", "Dir", "Strategy", "Entry", "Stop", "Target", "EV net", "Score", "Alloc"]
+    align = ["l", "l", "l", "r", "r", "r", "r", "r", "r"]
+
+    selected_rows = [row for row in result.rows if row.get("status") == "SELECTED"]
+    table_rows = []
+    for row in selected_rows:
+        direction = row.get("direction", "")
+        derived = row.get("derived", {}) or {}
+        ev_net = derived.get("ev_net")
+        score = derived.get("score")
+        alloc = row.get("alloc", 0.0)
+
+        entry = row.get("entry")
+        stop = row.get("stop")
+        target = row.get("target")
+
+        table_rows.append({
+            "Ticker": row.get("ticker", ""),
+            "Dir": direction.capitalize() if isinstance(direction, str) else "",
+            "Strategy": row.get("strategy", ""),
+            "Entry": f"{entry:.2f}" if entry is not None else "",
+            "Stop": f"{stop:.2f}" if stop is not None else "",
+            "Target": f"{target:.2f}" if target is not None else "",
+            "EV net": f"{ev_net:.2f}%" if ev_net is not None else "",
+            "Score": f"{score:.2f}" if score is not None else "",
+            "Alloc": f"{alloc:.1f}%",
+        })
+
+    table_lines = format_table(headers, table_rows, align)
+    lines.extend(table_lines)
+    lines.append("")
+
+    # Cluster exposure line: sum alloc per cluster among selected rows
+    cluster_sums: dict[str, float] = {}
+    for row in selected_rows:
+        ticker = row.get("ticker", "")
+        cluster = config.cluster_map.get(ticker, ticker)
+        cluster_sums[cluster] = cluster_sums.get(cluster, 0.0) + row.get("alloc", 0.0)
+
+    if cluster_sums:
+        sorted_clusters = sorted(cluster_sums.items(), key=lambda kv: (-kv[1], kv[0]))
+        cluster_parts = [f"{cluster} {total:.1f}%" for cluster, total in sorted_clusters]
+        lines.append(f"Cluster exposure: {', '.join(cluster_parts)}")
+    else:
+        lines.append("Cluster exposure: none")
+    lines.append("")
+
+    # Rejection-count summary line
+    non_selected_count = total_signals - result.selected_count
+    if result.rejection_counts:
+        sorted_reasons = sorted(
+            result.rejection_counts.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        reason_parts = [f"{reason} {count}" for reason, count in sorted_reasons]
+        lines.append(f"Rejected: {non_selected_count} total -- {', '.join(reason_parts)}")
+    else:
+        lines.append(f"Rejected: {non_selected_count} total --")
+
+    return "\n".join(lines)
