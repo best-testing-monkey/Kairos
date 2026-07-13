@@ -77,3 +77,20 @@
 - [x] E10-S04 CLI Wiring (docs/tickets/E10-S04-cli-wiring.md)
 - [x] E10-S05 Interval-aware Correlation (docs/tickets/E10-S05-correlation-interval.md)
 - [x] E10-S06 PIPELINE.md Docs (docs/tickets/E10-S06-pipeline-docs.md)
+
+## Epic E11 — Portfolio Allocation Sheet
+
+- [x] E11-S01 Candidate Schema + fetch_signals (docs/tickets/E11-S01-candidate-schema-fetch.md)
+- [ ] E11-S02 SCHEMA_ERROR Validation (docs/tickets/E11-S02-schema-validation.md)
+- [ ] E11-S03 Config + Per-row Derived Columns (docs/tickets/E11-S03-config-and-derived-columns.md)
+- [ ] E11-S04 ev_implied Data Quality Check (docs/tickets/E11-S04-data-quality-check.md)
+- [ ] E11-S05 Selection: Gate, Collapse, Top-K (docs/tickets/E11-S05-selection-gate-collapse-topk.md)
+- [ ] E11-S06 Sizing: Kelly Cap, Cluster Caps, Dust (docs/tickets/E11-S06-sizing-caps-dust.md)
+- [ ] E11-S07 allocate() Orchestration + Cluster Map (docs/tickets/E11-S07-allocate-orchestration.md)
+- [ ] E11-S08 Formula Template Engine (docs/tickets/E11-S08-formula-template-engine.md)
+- [ ] E11-S09 XLSX Sheet Writer (docs/tickets/E11-S09-xlsx-sheet-writer.md)
+- [ ] E11-S10 ODS Sheet Writer (docs/tickets/E11-S10-ods-sheet-writer.md)
+- [ ] E11-S11 Markdown Section Writer (docs/tickets/E11-S11-markdown-section-writer.md)
+- [ ] E11-S12 Wire into kairos_signals.py (docs/tickets/E11-S12-wire-into-kairos-signals.md)
+- [ ] E11-S13 LibreOffice Parity Tests (docs/tickets/E11-S13-libreoffice-parity-tests.md)
+- [ ] E11-S14 Golden-file + Property Tests (docs/tickets/E11-S14-remaining-unit-tests.md)
