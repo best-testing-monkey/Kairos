@@ -92,5 +92,5 @@
 - [x] E11-S10 ODS Sheet Writer (docs/tickets/E11-S10-ods-sheet-writer.md)
 - [x] E11-S11 Markdown Section Writer (docs/tickets/E11-S11-markdown-section-writer.md)
 - [x] E11-S12 Wire into kairos_signals.py (docs/tickets/E11-S12-wire-into-kairos-signals.md)
-- [ ] E11-S13 LibreOffice Parity Tests (docs/tickets/E11-S13-libreoffice-parity-tests.md)
+- [x] E11-S13 LibreOffice Parity Tests (docs/tickets/E11-S13-libreoffice-parity-tests.md)
 - [ ] E11-S14 Golden-file + Property Tests (docs/tickets/E11-S14-remaining-unit-tests.md)
