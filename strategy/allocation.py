@@ -857,13 +857,13 @@ def get_formula_aliases() -> dict[str, str]:
 
 
 # =============================================================================
-# E11-S09: XLSX Sheet Writer
+# E11-S09 / E11-S10: Shared Sheet Layout Constants
 # =============================================================================
 
 # Config block layout.  Order is chosen so that the first seven editable value
 # cells ($D$3..$D$9) line up with the absolute references used by the formula
 # templates above.
-_XLSX_CONFIG_BLOCK = [
+_CONFIG_BLOCK = [
     ("n0", "n0"),
     ("round_trip_cost_pct", "round_trip_cost_pct"),
     ("kelly_mult", "kelly_mult"),
@@ -877,17 +877,17 @@ _XLSX_CONFIG_BLOCK = [
     ("cluster_map", "cluster_map"),
 ]
 
-_XLSX_DATA_START_ROW = 19
-_XLSX_HEADER_ROW = 19
+_DATA_START_ROW = 19
+_HEADER_ROW = 19
 
 # Static columns A-N and their human-readable header.
-_XLSX_STATIC_HEADERS = [
+_STATIC_HEADERS = [
     "Ticker", "Cluster", "Strategy", "Dir", "Entry", "Stop", "Target",
     "Risk %", "Reward %", "b", "n", "Win raw", "Win shrunk", "EV raw %",
 ]
 
 # Headers for the formula-driven columns O-U (visible Section A derived columns).
-_XLSX_FORMULA_HEADERS = {
+_FORMULA_HEADERS = {
     "O": "EV net %",
     "P": "Kelly raw",
     "Q": "Score",
@@ -898,16 +898,25 @@ _XLSX_FORMULA_HEADERS = {
 }
 
 # Headers for the helper formula columns V-AJ.
-_XLSX_HELPER_HEADERS = [
+_HELPER_HEADERS = [
     "risk_pct", "reward_pct", "b", "loss_pct", "shrink", "ev_shrunk",
     "p_shrunk", "kelly_frac", "alloc_raw_pct", "pos_capped_alloc",
     "pos_capped_flag", "ev_implied", "ev_ratio", "data_mismatch", "cluster_scale",
 ]
 
-_XLSX_FORMULA_COLS = [
+_FORMULA_COLS = [
     "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
     "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ",
 ]
+
+# Summary-block formulas shared by XLSX and ODS writers.  Dialect-specific
+# rendering (comma vs. semicolon separators, '=' vs. 'of:=' prefix) is applied
+# by the writers so the formula logic is not duplicated.
+_SUMMARY_FORMULAS = {
+    "selected_count": '=COUNTIF(R20:R400,">0")',
+    "gross_exposure": "=SUM(R20:R400)",
+    "enabled_count": "=COUNTA(N20:N400)",
+}
 
 
 def _xlsx_column_letter_to_index(col_letter: str) -> int:
@@ -923,6 +932,22 @@ def _empty_if_none(value):
     if value is None:
         return ""
     return value
+
+
+def _xlsx_formula_to_ods(formula: str) -> str:
+    """Convert an XLSX-style formula string into an ODS formula string.
+
+    Applies the same comma-to-semicolon conversion used by render_formula()
+    for ODS output and prefixes the result with ``of:=``.
+    """
+    if not formula.startswith("="):
+        return formula
+    return "of:=" + _convert_commas_to_semicolons(formula[1:])
+
+
+# =============================================================================
+# E11-S09: XLSX Sheet Writer
+# =============================================================================
 
 
 def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfig,
@@ -965,7 +990,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     # Parameter names in column C, editable values in column D, shipped defaults
     # (locked) in column E.
     default_config = AllocationConfig()
-    for offset, (label, attr) in enumerate(_XLSX_CONFIG_BLOCK):
+    for offset, (label, attr) in enumerate(_CONFIG_BLOCK):
         row = 3 + offset
         ws.cell(row=row, column=3, value=label)
         value = getattr(config, attr)
@@ -981,11 +1006,11 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     # Rows 14-16: summary block
     # -------------------------------------------------------------------------
     ws["A14"] = "Selected count"
-    ws["C14"] = '=COUNTIF(R20:R400,">0")'
+    ws["C14"] = _SUMMARY_FORMULAS["selected_count"]
     ws["A15"] = "Gross exposure %"
-    ws["C15"] = "=SUM(R20:R400)"
+    ws["C15"] = _SUMMARY_FORMULAS["gross_exposure"]
     ws["A16"] = "Enabled count"
-    ws["C16"] = "=COUNTA(N20:N400)"
+    ws["C16"] = _SUMMARY_FORMULAS["enabled_count"]
     ws["D14"] = render_formula("gross_scale", 14, "xlsx")
 
     # -------------------------------------------------------------------------
@@ -1000,12 +1025,12 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     # Row 19: header row
     # -------------------------------------------------------------------------
     headers = (
-        _XLSX_STATIC_HEADERS
-        + [_XLSX_FORMULA_HEADERS[col] for col in _XLSX_FORMULA_COLS[:7]]
-        + _XLSX_HELPER_HEADERS
+        _STATIC_HEADERS
+        + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:7]]
+        + _HELPER_HEADERS
     )
     for col_idx, header in enumerate(headers, start=1):
-        ws.cell(row=_XLSX_HEADER_ROW, column=col_idx, value=header)
+        ws.cell(row=_HEADER_ROW, column=col_idx, value=header)
 
     # -------------------------------------------------------------------------
     # Rows 20..N: candidate rows
@@ -1014,7 +1039,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
         return config.cluster_map.get(ticker, ticker)
 
     for row_offset, row_data in enumerate(result.rows):
-        excel_row = _XLSX_DATA_START_ROW + 1 + row_offset
+        excel_row = _DATA_START_ROW + 1 + row_offset
         derived = row_data.get("derived", {}) or {}
         ticker = row_data.get("ticker", "")
         direction = row_data.get("direction", "")
@@ -1038,7 +1063,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
         for col_idx, value in enumerate(static_values, start=1):
             ws.cell(row=excel_row, column=col_idx, value=_empty_if_none(value))
 
-        for col_letter in _XLSX_FORMULA_COLS:
+        for col_letter in _FORMULA_COLS:
             col_idx = _xlsx_column_letter_to_index(col_letter)
             ws.cell(row=excel_row, column=col_idx,
                     value=render_formula(col_letter, excel_row, "xlsx"))
@@ -1046,7 +1071,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     # -------------------------------------------------------------------------
     # Section B: cluster exposure table
     # -------------------------------------------------------------------------
-    data_end_row = _XLSX_DATA_START_ROW + len(result.rows)
+    data_end_row = _DATA_START_ROW + len(result.rows)
     cluster_header_row = data_end_row + 2
     ws.cell(row=cluster_header_row, column=1, value="Cluster")
     ws.cell(row=cluster_header_row, column=2, value="Positions")
@@ -1115,7 +1140,270 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     for cell in ws["N"]:
         cell.protection = Protection(locked=False)
 
-    for config_row in range(3, 3 + len(_XLSX_CONFIG_BLOCK)):
+    for config_row in range(3, 3 + len(_CONFIG_BLOCK)):
         ws.cell(row=config_row, column=4).protection = Protection(locked=False)
 
     ws.protection.sheet = True
+
+
+# =============================================================================
+# E11-S10: ODS Sheet Writer
+# =============================================================================
+
+def _ods_create_cell(value, formula=None):
+    """Create an odfpy ``TableCell`` with optional ODS formula."""
+    from odf.table import TableCell
+    from odf.text import P
+
+    text = "" if value is None else str(value)
+
+    if formula:
+        # Formula cells carry a cached float value of 0.0 and the formula
+        # attribute; the displayed text is left empty.
+        cell = TableCell(valuetype="float", value=0.0)
+        cell.setAttribute("formula", formula)
+        cell.addElement(P(text=text))
+    elif isinstance(value, bool):
+        cell = TableCell(valuetype="boolean", value="true" if value else "false")
+        cell.addElement(P(text=text))
+    elif isinstance(value, (int, float)):
+        cell = TableCell(valuetype="float", value=float(value))
+        cell.addElement(P(text=text))
+    else:
+        cell = TableCell(valuetype="string")
+        cell.addElement(P(text=text))
+    return cell
+
+
+def _ods_add_row(table, values, start_col=0, formulas=None):
+    """Append a row to an ODS ``Table`` with leading empty cells and formulas.
+
+    Args:
+        table: odfpy ``Table`` instance.
+        values: iterable of cell values placed starting at ``start_col``.
+        start_col: 0-based column index where ``values`` begin.
+        formulas: dict mapping absolute 0-based column index to an ODS formula
+            string (``of:=...``).  The matching cell is created as a formula
+            cell with the corresponding ``values`` entry as display text.
+    """
+    from odf.table import TableRow
+
+    formulas = formulas or {}
+    row = TableRow()
+    end_col = max(len(values) + start_col, max(formulas, default=-1) + 1)
+    for col_idx in range(end_col):
+        if start_col <= col_idx < start_col + len(values):
+            value = values[col_idx - start_col]
+        else:
+            value = ""
+        cell = _ods_create_cell(value, formula=formulas.get(col_idx))
+        row.addElement(cell)
+    table.addElement(row)
+    return row
+
+
+def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig,
+                    report_date, generator_version: str):
+    """Write the ``Allocation`` sheet into an existing ``odfpy`` document.
+
+    Layout mirrors ``write_xlsx_sheet`` exactly (RFC allocation_sheet.md §5 and
+    ticket E11-S10):
+      - Row 1: title, report date, generator version.
+      - Row 2: visible note that the sheet is unprotected.
+      - Rows 3-13: config block (parameter name, editable value, shipped default).
+      - Rows 14-16: summary formulas (selected count, gross exposure %, enabled
+        count, and the gross scale factor in $D$14).
+      - Row 18: instruction line.
+      - Row 19: header row A-AJ.
+      - Rows 20..N: one row per candidate in ``result.rows`` in the order given.
+      - Below the data: Section B cluster-exposure table and Section C rejected
+        signals table.
+
+    No sheet protection is applied because odfpy protection support is
+    unreliable (RFC §4.6); the unprotected state is surfaced to the user via
+    the row-2 note.
+
+    The function performs no disk I/O; it mutates the provided in-memory
+    ``OpenDocumentSpreadsheet``.
+    """
+    from odf import opendocument
+    from odf.table import Table
+
+    if not isinstance(document, opendocument.OpenDocument):
+        raise TypeError("document must be an odfpy OpenDocumentSpreadsheet")
+    if document.mimetype != "application/vnd.oasis.opendocument.spreadsheet":
+        raise TypeError("document must be an odfpy OpenDocumentSpreadsheet")
+
+    table = Table(name="Allocation")
+    document.spreadsheet.addElement(table)
+
+    # -------------------------------------------------------------------------
+    # Row 1: title line
+    # -------------------------------------------------------------------------
+    _ods_add_row(
+        table,
+        ["Portfolio Allocation", _empty_if_none(report_date), f"generator {generator_version}"],
+    )
+
+    # -------------------------------------------------------------------------
+    # Row 2: unprotected-sheet note (ODS protection is unreliable)
+    # -------------------------------------------------------------------------
+    _ods_add_row(
+        table,
+        ["Note: this sheet is intentionally unprotected (ODS protection support is unreliable)."],
+    )
+
+    # -------------------------------------------------------------------------
+    # Rows 3-13: config block
+    # -------------------------------------------------------------------------
+    # Parameter names in column C, editable values in column D, shipped defaults
+    # in column E.
+    default_config = AllocationConfig()
+    for label, attr in _CONFIG_BLOCK:
+        value = getattr(config, attr)
+        if attr == "cluster_map":
+            value = str(value) if value else ""
+        default_value = getattr(default_config, attr)
+        if attr == "cluster_map":
+            default_value = str(default_value) if default_value else ""
+        _ods_add_row(
+            table,
+            [label, _empty_if_none(value), _empty_if_none(default_value)],
+            start_col=2,
+        )
+
+    # -------------------------------------------------------------------------
+    # Rows 14-16: summary block
+    # -------------------------------------------------------------------------
+    _ods_add_row(
+        table,
+        ["Selected count", ""],
+        formulas={
+            2: _xlsx_formula_to_ods(_SUMMARY_FORMULAS["selected_count"]),
+            3: render_formula("gross_scale", 14, "ods"),
+        },
+    )
+    _ods_add_row(
+        table,
+        ["Gross exposure %", ""],
+        formulas={2: _xlsx_formula_to_ods(_SUMMARY_FORMULAS["gross_exposure"])},
+    )
+    _ods_add_row(
+        table,
+        ["Enabled count", ""],
+        formulas={2: _xlsx_formula_to_ods(_SUMMARY_FORMULAS["enabled_count"])},
+    )
+
+    # -------------------------------------------------------------------------
+    # Row 17: blank separator (mirrors XLSX layout)
+    # -------------------------------------------------------------------------
+    _ods_add_row(table, [""])
+
+    # -------------------------------------------------------------------------
+    # Row 18: instruction line
+    # -------------------------------------------------------------------------
+    _ods_add_row(
+        table,
+        [
+            "Edit only the config values (column D) and the per-row input column "
+            "(column N). All other cells are computed."
+        ],
+    )
+
+    # -------------------------------------------------------------------------
+    # Row 19: header row
+    # -------------------------------------------------------------------------
+    headers = (
+        _STATIC_HEADERS
+        + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:7]]
+        + _HELPER_HEADERS
+    )
+    _ods_add_row(table, headers)
+
+    # -------------------------------------------------------------------------
+    # Rows 20..N: candidate rows
+    # -------------------------------------------------------------------------
+    def _cluster_for_ticker(ticker: str) -> str:
+        return config.cluster_map.get(ticker, ticker)
+
+    for row_offset, row_data in enumerate(result.rows):
+        excel_row = _DATA_START_ROW + 1 + row_offset
+        derived = row_data.get("derived", {}) or {}
+        ticker = row_data.get("ticker", "")
+        direction = row_data.get("direction", "")
+
+        static_values = [
+            ticker,
+            _cluster_for_ticker(ticker),
+            row_data.get("strategy", ""),
+            direction.capitalize() if isinstance(direction, str) else "",
+            row_data.get("entry"),
+            row_data.get("stop"),
+            row_data.get("target"),
+            derived.get("risk_pct"),
+            derived.get("reward_pct"),
+            derived.get("b"),
+            row_data.get("n"),
+            row_data.get("base_win_rate"),
+            derived.get("p_shrunk"),
+            row_data.get("ev_pct"),
+        ]
+
+        # Visible + helper formula columns O..AJ are formula cells.
+        formulas = {}
+        for col_letter in _FORMULA_COLS:
+            col_idx = _xlsx_column_letter_to_index(col_letter) - 1
+            formulas[col_idx] = render_formula(col_letter, excel_row, "ods")
+
+        values = static_values + [""] * len(_FORMULA_COLS)
+        _ods_add_row(table, values, formulas=formulas)
+
+    # -------------------------------------------------------------------------
+    # Section B: cluster exposure table
+    # -------------------------------------------------------------------------
+    _ods_add_row(table, [""])  # blank separator row
+    _ods_add_row(
+        table,
+        ["Cluster", "Positions", "Gross %", "Cap %", "Capped?"],
+    )
+
+    selected_rows = [r for r in result.rows if r.get("status") == "SELECTED"]
+    clusters = sorted(set(config.cluster_map.values())) if config.cluster_map else []
+    for cluster in clusters:
+        cluster_rows = [
+            r for r in selected_rows
+            if _cluster_for_ticker(r.get("ticker", "")) == cluster
+        ]
+        positions = len(cluster_rows)
+        gross = sum(r.get("alloc", 0.0) for r in cluster_rows)
+        capped = any("CLUSTER_CAPPED" in r.get("flags", []) for r in cluster_rows)
+        _ods_add_row(
+            table,
+            [cluster, positions, gross, config.max_cluster_pct, "yes" if capped else "no"],
+        )
+
+    # -------------------------------------------------------------------------
+    # Section C: rejected signals (compact audit trail)
+    # -------------------------------------------------------------------------
+    _ods_add_row(table, ["Ticker", "Strategy", "Dir", "Score", "Reason"])
+
+    rejected = [r for r in result.rows if r.get("status") != "SELECTED"]
+    rejected.sort(
+        key=lambda r: (
+            r.get("status", ""),
+            -(r.get("derived", {}) or {}).get("score", float("-inf")),
+        )
+    )
+    for r in rejected:
+        direction = r.get("direction", "")
+        score = (r.get("derived", {}) or {}).get("score")
+        _ods_add_row(
+            table,
+            [
+                r.get("ticker", ""),
+                r.get("strategy", ""),
+                direction.capitalize() if isinstance(direction, str) else "",
+                _empty_if_none(score),
+                r.get("status", ""),
+            ],
+        )

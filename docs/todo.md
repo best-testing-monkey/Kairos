@@ -89,7 +89,7 @@
 - [x] E11-S07 allocate() Orchestration + Cluster Map (docs/tickets/E11-S07-allocate-orchestration.md)
 - [x] E11-S08 Formula Template Engine (docs/tickets/E11-S08-formula-template-engine.md)
 - [x] E11-S09 XLSX Sheet Writer (docs/tickets/E11-S09-xlsx-sheet-writer.md)
-- [ ] E11-S10 ODS Sheet Writer (docs/tickets/E11-S10-ods-sheet-writer.md)
+- [x] E11-S10 ODS Sheet Writer (docs/tickets/E11-S10-ods-sheet-writer.md)
 - [ ] E11-S11 Markdown Section Writer (docs/tickets/E11-S11-markdown-section-writer.md)
 - [ ] E11-S12 Wire into kairos_signals.py (docs/tickets/E11-S12-wire-into-kairos-signals.md)
 - [ ] E11-S13 LibreOffice Parity Tests (docs/tickets/E11-S13-libreoffice-parity-tests.md)
