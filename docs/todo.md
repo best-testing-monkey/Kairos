@@ -84,7 +84,7 @@
 - [x] E11-S02 SCHEMA_ERROR Validation (docs/tickets/E11-S02-schema-validation.md)
 - [x] E11-S03 Config + Per-row Derived Columns (docs/tickets/E11-S03-config-and-derived-columns.md)
 - [x] E11-S04 ev_implied Data Quality Check (docs/tickets/E11-S04-data-quality-check.md)
-- [ ] E11-S05 Selection: Gate, Collapse, Top-K (docs/tickets/E11-S05-selection-gate-collapse-topk.md)
+- [x] E11-S05 Selection: Gate, Collapse, Top-K (docs/tickets/E11-S05-selection-gate-collapse-topk.md)
 - [ ] E11-S06 Sizing: Kelly Cap, Cluster Caps, Dust (docs/tickets/E11-S06-sizing-caps-dust.md)
 - [ ] E11-S07 allocate() Orchestration + Cluster Map (docs/tickets/E11-S07-allocate-orchestration.md)
 - [ ] E11-S08 Formula Template Engine (docs/tickets/E11-S08-formula-template-engine.md)
