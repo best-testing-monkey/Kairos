@@ -301,7 +301,7 @@ def build_signals_table(advice_rows):
 
 
 def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
-                  min_ev_pct=0.10) -> str:
+                  min_ev_pct=0.10, allocation_section=None) -> str:
     """Assemble the full markdown report from pre-computed pieces.
 
     stats_rows: list of dicts with keys from STATS_COLUMNS (only strategies
@@ -317,6 +317,8 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
     failures: list of strings describing group-level failures.
     skipped: list of strings describing skipped/unknown or filtered strategies.
     timestamp: datetime used for the header.
+    allocation_section: optional markdown string (e.g. from allocation.py
+        write_md_section) to append after the Signals section, per RFC §6.
     """
     lines = []
     lines.append(f"# Kairos Signals Report {timestamp.strftime('%Y-%m-%d %H%Mh')}")
@@ -347,6 +349,10 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
     else:
         lines.append("_No signals generated._")
     lines.append("")
+
+    if allocation_section:
+        lines.append(allocation_section.rstrip("\n"))
+        lines.append("")
 
     # Add Legend
     lines.append("### Legend")
@@ -460,12 +466,16 @@ def upload_to_gsheets(stats_rows, advice_rows, timestamp,
 SPREADSHEET_ENGINES = {"xlsx": "openpyxl", "ods": "odf"}
 
 
-def write_spreadsheet(stats_rows, advice_rows, out_path, fmt) -> str:
-    """Write a 2-tab spreadsheet ('strategies', 'signals') to out_path.
+def write_spreadsheet(stats_rows, advice_rows, out_path, fmt,
+                      allocation_result=None, allocation_config=None,
+                      report_date=None, generator_version=None) -> str:
+    """Write a spreadsheet ('strategies', 'signals', and optionally 'Allocation') to out_path.
 
     fmt: 'xlsx' or 'ods'. Mirrors the Stats/Signals tables from the markdown
     report and the Google Sheets export (same build_stats_table /
-    build_signals_table helpers). Returns out_path.
+    build_signals_table helpers). When allocation_result and allocation_config
+    are provided, adds an 'Allocation' sheet via allocation.py's writer.
+    Returns out_path.
     """
     engine = SPREADSHEET_ENGINES[fmt]
 
@@ -485,6 +495,20 @@ def write_spreadsheet(stats_rows, advice_rows, out_path, fmt) -> str:
     with pd.ExcelWriter(out_path, engine=engine) as writer:
         strategies_df.to_excel(writer, sheet_name="strategies", index=False)
         signals_df.to_excel(writer, sheet_name="signals", index=False)
+
+        if allocation_result is not None and allocation_config is not None:
+            if engine == "openpyxl":
+                from allocation import write_xlsx_sheet
+                write_xlsx_sheet(
+                    writer.book, allocation_result, allocation_config,
+                    report_date=report_date, generator_version=generator_version,
+                )
+            elif engine == "odf":
+                from allocation import write_ods_sheet
+                write_ods_sheet(
+                    writer.book, allocation_result, allocation_config,
+                    report_date=report_date, generator_version=generator_version,
+                )
 
     return out_path
 
@@ -545,7 +569,8 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
 
 def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None,
-        min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False):
+        min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False,
+        cluster_map_path=None):
     """Run the full signals-report flow. Returns the path to the written report.
 
     now: the moment treated as "now" — stamps output filenames/report
@@ -560,6 +585,8 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     xlsx / ods: if True, also write the Stats/Signals tables to a local
         kairos_signals_<stamp>.xlsx / .ods file in out_dir (see
         write_spreadsheet); the path is printed to stdout.
+    cluster_map_path: optional path to a CSV file mapping ticker -> cluster
+        name for the portfolio allocation sheet/section.
     """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
@@ -698,11 +725,24 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
             failures.append(f"group assets={assets_str} interval={interval}: {e}")
             continue
 
+    # Portfolio allocation: derive from structured signal rows when available.
+    allocation_result = None
+    allocation_config = None
+    allocation_section = None
+    from allocation import fetch_signals, allocate, AllocationConfig, load_cluster_map, write_md_section
+    candidates = fetch_signals(stats_rows, advice_rows)
+    if candidates:
+        cluster_map = load_cluster_map(cluster_map_path) if cluster_map_path else {}
+        allocation_config = AllocationConfig(cluster_map=cluster_map)
+        allocation_result = allocate(candidates, allocation_config)
+        allocation_section = write_md_section(allocation_result, allocation_config)
+
     os.makedirs(out_dir, exist_ok=True)
     stamp = now.strftime("%Y%m%d%H%M")
     out_path = os.path.join(out_dir, f"kairos_signals_{stamp}.md")
     report = render_report(stats_rows, advice_rows, failures, skipped, now,
-                           min_ev_pct=min_ev_pct)
+                           min_ev_pct=min_ev_pct,
+                           allocation_section=allocation_section)
     with open(out_path, "w") as f:
         f.write(report)
 
@@ -710,10 +750,18 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         sheet_url = upload_to_gsheets(stats_rows, advice_rows, now)
         print(sheet_url)
 
+    report_date = now.strftime("%Y-%m-%d")
+    generator_version = "kairos_signals/0.1.0"
     for fmt, enabled in (("xlsx", xlsx), ("ods", ods)):
         if enabled:
             sheet_path = os.path.join(out_dir, f"kairos_signals_{stamp}.{fmt}")
-            write_spreadsheet(stats_rows, advice_rows, sheet_path, fmt)
+            write_spreadsheet(
+                stats_rows, advice_rows, sheet_path, fmt,
+                allocation_result=allocation_result,
+                allocation_config=allocation_config,
+                report_date=report_date,
+                generator_version=generator_version,
+            )
             print(sheet_path)
 
     return out_path
@@ -745,7 +793,8 @@ def run_bars_backtest(base_now, interval, bars_backtest, **run_kwargs) -> list:
 
     `run_kwargs` is forwarded to each `run()` call unchanged (db_path,
     out_dir, pred_samples, include_all, predict_fn, lookback, min_ev_pct,
-    gsheets, xlsx, ods); `now` and `intervals` are set per iteration.
+    gsheets, xlsx, ods, cluster_map_path); `now` and `intervals` are set per
+    iteration.
     """
     step = _interval_to_timedelta(interval)
     out_paths = []
@@ -777,6 +826,9 @@ def main(argv=None):
     parser.add_argument("--ods", action="store_true", default=False,
                         help="Also write the Stats/Signals tables to a local "
                              "kairos_signals_<stamp>.ods file (no setup required).")
+    parser.add_argument("--cluster_map", default=None,
+                        help="Optional path to a CSV file mapping ticker -> "
+                             "cluster name for the Allocation sheet/section.")
     parser.add_argument("--effective_per", default=None,
                         help='Treat this moment as "now": \'YYYYMMDD [HHnn]\' '
                              '(e.g. "20260615 1430" or "20260615"; time '
@@ -808,6 +860,7 @@ def main(argv=None):
             pred_samples=args.pred_samples, include_all=args.include_all,
             min_ev_pct=args.min_ev_pct, gsheets=args.gsheets,
             xlsx=args.xlsx, ods=args.ods,
+            cluster_map_path=args.cluster_map,
         )
         for p in out_paths:
             print(p)
@@ -818,6 +871,7 @@ def main(argv=None):
         pred_samples=args.pred_samples, include_all=args.include_all,
         min_ev_pct=args.min_ev_pct, gsheets=args.gsheets,
         xlsx=args.xlsx, ods=args.ods, now=now,
+        cluster_map_path=args.cluster_map,
     )
     print(out_path)
     return out_path

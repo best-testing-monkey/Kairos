@@ -1310,3 +1310,152 @@ class TestCLIBarsBacktest:
         assert captured["bars_backtest"] == 7
         assert captured["base_now"] == datetime(2026, 7, 1, 0, 0)
         assert result == ["/tmp/a.md", "/tmp/b.md"]
+
+
+# ============================================================================
+# Allocation integration (E11-S12)
+# ============================================================================
+
+class _LongSignalStrategy:
+    """Fake strategy that returns a valid LONG signal for any symbol."""
+
+    name = "long_signal"
+
+    def __init__(self, expected_value=0.5):
+        self.expected_value = expected_value
+
+    def generate_signal(self, dist, current_price, history, context):
+        return Signal(
+            direction=Direction.LONG, size=0.10, entry=current_price,
+            stop=current_price * 0.97, target=current_price * 1.05,
+            strategy_name=self.name, confidence=0.7,
+            expected_value=self.expected_value,
+        )
+
+
+class TestAllocationIntegration:
+    """End-to-end tests that the allocation pipeline is wired into the report."""
+
+    def _run_with_strategy(self, tmp_path, monkeypatch, strategy, xlsx=False,
+                           ods=False, cluster_map_path=None):
+        import pandas as pd
+        import numpy as np
+
+        db_path = os.path.join(tmp_path, "pipeline_results.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(VIABILITY_SCHEMA)
+        conn.execute(
+            "INSERT INTO viability_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (15, strategy.name, "BTC-USD,ETH-USD", "crypto", "1d", "1m",
+             23.3, 5, 0.8, 0.016, 235, 30.2, 100, 0.55, 0.023, 236, None, 0.69, 1),
+        )
+        conn.commit()
+        conn.close()
+
+        idx = pd.date_range("2024-01-01", periods=310, freq="D")
+        fake_history = pd.DataFrame({
+            "open": np.full(310, 100.0), "high": np.full(310, 101.0),
+            "low": np.full(310, 99.0), "close": np.full(310, 100.0),
+            "volume": np.full(310, 1e6),
+        }, index=idx)
+
+        import kairos_strategies
+        monkeypatch.setattr(
+            kairos_strategies, "fetch_data_raw",
+            lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
+        )
+
+        def fake_predict_fn(assets_dict):
+            from kairos_meta import AssetPrediction, KairosDistribution
+            frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
+            dist = KairosDistribution(frames)
+            return {
+                sym: AssetPrediction(symbol=sym, dist=dist, current_price=100.0, history=fake_history)
+                for sym in assets_dict
+            }
+
+        import kairos_orchestrator
+        monkeypatch.setattr(
+            kairos_orchestrator.StrategyRegistry, "build_all",
+            classmethod(lambda cls, config: [strategy]),
+        )
+        monkeypatch.setattr(
+            kairos_orchestrator.KairosOrchestrator, "_apply_meta_filters",
+            lambda self, dist, current_price: False,
+        )
+
+        out_path = run(
+            db_path=db_path, out_dir=str(tmp_path), intervals=None,
+            pred_samples=5, include_all=False, predict_fn=fake_predict_fn,
+            lookback=300, now=datetime(2026, 7, 9, 10, 0),
+            xlsx=xlsx, ods=ods, cluster_map_path=cluster_map_path,
+        )
+        return out_path
+
+    def test_run_appends_portfolio_allocation_to_markdown(self, tmp_path, monkeypatch):
+        report = open(self._run_with_strategy(
+            tmp_path, monkeypatch, _LongSignalStrategy(expected_value=0.5)
+        )).read()
+
+        assert "## Portfolio Allocation" in report
+        assert "Selected 2 of 2 signals" in report
+        assert "Cluster exposure:" in report
+
+    @pytest.mark.parametrize("fmt", ["xlsx", "ods"])
+    def test_run_adds_allocation_sheet_to_spreadsheet(self, tmp_path, monkeypatch, fmt):
+        out_path = self._run_with_strategy(
+            tmp_path, monkeypatch, _LongSignalStrategy(expected_value=0.5),
+            **{fmt: True},
+        )
+        sheet_path = out_path.replace(".md", f".{fmt}")
+
+        sheets = pd.read_excel(sheet_path, sheet_name=None)
+        assert list(sheets.keys()) == ["strategies", "signals", "Allocation"]
+
+    def test_zero_candidates_no_allocation_section_or_sheet(self, tmp_path, monkeypatch):
+        # Zero-size LONG signal is dropped before reaching allocation, so there
+        # are no candidates.
+        sig = Signal(
+            direction=Direction.LONG, size=0.0, entry=100.0,
+            stop=97.0, target=105.0, strategy_name="zero_kelly",
+            confidence=0.7, expected_value=0.5,
+        )
+        out_path = self._run_with_strategy(
+            tmp_path, monkeypatch, _FixedSignalStrategy("zero_kelly", sig), xlsx=True)
+
+        report = open(out_path).read()
+        assert "## Portfolio Allocation" not in report
+
+        sheet_path = out_path.replace(".md", ".xlsx")
+        sheets = pd.read_excel(sheet_path, sheet_name=None)
+        assert list(sheets.keys()) == ["strategies", "signals"]
+
+    def test_cluster_map_used_in_allocation_output(self, tmp_path, monkeypatch):
+        cluster_csv = os.path.join(tmp_path, "clusters.csv")
+        with open(cluster_csv, "w") as f:
+            f.write("BTC-USD,crypto\nETH-USD,crypto\n")
+
+        out_path = self._run_with_strategy(
+            tmp_path, monkeypatch, _LongSignalStrategy(expected_value=0.5),
+            cluster_map_path=cluster_csv,
+        )
+        report = open(out_path).read()
+
+        assert "## Portfolio Allocation" in report
+        assert "Cluster exposure: crypto" in report
+
+    def test_cli_parser_forwards_cluster_map(self, monkeypatch):
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main([
+            "--db", "unused.db", "--out", "/tmp",
+            "--cluster_map", "/tmp/clusters.csv",
+        ])
+        assert captured["cluster_map_path"] == "/tmp/clusters.csv"
