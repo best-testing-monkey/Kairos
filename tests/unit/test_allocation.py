@@ -6,7 +6,7 @@ fixtures that mirror the exact dict shapes from kairos_signals.py run().
 
 import math
 import pytest
-from allocation import Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived, compute_ev_ratio
+from allocation import Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived, compute_ev_ratio, select_candidates
 
 
 class TestCandidateDataclass:
@@ -1833,3 +1833,594 @@ class TestComputeEvRatio:
 
         assert ev_ratio < 0
         assert is_mismatch is True
+
+
+class TestSelectCandidates:
+    """Test select_candidates() gating, collapse, and top-K ranking.
+
+    Per ticket E11-S05, implements RFC §4.4 selection with these stages:
+    1. Gate: SCHEMA_ERROR → DISABLED → LOW_N → NEG_EV_NET
+    2. Per-asset collapse: DIRECTION_CONFLICT or DUP_ASSET
+    3. Rank + top-K: BELOW_TOPK or proceed to E11-S06
+    """
+
+    def test_gate_schema_error_invalid_direction(self):
+        """Candidate with invalid direction rejected as SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="invalid",  # Not "long" or "short"
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] == "SCHEMA_ERROR"
+        assert result[0]["flags"] == []
+        assert result[0]["derived"] == {}
+
+    def test_gate_schema_error_long_bad_placement(self):
+        """Long with stop >= entry rejected as SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=105.0,  # Should be < entry for long
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] == "SCHEMA_ERROR"
+
+    def test_gate_disabled(self):
+        """Candidate with enabled_mask[ticker]=False rejected as DISABLED."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        enabled_mask = {"TEST": False}
+        result = select_candidates([c], config, enabled_mask)
+
+        assert len(result) == 1
+        assert result[0]["status"] == "DISABLED"
+        assert result[0]["flags"] == []
+        assert result[0]["derived"]["score"] is not None
+
+    def test_gate_low_n(self):
+        """Candidate with n < config.min_n rejected as LOW_N."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=25,  # Less than default min_n=50
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig(min_n=50)
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] == "LOW_N"
+
+    def test_gate_neg_ev_net(self):
+        """Candidate with ev_net <= 0 rejected as NEG_EV_NET."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=0.1,  # Very low; will be shrunk below cost
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig(round_trip_cost_pct=0.15)
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] == "NEG_EV_NET"
+        # Verify ev_net is indeed <= 0
+        assert result[0]["derived"]["ev_net"] <= 0
+
+    def test_gate_order_schema_error_before_disabled(self):
+        """SCHEMA_ERROR is caught before DISABLED in gate order."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="invalid",  # SCHEMA_ERROR
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        enabled_mask = {"TEST": False}  # Would trigger DISABLED if checked
+        result = select_candidates([c], config, enabled_mask)
+
+        # Should be SCHEMA_ERROR, not DISABLED (earlier in order)
+        assert result[0]["status"] == "SCHEMA_ERROR"
+
+    def test_gate_order_low_n_before_neg_ev_net(self):
+        """LOW_N is caught before NEG_EV_NET in gate order."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=0.1,  # Would trigger NEG_EV_NET if checked
+            base_win_rate=0.55,
+            n=25,  # LOW_N
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig(min_n=50)
+        result = select_candidates([c], config, {})
+
+        # Should be LOW_N, not NEG_EV_NET
+        assert result[0]["status"] == "LOW_N"
+
+    def test_gate_survivor_status_none(self):
+        """Candidate passing all gates has status=None."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] is None
+        assert result[0]["derived"]["score"] is not None
+
+    def test_data_mismatch_flag_outside_band(self):
+        """Candidate with ev_ratio outside [0.5, 2.0] gets DATA_MISMATCH flag."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=7.0,  # Much higher than geometry implies (ratio > 2.0)
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] is None
+        assert result[0]["flags"] == ["DATA_MISMATCH"]
+
+    def test_data_mismatch_flag_inside_band(self):
+        """Candidate with ev_ratio inside [0.5, 2.0] has empty flags."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,  # 5% risk
+            target=110.0,  # 10% reward
+            ev_pct=2.5,  # Reasonable, inside band
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] is None
+        assert result[0]["flags"] == []
+
+    def test_direction_conflict_both_long_short(self):
+        """Two candidates same ticker (long + short) both gated as DIRECTION_CONFLICT."""
+        c1 = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        c2 = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="short",
+            entry=100.0,
+            stop=105.0,
+            target=90.0,
+            ev_pct=4.0,
+            base_win_rate=0.52,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = select_candidates([c1, c2], config, {})
+
+        assert len(result) == 2
+        assert result[0]["status"] == "DIRECTION_CONFLICT"
+        assert result[1]["status"] == "DIRECTION_CONFLICT"
+
+    def test_dup_asset_keeps_higher_score(self):
+        """Two candidates same ticker/direction; higher-score kept, other rejected DUP_ASSET."""
+        c1 = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,  # Higher EV, should have higher score
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        c2 = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=2.0,  # Lower EV, should have lower score
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = select_candidates([c1, c2], config, {})
+
+        assert len(result) == 2
+        # First candidate should survive (higher score)
+        assert result[0]["status"] is None
+        assert result[0]["ticker"] == "TEST"
+        # Second candidate should be rejected as DUP_ASSET
+        assert result[1]["status"] == "DUP_ASSET"
+        assert result[1]["ticker"] == "TEST"
+
+    def test_dup_asset_preserves_higher_score_row(self):
+        """When collapsing duplicates, the higher-score row survives."""
+        c1 = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=2.0,  # Lower EV initially
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        c2 = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,  # Higher EV
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="p",
+            sharpe=1.0,
+            advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig()
+        result = select_candidates([c1, c2], config, {})
+
+        assert len(result) == 2
+        # Second row (c2 with higher score) should survive
+        assert result[1]["status"] is None
+        assert result[0]["status"] == "DUP_ASSET"
+
+    def test_below_topk_exceeding_top_k_limit(self):
+        """Survivors beyond config.top_k are rejected as BELOW_TOPK."""
+        candidates = []
+        for i in range(15):
+            c = Candidate(
+                strategy="s1",
+                ticker=f"TEST{i}",  # Unique ticker
+                direction="long",
+                entry=100.0,
+                stop=95.0,
+                target=110.0,
+                ev_pct=5.0 - i * 0.2,  # Descending EV for ranking
+                base_win_rate=0.55,
+                n=100,
+                backtest_period="p",
+                sharpe=1.0,
+                advised_liquidity_pct=5.0,
+            )
+            candidates.append(c)
+
+        config = AllocationConfig(top_k=12)
+        result = select_candidates(candidates, config, {})
+
+        assert len(result) == 15
+        # First 12 should have status=None
+        for i in range(12):
+            assert result[i]["status"] is None, f"Row {i} should have status=None"
+        # Remaining 3 should have status=BELOW_TOPK
+        for i in range(12, 15):
+            assert result[i]["status"] == "BELOW_TOPK", f"Row {i} should have status=BELOW_TOPK"
+
+    def test_ranking_by_score_descending(self):
+        """Survivors ranked by score descending; top config.top_k selected."""
+        candidates = []
+        # Create candidates with varying scores (lower index = higher score)
+        for i in range(5):
+            c = Candidate(
+                strategy="s1",
+                ticker=f"T{i}",
+                direction="long",
+                entry=100.0,
+                stop=95.0,
+                target=110.0,
+                ev_pct=4.0 - i * 0.8,  # i=0 has highest EV
+                base_win_rate=0.55,
+                n=100,
+                backtest_period="p",
+                sharpe=1.0,
+                advised_liquidity_pct=5.0,
+            )
+            candidates.append(c)
+
+        config = AllocationConfig(top_k=3)
+        result = select_candidates(candidates, config, {})
+
+        # Collect survivors and their scores in result order
+        survivors = []
+        for r in result:
+            if r["status"] is None or r["status"] == "BELOW_TOPK":
+                survivors.append((r["ticker"], r["derived"]["score"], r["status"]))
+
+        # Verify top 3 have status=None, rest BELOW_TOPK
+        assert survivors[0][2] is None  # Highest score (T0)
+        assert survivors[1][2] is None  # Second highest (T1)
+        assert survivors[2][2] is None  # Third highest (T2)
+        assert survivors[3][2] == "BELOW_TOPK"  # Below top-K (T3)
+        assert survivors[4][2] == "BELOW_TOPK"  # Below top-K (T4)
+
+    def test_happy_path_multi_ticker_scenario(self):
+        """Multi-ticker scenario: some pass, some rejected, top-K selected."""
+        # Create a mix of candidates
+        candidates = [
+            # Ticker A: long (good)
+            Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0),
+            # Ticker B: short (good, higher score)
+            Candidate("s1", "B", "short", 100.0, 105.0, 90.0, 6.0, 0.55, 100, "p", 1.0, 5.0),
+            # Ticker C: low ev_net (rejected)
+            Candidate("s1", "C", "long", 100.0, 95.0, 110.0, 0.1, 0.55, 100, "p", 1.0, 5.0),
+            # Ticker D: long (good)
+            Candidate("s1", "D", "long", 100.0, 95.0, 110.0, 4.0, 0.55, 100, "p", 1.0, 5.0),
+            # Ticker A: short (direction conflict with long A)
+            Candidate("s1", "A", "short", 100.0, 105.0, 90.0, 3.0, 0.55, 100, "p", 1.0, 5.0),
+        ]
+
+        config = AllocationConfig(top_k=2)
+        result = select_candidates(candidates, config, {})
+
+        assert len(result) == 5
+
+        # Ticker C should be NEG_EV_NET
+        c_result = result[2]
+        assert c_result["ticker"] == "C"
+        assert c_result["status"] == "NEG_EV_NET"
+
+        # Ticker A: both long and short, so DIRECTION_CONFLICT for both
+        a_long_result = result[0]
+        a_short_result = result[4]
+        assert a_long_result["ticker"] == "A"
+        assert a_long_result["status"] == "DIRECTION_CONFLICT"
+        assert a_short_result["ticker"] == "A"
+        assert a_short_result["status"] == "DIRECTION_CONFLICT"
+
+        # Ticker B and D should pass gating/collapse
+        b_result = result[1]
+        d_result = result[3]
+        assert b_result["ticker"] == "B"
+        assert b_result["status"] is None  # In top-K
+        assert d_result["ticker"] == "D"
+        assert d_result["status"] is None  # In top-K (both B and D in top-K)
+
+    def test_output_returns_all_candidates(self):
+        """Output includes all candidates (rejected and selected)."""
+        c1 = Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0)
+        c2 = Candidate("s1", "B", "long", 100.0, 95.0, 110.0, 0.1, 0.55, 100, "p", 1.0, 5.0)
+        config = AllocationConfig()
+        result = select_candidates([c1, c2], config, {})
+
+        assert len(result) == 2
+        # First should survive
+        assert result[0]["ticker"] == "A"
+        assert result[0]["status"] is None
+        # Second should be rejected
+        assert result[1]["ticker"] == "B"
+        assert result[1]["status"] == "NEG_EV_NET"
+
+    def test_output_preserves_input_order(self):
+        """Output order matches input order (not sorted by score)."""
+        candidates = []
+        for i in range(5):
+            c = Candidate(
+                "s1", f"T{i}", "long", 100.0, 95.0, 110.0,
+                5.0 - i * 0.5,  # Descending scores
+                0.55, 100, "p", 1.0, 5.0
+            )
+            candidates.append(c)
+
+        config = AllocationConfig(top_k=5)
+        result = select_candidates(candidates, config, {})
+
+        # Verify output is in input order, not sorted by score
+        for i in range(5):
+            assert result[i]["ticker"] == f"T{i}"
+
+    def test_output_row_contains_all_fields(self):
+        """Each output row contains all required fields."""
+        c = Candidate("s1", "TEST", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0)
+        config = AllocationConfig()
+        result = select_candidates([c], config, {})
+
+        row = result[0]
+        # Original Candidate fields
+        assert "strategy" in row
+        assert "ticker" in row
+        assert "direction" in row
+        assert "entry" in row
+        assert "stop" in row
+        assert "target" in row
+        assert "ev_pct" in row
+        assert "base_win_rate" in row
+        assert "n" in row
+        assert "backtest_period" in row
+        assert "sharpe" in row
+        assert "advised_liquidity_pct" in row
+        assert "avg_win_pct" in row
+        assert "avg_loss_pct" in row
+        assert "avg_holding_days" in row
+        # New fields
+        assert "derived" in row
+        assert "status" in row
+        assert "flags" in row
+        # Derived should have score key
+        assert "score" in row["derived"]
+
+    def test_enabled_mask_defaults_to_enabled(self):
+        """Tickers not in enabled_mask default to enabled."""
+        c = Candidate("s1", "TEST", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0)
+        config = AllocationConfig()
+        # Empty enabled_mask
+        result = select_candidates([c], config, {})
+
+        # Should pass (default enabled)
+        assert result[0]["status"] is None
+
+    def test_enabled_mask_true_allows_candidate(self):
+        """enabled_mask[ticker]=True allows candidate."""
+        c = Candidate("s1", "TEST", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0)
+        config = AllocationConfig()
+        enabled_mask = {"TEST": True}
+        result = select_candidates([c], config, enabled_mask)
+
+        # Should pass
+        assert result[0]["status"] is None
+
+    def test_empty_candidate_list(self):
+        """Empty candidate list returns empty result."""
+        config = AllocationConfig()
+        result = select_candidates([], config, {})
+
+        assert result == []
+
+    def test_all_candidates_rejected_in_gate(self):
+        """All candidates rejected in gating stage."""
+        candidates = [
+            Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 0.1, 0.55, 100, "p", 1.0, 5.0),
+            Candidate("s1", "B", "long", 100.0, 95.0, 110.0, 0.1, 0.55, 100, "p", 1.0, 5.0),
+        ]
+        config = AllocationConfig()
+        result = select_candidates(candidates, config, {})
+
+        assert len(result) == 2
+        assert all(r["status"] == "NEG_EV_NET" for r in result)
+
+    def test_collapse_reduces_candidate_count_after_selection(self):
+        """After collapse, duplicate ticker with lower score is rejected."""
+        # Three candidates: A (good), B (good), A_dup (duplicate A, lower score)
+        candidates = [
+            Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 5.0, 0.55, 100, "p", 1.0, 5.0),
+            Candidate("s1", "B", "long", 100.0, 95.0, 110.0, 4.0, 0.55, 100, "p", 1.0, 5.0),
+            Candidate("s1", "A", "long", 100.0, 95.0, 110.0, 2.0, 0.55, 100, "p", 1.0, 5.0),
+        ]
+        config = AllocationConfig(top_k=2)
+        result = select_candidates(candidates, config, {})
+
+        assert len(result) == 3
+        # A first should survive (higher score)
+        assert result[0]["ticker"] == "A"
+        assert result[0]["status"] is None
+        # B should survive (in top-K)
+        assert result[1]["ticker"] == "B"
+        assert result[1]["status"] is None
+        # A duplicate should be DUP_ASSET
+        assert result[2]["ticker"] == "A"
+        assert result[2]["status"] == "DUP_ASSET"

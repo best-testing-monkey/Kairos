@@ -282,6 +282,166 @@ def fetch_signals(stats_rows, advice_rows):
     return candidates
 
 
+def select_candidates(candidates: list[Candidate], config: AllocationConfig, enabled_mask: dict) -> list[dict]:
+    """Select and reject candidates through gating, collapse, and top-K ranking.
+
+    Implements RFC §4.4 selection algorithm: gate → per-asset collapse → rank+top-K.
+
+    Rejection reasons (per RFC §4.5):
+    - SCHEMA_ERROR: required field missing or direction/stop/target inconsistent
+    - DISABLED: enabled_mask[ticker] is False
+    - LOW_N: n < config.min_n
+    - NEG_EV_NET: ev_net <= 0
+    - DIRECTION_CONFLICT: both long and short survive gating for same ticker
+    - DUP_ASSET: duplicate ticker/direction, not the max-score row
+    - BELOW_TOPK: survivor after collapse, but outside top config.top_k
+
+    Args:
+        candidates: list of Candidate objects
+        config: AllocationConfig with gating/ranking parameters
+        enabled_mask: dict mapping ticker -> bool; get(ticker, True) defaults to enabled
+
+    Returns:
+        list of dicts (one per candidate), in input order, each containing:
+        - All original Candidate fields (strategy, ticker, direction, entry, stop, target, etc.)
+        - derived: dict with keys from compute_derived (risk_pct, reward_pct, score, etc.)
+        - status: rejection reason (str) or None for rows proceeding to E11-S06 sizing
+        - flags: list starting with ["DATA_MISMATCH"] if ev_ratio flagged, else []
+    """
+    from collections import defaultdict
+
+    # Convert all candidates to dicts and prepare for processing
+    output_rows = {}  # original_index -> row dict
+
+    for i, c in enumerate(candidates):
+        row = _candidate_to_dict(c)
+        output_rows[i] = row
+
+    # =========================================================================
+    # Stage 1: GATE
+    # =========================================================================
+    # Gate order (RFC §4.4): SCHEMA_ERROR → DISABLED → LOW_N → NEG_EV_NET
+    # First matching reason wins; survivors get status=None
+    for i, c in enumerate(candidates):
+        row = output_rows[i]
+
+        # Check SCHEMA_ERROR first (earliest in gate order)
+        if validate_candidate(c) is not None:
+            row["status"] = "SCHEMA_ERROR"
+            row["flags"] = []
+            row["derived"] = {}  # No derived for invalid schema
+            continue
+
+        # Compute derived fields (needed for ev_net and later stages)
+        derived = compute_derived(c, config)
+        row["derived"] = derived
+
+        # Compute ev_ratio and DATA_MISMATCH flag
+        ev_ratio, is_mismatch = compute_ev_ratio(c, derived)
+        row["flags"] = ["DATA_MISMATCH"] if is_mismatch else []
+
+        # Check DISABLED (second in gate order)
+        if not enabled_mask.get(c.ticker, True):
+            row["status"] = "DISABLED"
+            continue
+
+        # Check LOW_N (third in gate order)
+        if c.n < config.min_n:
+            row["status"] = "LOW_N"
+            continue
+
+        # Check NEG_EV_NET (fourth in gate order)
+        if derived["ev_net"] <= 0:
+            row["status"] = "NEG_EV_NET"
+            continue
+
+        # Survived gating
+        row["status"] = None
+
+    # =========================================================================
+    # Stage 2: PER-ASSET COLLAPSE (on survivors only)
+    # =========================================================================
+    # Group survivors by ticker; check for direction conflict or mark duplicates
+    ticker_groups = defaultdict(list)
+
+    for i, c in enumerate(candidates):
+        row = output_rows[i]
+        if row["status"] is not None:
+            continue  # Skip rejected rows
+        ticker_groups[c.ticker].append((i, c, row))
+
+    # For each ticker, check direction conflict or mark duplicates
+    for ticker, group in ticker_groups.items():
+        directions = set(c.direction for _, c, _ in group)
+
+        if len(directions) > 1:
+            # Both long and short survived gating for this ticker
+            # Reject all rows for that ticker with DIRECTION_CONFLICT
+            for _, _, row in group:
+                row["status"] = "DIRECTION_CONFLICT"
+        else:
+            # Only one direction; keep max-score row, reject rest as DUP_ASSET
+            if len(group) > 1:
+                # Find index of max-score row
+                max_idx = max(
+                    range(len(group)),
+                    key=lambda j: group[j][2]["derived"]["score"]
+                )
+                for j, (_, _, row) in enumerate(group):
+                    if j != max_idx:
+                        row["status"] = "DUP_ASSET"
+
+    # =========================================================================
+    # Stage 3: RANK + TOP-K (on survivors only)
+    # =========================================================================
+    # Collect survivors after collapse, maintaining original index order
+    survivors = []
+    for i, c in enumerate(candidates):
+        row = output_rows[i]
+        if row["status"] is None:
+            survivors.append((i, row, c))
+
+    # Sort by score descending (stable sort preserves insertion order on ties)
+    # per RFC §4.4's deterministic tie-break note
+    survivors.sort(key=lambda x: x[1]["derived"]["score"], reverse=True)
+
+    # Mark top-K as selected (status remains None), rest as BELOW_TOPK
+    for rank, (_, row, _) in enumerate(survivors):
+        if rank >= config.top_k:
+            row["status"] = "BELOW_TOPK"
+
+    # Return all rows in original input order (not sorted)
+    return [output_rows[i] for i in range(len(candidates))]
+
+
+def _candidate_to_dict(c: Candidate) -> dict:
+    """Convert Candidate dataclass to dict with all fields.
+
+    Returns a dict ready for output, with all Candidate fields plus placeholders
+    for derived, status, and flags fields to be filled in by select_candidates().
+    """
+    return {
+        "strategy": c.strategy,
+        "ticker": c.ticker,
+        "direction": c.direction,
+        "entry": c.entry,
+        "stop": c.stop,
+        "target": c.target,
+        "ev_pct": c.ev_pct,
+        "base_win_rate": c.base_win_rate,
+        "n": c.n,
+        "backtest_period": c.backtest_period,
+        "sharpe": c.sharpe,
+        "advised_liquidity_pct": c.advised_liquidity_pct,
+        "avg_win_pct": c.avg_win_pct,
+        "avg_loss_pct": c.avg_loss_pct,
+        "avg_holding_days": c.avg_holding_days,
+        "derived": {},  # Filled in by select_candidates
+        "status": None,  # Filled in by select_candidates
+        "flags": [],  # Filled in by select_candidates
+    }
+
+
 def _is_missing(value):
     """Check if a value is missing (None or NaN).
 
