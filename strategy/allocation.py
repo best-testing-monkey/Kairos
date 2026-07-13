@@ -11,6 +11,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
+from openpyxl.styles import Protection
+
 from kairos_signals import _ev_pct_value
 
 
@@ -852,3 +854,268 @@ def get_formula_names() -> list[str]:
 def get_formula_aliases() -> dict[str, str]:
     """Return the concept-name -> canonical-key alias map."""
     return dict(_FORMULA_ALIASES)
+
+
+# =============================================================================
+# E11-S09: XLSX Sheet Writer
+# =============================================================================
+
+# Config block layout.  Order is chosen so that the first seven editable value
+# cells ($D$3..$D$9) line up with the absolute references used by the formula
+# templates above.
+_XLSX_CONFIG_BLOCK = [
+    ("n0", "n0"),
+    ("round_trip_cost_pct", "round_trip_cost_pct"),
+    ("kelly_mult", "kelly_mult"),
+    ("gross_cap_pct", "gross_cap_pct"),
+    ("max_pos_pct", "max_pos_pct"),
+    ("max_cluster_pct", "max_cluster_pct"),
+    ("equity", "equity"),
+    ("min_n", "min_n"),
+    ("top_k", "top_k"),
+    ("dust_min_pct", "dust_min_pct"),
+    ("cluster_map", "cluster_map"),
+]
+
+_XLSX_DATA_START_ROW = 19
+_XLSX_HEADER_ROW = 19
+
+# Static columns A-N and their human-readable header.
+_XLSX_STATIC_HEADERS = [
+    "Ticker", "Cluster", "Strategy", "Dir", "Entry", "Stop", "Target",
+    "Risk %", "Reward %", "b", "n", "Win raw", "Win shrunk", "EV raw %",
+]
+
+# Headers for the formula-driven columns O-U (visible Section A derived columns).
+_XLSX_FORMULA_HEADERS = {
+    "O": "EV net %",
+    "P": "Kelly raw",
+    "Q": "Score",
+    "R": "Alloc %",
+    "S": "Alloc EUR",
+    "T": "Flags",
+    "U": "Advised liq % (ignored)",
+}
+
+# Headers for the helper formula columns V-AJ.
+_XLSX_HELPER_HEADERS = [
+    "risk_pct", "reward_pct", "b", "loss_pct", "shrink", "ev_shrunk",
+    "p_shrunk", "kelly_frac", "alloc_raw_pct", "pos_capped_alloc",
+    "pos_capped_flag", "ev_implied", "ev_ratio", "data_mismatch", "cluster_scale",
+]
+
+_XLSX_FORMULA_COLS = [
+    "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+    "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ",
+]
+
+
+def _xlsx_column_letter_to_index(col_letter: str) -> int:
+    """Convert an Excel column letter (A, AA, AJ) to a 1-based column index."""
+    idx = 0
+    for ch in col_letter:
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx
+
+
+def _empty_if_none(value):
+    """Return an empty string for None, otherwise the value unchanged."""
+    if value is None:
+        return ""
+    return value
+
+
+def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfig,
+                     report_date, generator_version: str):
+    """Write the ``Allocation`` sheet into an existing ``openpyxl.Workbook``.
+
+    Layout follows RFC allocation_sheet.md §5 and ticket E11-S09:
+      - Row 1: title, report date, generator version.
+      - Rows 3-13: config block (parameter name, editable value, locked default).
+      - Rows 14-16: summary formulas (selected count, gross exposure %, enabled
+        count, and the gross scale factor in $D$14).
+      - Row 18: instruction line.
+      - Row 19: header row A-AJ.
+      - Rows 20..N: one row per candidate in ``result.rows`` in the order given.
+      - Below the data: Section B cluster-exposure table.
+      - Helper columns X-AF are grouped (outlined) but not hidden.
+      - All cells are locked except the editable config value cells (D3:D13) and
+        column N (the per-row editable input column).
+
+    The function performs no disk I/O; it mutates the provided in-memory
+    ``Workbook``.
+    """
+    from openpyxl import Workbook
+
+    if not isinstance(workbook, Workbook):
+        raise TypeError("workbook must be an openpyxl Workbook")
+
+    ws = workbook.create_sheet("Allocation")
+
+    # -------------------------------------------------------------------------
+    # Row 1: title line
+    # -------------------------------------------------------------------------
+    ws["A1"] = "Portfolio Allocation"
+    ws["B1"] = _empty_if_none(report_date)
+    ws["C1"] = f"generator {generator_version}"
+
+    # -------------------------------------------------------------------------
+    # Rows 3-13: config block
+    # -------------------------------------------------------------------------
+    # Parameter names in column C, editable values in column D, shipped defaults
+    # (locked) in column E.
+    default_config = AllocationConfig()
+    for offset, (label, attr) in enumerate(_XLSX_CONFIG_BLOCK):
+        row = 3 + offset
+        ws.cell(row=row, column=3, value=label)
+        value = getattr(config, attr)
+        if attr == "cluster_map":
+            value = str(value) if value else ""
+        ws.cell(row=row, column=4, value=_empty_if_none(value))
+        default_value = getattr(default_config, attr)
+        if attr == "cluster_map":
+            default_value = str(default_value) if default_value else ""
+        ws.cell(row=row, column=5, value=_empty_if_none(default_value))
+
+    # -------------------------------------------------------------------------
+    # Rows 14-16: summary block
+    # -------------------------------------------------------------------------
+    ws["A14"] = "Selected count"
+    ws["C14"] = '=COUNTIF(R20:R400,">0")'
+    ws["A15"] = "Gross exposure %"
+    ws["C15"] = "=SUM(R20:R400)"
+    ws["A16"] = "Enabled count"
+    ws["C16"] = "=COUNTA(N20:N400)"
+    ws["D14"] = render_formula("gross_scale", 14, "xlsx")
+
+    # -------------------------------------------------------------------------
+    # Row 18: instruction line
+    # -------------------------------------------------------------------------
+    ws["A18"] = (
+        "Edit only the config values (column D) and the per-row input column "
+        "(column N). All other cells are computed."
+    )
+
+    # -------------------------------------------------------------------------
+    # Row 19: header row
+    # -------------------------------------------------------------------------
+    headers = (
+        _XLSX_STATIC_HEADERS
+        + [_XLSX_FORMULA_HEADERS[col] for col in _XLSX_FORMULA_COLS[:7]]
+        + _XLSX_HELPER_HEADERS
+    )
+    for col_idx, header in enumerate(headers, start=1):
+        ws.cell(row=_XLSX_HEADER_ROW, column=col_idx, value=header)
+
+    # -------------------------------------------------------------------------
+    # Rows 20..N: candidate rows
+    # -------------------------------------------------------------------------
+    def _cluster_for_ticker(ticker: str) -> str:
+        return config.cluster_map.get(ticker, ticker)
+
+    for row_offset, row_data in enumerate(result.rows):
+        excel_row = _XLSX_DATA_START_ROW + 1 + row_offset
+        derived = row_data.get("derived", {}) or {}
+        ticker = row_data.get("ticker", "")
+        direction = row_data.get("direction", "")
+
+        static_values = [
+            ticker,
+            _cluster_for_ticker(ticker),
+            row_data.get("strategy", ""),
+            direction.capitalize() if isinstance(direction, str) else "",
+            row_data.get("entry"),
+            row_data.get("stop"),
+            row_data.get("target"),
+            derived.get("risk_pct"),
+            derived.get("reward_pct"),
+            derived.get("b"),
+            row_data.get("n"),
+            row_data.get("base_win_rate"),
+            derived.get("p_shrunk"),
+            row_data.get("ev_pct"),
+        ]
+        for col_idx, value in enumerate(static_values, start=1):
+            ws.cell(row=excel_row, column=col_idx, value=_empty_if_none(value))
+
+        for col_letter in _XLSX_FORMULA_COLS:
+            col_idx = _xlsx_column_letter_to_index(col_letter)
+            ws.cell(row=excel_row, column=col_idx,
+                    value=render_formula(col_letter, excel_row, "xlsx"))
+
+    # -------------------------------------------------------------------------
+    # Section B: cluster exposure table
+    # -------------------------------------------------------------------------
+    data_end_row = _XLSX_DATA_START_ROW + len(result.rows)
+    cluster_header_row = data_end_row + 2
+    ws.cell(row=cluster_header_row, column=1, value="Cluster")
+    ws.cell(row=cluster_header_row, column=2, value="Positions")
+    ws.cell(row=cluster_header_row, column=3, value="Gross %")
+    ws.cell(row=cluster_header_row, column=4, value="Cap %")
+    ws.cell(row=cluster_header_row, column=5, value="Capped?")
+
+    selected_rows = [r for r in result.rows if r.get("status") == "SELECTED"]
+    clusters = sorted(set(config.cluster_map.values())) if config.cluster_map else []
+    for cluster_offset, cluster in enumerate(clusters):
+        row = cluster_header_row + 1 + cluster_offset
+        cluster_rows = [
+            r for r in selected_rows
+            if _cluster_for_ticker(r.get("ticker", "")) == cluster
+        ]
+        positions = len(cluster_rows)
+        gross = sum(r.get("alloc", 0.0) for r in cluster_rows)
+        capped = any("CLUSTER_CAPPED" in r.get("flags", []) for r in cluster_rows)
+        ws.cell(row=row, column=1, value=cluster)
+        ws.cell(row=row, column=2, value=positions)
+        ws.cell(row=row, column=3, value=gross)
+        ws.cell(row=row, column=4, value=config.max_cluster_pct)
+        ws.cell(row=row, column=5, value="yes" if capped else "no")
+
+    # -------------------------------------------------------------------------
+    # Section C: rejected signals (compact audit trail)
+    # -------------------------------------------------------------------------
+    if cluster_header_row + len(clusters) + 1 >= ws.max_row:
+        rejected_header_row = cluster_header_row + len(clusters) + 2
+    else:
+        rejected_header_row = ws.max_row + 2
+
+    ws.cell(row=rejected_header_row, column=1, value="Ticker")
+    ws.cell(row=rejected_header_row, column=2, value="Strategy")
+    ws.cell(row=rejected_header_row, column=3, value="Dir")
+    ws.cell(row=rejected_header_row, column=4, value="Score")
+    ws.cell(row=rejected_header_row, column=5, value="Reason")
+
+    rejected = [r for r in result.rows if r.get("status") != "SELECTED"]
+    rejected.sort(
+        key=lambda r: (
+            r.get("status", ""),
+            -(r.get("derived", {}) or {}).get("score", float("-inf")),
+        )
+    )
+    for rej_offset, r in enumerate(rejected):
+        row = rejected_header_row + 1 + rej_offset
+        direction = r.get("direction", "")
+        score = (r.get("derived", {}) or {}).get("score")
+        ws.cell(row=row, column=1, value=r.get("ticker", ""))
+        ws.cell(row=row, column=2, value=r.get("strategy", ""))
+        ws.cell(row=row, column=3,
+                value=direction.capitalize() if isinstance(direction, str) else "")
+        ws.cell(row=row, column=4, value=_empty_if_none(score))
+        ws.cell(row=row, column=5, value=r.get("status", ""))
+
+    # -------------------------------------------------------------------------
+    # Column grouping: helper columns V-AF are outlined but not hidden.
+    # -------------------------------------------------------------------------
+    ws.column_dimensions.group("V", "AF", outline_level=1, hidden=False)
+
+    # -------------------------------------------------------------------------
+    # Sheet protection: lock everything except the editable config values (D3:D13)
+    # and column N.
+    # -------------------------------------------------------------------------
+    for cell in ws["N"]:
+        cell.protection = Protection(locked=False)
+
+    for config_row in range(3, 3 + len(_XLSX_CONFIG_BLOCK)):
+        ws.cell(row=config_row, column=4).protection = Protection(locked=False)
+
+    ws.protection.sheet = True
