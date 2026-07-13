@@ -760,8 +760,10 @@ _FORMULA_TEMPLATES = {
     "AI": 'IF(OR(AH{row}<0.5,AH{row}>2),"DATA_MISMATCH","")',
     "AJ": "IF(SUMIFS(AE$20:AE$400,B$20:B$400,B{row})>$D$8,$D$8/SUMIFS(AE$20:AE$400,B$20:B$400,B{row}),1)",
 
-    # Summary-block gross scale factor (rendered into $D$14)
-    "gross_scale": "IF(SUM(AJ$20:AJ$400)>$D$6,$D$6/SUM(AJ$20:AJ$400),1)",
+    # Summary-block gross scale factor (rendered into $D$14).
+    # Must scale the post-cluster-cap total (AE * AJ) down to gross_cap_pct.
+    # SUM(AJ) alone is wrong: it is just the count of cluster-scale factors.
+    "gross_scale": "IF(SUMPRODUCT(AE$20:AE$400,AJ$20:AJ$400)>$D$6,$D$6/SUMPRODUCT(AE$20:AE$400,AJ$20:AJ$400),1)",
 }
 
 

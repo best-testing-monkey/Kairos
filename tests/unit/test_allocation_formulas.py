@@ -290,7 +290,18 @@ class TestGrossScaleFactor:
         """Test that gross_scale formula references $D$6 (or appropriate config cell)."""
         result = render_formula("gross_scale", 20, "xlsx")
         # Should reference a config cell for gross cap
-        assert "$D$" in result
+        assert "$D$6" in result
+
+    def test_gross_scale_scales_post_cluster_total(self):
+        """gross_scale must compare the post-cluster-cap total, not just AJ count."""
+        result = render_formula("gross_scale", 20, "xlsx")
+        # It should use SUMPRODUCT over AE (position-capped alloc) and AJ
+        # (cluster scale), otherwise SUM(AJ) would be ~selected_count and never
+        # trigger scaling when gross_cap_pct is 100.
+        assert "SUMPRODUCT" in result
+        assert "AE$20:AE$400" in result
+        assert "AJ$20:AJ$400" in result
+        assert "SUM(AJ$20:AJ$400)" not in result
 
 
 class TestAllFormulasCoverage:

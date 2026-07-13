@@ -260,5 +260,77 @@ class TestClusterExposure:
         assert clusters == {"energy", "metals_miners"}
 
 
+class TestGrossCapScaling:
+    """Verify the sheet formulas scale gross exposure down to the cap."""
+
+    def test_gross_scale_formula_uses_post_cluster_total(self):
+        """If raw position-capped allocs exceed gross_cap_pct, gross_scale < 1."""
+        candidates = [
+            _make_candidate(
+                ticker=f"T{i:02d}",
+                entry=100.0,
+                stop=95.0,
+                target=110.0,
+                ev_pct=5.0,
+                base_win_rate=0.60,
+                n=200,
+            )
+            for i in range(12)
+        ]
+        config = AllocationConfig(
+            top_k=12,
+            max_pos_pct=15.0,
+            gross_cap_pct=100.0,
+        )
+        result = AllocationResult(
+            rows=[
+                _make_row(
+                    c,
+                    config,
+                    "SELECTED",
+                    alloc=min(compute_derived(c, config)["kelly_frac"] * 100, 15.0),
+                )
+                for c in candidates
+            ],
+            selected_count=12,
+            gross_exposure_pct=100.0,
+            rejection_counts={},
+        )
+
+        wb = Workbook()
+        write_xlsx_sheet(
+            wb,
+            result,
+            config,
+            report_date="2026-07-13",
+            generator_version="cap-test",
+        )
+        ws = wb["Allocation"]
+
+        # The gross_scale formula must reference AE and AJ via SUMPRODUCT, not
+        # just SUM(AJ). If it only summed AJ, the scale factor would be 1.
+        gross_scale_formula = str(ws["D14"].value)
+        assert "SUMPRODUCT" in gross_scale_formula
+        assert "AE$20:AE$400" in gross_scale_formula
+        assert "AJ$20:AJ$400" in gross_scale_formula
+
+        # Simulate what the formula evaluates to with no cluster caps.
+        # AE = position-capped alloc %, AJ = 1 for each row.
+        ae_values = [min(compute_derived(c, config)["kelly_frac"] * 100, 15.0)
+                     for c in candidates]
+        post_cluster_total = sum(ae_values)  # no cluster caps
+        assert post_cluster_total > config.gross_cap_pct
+        expected_scale = config.gross_cap_pct / post_cluster_total
+        assert expected_scale < 1.0
+
+        # Each R cell should contain AE*AJ*gross_scale.
+        for offset in range(len(candidates)):
+            excel_row = 20 + offset
+            r_formula = str(ws.cell(row=excel_row, column=18).value)
+            assert f"AE{excel_row}" in r_formula
+            assert f"AJ{excel_row}" in r_formula
+            assert "$D$14" in r_formula
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
