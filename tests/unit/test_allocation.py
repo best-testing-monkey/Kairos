@@ -4,8 +4,9 @@ Tests the schema and fetch adapter without GPU/network, using hand-constructed
 fixtures that mirror the exact dict shapes from kairos_signals.py run().
 """
 
+import math
 import pytest
-from allocation import Candidate, fetch_signals
+from allocation import Candidate, fetch_signals, validate_candidate
 
 
 class TestCandidateDataclass:
@@ -638,3 +639,511 @@ class TestFetchSignals:
         assert candidates[0].avg_win_pct is None
         assert candidates[0].avg_loss_pct is None
         assert candidates[0].avg_holding_days is None
+
+
+class TestValidateCandidate:
+    """Test validate_candidate() schema validation function."""
+
+    def test_valid_long_candidate(self):
+        """Well-formed long candidate passes validation (returns None)."""
+        c = Candidate(
+            strategy="path_execution",
+            ticker="REMX",
+            direction="long",
+            entry=50.0,
+            stop=45.0,
+            target=60.0,
+            ev_pct=4.04,
+            base_win_rate=0.47,
+            n=161,
+            backtest_period="2023-01-01 to 2023-12-31",
+            sharpe=1.23,
+            advised_liquidity_pct=11.0,
+        )
+        assert validate_candidate(c) is None
+
+    def test_valid_short_candidate(self):
+        """Well-formed short candidate passes validation (returns None)."""
+        c = Candidate(
+            strategy="momentum",
+            ticker="XYZ",
+            direction="short",
+            entry=100.0,
+            stop=105.0,
+            target=90.0,
+            ev_pct=2.5,
+            base_win_rate=0.52,
+            n=200,
+            backtest_period="2023-01-01 to 2023-12-31",
+            sharpe=0.95,
+            advised_liquidity_pct=8.0,
+        )
+        assert validate_candidate(c) is None
+
+    def test_missing_strategy_is_schema_error(self):
+        """Candidate with None strategy returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy=None,
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_ticker_is_schema_error(self):
+        """Candidate with None ticker returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker=None,
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_direction_is_schema_error(self):
+        """Candidate with None direction returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction=None,
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_entry_is_schema_error(self):
+        """Candidate with None entry returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=None,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_stop_is_schema_error(self):
+        """Candidate with None stop returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=None,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_target_is_schema_error(self):
+        """Candidate with None target returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=None,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_ev_pct_is_schema_error(self):
+        """Candidate with None ev_pct returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=None,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_base_win_rate_is_schema_error(self):
+        """Candidate with None base_win_rate returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=None,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_n_is_schema_error(self):
+        """Candidate with None n returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=None,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_backtest_period_is_schema_error(self):
+        """Candidate with None backtest_period returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period=None,
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_missing_sharpe_is_schema_error(self):
+        """Candidate with None sharpe returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=None,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_nan_entry_is_schema_error(self):
+        """Candidate with NaN entry returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=float("nan"),
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_nan_stop_is_schema_error(self):
+        """Candidate with NaN stop returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=float("nan"),
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_nan_target_is_schema_error(self):
+        """Candidate with NaN target returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=float("nan"),
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_nan_ev_pct_is_schema_error(self):
+        """Candidate with NaN ev_pct returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=float("nan"),
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_nan_base_win_rate_is_schema_error(self):
+        """Candidate with NaN base_win_rate returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=float("nan"),
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_nan_sharpe_is_schema_error(self):
+        """Candidate with NaN sharpe returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=float("nan"),
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_inf_entry_is_schema_error(self):
+        """Candidate with inf entry returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=float("inf"),
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_neg_inf_entry_is_schema_error(self):
+        """Candidate with -inf entry returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=float("-inf"),
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_long_with_swapped_stop_target_is_schema_error(self):
+        """Long candidate with stop > target (swapped) returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=110.0,  # Should be < entry
+            target=95.0,  # Should be > entry
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_long_with_target_before_entry_is_schema_error(self):
+        """Long candidate with target < entry returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=90.0,  # Should be > entry
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_long_with_stop_after_entry_is_schema_error(self):
+        """Long candidate with stop > entry returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=105.0,  # Should be < entry
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_short_with_swapped_stop_target_is_schema_error(self):
+        """Short candidate with target > stop (swapped) returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="short",
+            entry=100.0,
+            stop=95.0,  # Should be > entry
+            target=105.0,  # Should be < entry
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_short_with_target_after_entry_is_schema_error(self):
+        """Short candidate with target > entry returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="short",
+            entry=100.0,
+            stop=105.0,
+            target=110.0,  # Should be < entry
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_short_with_stop_before_entry_is_schema_error(self):
+        """Short candidate with stop < entry returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="short",
+            entry=100.0,
+            stop=95.0,  # Should be > entry
+            target=90.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"
+
+    def test_invalid_direction_is_schema_error(self):
+        """Candidate with invalid direction (not 'long' or 'short') returns SCHEMA_ERROR."""
+        c = Candidate(
+            strategy="s1",
+            ticker="TEST",
+            direction="invalid",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert validate_candidate(c) == "SCHEMA_ERROR"

@@ -4,6 +4,7 @@ Adapts the existing signals-report row data (stats_rows, advice_rows from kairos
 into structured Candidate objects matching RFC allocation_sheet.md §3.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,6 +33,54 @@ class Candidate:
     avg_win_pct: Optional[float] = None
     avg_loss_pct: Optional[float] = None
     avg_holding_days: Optional[float] = None
+
+
+def validate_candidate(c: Candidate) -> Optional[str]:
+    """Validate a Candidate against schema constraints per RFC allocation_sheet.md §3.
+
+    Returns "SCHEMA_ERROR" if:
+      - Any required field is None
+      - Any numeric required field (entry, stop, target, ev_pct, base_win_rate, sharpe)
+        is non-finite (NaN or inf)
+      - Direction/stop/target placement is inconsistent with direction:
+        * direction == "long" requires stop < entry < target
+        * direction == "short" requires target < entry < stop
+
+    Returns None if the candidate is valid.
+
+    Args:
+        c: Candidate object to validate
+
+    Returns:
+        "SCHEMA_ERROR" if invalid, None if valid
+    """
+    # Check all required fields are not None
+    if (c.strategy is None or c.ticker is None or c.direction is None or
+        c.entry is None or c.stop is None or c.target is None or
+        c.ev_pct is None or c.base_win_rate is None or c.n is None or
+        c.backtest_period is None or c.sharpe is None):
+        return "SCHEMA_ERROR"
+
+    # Check that numeric fields are finite (not NaN or inf)
+    numeric_fields = [c.entry, c.stop, c.target, c.ev_pct, c.base_win_rate, c.sharpe]
+    for field in numeric_fields:
+        if not math.isfinite(field):
+            return "SCHEMA_ERROR"
+
+    # Check direction/stop/target placement consistency
+    if c.direction == "long":
+        # For long: stop < entry < target
+        if not (c.stop < c.entry < c.target):
+            return "SCHEMA_ERROR"
+    elif c.direction == "short":
+        # For short: target < entry < stop
+        if not (c.target < c.entry < c.stop):
+            return "SCHEMA_ERROR"
+    else:
+        # Invalid direction value (not "long" or "short")
+        return "SCHEMA_ERROR"
+
+    return None
 
 
 def fetch_signals(stats_rows, advice_rows):
