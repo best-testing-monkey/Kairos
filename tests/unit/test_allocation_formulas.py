@@ -13,7 +13,7 @@ Per RFC §4.6 and ticket E11-S08 acceptance criteria:
 
 import pytest
 import re
-from strategy.allocation import render_formula, get_formula_names, _FORMULA_TEMPLATES
+from strategy.allocation import render_formula, get_formula_names, get_formula_aliases, _FORMULA_TEMPLATES
 
 
 class TestRenderFormula:
@@ -149,14 +149,15 @@ class TestBannedFunctions:
             "SUMPRODUCT", "SUMIFS", "COUNTIFS", "IFERROR"
         }
 
-        # Extract function names from formulas (looking for uppercase words followed by ()
+        # Extract function names from formulas (uppercase word directly followed by a
+        # left paren).  Argument separators or cell references cannot be mistaken
+        # for function calls this way.
         for name in get_formula_names():
             formula = render_formula(name, 20, "xlsx")
-            # Find all function-like tokens (uppercase word followed by ( or ;)
-            matches = re.findall(r'\b([A-Z_]+)\s*[(\;\,]', formula)
+            matches = re.findall(r'\b([A-Z_]+)\s*\(', formula)
             for func in matches:
-                if func in ("E", "F", "G", "K", "L", "M", "N", "D"):
-                    # Column names, skip
+                if func in ("E", "F", "G", "K", "L", "M", "N", "D", "B"):
+                    # Single-letter cell column references, skip
                     continue
                 assert func in allowed_functions, \
                     f"Function {func} not in allowed set for formula {name}: {formula}"
@@ -293,36 +294,48 @@ class TestGrossScaleFactor:
 
 
 class TestAllFormulasCoverage:
-    """Test that all required formulas are implemented."""
+    """Test that every required formula column is implemented."""
 
-    REQUIRED_FORMULAS = {
-        "risk_pct",      # O
-        "reward_pct",    # P
-        "b",             # Q
-        "loss_pct",      # R
-        "shrink",        # S
-        "ev_shrunk",     # T_base (intermediate)
-        "ev_net",        # T
-        "p_shrunk",      # U
-        "kelly_raw",     # V_base (intermediate)
-        "kelly_frac",    # V
-        "score",         # W
-        "gross_scale",   # Gross scale factor
+    # Canonical keys are column letters O..AJ plus the summary gross_scale factor.
+    COLUMN_FORMULAS = {
+        "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+        "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ",
+    }
+    SUMMARY_FORMULAS = {"gross_scale"}
+
+    # Concept aliases must still work for callers that prefer readable names.
+    CONCEPT_ALIASES = {
+        "risk_pct", "reward_pct", "b", "loss_pct", "shrink", "ev_shrunk",
+        "ev_net", "p_shrunk", "kelly_raw", "kelly_frac", "score", "gross_scale",
     }
 
-    def test_all_required_formulas_present(self):
-        """Test that all formulas from RFC §4.6 are implemented."""
+    def test_all_column_letter_formulas_present(self):
+        """Test that formulas for columns O through AJ are implemented."""
         available = set(get_formula_names())
-        assert self.REQUIRED_FORMULAS.issubset(available), \
-            f"Missing formulas: {self.REQUIRED_FORMULAS - available}"
+        assert self.COLUMN_FORMULAS.issubset(available), \
+            f"Missing column formulas: {self.COLUMN_FORMULAS - available}"
 
-    def test_render_all_required_formulas(self):
-        """Test that all required formulas can be rendered in both dialects."""
-        for name in self.REQUIRED_FORMULAS:
+    def test_summary_formula_present(self):
+        """Test that the gross scale summary formula is implemented."""
+        available = set(get_formula_names())
+        assert self.SUMMARY_FORMULAS.issubset(available), \
+            f"Missing summary formulas: {self.SUMMARY_FORMULAS - available}"
+
+    def test_render_all_column_letter_formulas(self):
+        """Test that every O..AJ formula renders in both dialects."""
+        for name in self.COLUMN_FORMULAS:
             for fmt in ["xlsx", "ods"]:
                 result = render_formula(name, 20, fmt)
-                assert result  # Non-empty
-                assert len(result) >= 5  # Reasonable minimum length
+                assert result
+                assert len(result) >= 3
+
+    def test_concept_aliases_resolve_to_same_template(self):
+        """Concept aliases must render identically to their canonical column key."""
+        aliases = get_formula_aliases()
+        for alias in self.CONCEPT_ALIASES:
+            canonical = aliases[alias]
+            for fmt in ["xlsx", "ods"]:
+                assert render_formula(alias, 42, fmt) == render_formula(canonical, 42, fmt)
 
 
 if __name__ == "__main__":

@@ -674,7 +674,7 @@ def _is_missing(value):
 
 """Formula templates for portfolio allocation computations.
 
-Each formula template is written once in a canonical form with:
+Each formula template is written once in a canonical XLSX form with:
 - Cell references using Excel A1 notation (e.g., E20, F$3)
 - Config cell references with absolute row anchors (e.g., $D$3, $D$4)
 - Placeholder tokens for row substitution: {row}
@@ -685,76 +685,111 @@ Templates are rendered per dialect via render_formula(name, row, fmt):
 - ODS: Returns formula with 'of:=' prefix and semicolon separators
   (per ODS spec; semicolons separate function arguments in many locales)
 
-Per RFC §4.6, these templates implement the per-row derived columns:
-- risk_pct (O): Loss risk as % of entry
-- reward_pct (P): Profit target as % of entry
-- b (Q): Payoff ratio (empirical or geometric)
-- loss_pct (R): Basis for score denominator (avg_loss or risk_pct)
-- shrink (S): Confidence weight per shrinkage formula
-- ev_shrunk (T_base): Raw EV shrunk toward zero by confidence weight
-- ev_net (T): EV net of round-trip costs
-- p_shrunk (U): Win rate shrunk toward 50% by confidence weight
-- kelly_raw (V_base): Binary Kelly before max(0,·) and multiplier
-- kelly_frac (V): Fractional Kelly allocation %
-- score (W): Return per unit risk (ranking key)
+Column mapping (formula columns O through AJ, per E11-S08/S09/S10):
+- O  = ev_net              EV net of costs (RFC §4.2)
+- P  = kelly_raw           Binary Kelly before capping/multiplier
+- Q  = score               Return per unit risk (ranking key)
+- R  = alloc_pct           Final allocation % after pos/cluster/gross caps
+- S  = alloc_eur           Allocation expressed as currency amount
+- T  = flags               Composite flags (DATA_MISMATCH, POS_CAPPED, CLUSTER_CAPPED)
+- U  = advised_liq         Carried upstream liquidity % (displayed but ignored)
+- V  = risk_pct            ABS(stop - entry) / entry * 100
+- W  = reward_pct          ABS(target - entry) / entry * 100
+- X  = b                   Payoff ratio (geometry fallback in v1)
+- Y  = loss_pct            Basis for score denominator
+- Z  = shrink              Confidence weight n / (n + n0)
+- AA = ev_shrunk           ev_pct * shrink
+- AB = p_shrunk            Win rate shrunk toward 50%
+- AC = kelly_frac          Fractional Kelly decimal (before cap)
+- AD = alloc_raw_pct       Kelly_frac * 100
+- AE = pos_capped_alloc    MIN(alloc_raw_pct, max_pos_pct)
+- AF = pos_capped_flag     "POS_CAPPED" if capped
+- AG = ev_implied          base_win_rate*reward - (1-base_win_rate)*risk
+- AH = ev_ratio            ev_pct / ev_implied
+- AI = data_mismatch       "DATA_MISMATCH" if ev_ratio outside [0.5, 2.0]
+- AJ = cluster_scale       Cluster-level scale factor (SUMIFS over pos_capped_alloc)
 
-Config cell references (assumed per RFC §3.1 display):
+Summary-block config cell layout (absolute references):
 - $D$3: n0 (shrinkage constant)
 - $D$4: round_trip_cost_pct (cost per round trip, %)
 - $D$5: kelly_mult (fractional Kelly multiplier)
 - $D$6: gross_cap_pct (total exposure cap, %)
+- $D$7: max_pos_pct (per-position cap, %)
+- $D$8: max_cluster_pct (per-cluster cap, %)
+- $D$9: equity (optional account equity for currency column; blank = no amount)
+- $D$14: gross_scale factor summary cell (proportional scale if over gross cap)
 
-Data cell layout for row N (per RFC §5.2 display columns A-U):
+Data cell layout for row N (per RFC §5.2 static columns A-N):
+- B: Cluster
 - E: Entry price
 - F: Stop loss price
 - G: Target price
 - K: n (number of backtest trades)
-- L: Win raw (base_win_rate as %)
-- M: Win shrunk (p_shrunk as %, computed)
+- L: Win raw (base_win_rate as a fraction, e.g., 0.47)
 - N: EV raw % (ev_pct from backtest)
-- O: EV net % (computed as ev_shrunk - costs)
-- P: Kelly raw (kelly_raw, %, computed)
-- Q: Score (ranking key, computed)
 """
 
-# Template strings with {row} placeholder for row number substitution
+# Template strings keyed by column letter (O..AJ) plus the summary factor.
+# Each contains a single {row} placeholder substituted by render_formula().
 _FORMULA_TEMPLATES = {
-    # Per-row risk/reward derived columns (O, P, R in display)
-    "risk_pct": "IF(E{row}=0,0,ABS(F{row}-E{row})/E{row}*100)",
-    "reward_pct": "IF(E{row}=0,0,ABS(G{row}-E{row})/E{row}*100)",
+    # Visible Section A derived columns
+    "O": "N{row}*Z{row}-$D$4",
+    "P": "IFERROR(AB{row}-(1-AB{row})/X{row},0)",
+    "Q": "IFERROR(O{row}/Y{row},0)",
+    "R": "AE{row}*AJ{row}*$D$14",
+    "S": 'IF($D$9="","",R{row}*$D$9/100)',
+    "T": 'IF(AI{row}="","",AI{row})&IF(AF{row}="","",IF(AI{row}="",""," ")&AF{row})&IF(AJ{row}<1,IF(AND(AI{row}="",AF{row}=""),""," ")&"CLUSTER_CAPPED","")',
+    "U": '""',
 
-    # Payoff ratio: empirical if L/M populated, else geometry
-    "b": "IF(AND(L{row}<>\"\",M{row}<>\"\"),L{row}/M{row},IF(F{row}=0,0,G{row}/F{row}))",
+    # Helper columns (grouped/collapsed by the sheet writer)
+    "V": "IF(E{row}=0,0,ABS(F{row}-E{row})/E{row}*100)",
+    "W": "IF(E{row}=0,0,ABS(G{row}-E{row})/E{row}*100)",
+    "X": "IF(Y{row}=0,0,W{row}/Y{row})",
+    "Y": "IF(E{row}=0,0,V{row})",
+    "Z": "IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
+    "AA": "N{row}*Z{row}",
+    "AB": "0.5+(L{row}-0.5)*Z{row}",
+    "AC": "MAX(P{row},0)*$D$5",
+    "AD": "AC{row}*100",
+    "AE": "MIN(AD{row},$D$7)",
+    "AF": 'IF(AD{row}>$D$7,"POS_CAPPED","")',
+    "AG": "L{row}*W{row}-(1-L{row})*V{row}",
+    "AH": "IFERROR(N{row}/AG{row},0)",
+    "AI": 'IF(OR(AH{row}<0.5,AH{row}>2),"DATA_MISMATCH","")',
+    "AJ": "IF(SUMIFS(AE$20:AE$400,B$20:B$400,B{row})>$D$8,$D$8/SUMIFS(AE$20:AE$400,B$20:B$400,B{row}),1)",
 
-    # Loss basis: empirical avg_loss if available, else risk_pct
-    # Note: Using a cached risk_pct value or recalculating inline
-    "loss_pct": "IF(AND(L{row}<>\"\",M{row}<>\"\"),M{row},IF(E{row}=0,0,ABS(F{row}-E{row})/E{row}*100))",
+    # Summary-block gross scale factor (rendered into $D$14)
+    "gross_scale": "IF(SUM(AJ$20:AJ$400)>$D$6,$D$6/SUM(AJ$20:AJ$400),1)",
+}
 
-    # Shrinkage weight: n / (n + n0)
-    "shrink": "IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
 
-    # EV shrunk: ev_pct * shrink
-    "ev_shrunk": "N{row}*IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
-
-    # EV net: ev_shrunk - round_trip_cost_pct
-    "ev_net": "N{row}*IF(K{row}=0,0,K{row}/(K{row}+$D$3))-$D$4",
-
-    # Win rate shrunk: 0.5 + (base_win_rate - 0.5) * shrink
-    # base_win_rate is stored as percentage in L{row}, so convert to [0,1]
-    "p_shrunk": "0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
-
-    # Kelly raw: p_shrunk - (1 - p_shrunk) / b
-    # Requires both p_shrunk and b; use IFERROR to guard division by zero
-    "kelly_raw": "IFERROR(0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))-(1-(0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))))/IF(AND(L{row}<>\"\",M{row}<>\"\"),L{row}/M{row},IF(F{row}=0,0,G{row}/F{row})),0)",
-
-    # Kelly frac: max(kelly_raw, 0) * kelly_mult
-    "kelly_frac": "MAX(IFERROR(0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))-(1-(0.5+(L{row}/100-0.5)*IF(K{row}=0,0,K{row}/(K{row}+$D$3))))/IF(AND(L{row}<>\"\",M{row}<>\"\"),L{row}/M{row},IF(F{row}=0,0,G{row}/F{row})),0),0)*$D$5",
-
-    # Score: ev_net / loss_pct
-    "score": "IFERROR((N{row}*IF(K{row}=0,0,K{row}/(K{row}+$D$3))-$D$4)/IF(AND(L{row}<>\"\",M{row}<>\"\"),M{row},IF(E{row}=0,0,ABS(F{row}-E{row})/E{row}*100)),0)",
-
-    # Gross scale factor (for proportional scaling under gross cap)
-    "gross_scale": "$D$6",
+# Concept-name aliases for callers that prefer readable names.  Each alias
+# resolves to one of the canonical column-letter keys above, so the same
+# single template is used for both naming styles.
+_FORMULA_ALIASES = {
+    "ev_net": "O",
+    "kelly_raw": "P",
+    "score": "Q",
+    "alloc_pct": "R",
+    "alloc_eur": "S",
+    "flags": "T",
+    "advised_liq_pct": "U",
+    "risk_pct": "V",
+    "reward_pct": "W",
+    "b": "X",
+    "loss_pct": "Y",
+    "shrink": "Z",
+    "ev_shrunk": "AA",
+    "p_shrunk": "AB",
+    "kelly_frac": "AC",
+    "alloc_raw_pct": "AD",
+    "pos_capped_alloc": "AE",
+    "pos_capped": "AF",
+    "ev_implied": "AG",
+    "ev_ratio": "AH",
+    "data_mismatch": "AI",
+    "cluster_scale": "AJ",
+    "gross_scale": "gross_scale",
 }
 
 
@@ -765,9 +800,10 @@ def render_formula(name: str, row: int, fmt: str) -> str:
     derive from one shared template, with only dialect-specific syntax changes.
 
     Args:
-        name: Formula name (key in _FORMULA_TEMPLATES), e.g., "risk_pct", "score"
-        row: Data row number (20..400 per RFC §5.1), used for cell reference substitution
-        fmt: Output dialect, "xlsx" or "ods"
+        name: Formula name.  Accepts canonical column-letter keys ("O".."AJ",
+            "gross_scale") and concept aliases ("risk_pct", "ev_net", ...).
+        row: Data row number (20..400 per RFC §5.1), used for cell reference substitution.
+        fmt: Output dialect, "xlsx" or "ods".
 
     Returns:
         Formula string ready for insertion into a spreadsheet cell:
@@ -775,7 +811,7 @@ def render_formula(name: str, row: int, fmt: str) -> str:
         - ODS: "of:=<formula>" with semicolon-separated function arguments
 
     Raises:
-        ValueError: if name not in _FORMULA_TEMPLATES or fmt not in ("xlsx", "ods")
+        ValueError: if name cannot be resolved or fmt not in ("xlsx", "ods")
 
     Notes:
         - Row-number substitution is exact: {row} placeholders become the literal row number
@@ -786,51 +822,33 @@ def render_formula(name: str, row: int, fmt: str) -> str:
     if fmt not in ("xlsx", "ods"):
         raise ValueError(f"fmt must be 'xlsx' or 'ods', got {fmt!r}")
 
-    if name not in _FORMULA_TEMPLATES:
+    canonical = _FORMULA_ALIASES.get(name, name)
+    if canonical not in _FORMULA_TEMPLATES:
         raise ValueError(f"formula name {name!r} not found in templates")
 
-    # Substitute row number into template
-    template = _FORMULA_TEMPLATES[name]
+    template = _FORMULA_TEMPLATES[canonical]
     formula = template.format(row=row)
 
-    # Convert to dialect-specific format
     if fmt == "xlsx":
-        # XLSX format: = prefix, comma separators (already in template)
         return "=" + formula
-    else:  # fmt == "ods"
-        # ODS format: of:= prefix, semicolon separators
-        # Replace commas with semicolons in function arguments
-        # Use a simple state machine to distinguish commas inside strings from arg separators
-        result = "of:=" + _convert_commas_to_semicolons(formula)
-        return result
+    return "of:=" + _convert_commas_to_semicolons(formula)
 
 
 def _convert_commas_to_semicolons(formula: str) -> str:
     """Convert comma argument separators to semicolons for ODS format.
 
-    Replaces commas used as function argument separators with semicolons,
-    while preserving commas inside strings (after detecting them as string content).
-
-    In practice, these formulas don't use string literals, so the conversion
-    is straightforward: replace all commas with semicolons.
-
-    Args:
-        formula: Formula string (without leading = or of:=)
-
-    Returns:
-        Formula string with all commas replaced by semicolons
+    The canonical templates use commas only as function-argument separators and
+    inside decimal numbers (e.g. 0.5) use a dot, so a global replacement is safe.
+    No string literal contains a comma.
     """
-    # Simple approach: replace all commas with semicolons
-    # Safe here because the templates don't use string literals with commas
     return formula.replace(",", ";")
 
 
 def get_formula_names() -> list[str]:
-    """Return list of all available formula names.
-
-    Useful for tests that scan all formulas.
-
-    Returns:
-        Sorted list of formula names from _FORMULA_TEMPLATES
-    """
+    """Return the sorted list of canonical formula names (column letters + gross_scale)."""
     return sorted(_FORMULA_TEMPLATES.keys())
+
+
+def get_formula_aliases() -> dict[str, str]:
+    """Return the concept-name -> canonical-key alias map."""
+    return dict(_FORMULA_ALIASES)
