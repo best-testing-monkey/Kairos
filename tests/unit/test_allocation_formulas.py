@@ -3,7 +3,7 @@
 Tests the render_formula() function and formula template consistency.
 Per RFC §4.6 and ticket E11-S08 acceptance criteria:
 
-1. One template per formula (O-W per RFC §4.2), each written once
+1. One template per formula (P-W per RFC §4.2), each written once
 2. render_formula(name, row, fmt) -> str returns correct A1-style formula for fmt="xlsx"
    and of:= formula with semicolon separators for fmt="ods"
 3. Both dialects derive from ONE shared template (structural test)
@@ -36,32 +36,32 @@ class TestRenderFormula:
     def test_render_formula_row_substitution_20(self):
         """Test row number substitution at boundary row 20."""
         result = render_formula("risk_pct", 20, "xlsx")
-        assert "E20" in result
         assert "F20" in result
-        assert "E21" not in result
+        assert "G20" in result
         assert "F21" not in result
+        assert "G21" not in result
 
     def test_render_formula_row_substitution_21(self):
         """Test row number substitution at row 21."""
         result = render_formula("risk_pct", 21, "xlsx")
-        assert "E21" in result
         assert "F21" in result
+        assert "G21" in result
 
     def test_render_formula_row_substitution_400(self):
         """Test row number substitution at upper boundary row 400."""
         result = render_formula("risk_pct", 400, "xlsx")
-        assert "E400" in result
         assert "F400" in result
+        assert "G400" in result
 
     def test_render_formula_config_cells_fixed(self):
-        """Test that config cell references stay fixed ($D$3, $D$4, etc.)."""
+        """Test that config cell references stay fixed ($E$3, $E$4, etc.)."""
         result = render_formula("shrink", 20, "xlsx")
-        # Config cell $D$3 should be present and unchanged
-        assert "$D$3" in result
+        # Config cell $E$3 should be present and unchanged
+        assert "$E$3" in result
 
         result2 = render_formula("shrink", 21, "xlsx")
         # Same formula at different row should have same config reference
-        assert "$D$3" in result2
+        assert "$E$3" in result2
 
     def test_render_formula_invalid_name(self):
         """Test that invalid formula names raise ValueError."""
@@ -146,7 +146,7 @@ class TestBannedFunctions:
         """Test that formulas use only the allowed compatibility functions."""
         allowed_functions = {
             "IF", "AND", "OR", "NOT", "MIN", "MAX", "SUM", "ABS", "ROW",
-            "SUMPRODUCT", "SUMIFS", "COUNTIFS", "IFERROR"
+            "SUMPRODUCT", "SUMIFS", "COUNTIFS", "IFERROR", "LOWER", "TRIM",
         }
 
         # Extract function names from formulas (uppercase word directly followed by a
@@ -156,7 +156,7 @@ class TestBannedFunctions:
             formula = render_formula(name, 20, "xlsx")
             matches = re.findall(r'\b([A-Z_]+)\s*\(', formula)
             for func in matches:
-                if func in ("E", "F", "G", "K", "L", "M", "N", "D", "B"):
+                if func in ("A", "F", "G", "H", "L", "M", "O", "E", "C"):
                     # Single-letter cell column references, skip
                     continue
                 assert func in allowed_functions, \
@@ -169,40 +169,40 @@ class TestFormulaLogic:
     def test_risk_pct_formula_structure(self):
         """Test risk_pct formula: ABS(stop - entry) / entry (fraction, no *100)."""
         result = render_formula("risk_pct", 20, "xlsx")
-        # Should reference F20 (stop) and E20 (entry)
+        # Should reference G20 (stop) and F20 (entry)
+        assert "G20" in result
         assert "F20" in result
-        assert "E20" in result
         assert "ABS" in result
         assert "*100" not in result
 
     def test_reward_pct_formula_structure(self):
         """Test reward_pct formula: ABS(target - entry) / entry (fraction, no *100)."""
         result = render_formula("reward_pct", 20, "xlsx")
-        # Should reference G20 (target) and E20 (entry)
-        assert "G20" in result
-        assert "E20" in result
+        # Should reference H20 (target) and F20 (entry)
+        assert "H20" in result
+        assert "F20" in result
         assert "ABS" in result
         assert "*100" not in result
 
     def test_shrink_formula_uses_n0_config(self):
-        """Test shrink formula: n / (n + n0), uses config $D$3."""
+        """Test shrink formula: n / (n + n0), uses config $E$3."""
         result = render_formula("shrink", 20, "xlsx")
-        # Should have n reference (K20) and n0 reference ($D$3)
-        assert "K20" in result
-        assert "$D$3" in result
+        # Should have n reference (L20) and n0 reference ($E$3)
+        assert "L20" in result
+        assert "$E$3" in result
         # Should have division and addition
         assert "/" in result
         assert "+" in result
 
     def test_kelly_frac_uses_kelly_mult_config(self):
-        """Test kelly_frac uses config $D$5 for kelly_mult."""
+        """Test kelly_frac uses config $E$5 for kelly_mult."""
         result = render_formula("kelly_frac", 20, "xlsx")
-        assert "$D$5" in result
+        assert "$E$5" in result
 
     def test_ev_net_uses_cost_config(self):
-        """Test ev_net uses config $D$4 for round_trip_cost_pct."""
+        """Test ev_net uses config $E$4 for round_trip_cost_pct."""
         result = render_formula("ev_net", 20, "xlsx")
-        assert "$D$4" in result
+        assert "$E$4" in result
 
 
 class TestODSDialectConversion:
@@ -246,25 +246,25 @@ class TestRangeSubstitution:
     """Test that range references are handled correctly."""
 
     def test_row_relative_references_update(self):
-        """Test that row-relative references (E20, F20) update with row number."""
+        """Test that row-relative references (F20, F21) update with row number."""
         result_20 = render_formula("risk_pct", 20, "xlsx")
         result_21 = render_formula("risk_pct", 21, "xlsx")
 
         # References should be different
         assert result_20 != result_21
-        assert "E20" in result_20
-        assert "E21" in result_21
+        assert "F20" in result_20
+        assert "F21" in result_21
 
     def test_absolute_row_references_fixed(self):
-        """Test that absolute row references ($D$3) don't update with row number."""
+        """Test that absolute row references ($E$3) don't update with row number."""
         result_20 = render_formula("shrink", 20, "xlsx")
         result_21 = render_formula("shrink", 21, "xlsx")
         result_400 = render_formula("shrink", 400, "xlsx")
 
-        # $D$3 should be the same in all rows
-        assert "$D$3" in result_20
-        assert "$D$3" in result_21
-        assert "$D$3" in result_400
+        # $E$3 should be the same in all rows
+        assert "$E$3" in result_20
+        assert "$E$3" in result_21
+        assert "$E$3" in result_400
 
 
 class TestErrorHandling:
@@ -287,30 +287,30 @@ class TestGrossScaleFactor:
     """Test the gross scale factor formula per ticket requirement."""
 
     def test_gross_scale_references_config(self):
-        """Test that gross_scale formula references $D$6 (or appropriate config cell)."""
+        """Test that gross_scale formula references $E$6 (or appropriate config cell)."""
         result = render_formula("gross_scale", 20, "xlsx")
         # Should reference a config cell for gross cap
-        assert "$D$6" in result
+        assert "$E$6" in result
 
     def test_gross_scale_scales_post_cluster_total(self):
-        """gross_scale must compare the post-cluster-cap total, not just AK count."""
+        """gross_scale must compare the post-cluster-cap total, not just AL count."""
         result = render_formula("gross_scale", 20, "xlsx")
-        # It should use SUMPRODUCT over AF (position-capped alloc) and AK
-        # (cluster scale), otherwise SUM(AK) would be ~selected_count and never
+        # It should use SUMPRODUCT over AG (position-capped alloc) and AL
+        # (cluster scale), otherwise SUM(AL) would be ~selected_count and never
         # trigger scaling when gross_cap_pct is 100.
         assert "SUMPRODUCT" in result
-        assert "AF$20:AF$400" in result
-        assert "AK$20:AK$400" in result
-        assert "SUM(AK$20:AK$400)" not in result
+        assert "AG$21:AG$401" in result
+        assert "AL$21:AL$401" in result
+        assert "SUM(AL$21:AL$401)" not in result
 
 
 class TestAllFormulasCoverage:
     """Test that every required formula column is implemented."""
 
-    # Canonical keys are column letters O..AK plus the summary gross_scale factor.
+    # Canonical keys are column letters P..AN plus the summary gross_scale factor.
     COLUMN_FORMULAS = {
-        "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
-        "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
+        "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "AA",
+        "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK", "AL", "AM", "AN",
     }
     SUMMARY_FORMULAS = {"gross_scale"}
 
@@ -318,10 +318,11 @@ class TestAllFormulasCoverage:
     CONCEPT_ALIASES = {
         "risk_pct", "reward_pct", "b", "loss_pct", "shrink", "ev_shrunk",
         "ev_net", "p_shrunk", "kelly_raw", "kelly_frac", "score", "gross_scale",
+        "enabled_flag", "base_alloc_pct",
     }
 
     def test_all_column_letter_formulas_present(self):
-        """Test that formulas for columns O through AJ are implemented."""
+        """Test that formulas for columns P through AN are implemented."""
         available = set(get_formula_names())
         assert self.COLUMN_FORMULAS.issubset(available), \
             f"Missing column formulas: {self.COLUMN_FORMULAS - available}"

@@ -182,74 +182,87 @@ class TestSheetStructure:
     def test_config_block_layout(self, document, config):
         rows = _get_rows(document)
         # Config block starts at row index 2 (spreadsheet row 3).
-        assert _cell_value(_get_cell(rows[2], 2)) == "n0"
-        assert _cell_value(_get_cell(rows[2], 3)) == float(config.n0)
-        assert _cell_value(_get_cell(rows[2], 4)) == 100.0  # shipped default
+        # Label in column D (idx 3), editable value in column E (idx 4),
+        # locked default in column F (idx 5).
+        assert _cell_value(_get_cell(rows[2], 3)) == "n0"
+        assert _cell_value(_get_cell(rows[2], 4)) == float(config.n0)
+        assert _cell_value(_get_cell(rows[2], 5)) == 100.0  # shipped default
 
-        assert _cell_value(_get_cell(rows[3], 2)) == "round_trip_cost_pct"
-        assert abs(_cell_value(_get_cell(rows[3], 3)) - config.round_trip_cost_pct / 100.0) < 1e-9
-        assert abs(_cell_value(_get_cell(rows[3], 4)) - 0.0015) < 1e-9
+        assert _cell_value(_get_cell(rows[3], 3)) == "round_trip_cost_pct"
+        assert abs(_cell_value(_get_cell(rows[3], 4)) - config.round_trip_cost_pct / 100.0) < 1e-9
+        assert abs(_cell_value(_get_cell(rows[3], 5)) - 0.0015) < 1e-9
 
-        assert _cell_value(_get_cell(rows[8], 2)) == "equity"
-        equity_value = _cell_value(_get_cell(rows[8], 3))
+        assert _cell_value(_get_cell(rows[8], 3)) == "equity"
+        equity_value = _cell_value(_get_cell(rows[8], 4))
         assert equity_value == "" or equity_value is None
 
         # All 11 config rows are present (rows 3 through 13, indices 2-12).
         for idx in range(2, 13):
-            assert _cell_value(_get_cell(rows[idx], 2)) is not None
-            assert str(_cell_value(_get_cell(rows[idx], 2))) != ""
+            assert _cell_value(_get_cell(rows[idx], 3)) is not None
+            assert str(_cell_value(_get_cell(rows[idx], 3))) != ""
 
     def test_summary_block_formulas(self, document):
         rows = _get_rows(document)
         assert _cell_value(_get_cell(rows[13], 0)) == "Selected count"
-        assert str(_cell_value(_get_cell(rows[13], 2))).startswith("of:=")
+        assert str(_cell_value(_get_cell(rows[13], 3))).startswith("of:=")
         assert _cell_value(_get_cell(rows[14], 0)) == "Gross exposure %"
-        assert str(_cell_value(_get_cell(rows[14], 2))).startswith("of:=")
+        assert str(_cell_value(_get_cell(rows[14], 3))).startswith("of:=")
         assert _cell_value(_get_cell(rows[15], 0)) == "Enabled count"
-        assert str(_cell_value(_get_cell(rows[15], 2))).startswith("of:=")
-        assert _cell_value(_get_cell(rows[13], 3)) == render_formula("gross_scale", 14, "ods")
+        assert str(_cell_value(_get_cell(rows[15], 3))).startswith("of:=")
+        assert _cell_value(_get_cell(rows[13], 4)) == render_formula("gross_scale", 14, "ods")
         assert _cell_value(_get_cell(rows[16], 0)) == "EV total"
-        assert str(_cell_value(_get_cell(rows[16], 2))).startswith("of:=")
-        assert "P20:P400" in str(_cell_value(_get_cell(rows[16], 2)))
+        assert str(_cell_value(_get_cell(rows[16], 3))).startswith("of:=")
+        assert "Q21:Q401" in str(_cell_value(_get_cell(rows[16], 3)))
+
+    def test_blank_row_18(self, document):
+        rows = _get_rows(document)
+        # Row index 17 is the new genuinely-blank spacer row (spreadsheet row 18).
+        cells = rows[17].getElementsByType(TableCell)
+        for cell in cells:
+            assert _cell_value(cell) in (None, "")
 
     def test_instruction_line(self, document):
         rows = _get_rows(document)
-        instruction = _cell_value(_get_cell(rows[17], 0))
+        instruction = _cell_value(_get_cell(rows[18], 0))
         assert instruction is not None
         assert isinstance(instruction, str)
         assert "computed" in instruction
+        assert "column A" in instruction
 
 
 class TestHeaderRow:
-    """Header row 19 spot checks per RFC §5.2."""
+    """Header row 20 (index 19) spot checks per RFC §5.2."""
 
     def test_header_row_static_columns(self, document):
         rows = _get_rows(document)
-        header_cells = rows[18].getElementsByType(TableCell)
-        assert _cell_value(header_cells[0]) == "Ticker"
-        assert _cell_value(header_cells[1]) == "Cluster"
-        assert _cell_value(header_cells[2]) == "Strategy"
-        assert _cell_value(header_cells[3]) == "Dir"
-        assert _cell_value(header_cells[4]) == "Entry"
-        assert _cell_value(header_cells[5]) == "Stop"
-        assert _cell_value(header_cells[6]) == "Target"
-        assert _cell_value(header_cells[13]) == "EV raw %"
+        header_cells = rows[19].getElementsByType(TableCell)
+        assert _cell_value(header_cells[0]) == "Enabled"
+        assert _cell_value(header_cells[1]) == "Ticker"
+        assert _cell_value(header_cells[2]) == "Cluster"
+        assert _cell_value(header_cells[3]) == "Strategy"
+        assert _cell_value(header_cells[4]) == "Dir"
+        assert _cell_value(header_cells[5]) == "Entry"
+        assert _cell_value(header_cells[6]) == "Stop"
+        assert _cell_value(header_cells[7]) == "Target"
+        assert _cell_value(header_cells[14]) == "EV raw %"
 
     def test_header_row_formula_columns(self, document):
         rows = _get_rows(document)
-        header_cells = rows[18].getElementsByType(TableCell)
-        assert _cell_value(header_cells[14]) == "EV net %"
-        assert _cell_value(header_cells[15]) == "EV total"
-        assert _cell_value(header_cells[18]) == "Alloc %"
-        assert _cell_value(header_cells[20]) == "Flags"
-        assert _cell_value(header_cells[21]) == "Advised liq % (ignored)"
+        header_cells = rows[19].getElementsByType(TableCell)
+        assert _cell_value(header_cells[15]) == "EV net %"
+        assert _cell_value(header_cells[16]) == "EV total"
+        assert _cell_value(header_cells[19]) == "Alloc %"
+        assert _cell_value(header_cells[21]) == "Flags"
+        assert _cell_value(header_cells[22]) == "Advised liq % (ignored)"
 
     def test_header_row_helper_columns(self, document):
         rows = _get_rows(document)
-        header_cells = rows[18].getElementsByType(TableCell)
-        assert _cell_value(header_cells[24]) == "b"
-        assert _cell_value(header_cells[26]) == "shrink"
-        assert _cell_value(header_cells[36]) == "cluster_scale"
+        header_cells = rows[19].getElementsByType(TableCell)
+        assert _cell_value(header_cells[25]) == "b"
+        assert _cell_value(header_cells[27]) == "shrink"
+        assert _cell_value(header_cells[37]) == "cluster_scale"
+        assert _cell_value(header_cells[38]) == "enabled_flag"
+        assert _cell_value(header_cells[39]) == "base_alloc_pct"
 
 
 class TestDataRows:
@@ -258,26 +271,35 @@ class TestDataRows:
     def test_data_rows_written_in_sorted_order(self, document, result):
         rows = _get_rows(document)
         sorted_rows = _sorted_for_sheet(result.rows)
-        assert _cell_value(_get_cell(rows[19], 0)) == sorted_rows[0]["ticker"]
-        assert _cell_value(_get_cell(rows[20], 0)) == sorted_rows[1]["ticker"]
+        assert _cell_value(_get_cell(rows[20], 1)) == sorted_rows[0]["ticker"]
+        assert _cell_value(_get_cell(rows[21], 1)) == sorted_rows[1]["ticker"]
 
     def test_static_values_from_result(self, document, result):
         rows = _get_rows(document)
         row0 = _sorted_for_sheet(result.rows)[0]
-        assert _cell_value(_get_cell(rows[19], 0)) == row0["ticker"]
-        assert _cell_value(_get_cell(rows[19], 1)) == "metals_miners"
-        assert _cell_value(_get_cell(rows[19], 2)) == row0["strategy"]
-        assert _cell_value(_get_cell(rows[19], 3)) == "Short"
-        assert _cell_value(_get_cell(rows[19], 4)) == row0["entry"]
-        assert _cell_value(_get_cell(rows[19], 5)) == row0["stop"]
-        assert _cell_value(_get_cell(rows[19], 6)) == row0["target"]
-        assert abs(_cell_value(_get_cell(rows[19], 13)) - row0["ev_pct"] / 100.0) < 1e-9
+        assert _cell_value(_get_cell(rows[20], 0)) == "true"  # SELECTED -> Enabled "true"
+        assert _cell_value(_get_cell(rows[20], 1)) == row0["ticker"]
+        assert _cell_value(_get_cell(rows[20], 2)) == "metals_miners"
+        assert _cell_value(_get_cell(rows[20], 3)) == row0["strategy"]
+        assert _cell_value(_get_cell(rows[20], 4)) == "Short"
+        assert _cell_value(_get_cell(rows[20], 5)) == row0["entry"]
+        assert _cell_value(_get_cell(rows[20], 6)) == row0["stop"]
+        assert _cell_value(_get_cell(rows[20], 7)) == row0["target"]
+        assert abs(_cell_value(_get_cell(rows[20], 14)) - row0["ev_pct"] / 100.0) < 1e-9
+
+    def test_rejected_row_enabled_defaults_false(self, document, result):
+        rows = _get_rows(document)
+        row1 = _sorted_for_sheet(result.rows)[1]
+        assert row1["status"] == "BELOW_TOPK"
+        assert _cell_value(_get_cell(rows[21], 0)) == "false"
 
     def test_formula_cell_matches_render_formula(self, document):
         rows = _get_rows(document)
-        assert _cell_value(_get_cell(rows[19], 14)) == render_formula("O", 20, "ods")
-        assert _cell_value(_get_cell(rows[19], 18)) == render_formula("S", 20, "ods")
-        assert _cell_value(_get_cell(rows[19], 36)) == render_formula("AK", 20, "ods")
+        assert _cell_value(_get_cell(rows[20], 15)) == render_formula("P", 21, "ods")
+        assert _cell_value(_get_cell(rows[20], 19)) == render_formula("T", 21, "ods")
+        assert _cell_value(_get_cell(rows[20], 37)) == render_formula("AL", 21, "ods")
+        assert _cell_value(_get_cell(rows[20], 38)) == render_formula("AM", 21, "ods")
+        assert _cell_value(_get_cell(rows[20], 39)) == render_formula("AN", 21, "ods")
 
 
 class TestClusterExposure:
@@ -285,16 +307,16 @@ class TestClusterExposure:
 
     def test_cluster_header_and_rows(self, document, config):
         rows = _get_rows(document)
-        # Data ends at row index 20; cluster block starts two rows below at index 22.
-        assert _cell_value(_get_cell(rows[22], 0)) == "Cluster"
-        assert _cell_value(_get_cell(rows[22], 1)) == "Positions"
-        assert _cell_value(_get_cell(rows[22], 2)) == "Gross %"
-        assert _cell_value(_get_cell(rows[22], 3)) == "Cap %"
-        assert _cell_value(_get_cell(rows[22], 4)) == "Capped?"
+        # Data ends at row index 21; blank separator at 22; cluster header at 23.
+        assert _cell_value(_get_cell(rows[23], 0)) == "Cluster"
+        assert _cell_value(_get_cell(rows[23], 1)) == "Positions"
+        assert _cell_value(_get_cell(rows[23], 2)) == "Gross %"
+        assert _cell_value(_get_cell(rows[23], 3)) == "Cap %"
+        assert _cell_value(_get_cell(rows[23], 4)) == "Capped?"
 
         clusters = {
             _cell_value(_get_cell(rows[r], 0))
-            for r in range(23, 25)
+            for r in range(24, 26)
         }
         assert clusters == {"energy", "metals_miners"}
 
@@ -304,8 +326,8 @@ class TestPercentStyle:
 
     def test_percent_cell_style_applied(self, document):
         rows = _get_rows(document)
-        # N column (index 13) is a percent-labeled static value (EV raw %).
-        cell = _get_cell(rows[19], 13)
+        # O column (index 14) is a percent-labeled static value (EV raw %).
+        cell = _get_cell(rows[20], 14)
         assert cell.getAttribute("stylename") == "KairosPercentCell"
 
     def test_percent_style_defined_in_automaticstyles(self, document):
@@ -327,8 +349,21 @@ class TestAutofilter:
         assert ranges, "expected at least one table:database-range element"
         target = ranges[0].getAttribute("targetrangeaddress")
         assert "Allocation" in target
-        assert "A19" in target
+        assert "A20" in target
         assert ranges[0].getAttribute("displayfilterbuttons") == "true"
+
+
+class TestAllocPctRedistribution:
+    """New column T: live redistribution formula among enabled rows."""
+
+    def test_alloc_pct_formula_structure(self, document):
+        rows = _get_rows(document)
+        formula = str(_cell_value(_get_cell(rows[20], 19)))
+        assert "AM21" in formula
+        assert "AN21" in formula
+        assert "AN$21:AN$401" in formula
+        assert "AM$21:AM$401" in formula
+        assert "SUMPRODUCT" in formula
 
 
 class TestTypeValidation:
