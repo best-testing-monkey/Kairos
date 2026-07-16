@@ -25,6 +25,7 @@ from allocation import (
     compute_derived,
     write_ods_sheet,
     write_xlsx_sheet,
+    _sorted_for_sheet,
 )
 
 
@@ -95,12 +96,18 @@ def config():
 def _recalculate_to_csv(workbook_path: Path) -> list[list[str]]:
     """Recalculate ``workbook_path`` with LibreOffice and return CSV rows."""
     tmpdir = tempfile.mkdtemp()
+    profile_dir = tempfile.mkdtemp()
     try:
         cmd = [
             SOFFICE,
             "--headless",
+            # Use a private user profile so this invocation never collides
+            # with an already-running (interactive or concurrent test)
+            # soffice instance sharing the default profile, which otherwise
+            # causes silent conversion failures.
+            f"-env:UserInstallation=file://{profile_dir}",
             "--convert-to",
-            'csv:"Text - txt - csv (StarCalc)":44,34,0,1,,,,,,,,-1',
+            "csv:Text - txt - csv (StarCalc):44,34,0,1",
             "--outdir",
             tmpdir,
             str(workbook_path),
@@ -125,11 +132,19 @@ def _recalculate_to_csv(workbook_path: Path) -> list[list[str]]:
             return list(csv.reader(f))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+        shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 def _csv_float(value):
     if value is None or value == "":
         return None
+    if isinstance(value, str) and value.endswith("%"):
+        # Percent-formatted cells are exported as e.g. "2.4%"; the sheet's
+        # underlying value is the 0-1 fraction, so divide back down.
+        try:
+            return float(value[:-1]) / 100.0
+        except ValueError:
+            return value
     try:
         return float(value)
     except ValueError:
@@ -152,6 +167,12 @@ class TestLibreOfficeParity:
             tmpdir = Path(tmpdir)
             if fmt == "xlsx":
                 wb = Workbook()
+                # Drop the default "Sheet" so the workbook has exactly one
+                # sheet ("Allocation"); soffice's CSV export filter emits one
+                # CSV per sheet (named "<stem>-<sheet>.csv") whenever a
+                # workbook has more than one sheet, which would otherwise
+                # break the single-file assumption in _recalculate_to_csv.
+                wb.remove(wb.active)
                 write_xlsx_sheet(
                     wb,
                     result,
@@ -180,10 +201,12 @@ class TestLibreOfficeParity:
 
     def _check_static_and_selected(self, result, csv_rows, config, fmt):
         """Spot-check static columns and selected-row allocation values."""
-        # Data rows begin at CSV index 19 (spreadsheet row 20).
+        # Data rows begin at CSV index 19 (spreadsheet row 20), in the same
+        # EV-total-descending order the writers use for the sheet.
+        sorted_rows = _sorted_for_sheet(result.rows)
         data_csv = csv_rows[19:]
-        assert len(data_csv) >= len(result.rows), (
-            f"{fmt}: expected at least {len(result.rows)} data rows, "
+        assert len(data_csv) >= len(sorted_rows), (
+            f"{fmt}: expected at least {len(sorted_rows)} data rows, "
             f"got {len(data_csv)}"
         )
 
@@ -191,29 +214,47 @@ class TestLibreOfficeParity:
             r["ticker"]: r for r in result.rows if r.get("status") == "SELECTED"
         }
 
-        for offset, row in enumerate(result.rows):
+        for offset, row in enumerate(sorted_rows):
             excel_row = 20 + offset
             csv_row = data_csv[offset]
 
             # Static columns A-N (indices 0-13) should match the input data.
             assert csv_row[0] == row.get("ticker", ""), f"A{excel_row} ticker mismatch"
             assert csv_row[2] == row.get("strategy", ""), f"C{excel_row} strategy mismatch"
-            assert csv_row[4] == str(row.get("entry", "")), f"E{excel_row} entry mismatch"
+            expected_entry = row.get("entry")
+            if expected_entry is not None:
+                assert abs(_csv_float(csv_row[4]) - expected_entry) <= 1e-9, (
+                    f"E{excel_row} entry mismatch"
+                )
 
-            # Column R (index 17) is the final Alloc %. For selected rows it must
-            # match the Python alloc within tolerance. Rejected rows have no
-            # Python alloc to compare against because selection is computed in
+            # Column S (index 18) is the final Alloc % as a 0-1 fraction. For
+            # selected rows it must match the Python alloc (also converted to
+            # a fraction) within tolerance. Rejected rows have no Python
+            # alloc to compare against because selection is computed in
             # Python, not in the sheet formulas.
             ticker = row.get("ticker", "")
             if ticker in selected_by_ticker:
                 py_alloc = selected_by_ticker[ticker].get("alloc")
-                calc_alloc = _csv_float(csv_row[17])
+                calc_alloc = _csv_float(csv_row[18])
                 assert py_alloc is not None and calc_alloc is not None, (
-                    f"R{excel_row}: missing alloc value"
+                    f"S{excel_row}: missing alloc value"
                 )
-                assert abs(py_alloc - calc_alloc) <= 1e-6, (
-                    f"R{excel_row}: expected alloc {py_alloc}, got {calc_alloc}"
+                # Percent-formatted cells round-trip through "0.0%" display
+                # (1 decimal place), so allow up to that rounding tolerance.
+                assert abs(py_alloc / 100.0 - calc_alloc) <= 5e-4, (
+                    f"S{excel_row}: expected alloc {py_alloc / 100.0}, got {calc_alloc}"
                 )
+
+                # Column P (index 15) is EV total = ev_pct/100 * alloc/100.
+                ev_pct = selected_by_ticker[ticker].get("ev_pct")
+                if ev_pct is not None:
+                    expected_ev_total = (ev_pct / 100.0) * (py_alloc / 100.0)
+                    calc_ev_total = _csv_float(csv_row[15])
+                    assert calc_ev_total is not None, f"P{excel_row}: missing EV total value"
+                    assert abs(expected_ev_total - calc_ev_total) <= 5e-4, (
+                        f"P{excel_row}: expected EV total {expected_ev_total}, "
+                        f"got {calc_ev_total}"
+                    )
 
     @pytest.mark.parametrize("fmt", ["xlsx", "ods"])
     def test_all_enabled_mask(self, rfc7_candidates, config, fmt):

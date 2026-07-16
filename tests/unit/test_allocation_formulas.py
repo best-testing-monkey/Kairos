@@ -167,22 +167,22 @@ class TestFormulaLogic:
     """Test that rendered formulas implement correct logic."""
 
     def test_risk_pct_formula_structure(self):
-        """Test risk_pct formula: ABS(stop - entry) / entry * 100."""
+        """Test risk_pct formula: ABS(stop - entry) / entry (fraction, no *100)."""
         result = render_formula("risk_pct", 20, "xlsx")
         # Should reference F20 (stop) and E20 (entry)
         assert "F20" in result
         assert "E20" in result
         assert "ABS" in result
-        assert "*100" in result
+        assert "*100" not in result
 
     def test_reward_pct_formula_structure(self):
-        """Test reward_pct formula: ABS(target - entry) / entry * 100."""
+        """Test reward_pct formula: ABS(target - entry) / entry (fraction, no *100)."""
         result = render_formula("reward_pct", 20, "xlsx")
         # Should reference G20 (target) and E20 (entry)
         assert "G20" in result
         assert "E20" in result
         assert "ABS" in result
-        assert "*100" in result
+        assert "*100" not in result
 
     def test_shrink_formula_uses_n0_config(self):
         """Test shrink formula: n / (n + n0), uses config $D$3."""
@@ -293,24 +293,24 @@ class TestGrossScaleFactor:
         assert "$D$6" in result
 
     def test_gross_scale_scales_post_cluster_total(self):
-        """gross_scale must compare the post-cluster-cap total, not just AJ count."""
+        """gross_scale must compare the post-cluster-cap total, not just AK count."""
         result = render_formula("gross_scale", 20, "xlsx")
-        # It should use SUMPRODUCT over AE (position-capped alloc) and AJ
-        # (cluster scale), otherwise SUM(AJ) would be ~selected_count and never
+        # It should use SUMPRODUCT over AF (position-capped alloc) and AK
+        # (cluster scale), otherwise SUM(AK) would be ~selected_count and never
         # trigger scaling when gross_cap_pct is 100.
         assert "SUMPRODUCT" in result
-        assert "AE$20:AE$400" in result
-        assert "AJ$20:AJ$400" in result
-        assert "SUM(AJ$20:AJ$400)" not in result
+        assert "AF$20:AF$400" in result
+        assert "AK$20:AK$400" in result
+        assert "SUM(AK$20:AK$400)" not in result
 
 
 class TestAllFormulasCoverage:
     """Test that every required formula column is implemented."""
 
-    # Canonical keys are column letters O..AJ plus the summary gross_scale factor.
+    # Canonical keys are column letters O..AK plus the summary gross_scale factor.
     COLUMN_FORMULAS = {
         "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
-        "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ",
+        "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
     }
     SUMMARY_FORMULAS = {"gross_scale"}
 

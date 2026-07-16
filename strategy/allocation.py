@@ -687,37 +687,42 @@ Templates are rendered per dialect via render_formula(name, row, fmt):
 - ODS: Returns formula with 'of:=' prefix and semicolon separators
   (per ODS spec; semicolons separate function arguments in many locales)
 
-Column mapping (formula columns O through AJ, per E11-S08/S09/S10):
-- O  = ev_net              EV net of costs (RFC §4.2)
-- P  = kelly_raw           Binary Kelly before capping/multiplier
-- Q  = score               Return per unit risk (ranking key)
-- R  = alloc_pct           Final allocation % after pos/cluster/gross caps
-- S  = alloc_eur           Allocation expressed as currency amount
-- T  = flags               Composite flags (DATA_MISMATCH, POS_CAPPED, CLUSTER_CAPPED)
-- U  = advised_liq         Carried upstream liquidity % (displayed but ignored)
-- V  = risk_pct            ABS(stop - entry) / entry * 100
-- W  = reward_pct          ABS(target - entry) / entry * 100
-- X  = b                   Payoff ratio (geometry fallback in v1)
-- Y  = loss_pct            Basis for score denominator
-- Z  = shrink              Confidence weight n / (n + n0)
-- AA = ev_shrunk           ev_pct * shrink
-- AB = p_shrunk            Win rate shrunk toward 50%
-- AC = kelly_frac          Fractional Kelly decimal (before cap)
-- AD = alloc_raw_pct       Kelly_frac * 100
-- AE = pos_capped_alloc    MIN(alloc_raw_pct, max_pos_pct)
-- AF = pos_capped_flag     "POS_CAPPED" if capped
-- AG = ev_implied          base_win_rate*reward - (1-base_win_rate)*risk
-- AH = ev_ratio            ev_pct / ev_implied
-- AI = data_mismatch       "DATA_MISMATCH" if ev_ratio outside [0.5, 2.0]
-- AJ = cluster_scale       Cluster-level scale factor (SUMIFS over pos_capped_alloc)
+Column mapping (formula columns O through AK, per E11-S08/S09/S10/S15):
+- O  = ev_net              EV net of costs (RFC §4.2), fraction
+- P  = ev_total            EV as % of total equity = ev_net_raw_pct * alloc_pct (both fractions)
+- Q  = kelly_raw           Binary Kelly before capping/multiplier
+- R  = score               Return per unit risk (ranking key)
+- S  = alloc_pct           Final allocation fraction after pos/cluster/gross caps
+- T  = alloc_eur           Allocation expressed as currency amount
+- U  = flags               Composite flags (DATA_MISMATCH, POS_CAPPED, CLUSTER_CAPPED)
+- V  = advised_liq         Carried upstream liquidity % (displayed but ignored)
+- W  = risk_pct            ABS(stop - entry) / entry, fraction
+- X  = reward_pct          ABS(target - entry) / entry, fraction
+- Y  = b                   Payoff ratio (geometry fallback in v1)
+- Z  = loss_pct            Basis for score denominator
+- AA = shrink              Confidence weight n / (n + n0)
+- AB = ev_shrunk           ev_pct * shrink
+- AC = p_shrunk            Win rate shrunk toward 50%
+- AD = kelly_frac          Fractional Kelly decimal (before cap)
+- AE = alloc_raw_pct       kelly_frac, fraction (no *100)
+- AF = pos_capped_alloc    MIN(alloc_raw_pct, max_pos_pct)
+- AG = pos_capped_flag     "POS_CAPPED" if capped
+- AH = ev_implied          base_win_rate*reward - (1-base_win_rate)*risk
+- AI = ev_ratio            ev_pct / ev_implied
+- AJ = data_mismatch       "DATA_MISMATCH" if ev_ratio outside [0.5, 2.0]
+- AK = cluster_scale       Cluster-level scale factor (SUMIFS over pos_capped_alloc)
+
+All percent-labeled quantities are stored as 0-1 fractions in the sheet and
+displayed via percent number format; only the Python domain (Candidate,
+AllocationConfig, allocate()) keeps the 0-100 scale.
 
 Summary-block config cell layout (absolute references):
 - $D$3: n0 (shrinkage constant)
-- $D$4: round_trip_cost_pct (cost per round trip, %)
+- $D$4: round_trip_cost_pct (cost per round trip, fraction)
 - $D$5: kelly_mult (fractional Kelly multiplier)
-- $D$6: gross_cap_pct (total exposure cap, %)
-- $D$7: max_pos_pct (per-position cap, %)
-- $D$8: max_cluster_pct (per-cluster cap, %)
+- $D$6: gross_cap_pct (total exposure cap, fraction)
+- $D$7: max_pos_pct (per-position cap, fraction)
+- $D$8: max_cluster_pct (per-cluster cap, fraction)
 - $D$9: equity (optional account equity for currency column; blank = no amount)
 - $D$14: gross_scale factor summary cell (proportional scale if over gross cap)
 
@@ -731,39 +736,41 @@ Data cell layout for row N (per RFC §5.2 static columns A-N):
 - N: EV raw % (ev_pct from backtest)
 """
 
-# Template strings keyed by column letter (O..AJ) plus the summary factor.
+# Template strings keyed by column letter (O..AK) plus the summary factor.
 # Each contains a single {row} placeholder substituted by render_formula().
+# All percent-like quantities are fractions (0-1); no *100/ /100 conversions.
 _FORMULA_TEMPLATES = {
     # Visible Section A derived columns
-    "O": "N{row}*Z{row}-$D$4",
-    "P": "IFERROR(AB{row}-(1-AB{row})/X{row},0)",
-    "Q": "IFERROR(O{row}/Y{row},0)",
-    "R": "AE{row}*AJ{row}*$D$14",
-    "S": 'IF($D$9="","",R{row}*$D$9/100)',
-    "T": 'IF(AI{row}="","",AI{row})&IF(AF{row}="","",IF(AI{row}="",""," ")&AF{row})&IF(AJ{row}<1,IF(AND(AI{row}="",AF{row}=""),""," ")&"CLUSTER_CAPPED","")',
-    "U": '""',
+    "O": "N{row}*AA{row}-$D$4",
+    "P": "N{row}*S{row}",
+    "Q": "IFERROR(AC{row}-(1-AC{row})/Y{row},0)",
+    "R": "IFERROR(O{row}/Z{row},0)",
+    "S": "AF{row}*AK{row}*$D$14",
+    "T": 'IF($D$9="","",S{row}*$D$9)',
+    "U": 'IF(AJ{row}="","",AJ{row})&IF(AG{row}="","",IF(AJ{row}="",""," ")&AG{row})&IF(AK{row}<1,IF(AND(AJ{row}="",AG{row}=""),""," ")&"CLUSTER_CAPPED","")',
+    "V": '""',
 
     # Helper columns (grouped/collapsed by the sheet writer)
-    "V": "IF(E{row}=0,0,ABS(F{row}-E{row})/E{row}*100)",
-    "W": "IF(E{row}=0,0,ABS(G{row}-E{row})/E{row}*100)",
-    "X": "IF(Y{row}=0,0,W{row}/Y{row})",
-    "Y": "IF(E{row}=0,0,V{row})",
-    "Z": "IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
-    "AA": "N{row}*Z{row}",
-    "AB": "0.5+(L{row}-0.5)*Z{row}",
-    "AC": "MAX(P{row},0)*$D$5",
-    "AD": "AC{row}*100",
-    "AE": "MIN(AD{row},$D$7)",
-    "AF": 'IF(AD{row}>$D$7,"POS_CAPPED","")',
-    "AG": "L{row}*W{row}-(1-L{row})*V{row}",
-    "AH": "IFERROR(N{row}/AG{row},0)",
-    "AI": 'IF(OR(AH{row}<0.5,AH{row}>2),"DATA_MISMATCH","")',
-    "AJ": "IF(SUMIFS(AE$20:AE$400,B$20:B$400,B{row})>$D$8,$D$8/SUMIFS(AE$20:AE$400,B$20:B$400,B{row}),1)",
+    "W": "IF(E{row}=0,0,ABS(F{row}-E{row})/E{row})",
+    "X": "IF(E{row}=0,0,ABS(G{row}-E{row})/E{row})",
+    "Y": "IF(Z{row}=0,0,X{row}/Z{row})",
+    "Z": "IF(E{row}=0,0,W{row})",
+    "AA": "IF(K{row}=0,0,K{row}/(K{row}+$D$3))",
+    "AB": "N{row}*AA{row}",
+    "AC": "0.5+(L{row}-0.5)*AA{row}",
+    "AD": "MAX(Q{row},0)*$D$5",
+    "AE": "AD{row}",
+    "AF": "MIN(AE{row},$D$7)",
+    "AG": 'IF(AE{row}>$D$7,"POS_CAPPED","")',
+    "AH": "L{row}*X{row}-(1-L{row})*W{row}",
+    "AI": "IFERROR(N{row}/AH{row},0)",
+    "AJ": 'IF(OR(AI{row}<0.5,AI{row}>2),"DATA_MISMATCH","")',
+    "AK": "IF(SUMIFS(AF$20:AF$400,B$20:B$400,B{row})>$D$8,$D$8/SUMIFS(AF$20:AF$400,B$20:B$400,B{row}),1)",
 
     # Summary-block gross scale factor (rendered into $D$14).
-    # Must scale the post-cluster-cap total (AE * AJ) down to gross_cap_pct.
-    # SUM(AJ) alone is wrong: it is just the count of cluster-scale factors.
-    "gross_scale": "IF(SUMPRODUCT(AE$20:AE$400,AJ$20:AJ$400)>$D$6,$D$6/SUMPRODUCT(AE$20:AE$400,AJ$20:AJ$400),1)",
+    # Must scale the post-cluster-cap total (AF * AK) down to gross_cap_pct.
+    # SUM(AK) alone is wrong: it is just the count of cluster-scale factors.
+    "gross_scale": "IF(SUMPRODUCT(AF$20:AF$400,AK$20:AK$400)>$D$6,$D$6/SUMPRODUCT(AF$20:AF$400,AK$20:AK$400),1)",
 }
 
 
@@ -772,27 +779,28 @@ _FORMULA_TEMPLATES = {
 # single template is used for both naming styles.
 _FORMULA_ALIASES = {
     "ev_net": "O",
-    "kelly_raw": "P",
-    "score": "Q",
-    "alloc_pct": "R",
-    "alloc_eur": "S",
-    "flags": "T",
-    "advised_liq_pct": "U",
-    "risk_pct": "V",
-    "reward_pct": "W",
-    "b": "X",
-    "loss_pct": "Y",
-    "shrink": "Z",
-    "ev_shrunk": "AA",
-    "p_shrunk": "AB",
-    "kelly_frac": "AC",
-    "alloc_raw_pct": "AD",
-    "pos_capped_alloc": "AE",
-    "pos_capped": "AF",
-    "ev_implied": "AG",
-    "ev_ratio": "AH",
-    "data_mismatch": "AI",
-    "cluster_scale": "AJ",
+    "ev_total": "P",
+    "kelly_raw": "Q",
+    "score": "R",
+    "alloc_pct": "S",
+    "alloc_eur": "T",
+    "flags": "U",
+    "advised_liq_pct": "V",
+    "risk_pct": "W",
+    "reward_pct": "X",
+    "b": "Y",
+    "loss_pct": "Z",
+    "shrink": "AA",
+    "ev_shrunk": "AB",
+    "p_shrunk": "AC",
+    "kelly_frac": "AD",
+    "alloc_raw_pct": "AE",
+    "pos_capped_alloc": "AF",
+    "pos_capped": "AG",
+    "ev_implied": "AH",
+    "ev_ratio": "AI",
+    "data_mismatch": "AJ",
+    "cluster_scale": "AK",
     "gross_scale": "gross_scale",
 }
 
@@ -804,7 +812,7 @@ def render_formula(name: str, row: int, fmt: str) -> str:
     derive from one shared template, with only dialect-specific syntax changes.
 
     Args:
-        name: Formula name.  Accepts canonical column-letter keys ("O".."AJ",
+        name: Formula name.  Accepts canonical column-letter keys ("O".."AK",
             "gross_scale") and concept aliases ("risk_pct", "ev_net", ...).
         row: Data row number (20..400 per RFC §5.1), used for cell reference substitution.
         fmt: Output dialect, "xlsx" or "ods".
@@ -888,18 +896,19 @@ _STATIC_HEADERS = [
     "Risk %", "Reward %", "b", "n", "Win raw", "Win shrunk", "EV raw %",
 ]
 
-# Headers for the formula-driven columns O-U (visible Section A derived columns).
+# Headers for the formula-driven columns O-V (visible Section A derived columns).
 _FORMULA_HEADERS = {
     "O": "EV net %",
-    "P": "Kelly raw",
-    "Q": "Score",
-    "R": "Alloc %",
-    "S": "Alloc EUR",
-    "T": "Flags",
-    "U": "Advised liq % (ignored)",
+    "P": "EV total",
+    "Q": "Kelly raw",
+    "R": "Score",
+    "S": "Alloc %",
+    "T": "Alloc EUR",
+    "U": "Flags",
+    "V": "Advised liq % (ignored)",
 }
 
-# Headers for the helper formula columns V-AJ.
+# Headers for the helper formula columns W-AK.
 _HELPER_HEADERS = [
     "risk_pct", "reward_pct", "b", "loss_pct", "shrink", "ev_shrunk",
     "p_shrunk", "kelly_frac", "alloc_raw_pct", "pos_capped_alloc",
@@ -908,17 +917,46 @@ _HELPER_HEADERS = [
 
 _FORMULA_COLS = [
     "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
-    "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ",
+    "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
 ]
+
+# Column letters (percent-labeled) that receive "0.0%" number format / ODS
+# percent cell style: visible Risk %, Reward %, EV raw %, EV net %, EV total,
+# Alloc %, plus helper risk_pct, reward_pct, loss_pct, alloc_raw_pct.
+_PERCENT_COLS = ("H", "I", "N", "O", "P", "S", "W", "X", "Z", "AE")
 
 # Summary-block formulas shared by XLSX and ODS writers.  Dialect-specific
 # rendering (comma vs. semicolon separators, '=' vs. 'of:=' prefix) is applied
 # by the writers so the formula logic is not duplicated.
 _SUMMARY_FORMULAS = {
-    "selected_count": '=COUNTIF(R20:R400,">0")',
-    "gross_exposure": "=SUM(R20:R400)",
+    "selected_count": '=COUNTIF(S20:S400,">0")',
+    "gross_exposure": "=SUM(S20:S400)",
     "enabled_count": "=COUNTA(N20:N400)",
+    "ev_total_sum": "=SUM(P20:P400)",
 }
+
+
+def _pct_to_frac(value):
+    """Convert a 0-100 percent value to a 0-1 fraction. None-safe."""
+    if value is None:
+        return None
+    return value / 100.0
+
+
+def _sorted_for_sheet(rows):
+    """Sort rows for sheet display: selected/allocated rows by EV total desc.
+
+    alloc > 0 rows come first (sorted by ev_total descending); everything
+    else (rejected/zero-alloc rows) keeps its original relative order at the
+    bottom. Uses a stable sort so ties preserve input order.
+    """
+    def key(r):
+        alloc = r.get("alloc") or 0.0
+        ev_pct = (r.get("ev_pct") or 0.0) / 100.0
+        ev_total = ev_pct * alloc / 100.0
+        return (0 if alloc > 0 else 1, -ev_total)
+
+    return sorted(rows, key=key)
 
 
 def _xlsx_column_letter_to_index(col_letter: str) -> int:
@@ -956,18 +994,21 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
                      report_date, generator_version: str):
     """Write the ``Allocation`` sheet into an existing ``openpyxl.Workbook``.
 
-    Layout follows RFC allocation_sheet.md §5 and ticket E11-S09:
+    Layout follows RFC allocation_sheet.md §5 and ticket E11-S09/S15:
       - Row 1: title, report date, generator version.
       - Rows 3-13: config block (parameter name, editable value, locked default).
-      - Rows 14-16: summary formulas (selected count, gross exposure %, enabled
-        count, and the gross scale factor in $D$14).
+      - Rows 14-17: summary formulas (selected count, gross exposure %, enabled
+        count, EV total, and the gross scale factor in $D$14).
       - Row 18: instruction line.
-      - Row 19: header row A-AJ.
-      - Rows 20..N: one row per candidate in ``result.rows`` in the order given.
+      - Row 19: header row A-AK.
+      - Rows 20..N: one row per candidate, sorted by EV total descending
+        (``_sorted_for_sheet``).
       - Below the data: Section B cluster-exposure table.
-      - Helper columns X-AF are grouped (outlined) but not hidden.
+      - Helper columns W-AG are grouped (outlined) but not hidden.
       - All cells are locked except the editable config value cells (D3:D13) and
         column N (the per-row editable input column).
+      - Percent-labeled cells are 0-1 fractions with "0.0%" number format.
+      - Autofilter is enabled on the header/data range.
 
     The function performs no disk I/O; it mutates the provided in-memory
     ``Workbook``.
@@ -992,20 +1033,29 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     # Parameter names in column C, editable values in column D, shipped defaults
     # (locked) in column E.
     default_config = AllocationConfig()
+    pct_value_cells = []  # (row, col) cells holding a pct fraction, for number_format
     for offset, (label, attr) in enumerate(_CONFIG_BLOCK):
         row = 3 + offset
         ws.cell(row=row, column=3, value=label)
+        is_pct = "pct" in label
         value = getattr(config, attr)
         if attr == "cluster_map":
             value = str(value) if value else ""
+        elif is_pct:
+            value = _pct_to_frac(value)
         ws.cell(row=row, column=4, value=_empty_if_none(value))
         default_value = getattr(default_config, attr)
         if attr == "cluster_map":
             default_value = str(default_value) if default_value else ""
+        elif is_pct:
+            default_value = _pct_to_frac(default_value)
         ws.cell(row=row, column=5, value=_empty_if_none(default_value))
+        if is_pct:
+            pct_value_cells.append((row, 4))
+            pct_value_cells.append((row, 5))
 
     # -------------------------------------------------------------------------
-    # Rows 14-16: summary block
+    # Rows 14-17: summary block
     # -------------------------------------------------------------------------
     ws["A14"] = "Selected count"
     ws["C14"] = _SUMMARY_FORMULAS["selected_count"]
@@ -1013,6 +1063,8 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     ws["C15"] = _SUMMARY_FORMULAS["gross_exposure"]
     ws["A16"] = "Enabled count"
     ws["C16"] = _SUMMARY_FORMULAS["enabled_count"]
+    ws["A17"] = "EV total"
+    ws["C17"] = _SUMMARY_FORMULAS["ev_total_sum"]
     ws["D14"] = render_formula("gross_scale", 14, "xlsx")
 
     # -------------------------------------------------------------------------
@@ -1028,19 +1080,21 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     # -------------------------------------------------------------------------
     headers = (
         _STATIC_HEADERS
-        + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:7]]
+        + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:8]]
         + _HELPER_HEADERS
     )
     for col_idx, header in enumerate(headers, start=1):
         ws.cell(row=_HEADER_ROW, column=col_idx, value=header)
 
     # -------------------------------------------------------------------------
-    # Rows 20..N: candidate rows
+    # Rows 20..N: candidate rows, sorted by EV total descending
     # -------------------------------------------------------------------------
     def _cluster_for_ticker(ticker: str) -> str:
         return config.cluster_map.get(ticker, ticker)
 
-    for row_offset, row_data in enumerate(result.rows):
+    sorted_rows = _sorted_for_sheet(result.rows)
+
+    for row_offset, row_data in enumerate(sorted_rows):
         excel_row = _DATA_START_ROW + 1 + row_offset
         derived = row_data.get("derived", {}) or {}
         ticker = row_data.get("ticker", "")
@@ -1054,13 +1108,13 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
             row_data.get("entry"),
             row_data.get("stop"),
             row_data.get("target"),
-            derived.get("risk_pct"),
-            derived.get("reward_pct"),
+            _pct_to_frac(derived.get("risk_pct")),
+            _pct_to_frac(derived.get("reward_pct")),
             derived.get("b"),
             row_data.get("n"),
             row_data.get("base_win_rate"),
             derived.get("p_shrunk"),
-            row_data.get("ev_pct"),
+            _pct_to_frac(row_data.get("ev_pct")),
         ]
         for col_idx, value in enumerate(static_values, start=1):
             ws.cell(row=excel_row, column=col_idx, value=_empty_if_none(value))
@@ -1071,9 +1125,27 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
                     value=render_formula(col_letter, excel_row, "xlsx"))
 
     # -------------------------------------------------------------------------
+    # Percent number formatting: visible + helper percent-labeled columns,
+    # over the data rows, plus config/summary cells noted above.
+    # -------------------------------------------------------------------------
+    data_end_row = _DATA_START_ROW + len(sorted_rows)
+    for col_letter in _PERCENT_COLS:
+        col_idx = _xlsx_column_letter_to_index(col_letter)
+        for row in range(_DATA_START_ROW + 1, data_end_row + 1):
+            ws.cell(row=row, column=col_idx).number_format = "0.0%"
+    for row, col in pct_value_cells:
+        ws.cell(row=row, column=col).number_format = "0.0%"
+    ws["C15"].number_format = "0.0%"
+    ws["C17"].number_format = "0.0%"
+
+    # -------------------------------------------------------------------------
+    # Autofilter over header + data rows
+    # -------------------------------------------------------------------------
+    ws.auto_filter.ref = f"A{_HEADER_ROW}:{_FORMULA_COLS[-1]}{data_end_row}"
+
+    # -------------------------------------------------------------------------
     # Section B: cluster exposure table
     # -------------------------------------------------------------------------
-    data_end_row = _DATA_START_ROW + len(result.rows)
     cluster_header_row = data_end_row + 2
     ws.cell(row=cluster_header_row, column=1, value="Cluster")
     ws.cell(row=cluster_header_row, column=2, value="Positions")
@@ -1094,8 +1166,8 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
         capped = any("CLUSTER_CAPPED" in r.get("flags", []) for r in cluster_rows)
         ws.cell(row=row, column=1, value=cluster)
         ws.cell(row=row, column=2, value=positions)
-        ws.cell(row=row, column=3, value=gross)
-        ws.cell(row=row, column=4, value=config.max_cluster_pct)
+        ws.cell(row=row, column=3, value=_pct_to_frac(gross)).number_format = "0.0%"
+        ws.cell(row=row, column=4, value=_pct_to_frac(config.max_cluster_pct)).number_format = "0.0%"
         ws.cell(row=row, column=5, value="yes" if capped else "no")
 
     # -------------------------------------------------------------------------
@@ -1131,9 +1203,9 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
         ws.cell(row=row, column=5, value=r.get("status", ""))
 
     # -------------------------------------------------------------------------
-    # Column grouping: helper columns V-AF are outlined but not hidden.
+    # Column grouping: helper columns W-AG are outlined but not hidden.
     # -------------------------------------------------------------------------
-    ws.column_dimensions.group("V", "AF", outline_level=1, hidden=False)
+    ws.column_dimensions.group("W", "AG", outline_level=1, hidden=False)
 
     # -------------------------------------------------------------------------
     # Sheet protection: lock everything except the editable config values (D3:D13)
@@ -1152,32 +1224,65 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
 # E11-S10: ODS Sheet Writer
 # =============================================================================
 
-def _ods_create_cell(value, formula=None):
-    """Create an odfpy ``TableCell`` with optional ODS formula."""
+_ODS_PERCENT_STYLE_NAME = "KairosPercent"
+_ODS_PERCENT_CELL_STYLE_NAME = "KairosPercentCell"
+
+
+def _ods_ensure_percent_style(document):
+    """Ensure the document has a percent number style + cell style defined.
+
+    Idempotent: safe to call multiple times for the same document (odfpy does
+    not de-duplicate automaticstyles, so callers should only call this once
+    per document, but re-adding is otherwise harmless).
+    """
+    from odf.number import Number, PercentageStyle, Text
+    from odf.style import Style
+
+    percent_style = PercentageStyle(name=_ODS_PERCENT_STYLE_NAME)
+    percent_style.addElement(Number(decimalplaces="1", minintegerdigits="1"))
+    percent_style.addElement(Text(text="%"))
+    document.automaticstyles.addElement(percent_style)
+
+    cell_style = Style(
+        name=_ODS_PERCENT_CELL_STYLE_NAME,
+        family="table-cell",
+        datastylename=_ODS_PERCENT_STYLE_NAME,
+    )
+    document.automaticstyles.addElement(cell_style)
+
+
+def _ods_create_cell(value, formula=None, percent=False):
+    """Create an odfpy ``TableCell`` with optional ODS formula.
+
+    Args:
+        percent: if True, apply the percent cell style (``KairosPercentCell``)
+            so the numeric value renders as ``0.0%``.
+    """
     from odf.table import TableCell
     from odf.text import P
 
     text = "" if value is None else str(value)
+    style_kwargs = {"stylename": _ODS_PERCENT_CELL_STYLE_NAME} if percent else {}
 
     if formula:
         # Formula cells carry a cached float value of 0.0 and the formula
         # attribute; the displayed text is left empty.
-        cell = TableCell(valuetype="float", value=0.0)
+        cell = TableCell(valuetype="float", value=0.0, **style_kwargs)
         cell.setAttribute("formula", formula)
         cell.addElement(P(text=text))
     elif isinstance(value, bool):
-        cell = TableCell(valuetype="boolean", value="true" if value else "false")
+        cell = TableCell(valuetype="boolean", value="true" if value else "false", **style_kwargs)
         cell.addElement(P(text=text))
     elif isinstance(value, (int, float)):
-        cell = TableCell(valuetype="float", value=float(value))
+        cell = TableCell(valuetype="float", value=float(value), **style_kwargs)
         cell.addElement(P(text=text))
     else:
-        cell = TableCell(valuetype="string")
+        cell = TableCell(valuetype="string", **style_kwargs)
         cell.addElement(P(text=text))
     return cell
 
 
-def _ods_add_row(table, values, start_col=0, formulas=None):
+def _ods_add_row(table, values, start_col=0, formulas=None, percent_cols=None):
     """Append a row to an ODS ``Table`` with leading empty cells and formulas.
 
     Args:
@@ -1187,10 +1292,13 @@ def _ods_add_row(table, values, start_col=0, formulas=None):
         formulas: dict mapping absolute 0-based column index to an ODS formula
             string (``of:=...``).  The matching cell is created as a formula
             cell with the corresponding ``values`` entry as display text.
+        percent_cols: set of absolute 0-based column indices to render with
+            the percent cell style.
     """
     from odf.table import TableRow
 
     formulas = formulas or {}
+    percent_cols = percent_cols or set()
     row = TableRow()
     end_col = max(len(values) + start_col, max(formulas, default=-1) + 1)
     for col_idx in range(end_col):
@@ -1198,7 +1306,9 @@ def _ods_add_row(table, values, start_col=0, formulas=None):
             value = values[col_idx - start_col]
         else:
             value = ""
-        cell = _ods_create_cell(value, formula=formulas.get(col_idx))
+        cell = _ods_create_cell(
+            value, formula=formulas.get(col_idx), percent=col_idx in percent_cols,
+        )
         row.addElement(cell)
     table.addElement(row)
     return row
@@ -1236,6 +1346,8 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
     if document.mimetype != "application/vnd.oasis.opendocument.spreadsheet":
         raise TypeError("document must be an odfpy OpenDocumentSpreadsheet")
 
+    _ods_ensure_percent_style(document)
+
     table = Table(name="Allocation")
     document.spreadsheet.addElement(table)
 
@@ -1262,20 +1374,26 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
     # in column E.
     default_config = AllocationConfig()
     for label, attr in _CONFIG_BLOCK:
+        is_pct = "pct" in label
         value = getattr(config, attr)
         if attr == "cluster_map":
             value = str(value) if value else ""
+        elif is_pct:
+            value = _pct_to_frac(value)
         default_value = getattr(default_config, attr)
         if attr == "cluster_map":
             default_value = str(default_value) if default_value else ""
+        elif is_pct:
+            default_value = _pct_to_frac(default_value)
         _ods_add_row(
             table,
             [label, _empty_if_none(value), _empty_if_none(default_value)],
             start_col=2,
+            percent_cols={3, 4} if is_pct else None,
         )
 
     # -------------------------------------------------------------------------
-    # Rows 14-16: summary block
+    # Rows 14-17: summary block
     # -------------------------------------------------------------------------
     _ods_add_row(
         table,
@@ -1289,6 +1407,7 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
         table,
         ["Gross exposure %", ""],
         formulas={2: _xlsx_formula_to_ods(_SUMMARY_FORMULAS["gross_exposure"])},
+        percent_cols={2},
     )
     _ods_add_row(
         table,
@@ -1297,9 +1416,14 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
     )
 
     # -------------------------------------------------------------------------
-    # Row 17: blank separator (mirrors XLSX layout)
+    # Row 17: EV total summary row (mirrors XLSX layout)
     # -------------------------------------------------------------------------
-    _ods_add_row(table, [""])
+    _ods_add_row(
+        table,
+        ["EV total", ""],
+        formulas={2: _xlsx_formula_to_ods(_SUMMARY_FORMULAS["ev_total_sum"])},
+        percent_cols={2},
+    )
 
     # -------------------------------------------------------------------------
     # Row 18: instruction line
@@ -1317,18 +1441,29 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
     # -------------------------------------------------------------------------
     headers = (
         _STATIC_HEADERS
-        + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:7]]
+        + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:8]]
         + _HELPER_HEADERS
     )
     _ods_add_row(table, headers)
 
     # -------------------------------------------------------------------------
-    # Rows 20..N: candidate rows
+    # Rows 20..N: candidate rows, sorted by EV total descending
     # -------------------------------------------------------------------------
     def _cluster_for_ticker(ticker: str) -> str:
         return config.cluster_map.get(ticker, ticker)
 
-    for row_offset, row_data in enumerate(result.rows):
+    # 0-based column indices of the static percent-labeled columns (H, I, N).
+    static_percent_cols = {
+        _xlsx_column_letter_to_index(c) - 1 for c in ("H", "I", "N")
+    }
+    formula_percent_cols = {
+        _xlsx_column_letter_to_index(c) - 1 for c in _PERCENT_COLS
+        if c not in ("H", "I", "N")
+    }
+
+    sorted_rows = _sorted_for_sheet(result.rows)
+
+    for row_offset, row_data in enumerate(sorted_rows):
         excel_row = _DATA_START_ROW + 1 + row_offset
         derived = row_data.get("derived", {}) or {}
         ticker = row_data.get("ticker", "")
@@ -1342,23 +1477,46 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
             row_data.get("entry"),
             row_data.get("stop"),
             row_data.get("target"),
-            derived.get("risk_pct"),
-            derived.get("reward_pct"),
+            _pct_to_frac(derived.get("risk_pct")),
+            _pct_to_frac(derived.get("reward_pct")),
             derived.get("b"),
             row_data.get("n"),
             row_data.get("base_win_rate"),
             derived.get("p_shrunk"),
-            row_data.get("ev_pct"),
+            _pct_to_frac(row_data.get("ev_pct")),
         ]
 
-        # Visible + helper formula columns O..AJ are formula cells.
+        # Visible + helper formula columns O..AK are formula cells.
         formulas = {}
         for col_letter in _FORMULA_COLS:
             col_idx = _xlsx_column_letter_to_index(col_letter) - 1
             formulas[col_idx] = render_formula(col_letter, excel_row, "ods")
 
         values = static_values + [""] * len(_FORMULA_COLS)
-        _ods_add_row(table, values, formulas=formulas)
+        percent_cols = static_percent_cols | formula_percent_cols
+        _ods_add_row(table, values, formulas=formulas, percent_cols=percent_cols)
+
+    # -------------------------------------------------------------------------
+    # Autofilter: table:database-range over header + data rows (A19:AK<end>)
+    # -------------------------------------------------------------------------
+    from odf.table import DatabaseRange, DatabaseRanges
+
+    data_end_row = _DATA_START_ROW + len(sorted_rows)
+    db_ranges = document.spreadsheet.getElementsByType(DatabaseRanges)
+    if db_ranges:
+        db_ranges_elem = db_ranges[0]
+    else:
+        db_ranges_elem = DatabaseRanges()
+        document.spreadsheet.addElement(db_ranges_elem)
+    db_ranges_elem.addElement(
+        DatabaseRange(
+            name="AllocationFilter",
+            targetrangeaddress=(
+                f"'Allocation'.A{_HEADER_ROW}:'Allocation'.{_FORMULA_COLS[-1]}{data_end_row}"
+            ),
+            displayfilterbuttons="true",
+        )
+    )
 
     # -------------------------------------------------------------------------
     # Section B: cluster exposure table
@@ -1381,7 +1539,12 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
         capped = any("CLUSTER_CAPPED" in r.get("flags", []) for r in cluster_rows)
         _ods_add_row(
             table,
-            [cluster, positions, gross, config.max_cluster_pct, "yes" if capped else "no"],
+            [
+                cluster, positions,
+                _pct_to_frac(gross), _pct_to_frac(config.max_cluster_pct),
+                "yes" if capped else "no",
+            ],
+            percent_cols={2, 3},
         )
 
     # -------------------------------------------------------------------------
@@ -1443,9 +1606,14 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
 
     # Selection summary
     total_signals = len(result.rows)
+    ev_total_pct = sum(
+        (row.get("ev_pct") or 0) / 100 * (row.get("alloc") or 0) / 100
+        for row in result.rows
+    ) * 100
     lines.append(
         f"Selected {result.selected_count} of {total_signals} signals. "
-        f"Gross exposure: {result.gross_exposure_pct:.1f}%."
+        f"Gross exposure: {result.gross_exposure_pct:.1f}%. "
+        f"EV total: {ev_total_pct:.2f}%."
     )
     lines.append("")
 

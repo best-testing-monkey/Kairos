@@ -18,6 +18,7 @@ from allocation import (
     compute_derived,
     render_formula,
     write_ods_sheet,
+    _sorted_for_sheet,
 )
 
 
@@ -186,8 +187,8 @@ class TestSheetStructure:
         assert _cell_value(_get_cell(rows[2], 4)) == 100.0  # shipped default
 
         assert _cell_value(_get_cell(rows[3], 2)) == "round_trip_cost_pct"
-        assert abs(_cell_value(_get_cell(rows[3], 3)) - config.round_trip_cost_pct) < 1e-9
-        assert abs(_cell_value(_get_cell(rows[3], 4)) - 0.15) < 1e-9
+        assert abs(_cell_value(_get_cell(rows[3], 3)) - config.round_trip_cost_pct / 100.0) < 1e-9
+        assert abs(_cell_value(_get_cell(rows[3], 4)) - 0.0015) < 1e-9
 
         assert _cell_value(_get_cell(rows[8], 2)) == "equity"
         equity_value = _cell_value(_get_cell(rows[8], 3))
@@ -207,6 +208,9 @@ class TestSheetStructure:
         assert _cell_value(_get_cell(rows[15], 0)) == "Enabled count"
         assert str(_cell_value(_get_cell(rows[15], 2))).startswith("of:=")
         assert _cell_value(_get_cell(rows[13], 3)) == render_formula("gross_scale", 14, "ods")
+        assert _cell_value(_get_cell(rows[16], 0)) == "EV total"
+        assert str(_cell_value(_get_cell(rows[16], 2))).startswith("of:=")
+        assert "P20:P400" in str(_cell_value(_get_cell(rows[16], 2)))
 
     def test_instruction_line(self, document):
         rows = _get_rows(document)
@@ -235,29 +239,31 @@ class TestHeaderRow:
         rows = _get_rows(document)
         header_cells = rows[18].getElementsByType(TableCell)
         assert _cell_value(header_cells[14]) == "EV net %"
-        assert _cell_value(header_cells[17]) == "Alloc %"
-        assert _cell_value(header_cells[19]) == "Flags"
-        assert _cell_value(header_cells[20]) == "Advised liq % (ignored)"
+        assert _cell_value(header_cells[15]) == "EV total"
+        assert _cell_value(header_cells[18]) == "Alloc %"
+        assert _cell_value(header_cells[20]) == "Flags"
+        assert _cell_value(header_cells[21]) == "Advised liq % (ignored)"
 
     def test_header_row_helper_columns(self, document):
         rows = _get_rows(document)
         header_cells = rows[18].getElementsByType(TableCell)
-        assert _cell_value(header_cells[23]) == "b"
-        assert _cell_value(header_cells[25]) == "shrink"
-        assert _cell_value(header_cells[35]) == "cluster_scale"
+        assert _cell_value(header_cells[24]) == "b"
+        assert _cell_value(header_cells[26]) == "shrink"
+        assert _cell_value(header_cells[36]) == "cluster_scale"
 
 
 class TestDataRows:
     """Checks for the per-candidate data rows."""
 
-    def test_data_rows_written_in_input_order(self, document, result):
+    def test_data_rows_written_in_sorted_order(self, document, result):
         rows = _get_rows(document)
-        assert _cell_value(_get_cell(rows[19], 0)) == result.rows[0]["ticker"]
-        assert _cell_value(_get_cell(rows[20], 0)) == result.rows[1]["ticker"]
+        sorted_rows = _sorted_for_sheet(result.rows)
+        assert _cell_value(_get_cell(rows[19], 0)) == sorted_rows[0]["ticker"]
+        assert _cell_value(_get_cell(rows[20], 0)) == sorted_rows[1]["ticker"]
 
     def test_static_values_from_result(self, document, result):
         rows = _get_rows(document)
-        row0 = result.rows[0]
+        row0 = _sorted_for_sheet(result.rows)[0]
         assert _cell_value(_get_cell(rows[19], 0)) == row0["ticker"]
         assert _cell_value(_get_cell(rows[19], 1)) == "metals_miners"
         assert _cell_value(_get_cell(rows[19], 2)) == row0["strategy"]
@@ -265,13 +271,13 @@ class TestDataRows:
         assert _cell_value(_get_cell(rows[19], 4)) == row0["entry"]
         assert _cell_value(_get_cell(rows[19], 5)) == row0["stop"]
         assert _cell_value(_get_cell(rows[19], 6)) == row0["target"]
-        assert abs(_cell_value(_get_cell(rows[19], 13)) - row0["ev_pct"]) < 1e-9
+        assert abs(_cell_value(_get_cell(rows[19], 13)) - row0["ev_pct"] / 100.0) < 1e-9
 
     def test_formula_cell_matches_render_formula(self, document):
         rows = _get_rows(document)
         assert _cell_value(_get_cell(rows[19], 14)) == render_formula("O", 20, "ods")
-        assert _cell_value(_get_cell(rows[19], 17)) == render_formula("R", 20, "ods")
-        assert _cell_value(_get_cell(rows[19], 35)) == render_formula("AJ", 20, "ods")
+        assert _cell_value(_get_cell(rows[19], 18)) == render_formula("S", 20, "ods")
+        assert _cell_value(_get_cell(rows[19], 36)) == render_formula("AK", 20, "ods")
 
 
 class TestClusterExposure:
@@ -291,6 +297,38 @@ class TestClusterExposure:
             for r in range(23, 25)
         }
         assert clusters == {"energy", "metals_miners"}
+
+
+class TestPercentStyle:
+    """Percent-labeled cells carry the KairosPercentCell style."""
+
+    def test_percent_cell_style_applied(self, document):
+        rows = _get_rows(document)
+        # N column (index 13) is a percent-labeled static value (EV raw %).
+        cell = _get_cell(rows[19], 13)
+        assert cell.getAttribute("stylename") == "KairosPercentCell"
+
+    def test_percent_style_defined_in_automaticstyles(self, document):
+        from odf.style import Style
+        style_names = {
+            s.getAttribute("name")
+            for s in document.automaticstyles.getElementsByType(Style)
+        }
+        assert "KairosPercentCell" in style_names
+
+
+class TestAutofilter:
+    """table:database-range with filter buttons over the header + data range."""
+
+    def test_database_range_present(self, document):
+        from odf.table import DatabaseRange
+
+        ranges = document.spreadsheet.getElementsByType(DatabaseRange)
+        assert ranges, "expected at least one table:database-range element"
+        target = ranges[0].getAttribute("targetrangeaddress")
+        assert "Allocation" in target
+        assert "A19" in target
+        assert ranges[0].getAttribute("displayfilterbuttons") == "true"
 
 
 class TestTypeValidation:

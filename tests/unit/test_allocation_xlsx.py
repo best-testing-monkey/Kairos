@@ -17,6 +17,7 @@ from allocation import (
     compute_derived,
     render_formula,
     write_xlsx_sheet,
+    _sorted_for_sheet,
 )
 
 
@@ -138,8 +139,8 @@ class TestSheetStructure:
         assert ws["E3"].value == 100  # shipped default
 
         assert ws["C4"].value == "round_trip_cost_pct"
-        assert abs(ws["D4"].value - config.round_trip_cost_pct) < 1e-9
-        assert abs(ws["E4"].value - 0.15) < 1e-9
+        assert abs(ws["D4"].value - config.round_trip_cost_pct / 100.0) < 1e-9
+        assert abs(ws["E4"].value - 0.0015) < 1e-9
 
         assert ws["C9"].value == "equity"
         assert ws["D9"].value == "" or ws["D9"].value is None
@@ -181,28 +182,30 @@ class TestHeaderRow:
     def test_header_row_formula_columns(self, workbook):
         ws = workbook["Allocation"]
         assert ws["O19"].value == "EV net %"
-        assert ws["R19"].value == "Alloc %"
-        assert ws["T19"].value == "Flags"
-        assert ws["U19"].value == "Advised liq % (ignored)"
+        assert ws["P19"].value == "EV total"
+        assert ws["S19"].value == "Alloc %"
+        assert ws["U19"].value == "Flags"
+        assert ws["V19"].value == "Advised liq % (ignored)"
 
     def test_header_row_helper_columns(self, workbook):
         ws = workbook["Allocation"]
-        assert ws["X19"].value == "b"
-        assert ws["Z19"].value == "shrink"
-        assert ws["AJ19"].value == "cluster_scale"
+        assert ws["Y19"].value == "b"
+        assert ws["AA19"].value == "shrink"
+        assert ws["AK19"].value == "cluster_scale"
 
 
 class TestDataRows:
     """Checks for the per-candidate data rows."""
 
-    def test_data_rows_written_in_input_order(self, workbook, result):
+    def test_data_rows_written_in_sorted_order(self, workbook, result):
         ws = workbook["Allocation"]
-        assert ws["A20"].value == result.rows[0]["ticker"]
-        assert ws["A21"].value == result.rows[1]["ticker"]
+        sorted_rows = _sorted_for_sheet(result.rows)
+        assert ws["A20"].value == sorted_rows[0]["ticker"]
+        assert ws["A21"].value == sorted_rows[1]["ticker"]
 
     def test_static_values_from_result(self, workbook, result):
         ws = workbook["Allocation"]
-        row0 = result.rows[0]
+        row0 = _sorted_for_sheet(result.rows)[0]
         assert ws["A20"].value == row0["ticker"]
         assert ws["B20"].value == "metals_miners"
         assert ws["C20"].value == row0["strategy"]
@@ -210,13 +213,13 @@ class TestDataRows:
         assert ws["E20"].value == row0["entry"]
         assert ws["F20"].value == row0["stop"]
         assert ws["G20"].value == row0["target"]
-        assert abs(ws["N20"].value - row0["ev_pct"]) < 1e-9
+        assert abs(ws["N20"].value - row0["ev_pct"] / 100.0) < 1e-9
 
     def test_formula_cell_matches_render_formula(self, workbook):
         ws = workbook["Allocation"]
         assert ws["O20"].value == render_formula("O", 20, "xlsx")
-        assert ws["R20"].value == render_formula("R", 20, "xlsx")
-        assert ws["AJ20"].value == render_formula("AJ", 20, "xlsx")
+        assert ws["S20"].value == render_formula("S", 20, "xlsx")
+        assert ws["AK20"].value == render_formula("AK", 20, "xlsx")
 
 
 class TestProtection:
@@ -307,29 +310,71 @@ class TestGrossCapScaling:
         )
         ws = wb["Allocation"]
 
-        # The gross_scale formula must reference AE and AJ via SUMPRODUCT, not
-        # just SUM(AJ). If it only summed AJ, the scale factor would be 1.
+        # The gross_scale formula must reference AF and AK via SUMPRODUCT, not
+        # just SUM(AK). If it only summed AK, the scale factor would be 1.
         gross_scale_formula = str(ws["D14"].value)
         assert "SUMPRODUCT" in gross_scale_formula
-        assert "AE$20:AE$400" in gross_scale_formula
-        assert "AJ$20:AJ$400" in gross_scale_formula
+        assert "AF$20:AF$400" in gross_scale_formula
+        assert "AK$20:AK$400" in gross_scale_formula
 
         # Simulate what the formula evaluates to with no cluster caps.
-        # AE = position-capped alloc %, AJ = 1 for each row.
-        ae_values = [min(compute_derived(c, config)["kelly_frac"] * 100, 15.0)
+        # AF = position-capped alloc %, AK = 1 for each row.
+        af_values = [min(compute_derived(c, config)["kelly_frac"] * 100, 15.0)
                      for c in candidates]
-        post_cluster_total = sum(ae_values)  # no cluster caps
+        post_cluster_total = sum(af_values)  # no cluster caps
         assert post_cluster_total > config.gross_cap_pct
         expected_scale = config.gross_cap_pct / post_cluster_total
         assert expected_scale < 1.0
 
-        # Each R cell should contain AE*AJ*gross_scale.
+        # Each S cell should contain AF*AK*gross_scale.
         for offset in range(len(candidates)):
             excel_row = 20 + offset
-            r_formula = str(ws.cell(row=excel_row, column=18).value)
-            assert f"AE{excel_row}" in r_formula
-            assert f"AJ{excel_row}" in r_formula
-            assert "$D$14" in r_formula
+            s_formula = str(ws.cell(row=excel_row, column=19).value)
+            assert f"AF{excel_row}" in s_formula
+            assert f"AK{excel_row}" in s_formula
+            assert "$D$14" in s_formula
+
+
+class TestPercentFormatting:
+    """Percent-labeled cells use 0-1 fraction values with 0.0% number format."""
+
+    def test_percent_number_format_on_data_columns(self, workbook):
+        ws = workbook["Allocation"]
+        for col in ("H", "I", "N", "O", "P", "S", "W", "X", "Z", "AE"):
+            assert ws[f"{col}20"].number_format == "0.0%"
+
+    def test_summary_cells_percent_format(self, workbook):
+        ws = workbook["Allocation"]
+        assert ws["C15"].number_format == "0.0%"
+        assert ws["C17"].number_format == "0.0%"
+
+
+class TestAutofilter:
+    """Autofilter is enabled over the header + data range."""
+
+    def test_auto_filter_ref(self, workbook, result):
+        ws = workbook["Allocation"]
+        data_end_row = 19 + len(result.rows)
+        assert ws.auto_filter.ref == f"A19:AK{data_end_row}"
+
+
+class TestEvTotalSummaryRow:
+    """Row 17 carries the EV total summary formula, percent-formatted."""
+
+    def test_ev_total_summary_row(self, workbook):
+        ws = workbook["Allocation"]
+        assert ws["A17"].value == "EV total"
+        assert str(ws["C17"].value).startswith("=")
+        assert "P20:P400" in str(ws["C17"].value)
+
+
+class TestEvTotalColumn:
+    """New 'EV total' column P: ev_pct fraction * alloc fraction."""
+
+    def test_ev_total_formula(self, workbook):
+        ws = workbook["Allocation"]
+        assert ws["P20"].value == render_formula("P", 20, "xlsx")
+        assert ws["P20"].value == "=N20*S20"
 
 
 if __name__ == "__main__":

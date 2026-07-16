@@ -130,7 +130,7 @@ class TestWriteMdSection:
         result = self._make_result()
         output = write_md_section(result, config)
 
-        assert "Selected 3 of 6 signals. Gross exposure: 18.8%." in output
+        assert "Selected 3 of 6 signals. Gross exposure: 18.8%. EV total: 0.00%." in output
 
     def test_table_header_and_selected_rows(self):
         """Markdown table contains expected header and all selected rows."""
@@ -194,7 +194,7 @@ class TestWriteMdSection:
 
 Config: n0=100 min_n=50 cost=0.15% kelly_mult=0.35 top_k=12 max_pos=15% max_cluster=25% gross_cap=100%
 
-Selected 3 of 6 signals. Gross exposure: 18.8%.
+Selected 3 of 6 signals. Gross exposure: 18.8%. EV total: 0.00%.
 
 | Ticker | Dir   | Strategy        |  Entry |   Stop | Target | EV net | Score | Alloc |
 | ------ | ----- | --------------- | ------ | ------ | ------ | ------ | ----- | ----- |
