@@ -181,23 +181,40 @@ def l2_uvm_reload(runner: Runner, dry_run: bool) -> None:
 
 # ── L3: full module reload (disruptive) ─────────────────────────────────────
 
+L3_UNIT_NAME = "kairos-gpu-l3.service"
+
+
 def l3_full_reload(runner: Runner, dry_run: bool) -> None:
-    log("L3: WARNING - this bounces display-manager and kills the X session")
-    log("L3: sudo systemctl stop display-manager")
-    if not dry_run:
-        runner.run(["sudo", "systemctl", "stop", "display-manager"], timeout=30)
+    # Stopping display-manager kills the graphical session, and if this
+    # process was launched from a terminal inside that session it dies with
+    # it. Run the whole stop->rmmod->modprobe->start sequence as a detached
+    # transient systemd unit so `systemctl start display-manager` executes
+    # even after this process is gone.
     modules = ["nvidia_uvm", "nvidia_drm", "nvidia_modeset", "nvidia"]
-    for m in modules:
-        log(f"L3: sudo rmmod {m}")
-        if not dry_run:
-            runner.run(["sudo", "rmmod", m], timeout=30)
-    for m in reversed(modules):
-        log(f"L3: sudo modprobe {m}")
-        if not dry_run:
-            runner.run(["sudo", "modprobe", m], timeout=30)
-    log("L3: sudo systemctl start display-manager")
-    if not dry_run:
-        runner.run(["sudo", "systemctl", "start", "display-manager"], timeout=30)
+    steps = ["systemctl stop display-manager", "sleep 3"]
+    steps += [f"rmmod {m} || true" for m in modules]
+    steps += [f"modprobe {m}" for m in reversed(modules)]
+    steps += ["systemctl start display-manager"]
+    script = "; ".join(steps)
+    log("L3: WARNING - this bounces display-manager and kills the graphical session")
+    log(f"L3: sudo systemd-run --collect --unit={L3_UNIT_NAME} /bin/bash -c '{script}'")
+    if dry_run:
+        return
+    result = runner.run(
+        ["sudo", "systemd-run", "--collect", f"--unit={L3_UNIT_NAME}",
+         "/bin/bash", "-c", script],
+        timeout=30,
+    )
+    if not result.ok:
+        log(f"L3: systemd-run failed rc={result.returncode}: {result.stderr.strip()}")
+        return
+    # If we survived (headless/TTY/ssh), wait for the detached unit to finish.
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        status = runner.run(["systemctl", "is-active", L3_UNIT_NAME], timeout=10)
+        if status.stdout.strip() not in ("active", "activating"):
+            break
+        time.sleep(3)
 
 
 # ── L4: reboot + resume ──────────────────────────────────────────────────────
