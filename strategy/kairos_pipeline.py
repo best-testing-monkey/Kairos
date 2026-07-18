@@ -164,6 +164,18 @@ CREATE TABLE IF NOT EXISTS model_results (
     model_path TEXT
 );
 
+CREATE TABLE IF NOT EXISTS disabled_strategies (
+    interval TEXT NOT NULL,
+    assets TEXT NOT NULL,           -- sorted CSV, normalized
+    strategy_name TEXT NOT NULL,
+    avg_pnl_per_trade REAL,
+    sharpe REAL,
+    signal_count INTEGER,
+    source_run_id INTEGER,
+    updated_at TEXT,
+    PRIMARY KEY (interval, assets, strategy_name)
+);
+
 CREATE TABLE IF NOT EXISTS viability_report (
     run_id INTEGER,
     strategy_name TEXT,
@@ -259,6 +271,64 @@ def insert_model_row(conn, run_id, row: dict):
          row.get("signal_count"), row.get("win_rate"), row.get("avg_pnl_per_trade"),
          row.get("assets"), row.get("interval"), row.get("backtest_period"), row.get("model_path")),
     )
+
+
+def refresh_disabled_strategies(conn, run_id, rows, interval, assets, min_signals=5):
+    """
+    Replace the disabled_strategies rows for one (interval, assets) profile
+    with the current criterion applied to `rows` (the same oracle_results row
+    dicts that were just inserted for this run).
+
+    A strategy is disabled for this profile if its `avg_pnl_per_trade` is
+    negative AND its `signal_count` is >= `min_signals` (avoids disabling on
+    noise from a handful of trades). This is a full replace, not a merge: any
+    strategy previously disabled for this profile that no longer meets the
+    criterion (positive avg_pnl_per_trade, too few signals, or simply absent
+    from `rows`) is dropped from the table, i.e. re-enabled.
+
+    `assets` is normalized to a sorted CSV key internally - callers do not
+    need to pre-sort it.
+
+    Returns (newly_disabled, re_enabled): two sorted lists of strategy names -
+    newly_disabled = names in the new set but not the old set, re_enabled =
+    names in the old set but not the new set.
+    """
+    assets_key = ",".join(sorted(assets))
+
+    old_set = {
+        r[0] for r in conn.execute(
+            "SELECT strategy_name FROM disabled_strategies WHERE interval=? AND assets=?",
+            (interval, assets_key),
+        ).fetchall()
+    }
+
+    conn.execute(
+        "DELETE FROM disabled_strategies WHERE interval=? AND assets=?",
+        (interval, assets_key),
+    )
+
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    new_set = set()
+    for row in rows:
+        avg_pnl = row.get("avg_pnl_per_trade")
+        signal_count = row.get("signal_count") or 0
+        if avg_pnl is not None and avg_pnl < 0 and signal_count >= min_signals:
+            name = row["strategy_name"]
+            new_set.add(name)
+            conn.execute(
+                """INSERT INTO disabled_strategies
+                   (interval, assets, strategy_name, avg_pnl_per_trade, sharpe,
+                    signal_count, source_run_id, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (interval, assets_key, name, avg_pnl, row.get("sharpe"),
+                 signal_count, run_id, updated_at),
+            )
+
+    conn.commit()
+
+    newly_disabled = sorted(new_set - old_set)
+    re_enabled = sorted(old_set - new_set)
+    return newly_disabled, re_enabled
 
 
 def dump_csv(table: str, rows: list, stage: str):
@@ -720,7 +790,7 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
 
 def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
                              no_prediction=False, model_path=None, pred_samples=100,
-                             extra_env=None):
+                             extra_env=None, no_disabled_filter=False):
     """
     Invoke strategy/kairos_strategies.py as a subprocess and return the parsed
     JSON export (summary, strategy_rankings, shadow_performance).
@@ -730,6 +800,13 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
     no_prediction=False, model_path=<checkpoint>). kairos_strategies.py
     already exposes a `--model` flag for a local finetuned checkpoint path,
     so stage 5 reuses it rather than inventing a new `--model_path` flag.
+
+    `no_disabled_filter=True` appends `--no_disabled_filter`, bypassing the
+    DB/class disabled-strategy resolution so every strategy is evaluated.
+    The oracle stage (stage 3) always passes this - disabled strategies must
+    still be evaluated by the oracle so they can be re-enabled once their
+    numbers improve; base/finetuned (stages 4/5) never do, since they should
+    keep skipping strategies that are already known to be disabled.
     """
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         tmp_path = tmp.name
@@ -746,6 +823,8 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
         cmd.append("--no-prediction")
     if model_path:
         cmd.extend(["--model", model_path])
+    if no_disabled_filter:
+        cmd.append("--no_disabled_filter")
 
     env = None
     if extra_env:
@@ -800,13 +879,15 @@ def _rows_from_export(payload: dict, assets, interval, backtest_period, stage: s
     return rows
 
 
-def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100,
+                      disable_min_signals=5):
     run_id = start_run(conn, "oracle", interval, {
         "assets": assets, "backtest_period": backtest_period, "pred_samples": pred_samples,
     })
     payload = run_backtest_subprocess(
         assets, interval=interval, backtest_period=backtest_period,
         no_prediction=True, model_path=None, pred_samples=pred_samples,
+        no_disabled_filter=True,
     )
     rows = _rows_from_export(payload, assets, interval, backtest_period, stage="oracle")
     for row in rows:
@@ -829,6 +910,28 @@ def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_sam
     print(f"Strategies with negative Sharpe ({len(negative)}):")
     for r in negative:
         print(f"  {r['strategy_name']:<28} sharpe={r['sharpe']:.3f} n={r['signal_count']}")
+
+    newly_disabled, re_enabled = refresh_disabled_strategies(
+        conn, run_id, rows, interval, assets, min_signals=disable_min_signals,
+    )
+    print(
+        f"[disabled] +{len(newly_disabled)} newly disabled: {newly_disabled}; "
+        f"{len(re_enabled)} re-enabled: {re_enabled}"
+    )
+    current_rows = [
+        dict(zip(
+            ("interval", "assets", "strategy_name", "avg_pnl_per_trade", "sharpe",
+             "signal_count", "source_run_id", "updated_at"),
+            r,
+        ))
+        for r in conn.execute(
+            "SELECT interval, assets, strategy_name, avg_pnl_per_trade, sharpe, "
+            "signal_count, source_run_id, updated_at FROM disabled_strategies "
+            "WHERE interval=? AND assets=?",
+            (interval, ",".join(sorted(assets))),
+        ).fetchall()
+    ]
+    dump_csv("disabled_strategies", current_rows, "oracle_disabled_strategies")
     return run_id
 
 
@@ -872,6 +975,87 @@ def run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
     else:
         print(f"\nStage {stage} done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
     return run_id
+
+
+def run_stage_rebuild_disabled(conn, min_signals=5):
+    """
+    Recompute the ENTIRE disabled_strategies table from scratch, DB-wide.
+
+    Unlike run_stage_oracle's incremental refresh (scoped to the single
+    profile it just tested), this walks every (interval, assets) profile
+    present in oracle_results and rebuilds its disabled set from the most
+    recent oracle run for that profile - the same "latest row per key"
+    correlated-subquery pattern used by build_viability_report, without the
+    interval/backtest_period WHERE filter (this rebuilds across ALL of them).
+    Useful after manual DB edits, a criterion change (different
+    --disable_min_signals), or to reconcile disabled_strategies with data
+    written by direct (non --stage auto) CLI oracle invocations.
+
+    Takes no --assets/--group_id - it operates DB-wide, grouping the latest
+    oracle_results rows by (interval, assets) and calling
+    refresh_disabled_strategies once per profile.
+
+    Returns (profiles_processed, total_disabled) for the CLI summary print.
+    """
+    latest_q = """
+        SELECT strategy_name, assets, interval, backtest_period,
+               avg_pnl_per_trade, sharpe, signal_count, run_id
+        FROM oracle_results
+        WHERE stage = 'oracle'
+        AND run_id = (
+            SELECT MAX(run_id) FROM oracle_results o2
+            WHERE o2.strategy_name = oracle_results.strategy_name
+              AND o2.assets = oracle_results.assets
+              AND o2.interval = oracle_results.interval
+              AND o2.backtest_period = oracle_results.backtest_period
+              AND o2.stage = 'oracle'
+        )
+    """
+    latest_rows = conn.execute(latest_q).fetchall()
+
+    # disabled_strategies has no backtest_period column, so within a
+    # (interval, assets, strategy_name) triple we keep only the row from the
+    # most recent run_id across all backtest_periods - "latest run wins".
+    # Normalize `assets` to a sorted key here (not just inside
+    # refresh_disabled_strategies): oracle_results.assets may hold both sort
+    # orderings of the same profile (e.g. direct CLI calls that didn't sort
+    # --assets), and this is precisely the stage meant to reconcile that -
+    # without normalizing before grouping, the two literal orderings would be
+    # treated as separate profiles, each independently DELETE+INSERTing into
+    # the same normalized disabled_strategies row, silently discarding
+    # whichever ordering's contribution was processed first.
+    best = {}
+    for strategy_name, assets, interval, backtest_period, avg_pnl, sharpe, signal_count, run_id in latest_rows:
+        assets_norm = ",".join(sorted(assets.split(",")))
+        key = (interval, assets_norm, strategy_name)
+        if key not in best or run_id > best[key]["run_id"]:
+            best[key] = {
+                "strategy_name": strategy_name, "avg_pnl_per_trade": avg_pnl,
+                "sharpe": sharpe, "signal_count": signal_count, "run_id": run_id,
+            }
+
+    profiles = {}
+    for (interval, assets, strategy_name), row in best.items():
+        profiles.setdefault((interval, assets), []).append(row)
+
+    total_disabled = 0
+    for (interval, assets_key), rows in profiles.items():
+        assets_list = assets_key.split(",")
+        source_run_id = max((r["run_id"] for r in rows), default=None)
+        newly_disabled, re_enabled = refresh_disabled_strategies(
+            conn, source_run_id, rows, interval, assets_list, min_signals=min_signals,
+        )
+        n = conn.execute(
+            "SELECT COUNT(*) FROM disabled_strategies WHERE interval=? AND assets=?",
+            (interval, ",".join(sorted(assets_list))),
+        ).fetchone()[0]
+        total_disabled += n
+        print(f"  [{interval}] {assets_key}: +{len(newly_disabled)} disabled, "
+              f"{len(re_enabled)} re-enabled (now {n} disabled)")
+
+    print(f"\nrebuild_disabled done: {len(profiles)} profiles processed, "
+          f"{total_disabled} strategies disabled across all profiles.")
+    return len(profiles), total_disabled
 
 
 # ── Viability report ─────────────────────────────────────────────────────────
@@ -1116,7 +1300,7 @@ def _print_report_summary(df, intervals):
 
 def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
                    pred_samples=100, min_sharpe=0.0, min_signals=3, force=False,
-                   skip_universe=False, min_abs_corr=None):
+                   skip_universe=False, min_abs_corr=None, disable_min_signals=5):
     """
     Chain universe → correlation → per-group oracle → per-group base for each interval.
 
@@ -1150,7 +1334,7 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
         return _run_stage_auto_body(
             conn, intervals, backtest_period, asset_class_filter, pred_samples,
             min_sharpe, min_signals, force, skip_universe, min_abs_corr,
-            auto_run_id, failures, extra_env,
+            auto_run_id, failures, extra_env, disable_min_signals,
         )
     finally:
         import shutil
@@ -1159,7 +1343,8 @@ def run_stage_auto(conn, intervals, backtest_period, asset_class_filter=None,
 
 def _run_stage_auto_body(conn, intervals, backtest_period, asset_class_filter,
                           pred_samples, min_sharpe, min_signals, force,
-                          skip_universe, min_abs_corr, auto_run_id, failures, extra_env):
+                          skip_universe, min_abs_corr, auto_run_id, failures, extra_env,
+                          disable_min_signals=5):
     for interval in intervals:
         print(f"\n=== Auto stage for interval {interval} ===")
 
@@ -1226,7 +1411,8 @@ def _run_stage_auto_body(conn, intervals, backtest_period, asset_class_filter,
                 try:
                     oracle_run_id = run_stage_oracle(conn, assets, interval=interval,
                                                      backtest_period=backtest_period,
-                                                     pred_samples=pred_samples)
+                                                     pred_samples=pred_samples,
+                                                     disable_min_signals=disable_min_signals)
                     print(f"    [done] oracle (run_id={oracle_run_id})")
                 except Exception as exc:
                     failures.append({"group_id": group_id, "assets": assets_key,
@@ -1322,7 +1508,8 @@ def _build_parser():
     """Build and return the argparse parser (extracted for testability)."""
     parser = argparse.ArgumentParser(description="Kairos staged asset-discovery pipeline")
     parser.add_argument("--stage", required=True,
-                         choices=["universe", "correlation", "oracle", "base", "finetuned", "auto"])
+                         choices=["universe", "correlation", "oracle", "base", "finetuned", "auto",
+                                  "rebuild_disabled"])
     parser.add_argument("--interval", default="1d")
     parser.add_argument("--intervals", nargs="+", default=None,
                          help="Bar intervals for --stage auto (e.g. 1d 1h)")
@@ -1341,6 +1528,9 @@ def _build_parser():
                          help="Minimum Sharpe for viability (--stage auto only)")
     parser.add_argument("--min_signals", type=int, default=3,
                          help="Minimum signal count for viability (--stage auto only)")
+    parser.add_argument("--disable_min_signals", type=int, default=5,
+                         help="Minimum oracle signal_count for the disabled_strategies criterion "
+                              "(--stage oracle/auto/rebuild_disabled only)")
     parser.add_argument("--force", action="store_true",
                          help="Re-run completed stages (--stage auto only)")
     parser.add_argument("--skip_universe", action="store_true",
@@ -1382,6 +1572,10 @@ def main(argv=None):
     if args.stage not in ("correlation", "auto") and args.min_abs_corr is not None:
         parser.error("--min_abs_corr is only valid with --stage correlation or --stage auto")
 
+    disable_min_signals_flag = "--disable_min_signals" in actual_argv
+    if args.stage not in ("oracle", "auto", "rebuild_disabled") and disable_min_signals_flag:
+        parser.error("--disable_min_signals is only valid with --stage oracle, auto, or rebuild_disabled")
+
     try:
         min_abs_corr = _parse_min_abs_corr(args.min_abs_corr)
     except ValueError as exc:
@@ -1408,7 +1602,7 @@ def main(argv=None):
                           asset_class_filter=args.asset_class, pred_samples=args.pred_samples,
                           min_sharpe=args.min_sharpe, min_signals=args.min_signals,
                           force=args.force, skip_universe=args.skip_universe,
-                          min_abs_corr=min_abs_corr)
+                          min_abs_corr=min_abs_corr, disable_min_signals=args.disable_min_signals)
 
     elif args.stage == "universe":
         run_stage_universe(conn, interval=args.interval)
@@ -1422,7 +1616,8 @@ def main(argv=None):
         if not assets:
             raise SystemExit("--stage oracle requires --assets SYM... or --group_id N")
         run_stage_oracle(conn, assets, interval=args.interval,
-                          backtest_period=args.backtest_period, pred_samples=args.pred_samples)
+                          backtest_period=args.backtest_period, pred_samples=args.pred_samples,
+                          disable_min_signals=args.disable_min_signals)
     elif args.stage in ("base", "finetuned"):
         assets = args.assets
         if args.group_id is not None:
@@ -1432,6 +1627,8 @@ def main(argv=None):
         run_stage_model(conn, args.stage, assets, interval=args.interval,
                          backtest_period=args.backtest_period, pred_samples=args.pred_samples,
                          model_path=args.model_path if args.stage == "finetuned" else None)
+    elif args.stage == "rebuild_disabled":
+        run_stage_rebuild_disabled(conn, min_signals=args.disable_min_signals)
 
     conn.close()
 

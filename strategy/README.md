@@ -334,7 +334,10 @@ No external trading libraries. No GPU required.
 See `PIPELINE.md` for the asset-discovery pipeline (`kairos_pipeline.py`)
 that screens candidate symbols, groups correlated assets for the
 `cross_asset_*` strategies, and runs oracle/base/finetuned backtests to
-populate `_DISABLED_BY_PROFILE`.
+auto-maintain the `disabled_strategies` DB table (a strategy is disabled per
+`(interval, assets)` profile when oracle `avg_pnl_per_trade < 0` and
+`signal_count >= --disable_min_signals`, and automatically re-enabled once
+it turns profitable again - see PIPELINE.md's "Auto-disabled strategies").
 
 ---
 

@@ -643,6 +643,193 @@ class TestViabilityReport:
         assert table_rows == len(df)
 
 
+class TestRefreshDisabledStrategies:
+    """Tests for refresh_disabled_strategies (disabled_strategies table
+    maintenance) in kairos_pipeline.py."""
+
+    def _row(self, strategy_name, avg_pnl_per_trade, signal_count, sharpe=-1.0):
+        return {
+            "strategy_name": strategy_name,
+            "sharpe": sharpe,
+            "signal_count": signal_count,
+            "avg_pnl_per_trade": avg_pnl_per_trade,
+        }
+
+    def test_negative_pnl_and_enough_signals_disables(self, temp_db):
+        from kairos_pipeline import refresh_disabled_strategies
+        rows = [self._row("bad_strat", -0.01, signal_count=10)]
+        newly_disabled, re_enabled = refresh_disabled_strategies(
+            temp_db, run_id=1, rows=rows, interval="1d", assets=["BTC-USD"], min_signals=5,
+        )
+        assert newly_disabled == ["bad_strat"]
+        assert re_enabled == []
+        stored = temp_db.execute(
+            "SELECT strategy_name FROM disabled_strategies WHERE interval=? AND assets=?",
+            ("1d", "BTC-USD"),
+        ).fetchall()
+        assert [r[0] for r in stored] == ["bad_strat"]
+
+    def test_positive_pnl_excluded_even_with_high_signal_count(self, temp_db):
+        from kairos_pipeline import refresh_disabled_strategies
+        rows = [self._row("good_strat", 0.02, signal_count=100)]
+        newly_disabled, re_enabled = refresh_disabled_strategies(
+            temp_db, run_id=1, rows=rows, interval="1d", assets=["BTC-USD"], min_signals=5,
+        )
+        assert newly_disabled == []
+        count = temp_db.execute("SELECT COUNT(*) FROM disabled_strategies").fetchone()[0]
+        assert count == 0
+
+    def test_negative_pnl_but_too_few_signals_excluded(self, temp_db):
+        from kairos_pipeline import refresh_disabled_strategies
+        rows = [self._row("thin_strat", -0.05, signal_count=2)]
+        newly_disabled, re_enabled = refresh_disabled_strategies(
+            temp_db, run_id=1, rows=rows, interval="1d", assets=["BTC-USD"], min_signals=5,
+        )
+        assert newly_disabled == []
+        count = temp_db.execute("SELECT COUNT(*) FROM disabled_strategies").fetchone()[0]
+        assert count == 0
+
+    def test_full_refresh_re_enables_strategy_no_longer_qualifying(self, temp_db):
+        from kairos_pipeline import refresh_disabled_strategies
+        # First refresh: disable "flaky_strat".
+        rows_1 = [self._row("flaky_strat", -0.02, signal_count=10)]
+        refresh_disabled_strategies(temp_db, 1, rows_1, "1d", ["BTC-USD"], min_signals=5)
+        assert temp_db.execute(
+            "SELECT COUNT(*) FROM disabled_strategies WHERE strategy_name='flaky_strat'"
+        ).fetchone()[0] == 1
+
+        # Second refresh: now positive avg_pnl -> should be re-enabled (removed).
+        rows_2 = [self._row("flaky_strat", 0.01, signal_count=10)]
+        newly_disabled, re_enabled = refresh_disabled_strategies(
+            temp_db, 2, rows_2, "1d", ["BTC-USD"], min_signals=5,
+        )
+        assert newly_disabled == []
+        assert re_enabled == ["flaky_strat"]
+        assert temp_db.execute(
+            "SELECT COUNT(*) FROM disabled_strategies WHERE strategy_name='flaky_strat'"
+        ).fetchone()[0] == 0
+
+    def test_assets_normalization_unsorted_input(self, temp_db):
+        from kairos_pipeline import refresh_disabled_strategies
+        rows = [self._row("bad_strat", -0.01, signal_count=10)]
+        refresh_disabled_strategies(
+            temp_db, 1, rows, "1d", ["ETH-USD", "BTC-USD"], min_signals=5,
+        )
+        stored = temp_db.execute(
+            "SELECT assets FROM disabled_strategies WHERE strategy_name='bad_strat'"
+        ).fetchone()
+        assert stored[0] == "BTC-USD,ETH-USD"
+
+    def test_returned_diff_lists_disable_and_re_enable_together(self, temp_db):
+        from kairos_pipeline import refresh_disabled_strategies
+        # Seed an initial disabled set: "old_bad" disabled, "old_good" not.
+        rows_initial = [
+            self._row("old_bad", -0.03, signal_count=10),
+            self._row("old_good", 0.02, signal_count=10),
+        ]
+        refresh_disabled_strategies(temp_db, 1, rows_initial, "1d", ["BTC-USD"], min_signals=5)
+
+        # New refresh: "old_bad" turns positive (re-enabled), "new_bad" turns
+        # negative (newly disabled).
+        rows_new = [
+            self._row("old_bad", 0.01, signal_count=10),
+            self._row("new_bad", -0.04, signal_count=10),
+        ]
+        newly_disabled, re_enabled = refresh_disabled_strategies(
+            temp_db, 2, rows_new, "1d", ["BTC-USD"], min_signals=5,
+        )
+        assert newly_disabled == ["new_bad"]
+        assert re_enabled == ["old_bad"]
+
+
+class TestRunStageOracleDisabledIntegration:
+    """Integration tests: run_stage_oracle's disabled_strategies refresh, and
+    the no_disabled_filter flag reaching run_backtest_subprocess."""
+
+    def _canned_payload(self):
+        return {
+            "summary": {},
+            "strategy_rankings": [["bad_strat", -1.0], ["good_strat", 1.0]],
+            "shadow_performance": {
+                "bad_strat": {
+                    "sharpe": -1.0, "signal_count": 10,
+                    "pnl_list": [-0.01] * 6 + [0.002] * 4,  # negative avg
+                },
+                "good_strat": {
+                    "sharpe": 1.0, "signal_count": 10,
+                    "pnl_list": [0.01] * 10,
+                },
+            },
+        }
+
+    def test_run_stage_oracle_populates_disabled_strategies(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        from kairos_pipeline import run_stage_oracle
+        monkeypatch.setattr(kairos_pipeline, "RESULTS_DIR", str(tmp_path))
+
+        with patch("kairos_pipeline.run_backtest_subprocess", return_value=self._canned_payload()) as mock_sub:
+            run_stage_oracle(temp_db, ["BTC-USD", "ETH-USD"], interval="1d",
+                              backtest_period="6m", disable_min_signals=5)
+
+        rows = temp_db.execute(
+            "SELECT strategy_name FROM disabled_strategies WHERE interval='1d' AND assets='BTC-USD,ETH-USD'"
+        ).fetchall()
+        names = {r[0] for r in rows}
+        assert names == {"bad_strat"}
+
+        mock_sub.assert_called_once()
+        _, call_kwargs = mock_sub.call_args
+        assert call_kwargs.get("no_disabled_filter") is True
+
+    def test_run_stage_model_does_not_pass_no_disabled_filter(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        from kairos_pipeline import run_stage_model
+        monkeypatch.setattr(kairos_pipeline, "RESULTS_DIR", str(tmp_path))
+
+        with patch("kairos_pipeline.run_backtest_subprocess", return_value=self._canned_payload()) as mock_sub:
+            run_stage_model(temp_db, "base", ["BTC-USD", "ETH-USD"], interval="1d", backtest_period="6m")
+
+        mock_sub.assert_called_once()
+        _, call_kwargs = mock_sub.call_args
+        assert call_kwargs.get("no_disabled_filter", False) is not True
+
+
+class TestRebuildDisabledStage:
+    """Tests for run_stage_rebuild_disabled: DB-wide rebuild of
+    disabled_strategies from the latest oracle_results row per profile."""
+
+    def test_rebuild_uses_latest_run_only(self, temp_db):
+        from kairos_pipeline import run_stage_rebuild_disabled
+
+        # Earlier run: strategy_name negative (would be disabled).
+        run_id_1 = start_run(temp_db, "oracle", "1d", {})
+        insert_oracle_row(temp_db, run_id_1, {
+            "stage": "oracle", "strategy_name": "flip_strat", "sharpe": -1.0,
+            "signal_count": 10, "win_rate": 0.4, "avg_pnl_per_trade": -0.02,
+            "assets": "BTC-USD,ETH-USD", "interval": "1d", "backtest_period": "6m",
+        })
+
+        # Later run (higher run_id): same profile/strategy now positive.
+        run_id_2 = start_run(temp_db, "oracle", "1d", {})
+        assert run_id_2 > run_id_1
+        insert_oracle_row(temp_db, run_id_2, {
+            "stage": "oracle", "strategy_name": "flip_strat", "sharpe": 1.0,
+            "signal_count": 10, "win_rate": 0.6, "avg_pnl_per_trade": 0.02,
+            "assets": "BTC-USD,ETH-USD", "interval": "1d", "backtest_period": "6m",
+        })
+        temp_db.commit()
+
+        run_stage_rebuild_disabled(temp_db, min_signals=5)
+
+        # Only the latest run's (positive) numbers should be reflected -
+        # "flip_strat" must NOT be disabled.
+        rows = temp_db.execute(
+            "SELECT strategy_name FROM disabled_strategies WHERE interval='1d' AND assets='BTC-USD,ETH-USD'"
+        ).fetchall()
+        names = {r[0] for r in rows}
+        assert "flip_strat" not in names
+
+
 class TestRunStageAuto:
     """Tests for run_stage_auto chaining orchestration."""
 
@@ -693,7 +880,7 @@ class TestRunStageAuto:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             call_log.append(("oracle", tuple(sorted(assets)), interval))
             run_id = start_run(conn, "oracle", interval,
                              {"assets": assets, "backtest_period": backtest_period})
@@ -769,7 +956,7 @@ class TestRunStageAuto:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             call_log.append(("oracle", interval))
             run_id = start_run(conn, "oracle", interval, {})
             assets_key = ",".join(sorted(assets))
@@ -838,7 +1025,7 @@ class TestRunStageAuto:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             call_log.append(("oracle", tuple(sorted(assets))))
             run_id = start_run(conn, "oracle", interval, {})
             return run_id
@@ -899,7 +1086,7 @@ class TestRunStageAuto:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             call_log.append(("oracle", tuple(sorted(assets))))
             run_id = start_run(conn, "oracle", interval, {})
             return run_id
@@ -943,7 +1130,7 @@ class TestRunStageAuto:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             assets_tuple = tuple(sorted(assets))
             call_log.append(("oracle", assets_tuple))
             # Raise error for first group only
@@ -996,7 +1183,7 @@ class TestRunStageAuto:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             call_log.append(("oracle", tuple(sorted(assets))))
             run_id = start_run(conn, "oracle", interval, {})
             return run_id
@@ -1044,7 +1231,7 @@ class TestRunStageAuto:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             run_id = start_run(conn, "oracle", interval, {})
             return run_id
 
@@ -1094,7 +1281,7 @@ class TestRunStageAuto:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             call_log.append(("oracle",))
             run_id = start_run(conn, "oracle", interval, {})
             return run_id
@@ -1141,7 +1328,7 @@ class TestRunStageAuto:
             run_id = start_run(conn, "correlation", interval, {})
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             call_log.append(("oracle",))
             run_id = start_run(conn, "oracle", interval, {})
             return run_id
@@ -2022,7 +2209,7 @@ class TestRunStageAutoSingletonGroup:
             temp_db.commit()
             return run_id
 
-        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+        def mock_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100, **kwargs):
             call_log.append(("oracle", list(assets), interval))
             run_id = start_run(conn, "oracle", interval, {"assets": assets, "backtest_period": backtest_period})
             for name, perf in self._mock_payload()["shadow_performance"].items():

@@ -37,9 +37,12 @@ For the full flag reference (`--min_ev_pct`, `--pred_samples`, `--all`,
   likely to bind relative to round-trip trading costs. Check the `## Skipped`
   footer if the report looks thin.
 - **Disabled-strategy set differs from `1d`:** `resolve_disabled_strategies`
-  (`strategy/kairos_strategies.py:693`) resolves a different disabled set per
-  `(interval, assets)` profile, so don't assume the same strategies that fire
-  on daily bars will fire hourly, or vice versa.
+  resolves a different disabled set per `(interval, assets)` profile —
+  DB-backed via the auto-maintained `disabled_strategies` SQLite table for
+  profiles that have been oracle-tested, falling back to the hand-curated
+  `_DISABLED_BY_CLASS` table only for profiles that haven't — so don't
+  assume the same strategies that fire on daily bars will fire hourly, or
+  vice versa.
 - **This is the strongest case for automation in the whole system:** running
   this by hand every hour is impractical. If you automate one thing first,
   automate this one (see below).

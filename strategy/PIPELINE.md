@@ -44,6 +44,11 @@ table in the SQLite DB (e.g. `correlation` reads `MAX(run_id)` from
 after which stages 3-5 can be re-run repeatedly with different
 `--assets`/`--group_id`/`--interval` combinations without re-running 1-2.
 
+Two additional stage modes sit outside this 1-5 chain: `auto` (chains stages
+1-4 automatically per interval, see "Stage auto" below) and
+`rebuild_disabled` (DB-maintenance only - recomputes the `disabled_strategies`
+table from existing `oracle_results`, see "Auto-disabled strategies" below).
+
 ## 2. Storage
 
 ### SQLite: `data/pipeline_results.db`
@@ -78,6 +83,13 @@ connection by `get_connection()`. Tables (columns as declared in `SCHEMA` in
 `run_id`, `stage` (`"base"` or `"finetuned"`), `strategy_name`, `sharpe`,
 `signal_count`, `win_rate`, `avg_pnl_per_trade`, `assets`, `interval`,
 `backtest_period`, `model_path`.
+
+**`disabled_strategies`** - one row per currently-disabled strategy per
+`(interval, assets)` profile: `interval`, `assets` (sorted CSV, normalized),
+`strategy_name`, `avg_pnl_per_trade`, `sharpe`, `signal_count`,
+`source_run_id`, `updated_at`, with `PRIMARY KEY (interval, assets,
+strategy_name)`. Fully replaced (deleted + re-inserted) per profile on every
+`oracle` run - see "Auto-disabled strategies" below.
 
 ### CSV dumps: `results/`
 
@@ -173,9 +185,16 @@ Flags (defaults from `kairos_pipeline.py`'s argparse):
 - `--interval` (default `"1d"`)
 - `--backtest_period` (default `"6m"`)
 - `--pred_samples` (int, default `100`)
+- `--disable_min_signals` (int, default `5`) - minimum oracle `signal_count`
+  for the `disabled_strategies` auto-disable criterion (also valid with
+  `--stage auto`/`--stage rebuild_disabled`) - see "Auto-disabled
+  strategies" below.
 
 This stage always runs `kairos_strategies.py` with `--no-prediction`, so it
-never touches the GPU or downloads a model - it is safe to run anywhere.
+never touches the GPU or downloads a model - it is safe to run anywhere. It
+also always passes `--no_disabled_filter`, so every strategy is scored on
+every oracle run regardless of its current disabled status - see
+"Auto-disabled strategies" below for why.
 
 Examples:
 
@@ -248,6 +267,33 @@ uv run ./strategy/kairos_pipeline.py --stage finetuned --assets BTC-USD ETH-USD 
     --model_path /path/to/finetuned_kronos_checkpoint
 ```
 
+### Stage: `rebuild_disabled` (DB maintenance, no backtest)
+
+```
+uv run ./strategy/kairos_pipeline.py --stage rebuild_disabled \
+    [--disable_min_signals N]
+```
+
+Recomputes the *entire* `disabled_strategies` table, DB-wide, from the
+latest `oracle_results` row per `(strategy_name, assets, interval,
+backtest_period)` profile - no `--assets`/`--interval`/`--backtest_period`
+needed, it walks every profile present in `oracle_results`. Runs no
+backtests and touches no GPU. Use it after changing `--disable_min_signals`
+(to re-apply the new threshold to already-collected oracle data) or to
+backfill/reconcile the table without waiting for the next scheduled oracle
+run. Applies the same criterion as `refresh_disabled_strategies()` (see
+"Auto-disabled strategies" above) once per profile, and prints a per-profile
+`+N disabled, M re-enabled (now K disabled)` line plus a final
+`rebuild_disabled done: P profiles processed, T strategies disabled across
+all profiles` summary.
+
+- `--disable_min_signals` (int, default `5`) - same flag and meaning as
+  `oracle`/`auto`.
+
+```
+uv run ./strategy/kairos_pipeline.py --stage rebuild_disabled --disable_min_signals 10
+```
+
 ## Stage auto: Unified discovery pipeline
 
 For a complete discovery cycle in one command, use `--stage auto` to chain stages 1–4
@@ -273,6 +319,7 @@ uv run ./strategy/kairos_pipeline.py --stage auto \
 | `--force` | `FLAG` | off | Force re-run of oracle/base, even if results already exist for an (assets, interval, backtest_period) key. |
 | `--skip_universe` | `FLAG` | off | Skip stage 1; reuse the latest existing universe/correlation run per interval. Useful after a crash. |
 | `--report_only` | `FLAG` | off | Skip stages 1–4 entirely; rebuild the viability report from existing DB rows matching the other flags. |
+| `--disable_min_signals` | `INT` | `5` | Minimum oracle `signal_count` for the `disabled_strategies` auto-disable criterion - see "Auto-disabled strategies" below. |
 
 ### How stage auto works
 
@@ -347,7 +394,49 @@ After all intervals and groups are processed (or immediately with `--report_only
   Any row with NaN on either side defaults to `viable=False`.
 - **signals_per_week:** Computed as `base_signals / (backtest_period_in_weeks)`, where `6m` ≈ 26.1 weeks, `1m` ≈ 4.35 weeks, etc. Falls back to `oracle_signals` if base is NaN.
 - **Sort:** Viable strategies first, then by `base_sharpe` descending.
-- **Disabled strategies:** The report covers *enabled* strategies only. Disabled strategies (as per `resolve_disabled_strategies` in `kairos_strategies.py`) never appear in the results tables and thus never appear in the report. The printed summary line (e.g., "built 42, disabled 5, evaluating 37") shows the excluded count.
+- **Disabled strategies:** Since `oracle` evaluates the full strategy suite regardless of disabled status (see "Auto-disabled strategies" below), a disabled strategy still gets an `oracle_results` row and thus a row in this report - just a non-viable one, since `base`/`finetuned` skip disabled strategies and leave the `base_*` columns `NaN`. The printed summary line at the end of a `base`/`finetuned` run (e.g., "built 42, disabled 5, evaluating 37") shows how many strategies *that* stage excluded.
+
+### Auto-disabled strategies
+
+The `oracle` stage auto-maintains the `disabled_strategies` table (see
+"Storage" above), which replaces the old hand-edited `_DISABLED_BY_PROFILE`
+dict entirely:
+
+- **Criteria:** a strategy is disabled for its exact `(interval,
+  sorted-assets)` profile when its oracle `avg_pnl_per_trade < 0` **and**
+  `signal_count >= --disable_min_signals` (default `5`). This is a more
+  direct "loses money" measure than the Sharpe-based diagnostic used
+  elsewhere in this doc - a strategy can have negative Sharpe with positive
+  average PnL (or vice versa on thin samples), so the two don't always
+  agree.
+- **Full refresh, not a merge:** every `oracle` run deletes and re-derives
+  the profile's `disabled_strategies` rows from that run's results
+  (`refresh_disabled_strategies()`), so a strategy that turns profitable is
+  automatically re-enabled the next time oracle runs for that profile - no
+  hand-editing in either direction.
+- **Full-suite evaluation enables re-enabling:** to make re-enabling
+  possible, `oracle`'s subprocess call always passes `--no_disabled_filter`,
+  so every strategy is scored every run regardless of current disabled
+  status. `base`/`finetuned` still skip disabled strategies (no wasted GPU
+  on strategies already known non-viable), which is why a disabled strategy
+  shows up in the viability report with oracle metrics populated but
+  `base_*` columns `NaN` rather than being absent from the report entirely.
+- **Diff + CSV per run:** `run_stage_oracle()` prints `[disabled] +N newly
+  disabled: [...]; M re-enabled: [...]` after each run, and dumps a CSV
+  mirror of the profile's current disabled rows to
+  `results/oracle_disabled_strategies_<YYYYmmdd_HHMMSS>.csv`.
+- **Tuning the threshold:** `--disable_min_signals` is valid with `--stage
+  oracle`, `--stage auto`, and `--stage rebuild_disabled`.
+- **Backfill/reconcile:** `--stage rebuild_disabled` recomputes the whole
+  table from existing `oracle_results` without re-running any backtests -
+  see below.
+- **Resolution at read time:** `resolve_disabled_strategies(interval,
+  assets)` in `strategy/kairos_strategies.py` is DB-backed: an exact profile
+  match returns the (possibly empty) set of disabled names for that profile,
+  and an empty result is a meaningful "tested and clean" - it does not fall
+  through. Only profiles that have never been oracle-tested fall back to the
+  hand-curated `_DISABLED_BY_CLASS` per-`(interval, asset_class)` table,
+  which remains the only hand-maintained artifact.
 
 ### Example: crypto discovery over 3 months and 1 day
 
@@ -447,12 +536,14 @@ also unconstrained, since `fx_commodity`'s `liquidity_threshold()` return is
   independent of whether that strategy was live/ranked/executed on a given
   day. It's the per-strategy diagnostic signal used to decide which
   strategies are worth keeping for a given `(interval, assets)` profile.
-- Strategies with **negative Sharpe** in an `oracle` run are the primary
-  candidates for the `_DISABLED_BY_PROFILE` table in `kairos_strategies.py`
-  (see existing entries keyed by `(interval, "SYM1,SYM2,SYM3")` - e.g.
-  `("1d", "BTC-USD,ETH-USD,SOL-USD")`). `run_stage_oracle()` prints the
-  negative-Sharpe strategies at the end of each run specifically to make
-  this easy to review and copy into the profile dict.
+- Strategies with **negative `avg_pnl_per_trade`** and enough signals
+  (`signal_count >= --disable_min_signals`, default `5`) in an `oracle` run
+  are automatically written to the `disabled_strategies` table for that
+  exact `(interval, assets)` profile - see "Auto-disabled strategies" above.
+  `run_stage_oracle()` still prints the negative-Sharpe strategies at the
+  end of each run for quick visual review (Sharpe and avg-PnL-based
+  disabling don't always agree on thin samples), plus a `[disabled]` diff
+  line showing exactly what changed in the table.
 - **Caveat - small `signal_count`**: a strategy with `n < 3` signals in a
   given backtest window has a statistically unreliable Sharpe (one or two
   lucky/unlucky trades can swing it arbitrarily). Do not disable a strategy
@@ -462,8 +553,8 @@ also unconstrained, since `fx_commodity`'s `liquidity_threshold()` return is
 
 ## 6. Typical workflow
 
-A full discovery cycle, from a fresh universe scan to updating
-`_DISABLED_BY_PROFILE`:
+A full discovery cycle, from a fresh universe scan through auto-disabling
+underperforming strategies:
 
 ```
 # 1. Screen the full candidate universe (daily bars)
@@ -484,10 +575,13 @@ uv run ./strategy/kairos_pipeline.py --stage base --assets BTC-USD ETH-USD SOL-U
 uv run ./strategy/kairos_pipeline.py --stage finetuned --assets BTC-USD ETH-USD SOL-USD \
     --model_path /path/to/checkpoint
 
-# 6. Review negative-Sharpe strategies from the oracle run's stdout (or query
-#    the DB, below), then hand-edit _DISABLED_BY_PROFILE in
-#    strategy/kairos_strategies.py with a new/updated
-#    (interval, "SYM1,SYM2,...") key.
+# 6. Review the printed `[disabled]` diff from step 3 (or query
+#    disabled_strategies / the oracle_disabled_strategies_<timestamp>.csv
+#    dump, below) - no hand-editing needed, the table is maintained
+#    automatically by run_stage_oracle(). After changing
+#    --disable_min_signals, or to backfill/reconcile without re-running
+#    backtests, recompute the whole table instead:
+uv run ./strategy/kairos_pipeline.py --stage rebuild_disabled --disable_min_signals 5
 ```
 
 Useful `sqlite3` one-liners against `data/pipeline_results.db`:
@@ -513,6 +607,12 @@ sqlite3 data/pipeline_results.db \
   "SELECT strategy_name, sharpe, signal_count, avg_pnl_per_trade FROM oracle_results
    WHERE run_id=(SELECT MAX(run_id) FROM oracle_results) AND sharpe < 0
    ORDER BY sharpe ASC;"
+
+# Currently disabled strategies for a given profile
+sqlite3 data/pipeline_results.db \
+  "SELECT strategy_name, avg_pnl_per_trade, sharpe, signal_count, updated_at
+   FROM disabled_strategies
+   WHERE interval='1d' AND assets='BTC-USD,ETH-USD,SOL-USD';"
 
 # Compare oracle vs base vs finetuned Sharpe for one strategy across all runs
 sqlite3 data/pipeline_results.db \

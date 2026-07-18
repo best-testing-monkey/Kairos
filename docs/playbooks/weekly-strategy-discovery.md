@@ -44,6 +44,13 @@ stage repeats the same subprocess call *without* `--no-prediction`, using the
 real Kronos base model — this is GPU-bound and is what confirms the oracle
 ceiling holds up against actual model predictions.
 
+Oracle always evaluates the **full** strategy suite, including strategies
+currently disabled for this profile (it passes `--no_disabled_filter`) —
+that's what lets a strategy earn its way back in automatically once its
+performance turns positive (see "Post-run review checklist" below). `base`
+still skips disabled strategies, since there's no point spending GPU time
+confirming a strategy already known non-viable.
+
 ## Viability criteria
 
 A strategy is marked `viable=1` in the report only if all three hold:
@@ -99,12 +106,17 @@ smoke test first, then the full 3m run to supersede it.
 
 1. Open `results/auto_viability_report_<timestamp>.csv` (or query the
    `viability_report` table) for the run you just produced.
-2. Sort by `oracle_sharpe`. Strategies with **negative oracle Sharpe** are
-   candidates for the hand-curated `_DISABLED_BY_PROFILE` dict in
-   `strategy/kairos_strategies.py` (~line 558) — add a
-   `(interval, "SYM1,SYM2,...")` entry to silence them for that profile.
-   Don't disable on a single low-`signal_count` result; corroborate with
-   another window or asset set first.
+2. Review the `[disabled]` diff each oracle run prints to stdout (newly
+   disabled / re-enabled strategy names), or query the `disabled_strategies`
+   table directly, or open the CSV mirror written to
+   `results/oracle_disabled_strategies_<timestamp>.csv`. Disabling is fully
+   automatic per `(interval, assets)` profile: a strategy is disabled when
+   its oracle `avg_pnl_per_trade < 0` and `signal_count >= 5` (tune the
+   threshold with `--disable_min_signals`), and re-enabled the moment it no
+   longer meets that bar — there's nothing to hand-edit. If you change
+   `--disable_min_signals` after the fact, run `--stage rebuild_disabled` to
+   recompute the whole table from existing oracle results instead of
+   waiting for the next weekly oracle run.
 3. Confirm both interval runs (1d and 1h) landed a viability row set before
    moving to the daily/hourly signals playbooks.
 
@@ -112,8 +124,11 @@ smoke test first, then the full 3m run to supersede it.
 
 - A systemd user timer (or a `/schedule` cloud routine) for the weekly pair
   of commands above — nothing is scheduled today.
-- Auto-append negative-oracle strategies to `_DISABLED_BY_PROFILE` instead of
-  hand-editing the dict after each review.
+- The per-profile `disabled_strategies` table is now auto-maintained (see
+  "Post-run review checklist" above); the remaining hand-curated artifact is
+  the coarser `_DISABLED_BY_CLASS` per-`(interval, asset_class)` fallback
+  table in `strategy/kairos_strategies.py`, used only for profiles that have
+  never been oracle-tested. Automating that is still future work.
 - Auto-prune stale `viability_report` runs / old `results/auto_viability_report_*.csv`
   snapshots once superseded.
 

@@ -11,6 +11,7 @@ sys.path.insert(0, '.')
 
 import argparse
 import json
+import sqlite3
 import ta as ta_lib
 from tqdm import tqdm
 
@@ -553,49 +554,6 @@ def _period_to_weeks(period: str) -> float:
     return cal_days / 7
 
 
-# Disabled strategies per (interval, sorted-assets-key) profile.
-# Determined by --no-prediction oracle shadow runs; add new profiles as needed.
-_DISABLED_BY_PROFILE: dict = {
-    ("1d", "BTC-USD,ETH-USD,SOL-USD"): {
-        # Negative %/trade from oracle shadow run 2026-07-04
-        "dynamic_bracket",         # -0.05% / trade
-        "inverse_variance",        # -0.07% / trade
-        "distribution_overlap",    # -0.09% / trade
-        "conditional_path",        # -0.14% / trade
-        "particle_filter",         # -0.21% / trade
-        "close_direction",         # -0.23% / trade
-        "bsts_decomposition",      # -0.32% / trade
-        "path_v_shape",            # -0.34% / trade
-        "cross_asset_spread",      # -2.15% / trade
-        "volume_confirmation",     # -2.75% / trade
-        "funding_rate_prediction", # -5.22% / trade
-        "volume_fade",             # -5.60% / trade
-    },
-    ("1h", "BTC-USD,ETH-USD,SOL-USD"): {
-        # Negative Sharpe from oracle shadow run 2026-07-04
-        "volume_fade",             # Sharpe -0.00,  -4.72% / trade
-        "cross_asset_rank",        # Sharpe -0.36,  -0.00% / trade
-        "distribution_overlap",    # Sharpe -1.53,  -0.03% / trade
-        "rsi_divergence",          # Sharpe -1.72,  -0.02% / trade
-        "conditional_path",        # Sharpe -2.15,  -0.03% / trade
-        "dynamic_bracket",         # Sharpe -2.30,  -0.03% / trade
-        "inverse_variance",        # Sharpe -2.33,  -0.03% / trade
-        "close_direction",         # Sharpe -2.50,  -0.03% / trade
-        "rsi_filter",              # Sharpe -2.77,  -0.06% / trade
-        "particle_filter",         # Sharpe -2.85,  -0.04% / trade
-        "bsts_decomposition",      # Sharpe -3.79,  -0.05% / trade
-        "rl_meta_controller",      # Sharpe -6.82,  -0.14% / trade
-        "cross_asset_spread",      # Sharpe -9.17,  -0.28% / trade
-        "dfa_persistence",         # Sharpe -10.60, -0.20% / trade
-        "hurst_regime_switch",     # Sharpe -10.60, -0.21% / trade
-        "range_trading",           # Sharpe -10.80, -0.21% / trade
-        "rqa_determinism",         # Sharpe -10.84, -0.21% / trade
-        "hmm_regime",              # Sharpe -13.96, -0.24% / trade
-        "volume_confirmation",     # Sharpe -15.60, -0.41% / trade
-        "path_rally",              # Sharpe -20.11, -0.73% / trade
-        "funding_rate_prediction", # Sharpe -36.17, -2.29% / trade
-    },
-}
 _COMMODITY_ETFS = {"GLD", "SLV", "USO", "UNG", "DBC", "PDBC", "CPER", "COPX", "GDX"}
 
 
@@ -628,8 +586,10 @@ def asset_class_for(assets) -> str:
     return "mixed"
 
 
-# Disabled strategies per (interval, asset_class) fallback, used when no exact
-# _DISABLED_BY_PROFILE entry exists for the (interval, assets) pair.
+# Disabled strategies per (interval, asset_class) fallback, used when no
+# oracle-tested DB profile (data/pipeline_results.db, disabled_strategies
+# table, keyed on the exact (interval, sorted-assets) pair) exists for the
+# (interval, assets) pair - see resolve_disabled_strategies() below.
 #
 # Derived from the 2026-07-05 oracle (--no-prediction) shadow sweep at
 # interval=1d, backtest_period=3m, across 27 asset groups (7 crypto, 10
@@ -690,21 +650,67 @@ _DISABLED_BY_CLASS: dict = {
 }
 
 
-def resolve_disabled_strategies(interval: str, assets) -> set:
+# Repo-root / DB-path derivation, matching kairos_signals.py's pattern. Kept
+# as module constants for readability, but resolve_disabled_strategies()
+# recomputes the actual path used per-call (when db_path is None) rather than
+# baking DEFAULT_DB_PATH in at import time, so tests can override db_path and
+# a fresh clone (no data/ dir yet) doesn't fail at import.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "data", "pipeline_results.db")
+
+
+def resolve_disabled_strategies(interval: str, assets, db_path: str = None) -> set:
     """Resolve the set of disabled strategy names for a run.
 
     Resolution order:
-      1. Exact (interval, sorted-assets-key) match in _DISABLED_BY_PROFILE.
-      2. Fallback to (interval, asset_class) in _DISABLED_BY_CLASS, where
-         asset_class is computed via asset_class_for(assets).
+      1. If data/pipeline_results.db's oracle_results table has ANY row for
+         the exact (interval, sorted-assets-key) profile - i.e. the profile
+         has been oracle-tested - return the (possibly empty) set of
+         strategy names found in that DB's disabled_strategies table for the
+         same profile. An empty result here is meaningful ("tested and
+         clean") and does NOT fall through to the class fallback.
+      2. Otherwise (profile never oracle-tested, DB missing, or any sqlite3
+         error), fall back to (interval, asset_class) in _DISABLED_BY_CLASS,
+         where asset_class is computed via asset_class_for(assets).
       3. Empty set if neither matches.
+
+    `db_path` defaults to None, resolving to DEFAULT_DB_PATH at call time
+    (not baked in at import time) so tests can point at a temp DB. Never
+    imports kairos_pipeline (would create an import cycle) - plain sqlite3
+    only, opened/closed per call.
+
+    Note: this assumes oracle_results.assets was written with a consistently
+    sorted CSV for a given profile going forward (run_stage_oracle /
+    refresh_disabled_strategies in kairos_pipeline.py normalize independently
+    at insert time); legacy rows written by an unsorted direct CLI call are a
+    pre-existing data-quality issue out of scope here.
     """
-    profile_key = (interval, ",".join(sorted(assets)))
-    exact = _DISABLED_BY_PROFILE.get(profile_key)
-    if exact is not None:
-        return exact
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH
+
+    assets_key = ",".join(sorted(assets))
     cls = asset_class_for(assets)
-    return _DISABLED_BY_CLASS.get((interval, cls), set())
+    class_fallback = _DISABLED_BY_CLASS.get((interval, cls), set())
+
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        tested = conn.execute(
+            "SELECT 1 FROM oracle_results WHERE interval=? AND assets=? LIMIT 1",
+            (interval, assets_key),
+        ).fetchone()
+        if tested is None:
+            return class_fallback
+        rows = conn.execute(
+            "SELECT strategy_name FROM disabled_strategies WHERE interval=? AND assets=?",
+            (interval, assets_key),
+        ).fetchall()
+        return {r[0] for r in rows}
+    except sqlite3.Error:
+        return class_fallback
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 _DEFAULT_ASSETS = ["BTC-USD", "ETH-USD", "SOL-USD"]
@@ -734,15 +740,22 @@ if __name__ == "__main__":
                         help="Replace model predictions with actual next-bar OHLCV (oracle baseline)")
     parser.add_argument("--export_json", metavar="PATH", default=None, dest="export_json",
                         help="Additionally dump summary/strategy_rankings/shadow_performance to this JSON path")
+    parser.add_argument("--no_disabled_filter", dest="no_disabled_filter", action="store_true", default=False,
+                        help="Bypass DB/class disabled-strategy resolution; evaluate every strategy "
+                             "(used by the oracle pipeline stage)")
 
     args = parser.parse_args()
     KairosSettings.configure(args)
 
     assets = KairosSettings.assets or _DEFAULT_ASSETS
-    disabled = resolve_disabled_strategies(KairosSettings.interval, assets)
-    if not disabled:
-        profile_key = (KairosSettings.interval, ",".join(sorted(assets)))
-        print(f"  [info] No oracle-tested disabled-strategy profile or class fallback for {profile_key} - all strategies enabled.")
+    if args.no_disabled_filter:
+        disabled = set()
+        print(f"  [info] --no_disabled_filter set - bypassing disabled-strategy resolution, all strategies enabled.")
+    else:
+        disabled = resolve_disabled_strategies(KairosSettings.interval, assets)
+        if not disabled:
+            profile_key = (KairosSettings.interval, ",".join(sorted(assets)))
+            print(f"  [info] No oracle-tested disabled-strategy profile or class fallback for {profile_key} - all strategies enabled.")
 
     DEMO_BACKTEST_OVER_N_BARS = _period_to_bars(KairosSettings.backtest_period, KairosSettings.interval)
 

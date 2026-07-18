@@ -18,7 +18,10 @@ runs in stages: **universe** (liquidity/volatility screen) → **correlation**
 strategy, no GPU — actual next-bar OHLCV instead of a model prediction) →
 **base** (the same backtest against the real Kronos model, GPU required) →
 a **viability report** persisted to SQLite (`data/pipeline_results.db`) with
-point-in-time CSV mirrors in `results/`. `strategy/kairos_signals.py` reads
+point-in-time CSV mirrors in `results/`. The **oracle** stage also
+auto-maintains a `disabled_strategies` table in the same DB, so
+underperforming strategies are silenced (and later automatically
+re-enabled) without any hand-editing. `strategy/kairos_signals.py` reads
 the latest viability report and turns viable strategies into a **signals
 report** (entries/stops/targets, expected value, an Allocation sheet). A
 human reviews the report, edits the Allocation sheet's Enabled column as a
