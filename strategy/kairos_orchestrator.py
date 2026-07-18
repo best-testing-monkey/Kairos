@@ -3,12 +3,11 @@ kairos_orchestrator.py
 ======================
 The master orchestrator for the Kairos trading framework.
 
-Wires together all 42 strategies across 5 modules:
-  - kairos_backtest.py    (18 base strategies)
-  - kairos_path.py        (5 path-aware strategies)
-  - kairos_horizon.py     (3 multi-horizon strategies)
-  - kairos_execution.py   (7 execution + volume strategies)
-  - kairos_meta.py        (9 meta + cross-asset + tail strategies)
+Wires together strategies across many modules, including the original 42
+(kairos_backtest/path/horizon/execution/meta), crypto/forex/stocks/universal
+asset-class modules, and 27 awesome-quant strategies added across
+kairos_volatility.py, kairos_econometric.py, kairos_ml.py, kairos_sentiment.py,
+kairos_execution.py, kairos_meta.py, and kairos_backtest.py.
 
 Features:
   - Multi-asset prediction and ranking
@@ -73,6 +72,8 @@ try:
         VaRPositionCapStrategy, DistributionOverlapStrategy,
         ModelDecayMonitorStrategy, OvernightExposureFilter,
         RSIDivergenceStrategy, LeverageCalibrationStrategy,
+        StochasticFilterStrategy, ADXGateStrategy, OBVConfirmationStrategy,
+        MTFConsensusStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_backtest: {e}")
@@ -107,6 +108,8 @@ try:
         AmountFlowStrategy, PredictedVWAPStrategy,
         PartialExitBacktestEngine,
         PyramidingStrategy, TimeBasedStopStrategy,
+        VolumeProfileLevelsStrategy, CVDDivergenceStrategy,
+        TWAPExecutionStrategy, ImplementationShortfallStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_execution: {e}")
@@ -123,6 +126,7 @@ try:
         SellPremiumStrategy, BuyWingsStrategy,
         TailAsymmetryStrategy, PercentileTailStrategy,
         RegimeClusterStrategy, MonteCarloScenarioStrategy,
+        MultiFactorRankStrategy, PCAResidualReversalStrategy,
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_meta: {e}")
@@ -153,6 +157,37 @@ try:
     )
 except ImportError as e:
     raise ImportError(f"Failed to import kairos_stocks: {e}")
+
+try:
+    from kairos_volatility import (
+        ATRBracketStrategy, GARCHFilterStrategy, VolTargetSizerStrategy,
+        VarianceRiskPremiumStrategy,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_volatility: {e}")
+
+try:
+    from kairos_econometric import (
+        ARIMADisagreementStrategy, VARLeadLagStrategy, SeasonalityFilterStrategy,
+        ChangepointGuardStrategy, GrangerPairsStrategy, MatrixProfileAnomalyStrategy,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_econometric: {e}")
+
+try:
+    from kairos_ml import (
+        MetaLabelStrategy, GBMDirectionStrategy, LPPLSGuardStrategy,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_ml: {e}")
+
+try:
+    from kairos_sentiment import (
+        NewsSentimentFilterStrategy, Institutional13FFilterStrategy,
+        SocialMomentumStrategy, EconCalendarGuardStrategy,
+    )
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_sentiment: {e}")
 
 try:
     from kairos_universal import (
@@ -269,14 +304,39 @@ class OrchestratorConfig:
 
 class StrategyRegistry:
     """
-    Maintains the full registry of all 42 strategies.
+    Maintains the full registry of all strategies (108 after disabled-strategy
+    filtering; 121 constructed before filtering).
     """
 
     ALL_STRATEGIES: List[Strategy] = []
 
+    # Populated by build_all() with counts describing the most recent build,
+    # so callers (kairos_strategies.py, kairos_pipeline.py) can print an
+    # honest "built X, disabled Y, evaluating Z" line instead of conflating
+    # "evaluated" with "strategies that happened to fire a signal".
+    LAST_BUILD_STATS: Dict[str, int] = {}
+
+    def __init__(self):
+        # Instance-level: at most one active allocator per registry.
+        self._allocator: Optional["PortfolioAllocator"] = None
+
+    def register_allocator(self, allocator: Optional["PortfolioAllocator"]) -> None:
+        """
+        Register the active portfolio allocator.
+
+        At most one allocator is active at a time; calling this again replaces
+        the previously registered allocator. Passing None clears it, disabling
+        allocator-driven sizing (per-signal fallback resumes).
+        """
+        self._allocator = allocator
+
+    def get_allocator(self) -> Optional["PortfolioAllocator"]:
+        """Return the currently registered allocator, or None if none is set."""
+        return self._allocator
+
     @classmethod
     def build_all(cls, config: OrchestratorConfig) -> List[Strategy]:
-        """Build all 42 strategies with the given config."""
+        """Build all 108 strategies with the given config."""
         strategies = []
 
         # === BASE STRATEGIES (18) ===
@@ -444,9 +504,73 @@ class StrategyRegistry:
             SpectralClustering(),
         ])
 
+        # === AWESOME-QUANT STRATEGIES (27) ===
+        # Standalone strategies - default constructor params
+        strategies.extend([
+            VarianceRiskPremiumStrategy(),
+            VARLeadLagStrategy(),
+            GrangerPairsStrategy(),
+            MatrixProfileAnomalyStrategy(),
+            GBMDirectionStrategy(),
+            SocialMomentumStrategy(),
+            CVDDivergenceStrategy(),
+            MultiFactorRankStrategy(),
+            PCAResidualReversalStrategy(),
+        ])
+
+        # Wrappers - paired with a base strategy that complements their intent.
+        stochastic_filter = StochasticFilterStrategy(base_strategy=FadeExtremeStrategy())
+
+        adx_gate_trend = ADXGateStrategy(base_strategy=TrendFollowingStrategy(), kind="trend")
+        adx_gate_trend.name = "adx_gate_trend"
+        adx_gate_reversion = ADXGateStrategy(base_strategy=RangeTradingStrategy(), kind="reversion")
+        adx_gate_reversion.name = "adx_gate_reversion"
+
+        obv_confirmation = OBVConfirmationStrategy(base_strategy=MomentumContinuationStrategy())
+        mtf_consensus = MTFConsensusStrategy(base_strategy=TrendFollowingStrategy())
+        atr_bracket = ATRBracketStrategy(base_strategy=TrendFollowingStrategy())
+        garch_filter = GARCHFilterStrategy(base_strategy=TrendFollowingStrategy())
+        vol_target_sizer = VolTargetSizerStrategy(base_strategy=ExpectedValueStrategy())
+        arima_disagreement = ARIMADisagreementStrategy(base_strategy=TrendFollowingStrategy())
+        seasonality_filter = SeasonalityFilterStrategy(base_strategy=TrendFollowingStrategy())
+        changepoint_guard = ChangepointGuardStrategy(base_strategy=TrendFollowingStrategy())
+        meta_label = MetaLabelStrategy(base_strategy=ExpectedValueStrategy())
+        lppls_guard = LPPLSGuardStrategy(base_strategy=TrendFollowingStrategy())
+        news_sentiment_filter = NewsSentimentFilterStrategy(base_strategy=MomentumContinuationStrategy())
+        institutional_13f_filter = Institutional13FFilterStrategy(base_strategy=TrendFollowingStrategy())
+        econ_calendar_guard = EconCalendarGuardStrategy(base_strategy=TrendFollowingStrategy())
+        volume_profile_levels = VolumeProfileLevelsStrategy(base_strategy=TrendFollowingStrategy())
+        twap_execution = TWAPExecutionStrategy(base_strategy=MomentumContinuationStrategy())
+        implementation_shortfall = ImplementationShortfallStrategy(base_strategy=TrendFollowingStrategy())
+
+        strategies.extend([
+            stochastic_filter,
+            adx_gate_trend,
+            adx_gate_reversion,
+            obv_confirmation,
+            mtf_consensus,
+            atr_bracket,
+            garch_filter,
+            vol_target_sizer,
+            arima_disagreement,
+            seasonality_filter,
+            changepoint_guard,
+            meta_label,
+            lppls_guard,
+            news_sentiment_filter,
+            institutional_13f_filter,
+            econ_calendar_guard,
+            volume_profile_levels,
+            twap_execution,
+            implementation_shortfall,
+        ])
+
         # Drop strategies the user has disabled
+        total_constructed = len(strategies)
         if config.disabled_strategies:
             strategies = [s for s in strategies if s.name not in config.disabled_strategies]
+        disabled_removed = total_constructed - len(strategies)
+        evaluated = len(strategies)
 
         # Apply kurtosis filter to all directional strategies
         if config.kurtosis_action != "none":
@@ -490,6 +614,11 @@ class StrategyRegistry:
             strategies = filtered
 
         cls.ALL_STRATEGIES = strategies
+        cls.LAST_BUILD_STATS = {
+            "total_constructed": total_constructed,
+            "disabled_removed": disabled_removed,
+            "evaluated": evaluated,
+        }
         return strategies
 
 
@@ -525,6 +654,63 @@ class UnifiedSignal:
             f"-> {self.target_price:.4f} stop {self.stop_price:.4f} "
             f"[{self.strategy_name}] conf={self.confidence:.2f})"
         )
+
+
+def apply_allocator(
+    signals: Dict[str, "Signal"],
+    allocator: Optional["PortfolioAllocator"],
+    returns: Optional[pd.DataFrame],
+    dists: Dict[str, Any],
+    context: Dict[str, Any],
+    verbose: bool = False,
+) -> Dict[str, "Signal"]:
+    """
+    Apply a registered PortfolioAllocator to a set of surviving per-symbol
+    signals, replacing each signal's size with min(original_size, |weight|).
+
+    Per §7.3 of the design doc: allocation runs *after* per-asset signal
+    generation and meta-filters. Per-signal size is preserved as the
+    within-asset cap - the allocator can only shrink it, never widen it.
+    Symbols whose allocator weight is exactly 0 are dropped entirely.
+
+    Graceful degradation: if no allocator is registered, fewer than 2 signals
+    survived (nothing to allocate across), or the allocator raises, the
+    original signals are returned unchanged so the orchestrator keeps trading.
+
+    Args:
+        signals: Dict[symbol -> Signal], the surviving best-per-asset signals.
+        allocator: The active PortfolioAllocator, or None.
+        returns: Trailing daily returns panel (context["returns_window"]).
+        dists: Dict[symbol -> KairosDistribution].
+        context: Execution context dict passed through to allocate().
+        verbose: If True, print a warning on allocator failure.
+
+    Returns:
+        Dict[symbol -> Signal] with sizes replaced (and zero-weight symbols
+        dropped), or the original `signals` dict unchanged on any failure.
+    """
+    if allocator is None or len(signals) <= 1:
+        return signals
+
+    try:
+        weights = allocator.allocate(signals, returns, dists, context)
+    except Exception as e:
+        if verbose:
+            print(f"Allocator {getattr(allocator, 'name', allocator)} failed: {e}")
+        return signals
+
+    result: Dict[str, "Signal"] = {}
+    for symbol, sig in signals.items():
+        if symbol not in weights:
+            # Allocator didn't opine on this symbol - keep it as-is.
+            result[symbol] = sig
+            continue
+        w = weights[symbol]
+        if w == 0:
+            continue
+        sig.size = min(sig.size, abs(w))
+        result[symbol] = sig
+    return result
 
 
 # =============================================================================
@@ -630,6 +816,51 @@ class KairosOrchestrator:
             )
         return result
 
+    def _compute_returns_window(self, histories: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        Build the trailing daily log-return panel for the active universe.
+
+        Computed once per day from the per-asset histories the orchestrator
+        already holds (no extra data fetch). Columns are asset symbols, index
+        is dates common to all assets (inner join), values are close-to-close
+        log returns. Used by allocators (context["returns_window"]) and by
+        any §2/§4/§6.4 portfolio/econometric/factor strategy.
+        """
+        if not histories:
+            return pd.DataFrame()
+
+        series = {}
+        for symbol, history in histories.items():
+            if history is None or len(history) < 2 or "close" not in history.columns:
+                continue
+            close = history["close"].astype(float)
+            log_ret = np.log(close / close.shift(1))
+            series[symbol] = log_ret
+
+        if not series:
+            return pd.DataFrame()
+
+        panel = pd.DataFrame(series).dropna(how="all")
+        return panel
+
+    def _compute_realized_vol(self, returns_window: pd.DataFrame,
+                               window: int = 20) -> Dict[str, float]:
+        """
+        Per-symbol trailing realized volatility (std of daily log returns
+        over the last `window` observations), computed once per day from
+        `returns_window`.
+        """
+        if returns_window is None or returns_window.empty:
+            return {}
+
+        realized_vol = {}
+        for symbol in returns_window.columns:
+            col = returns_window[symbol].dropna().tail(window)
+            if len(col) < 2:
+                continue
+            realized_vol[symbol] = float(col.std())
+        return realized_vol
+
     def _run_day(self, date: pd.Timestamp, histories: Dict[str, pd.DataFrame]):
         """Process a single day across all assets."""
         # 1. Multi-asset predictions
@@ -637,6 +868,12 @@ class KairosOrchestrator:
             multi_preds = self._make_realized_predictions(date, histories)
         else:
             multi_preds = self.multi_predictor.predict_all(histories)
+
+        # 1b. Context enrichment computed once per day for the active universe:
+        # trailing daily returns panel and per-symbol realized vol. Cheap
+        # (pandas pct_change/std only) - safe to compute every day.
+        returns_window = self._compute_returns_window(histories)
+        realized_vol = self._compute_realized_vol(returns_window)
 
         # 2. Evaluate all strategies for each asset
         all_signals = []
@@ -662,6 +899,8 @@ class KairosOrchestrator:
                     (p for p in self.active_positions if p["symbol"] == symbol), None
                 ),
                 "bar_index": len(self.equity_curve),
+                "returns_window": returns_window,
+                "realized_vol": realized_vol,
             }
 
             # Run all strategies
@@ -719,6 +958,32 @@ class KairosOrchestrator:
             if signals:
                 best = max(signals, key=lambda s: s.expected_value * s.confidence * s.size)
                 all_signals.append((symbol, best, pred))
+
+        # 2.5. Portfolio allocator: applied after per-asset signal generation
+        # and meta-filters, before cross-asset ranking / position entry.
+        # Replaces each surviving signal's size with min(original, |weight|)
+        # (per-signal size is the within-asset cap); zero-weight symbols are
+        # dropped. Any allocator failure falls back to the original sizes so
+        # the orchestrator keeps trading (per-class disabled-strategy
+        # fallback semantics from f0662fd).
+        allocator = self.registry.get_allocator()
+        if allocator is not None and len(all_signals) > 1:
+            signals_by_symbol = {symbol: sig for symbol, sig, _ in all_signals}
+            dists_by_symbol = {symbol: pred.dist for symbol, _, pred in all_signals}
+            allocator_context = {
+                "date": date,
+                "returns_window": returns_window,
+                "realized_vol": realized_vol,
+            }
+            allocated = apply_allocator(
+                signals_by_symbol, allocator, returns_window, dists_by_symbol,
+                allocator_context, verbose=self.config.verbose,
+            )
+            all_signals = [
+                (symbol, allocated[symbol], pred)
+                for symbol, sig, pred in all_signals
+                if symbol in allocated
+            ]
 
         # 3. Cross-asset ranking: if enabled, only trade top asset(s)
         if self.config.cross_asset_ranking and len(all_signals) > 1:
@@ -1154,6 +1419,8 @@ class KairosOrchestrator:
             "shadow_performance": shadow_perf,
             "daily_logs": self.daily_logs,
             "no_prediction": self.config.no_prediction,
+            "strategy_build_stats": dict(StrategyRegistry.LAST_BUILD_STATS),
+            "signal_firing_count": len(shadow_ranked),
         }
 
     def run_single_asset(self, df: pd.DataFrame, lookback: int = 200) -> Dict:
@@ -1249,6 +1516,15 @@ def print_results(results: Dict, top_strategy_results: Optional[List[Dict]] = No
     print(f"  Best Strategy:    {results['best_strategy']}")
     print(f"  Worst Strategy:   {results['worst_strategy']}")
     print("=" * W)
+    stats = results.get("strategy_build_stats") or {}
+    if stats:
+        print(
+            f"  Strategies: built {stats.get('total_constructed', '?')}, "
+            f"disabled {stats.get('disabled_removed', '?')}, "
+            f"evaluating {stats.get('evaluated', '?')} "
+            f"({results.get('signal_firing_count', 0)} fired at least one signal)"
+        )
+        print("=" * W)
 
     if results["strategy_rankings"]:
         shadow_perf = results.get("shadow_performance", {})

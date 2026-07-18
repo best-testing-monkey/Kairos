@@ -210,6 +210,21 @@ environment" without a GPU.
 uv run ./strategy/kairos_pipeline.py --stage base --assets BTC-USD ETH-USD SOL-USD
 ```
 
+### Unattended / overnight runs and GPU recovery
+
+Stages 4/5 (and `--stage auto`) require CUDA by default: `_ensure_model_loaded()`
+calls `kairos_gpu.ensure_cuda()`, which invokes `scripts/gpu_recover.py`'s
+escalation ladder (free GPU processes -> UVM reload -> full module reload ->
+reboot+resume) if torch can't see CUDA. For long overnight discovery runs where
+no one is present to approve a reboot, set `KAIROS_GPU_ALLOW_REBOOT=1` so the
+ladder is allowed to reach L4 and reboot+resume the pipeline automatically; the
+resume unit re-runs the requesting command after the next login (or immediately
+if `loginctl enable-linger` is set for the user). Set `KAIROS_ALLOW_CPU=1` to
+opt back into the old silent CPU fallback instead of invoking recovery. A
+subprocess that exits `75` (EX_TEMPFAIL - GPU was just healed but this
+process's cached torch state is stale) is retried exactly once by
+`run_backtest_subprocess`.
+
 ### Stage 5: `finetuned` (finetuned checkpoint, GPU required)
 
 ```
@@ -232,6 +247,135 @@ its own default (`NeoQuasar/Kronos-base`).
 uv run ./strategy/kairos_pipeline.py --stage finetuned --assets BTC-USD ETH-USD SOL-USD \
     --model_path /path/to/finetuned_kronos_checkpoint
 ```
+
+## Stage auto: Unified discovery pipeline
+
+For a complete discovery cycle in one command, use `--stage auto` to chain stages 1–4
+in order: universe → correlation → oracle → base for each requested bar interval.
+
+```
+uv run ./strategy/kairos_pipeline.py --stage auto \
+    [--intervals 1d [1h ...]] [--backtest_period 6m] [--asset_class crypto] \
+    [--pred_samples 100] [--min_sharpe 0.0] [--min_signals 3] \
+    [--force] [--skip_universe] [--report_only]
+```
+
+### Flags
+
+| Flag | Type | Default | Purpose |
+|------|------|---------|---------|
+| `--intervals` | `STR [STR ...]` | `["1d"]` | Bar intervals to test (e.g., `1d`, `1h`, `15m`); repeats the full chain once per interval. |
+| `--backtest_period` | `STR` | `"6m"` | Lookback window passed to stages 3–4 (oracle and base). |
+| `--asset_class` | `{crypto, equity, fx_commodity}` | `None` (all) | Optional filter: only test assets in this class. |
+| `--pred_samples` | `INT` | `100` | Number of prediction samples for stochastic inference. |
+| `--min_sharpe` | `FLOAT` | `0.0` | Viability threshold: oracle *and* base Sharpe must exceed this. |
+| `--min_signals` | `INT` | `3` | Viability threshold: both sides must have ≥ this many trade signals. |
+| `--force` | `FLAG` | off | Force re-run of oracle/base, even if results already exist for an (assets, interval, backtest_period) key. |
+| `--skip_universe` | `FLAG` | off | Skip stage 1; reuse the latest existing universe/correlation run per interval. Useful after a crash. |
+| `--report_only` | `FLAG` | off | Skip stages 1–4 entirely; rebuild the viability report from existing DB rows matching the other flags. |
+
+### How stage auto works
+
+For each interval in `--intervals`:
+
+1. **Universe (stage 1):** Screen the candidate universe unless `--skip_universe` and a prior universe run already exists for this interval.
+2. **Correlation (stage 2):** Compute pairwise correlations and greedily cluster symbols into suggested trading groups. Respects `--asset_class` if given.
+3. **Per group:** For each group discovered by stage 2:
+   - Run stage 3 (oracle) with `--no-prediction` to get a ceiling baseline.
+   - Run stage 4 (base) with the real Kronos-base model to get actual performance.
+   - Each stage is skipped if results already exist for that `(assets, interval, backtest_period)` tuple, unless `--force` is passed.
+4. **Viability report:** After all intervals and groups complete, join the latest oracle and base results and build a consolidated report (see below).
+
+### Per-run prediction cache (overlapping groups)
+
+With overlapping correlation groups, the same symbol can now show up in
+several groups within one `--stage auto` run. Each group's stage-4/5
+backtest runs as its own subprocess (`run_backtest_subprocess`), so without
+caching, identical per-bar Kronos predictions would be recomputed once per
+group that contains the symbol.
+
+`run_stage_auto()` creates a temporary per-run cache directory and sets
+`KAIROS_PRED_CACHE_DIR` in the environment passed to every group subprocess
+it spawns; `strategy/kairos_predcache.py` implements a disk-backed cache
+(one `.npz` file per key, so it survives across subprocess boundaries) with
+an in-memory LRU on top bounded by a fraction of `/proc/meminfo`'s
+`MemAvailable`. The cache key is `(symbol, interval, bar_timestamp,
+lookback_len, pred_samples, model_id, content_hash)`, where `content_hash`
+is a cheap hash of the lookback window's close prices - so a different or
+stale input window for the "same" symbol/bar never collides with an
+existing cache entry. The cache directory is deleted (`shutil.rmtree`) when
+the auto run finishes, success or failure. Single-stage invocations (e.g.
+`--stage base` on its own) never set `KAIROS_PRED_CACHE_DIR`, so behavior is
+unchanged when caching isn't in play. The oracle stage (`--no-prediction`)
+never calls the prediction path at all, so it is unaffected either way.
+
+### Resumability and `--force`
+
+Before running stage 3 (oracle) or stage 4 (base), the pipeline checks the `oracle_results` or `model_results` table for an existing row with matching `(assets, interval, backtest_period)`. If found and `--force` is off, that stage is logged as skipped and the next stage or group proceeds. This allows long pipelines to resume after a crash without re-running groups that succeeded.
+
+Passing `--force` clears this check and re-runs all stages unconditionally.
+
+A single group's oracle or base failure (any exception type) is caught,
+logged in the failure summary, and does not abort the run — remaining
+groups are still processed and the viability report is still built at the
+end.
+
+### Recovering from a crashed run
+
+If `--stage auto` was killed or crashed partway through (e.g. the CSV shows
+oracle stats but no base stats for some groups), no manual cleanup is
+needed:
+
+1. **Just rerun the same command** (no `--force`): already-completed
+   groups' oracle/base results are detected via the resumability check above
+   and skipped; only groups that never finished are (re)processed.
+2. **To regenerate the CSV immediately from whatever is already in the DB**,
+   without re-running any backtests: add `--report_only`. This is safe to
+   run at any time, including mid-crash-recovery, to check current progress.
+
+### Viability report
+
+After all intervals and groups are processed (or immediately with `--report_only`), a **viability report** is generated:
+
+- **Location:** `results/auto_viability_report_<YYYYmmdd_HHMMSS>.csv` and the `viability_report` SQLite table.
+- **Columns (in order):** strategy_name, assets, asset_class, interval, backtest_period, oracle_sharpe, oracle_signals, oracle_win_rate, oracle_avg_pnl_per_trade, oracle_run_id, base_sharpe, base_signals, base_win_rate, base_avg_pnl_per_trade, base_run_id, base_model_path, signals_per_week, viable.
+- **viability rule:** A strategy is marked `viable=True` only if:
+  - `oracle_sharpe > min_sharpe` **AND**
+  - `base_sharpe > min_sharpe` **AND**
+  - `min(oracle_signals, base_signals) >= min_signals`.
+  
+  Any row with NaN on either side defaults to `viable=False`.
+- **signals_per_week:** Computed as `base_signals / (backtest_period_in_weeks)`, where `6m` ≈ 26.1 weeks, `1m` ≈ 4.35 weeks, etc. Falls back to `oracle_signals` if base is NaN.
+- **Sort:** Viable strategies first, then by `base_sharpe` descending.
+- **Disabled strategies:** The report covers *enabled* strategies only. Disabled strategies (as per `resolve_disabled_strategies` in `kairos_strategies.py`) never appear in the results tables and thus never appear in the report. The printed summary line (e.g., "built 42, disabled 5, evaluating 37") shows the excluded count.
+
+### Example: crypto discovery over 3 months and 1 day
+
+```
+uv run ./strategy/kairos_pipeline.py --stage auto \
+    --intervals 1d \
+    --backtest_period 3m \
+    --asset_class crypto
+```
+
+This chains universe → correlation → oracle → base for all crypto assets, backtesting each discovered group over a 3-month window at daily bars. The viability report is written to `results/auto_viability_report_<timestamp>.csv` and the `viability_report` table.
+
+To add an intraday interval:
+
+```
+uv run ./strategy/kairos_pipeline.py --stage auto \
+    --intervals 1d 1h \
+    --backtest_period 3m \
+    --asset_class crypto
+```
+
+This runs the chain twice: once for daily bars, once for hourly bars. Both intervals appear in the report.
+
+### Stage 5 (finetuned) and future extensions
+
+Stage 5 (finetuned) remains **manual only** — it is not part of the auto chain, as finetuned checkpoints vary per experiment and are not part of the standard discovery flow.
+
+The viability report schema is designed to accept a future `finetuned_sharpe`, `finetuned_signals`, etc. column without schema changes. When a finetuned discovery workflow is established, `persist_viability_report()` can be extended to outer-join on `stage='finetuned'` rows alongside oracle and base, adding those columns to the report while keeping the same database table.
 
 ## 4. Screening criteria (from `kairos_pipeline.py` constants)
 
@@ -272,7 +416,17 @@ also unconstrained, since `fx_commodity`'s `liquidity_threshold()` return is
   `rolling_corr_median` (informational; grouping uses `full_corr`, the
   correlation of full-history log returns, not the rolling median).
 - `min_abs_corr = 0.6` - only pairs with `|full_corr| >= 0.6` are eligible
-  for grouping.
+  for grouping. This can now be a **per-asset-class dict** instead of a
+  single float: the module-level default is
+  `MIN_ABS_CORR = {"crypto": 0.75, "default": 0.6}`, i.e. crypto pairs need a
+  stronger correlation before they're clustered. A pair's effective
+  threshold is the *stricter* (max) of its two symbols' class thresholds, so
+  a "cross" pair (spanning two asset classes) uses
+  `max(threshold(class_a), threshold(class_b))`. Override via
+  `--min_abs_corr 0.7` (uniform float, old behavior) or
+  `--min_abs_corr crypto=0.8 equity=0.65 default=0.6` (per-class) on
+  `--stage correlation` or `--stage auto`; the effective thresholds are
+  printed in the stage-2 summary.
 - `max_group_size = 4` - groups stop absorbing new symbols once they reach
   4 members.
 - Grouping algorithm: sort strong pairs by `|corr|` descending, then
@@ -366,3 +520,37 @@ sqlite3 data/pipeline_results.db \
    UNION ALL
    SELECT stage, run_id, sharpe, signal_count FROM model_results WHERE strategy_name='cross_asset_rank';"
 ```
+
+## 7. Current signals report
+
+`strategy/kairos_signals.py` turns the latest `viability_report` run into an
+actionable, human-readable snapshot: for every viable `(strategy, assets,
+interval)` row, it runs one latest-bar prediction per `(assets, interval)`
+group and reports what each strategy would do *right now*.
+
+```bash
+uv run ./strategy/kairos_signals.py \
+    [--db data/pipeline_results.db] [--out results/] \
+    [--intervals 1d ...] [--pred_samples 100] [--all]
+```
+
+- Reads `viability_report` for `run_id = MAX(run_id)`; filters to `viable=1`
+  unless `--all` is passed. `--intervals` filters to a subset of intervals.
+- Groups viable rows by `(assets, interval)` so the GPU/model does one batched
+  prediction (`predict_all_batch`) per group, not one call per strategy.
+- Per group: fetches the latest bars for each symbol, predicts once, builds
+  the same per-symbol context `_run_day` uses (`returns_window`,
+  `realized_vol`, `capital`, etc.), applies the orchestrator's meta-filters,
+  and calls `generate_signal()` for every viable strategy in that group.
+- Per-group failures (fetch/prediction errors) and per-strategy issues
+  (unknown strategy name not in the registry, or a signal blocked by
+  meta-filters) are isolated and reported in `## Failures` / `## Skipped`
+  footers rather than aborting the whole run.
+- Writes `results/kairos_signals_<YYYYmmddHHMM>.md` with:
+  - `## Stats` - a table of every strategy that produced >=1 signal (entry,
+    stop, target, confidence, expected value, plus the oracle/base viability
+    stats carried over from the DB row).
+  - `## Signals` - plain-English bullets, e.g. *"Strategy dfa_persistence
+    advised **Long** position on BTC-USD for 12% liquidity with SL at
+    58,900.00 (-3.1%) and TP at 63,400.00 (+4.2%). Exit by TP/SL."*
+- The report path is printed to stdout when the run finishes.

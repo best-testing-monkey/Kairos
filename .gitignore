@@ -89,3 +89,7 @@ examples/data/
 /finetune_csv/data
 /finetune_csv/models
 /finetune_csv/train_data
+
+# Google Sheets OAuth secrets/tokens
+strategy/credentials.json
+strategy/token.json

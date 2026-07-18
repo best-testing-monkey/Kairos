@@ -5,15 +5,18 @@ Meta-level strategies for the Kairos framework.
 
 Contains:
   #6 Cross-Asset Sharpe Ranking
-  #7 Online Strategy Performance Tracking  
+  #7 Online Strategy Performance Tracking
   #9 Kurtosis & Tail Trading
+  Factor Investing: MultiFactorRankStrategy, PCAResidualReversalStrategy
 
 Usage:
     from kairos_meta import (
         MultiAssetKairosPredictor, CrossAssetRankStrategy,
         CrossAssetSpreadStrategy, StrategyPerformanceTracker,
         OnlineWeightedStrategy, KurtosisFilterStrategy,
-        TailRiskStrategy, SellPremiumStrategy, BuyWingsStrategy
+        TailRiskStrategy, SellPremiumStrategy, BuyWingsStrategy,
+        MultiFactorRankStrategy, PCAResidualReversalStrategy,
+        _pca_residuals
     )
 """
 
@@ -380,6 +383,386 @@ class CrossAssetMomentumTransferStrategy(Strategy):
                 "leader": self.leader_symbol,
                 "leader_move": leader_move,
                 "follower": current_symbol,
+            }
+        )
+
+
+def _factor_zscores(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cross-sectionally z-score a factor panel.
+
+    Parameters
+    ----------
+    panel : DataFrame, index = symbols, columns = factor names.
+
+    Returns
+    -------
+    DataFrame of the same shape where each column has been z-scored across
+    symbols (population std, ddof=0). Columns with zero std map to all zeros.
+    """
+    z = pd.DataFrame(index=panel.index, columns=panel.columns, dtype=float)
+    for col in panel.columns:
+        vals = panel[col].values.astype(float)
+        mu = float(np.mean(vals))
+        sd = float(np.std(vals))
+        z[col] = (vals - mu) / sd if sd > 0 else np.zeros(len(vals))
+    return z
+
+
+def _pca_residuals(returns: pd.DataFrame, k: int = 1) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """
+    Compute PCA residuals for a returns panel.
+
+    Demeans the returns, computes covariance, extracts top-k eigenvectors,
+    projects onto those eigenvectors, and reconstructs. Residuals are the
+    difference between actual (demeaned) and reconstructed returns.
+
+    Parameters
+    ----------
+    returns : DataFrame
+        Index = dates, columns = symbols (asset returns).
+    k : int
+        Number of principal components to extract (default 1).
+
+    Returns
+    -------
+    (residuals, factor_scores, loadings) : tuple
+        residuals : DataFrame, shape (n_dates, n_assets)
+                    Each asset's residual (actual - reconstruction).
+        factor_scores : ndarray, shape (n_dates, k)
+        loadings : ndarray, shape (n_assets, k)
+                   Top-k eigenvectors (columns).
+    """
+    returns_arr = returns.values.astype(float)
+    # Demean across assets
+    returns_demeaned = returns_arr - returns_arr.mean(axis=0)
+
+    # Covariance matrix
+    cov = np.cov(returns_demeaned.T)
+
+    # Eigendecomposition
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+    # Top-k eigenvectors (in descending order of eigenvalue)
+    idx = np.argsort(eigenvalues)[::-1][:k]
+    loadings = eigenvectors[:, idx]  # shape (n_assets, k)
+
+    # Factor scores
+    factor_scores = returns_demeaned @ loadings  # shape (n_dates, k)
+
+    # Reconstruction
+    reconstruction = factor_scores @ loadings.T  # shape (n_dates, n_assets)
+
+    # Residuals
+    residuals_array = returns_demeaned - reconstruction
+    residuals = pd.DataFrame(residuals_array, index=returns.index, columns=returns.columns)
+
+    return residuals, factor_scores, loadings
+
+
+class MultiFactorRankStrategy(Strategy):
+    """
+    Cross-sectional multi-factor composite rank strategy (design doc §6.4).
+
+    Extends the CrossAssetRankStrategy idea from 1 factor (predicted Sharpe)
+    to k factors computed from a trailing returns panel of the universe:
+
+      momentum : 12-month-minus-1-month proxy — sum of returns rows
+                 [-252:-21], or the full window minus the last 21 rows when
+                 the window is shorter (min 60 rows overall).
+      low_vol  : -std(last 60 returns)  (low volatility scores high)
+      value    : distance below the window high of the cumulative price
+                 index: -(current_index / max_index - 1)  (>= 0; larger =
+                 further below high = "cheaper")
+      quality  : mean(last 60 returns) / std(last 60 returns)
+
+    Each factor is z-scored cross-sectionally (see `_factor_zscores`), then
+    combined into a composite as a weighted mean of z-scores (`weights=None`
+    → equal weights).
+
+    Context contract (graceful None when missing):
+      context["returns_window"]   : PRIMARY — DataFrame of daily returns,
+                                    rows = days, columns = symbols.
+      context["universe_history"] : fallback — Dict[symbol, DataFrame] with
+                                    a "close" column; returns derived via
+                                    pct_change.
+      context["symbol"]           : the symbol being evaluated
+                                    ("current_symbol" accepted as fallback).
+
+    Trade logic, gated on Kronos agreement:
+      current symbol TOP-ranked composite AND Kronos bullish
+        (dist close mean > current_price) -> LONG
+      current symbol BOTTOM-ranked AND Kronos bearish -> SHORT
+      otherwise -> None.
+
+    Bracket: stop = close pct_15, target = close pct_85 (reversed for
+    SHORT). Size = min(kelly * 0.5, 1). Confidence = |composite z| squashed
+    to (0, 1] via z / (1 + |z|).
+    """
+    name = "multi_factor_rank"
+
+    FACTOR_NAMES = ("momentum", "low_vol", "value", "quality")
+    MIN_ROWS = 60
+
+    def __init__(self, weights: Optional[Dict[str, float]] = None):
+        if weights is None:
+            weights = {f: 1.0 for f in self.FACTOR_NAMES}
+        self.weights = {f: float(weights.get(f, 0.0)) for f in self.FACTOR_NAMES}
+
+    # ------------------------------------------------------------------ #
+    def _returns_panel(self, context) -> Optional[pd.DataFrame]:
+        """Build the returns panel from context (returns_window primary)."""
+        rw = context.get("returns_window")
+        if isinstance(rw, pd.DataFrame) and not rw.empty:
+            return rw
+        uh = context.get("universe_history")
+        if not uh:
+            return None
+        cols = {}
+        for symbol, df in uh.items():
+            if df is None or "close" not in df:
+                continue
+            cols[symbol] = (
+                df["close"].astype(float).pct_change().dropna().reset_index(drop=True)
+            )
+        if not cols:
+            return None
+        return pd.DataFrame(cols).dropna()
+
+    def _compute_factors(self, returns: pd.DataFrame) -> pd.DataFrame:
+        """Compute the raw factor panel (index=symbols, columns=factors)."""
+        rows = {}
+        for symbol in returns.columns:
+            r = returns[symbol].values.astype(float)
+            n = len(r)
+            # momentum: 12-1 month proxy
+            if n >= 252:
+                momentum = float(np.sum(r[-252:-21]))
+            else:
+                momentum = float(np.sum(r[:-21]))
+            last60 = r[-60:]
+            sd60 = float(np.std(last60))
+            low_vol = -sd60
+            # value proxy: distance below the window high of the cum index
+            cum = np.cumprod(1.0 + r)
+            value = -(float(cum[-1]) / float(np.max(cum)) - 1.0)
+            quality = float(np.mean(last60)) / sd60 if sd60 > 0 else 0.0
+            rows[symbol] = {
+                "momentum": momentum, "low_vol": low_vol,
+                "value": value, "quality": quality,
+            }
+        return pd.DataFrame.from_dict(rows, orient="index")[list(self.FACTOR_NAMES)]
+
+    def _composite(self, zscores: pd.DataFrame) -> pd.Series:
+        """Weighted mean of factor z-scores per symbol."""
+        w = np.array([self.weights[f] for f in self.FACTOR_NAMES], dtype=float)
+        if w.sum() == 0:
+            w = np.ones(len(w))
+        vals = zscores[list(self.FACTOR_NAMES)].values @ w / w.sum()
+        return pd.Series(vals, index=zscores.index)
+
+    # ------------------------------------------------------------------ #
+    def generate_signal(self, dist, current_price, history, context):
+        if not context:
+            return None
+        symbol = context.get("symbol") or context.get("current_symbol")
+        if not symbol:
+            return None
+        returns = self._returns_panel(context)
+        if returns is None or symbol not in returns.columns:
+            return None
+        if len(returns) < self.MIN_ROWS:
+            return None
+
+        factors = self._compute_factors(returns)
+        zscores = _factor_zscores(factors)
+        composite = self._composite(zscores)
+
+        top_symbol = composite.idxmax()
+        bottom_symbol = composite.idxmin()
+
+        s = dist.stats.get("close", {})
+        mean = s.get("mean")
+        if mean is None or "pct_15" not in s or "pct_85" not in s:
+            return None
+        bullish = mean > current_price
+
+        if symbol == top_symbol and bullish:
+            direction = Direction.LONG
+            stop, target = s["pct_15"], s["pct_85"]
+        elif symbol == bottom_symbol and not bullish:
+            direction = Direction.SHORT
+            stop, target = s["pct_85"], s["pct_15"]
+        else:
+            return None
+
+        z = float(composite[symbol])
+        ev = dist.expected_value(current_price, target, stop)
+        kelly = dist.kelly_fraction(current_price, target, stop)
+        return Signal(
+            direction=direction,
+            size=min(kelly * 0.5, 1.0),
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=abs(z) / (1.0 + abs(z)),
+            expected_value=ev,
+            metadata={
+                "symbol": symbol,
+                "composite_z": z,
+                "rank_top": top_symbol,
+                "rank_bottom": bottom_symbol,
+                "composite_scores": composite.to_dict(),
+                "factor_zscores": zscores.loc[symbol].to_dict(),
+                "weights": dict(self.weights),
+            }
+        )
+
+
+class PCAResidualReversalStrategy(Strategy):
+    """
+    Statistical factor model using PCA for residual mean reversion (design doc §6.4).
+
+    Performs PCA (k=1) on trailing 60-day returns to extract the top principal
+    component (the market factor). Computes each asset's residual vs. the factor
+    reconstruction. Fades assets with large residuals (|z| > z_entry) back toward
+    the factor, gated on Kronos agreement.
+
+    Context contract (graceful None when missing):
+      context["returns_window"]   : PRIMARY — DataFrame of daily returns,
+                                    rows = days, columns = symbols.
+      context["universe_history"] : fallback — Dict[symbol, DataFrame] with
+                                    a "close" column; returns derived via
+                                    pct_change.
+      context["symbol"]           : the symbol being evaluated.
+
+    Trade logic:
+      For current symbol with residual z over last 5 days:
+      - z > z_entry: asset overextended above factor → SHORT candidate (fade)
+      - z < -z_entry: asset overextended below factor → LONG candidate
+      - Otherwise: None
+
+      All signals gated on Kronos agreement (mean > price for LONG, < price for SHORT).
+
+    Bracket: stop = pct_15, target = pct_85 for LONG (reversed for SHORT).
+    Size = min(kelly * 0.5, 1); Confidence = min(|z| / 4, 1).
+    """
+    name = "pca_residual_reversal"
+
+    MIN_ROWS = 60  # minimum window
+    MIN_ASSETS = 3  # need at least 3 assets for meaningful PCA
+
+    def __init__(self, window: int = 60, z_entry: float = 2.0, k: int = 1):
+        self.window = int(window)
+        self.z_entry = float(z_entry)
+        self.k = int(k)
+
+    def _returns_panel(self, context) -> Optional[pd.DataFrame]:
+        """Build the returns panel from context (returns_window primary)."""
+        rw = context.get("returns_window")
+        if isinstance(rw, pd.DataFrame) and not rw.empty:
+            return rw
+        uh = context.get("universe_history")
+        if not uh:
+            return None
+        cols = {}
+        for symbol, df in uh.items():
+            if df is None or "close" not in df:
+                continue
+            cols[symbol] = (
+                df["close"].astype(float).pct_change().dropna().reset_index(drop=True)
+            )
+        if not cols:
+            return None
+        return pd.DataFrame(cols).dropna()
+
+    def generate_signal(self, dist, current_price, history, context):
+        if not context:
+            return None
+        symbol = context.get("symbol") or context.get("current_symbol")
+        if not symbol:
+            return None
+
+        returns = self._returns_panel(context)
+        if returns is None or symbol not in returns.columns:
+            return None
+        if len(returns) < self.window:
+            return None
+        if len(returns.columns) < self.MIN_ASSETS:
+            return None
+
+        # Get the window
+        window_returns = returns.iloc[-self.window:]
+
+        # PCA
+        residuals, factor_scores, loadings = _pca_residuals(window_returns, k=self.k)
+
+        # Get residuals for the current symbol
+        residual_series = residuals[symbol].values  # last `window` residuals
+
+        # Cumulative residuals over last 5 days
+        last5_residuals = residual_series[-5:]
+        cumsum_last5 = float(np.sum(last5_residuals))
+
+        # Std of rolling 5-day residual sums
+        rolling_sums = np.convolve(residual_series, np.ones(5), mode='valid')
+        if len(rolling_sums) < 2:
+            return None  # not enough history for std
+
+        rolling_std = float(np.std(rolling_sums))
+
+        if rolling_std == 0:
+            return None  # no variance in rolling sums
+
+        # Z-score of cumulative residual
+        z = float(cumsum_last5 / rolling_std)
+
+        # Gating logic
+        if abs(z) < self.z_entry:
+            return None  # Not extreme enough
+
+        # Kronos agreement
+        s = dist.stats.get("close", {})
+        mean = s.get("mean")
+        if mean is None or "pct_15" not in s or "pct_85" not in s:
+            return None
+
+        bullish = mean > current_price
+
+        if z > self.z_entry:
+            # SHORT candidate (fade back)
+            if bullish:
+                return None  # Kronos bullish, but residual says short: disagreement
+            direction = Direction.SHORT
+            stop, target = s["pct_85"], s["pct_15"]
+        elif z < -self.z_entry:
+            # LONG candidate
+            if not bullish:
+                return None  # Kronos bearish, but residual says long: disagreement
+            direction = Direction.LONG
+            stop, target = s["pct_15"], s["pct_85"]
+        else:
+            return None
+
+        # Sizing
+        ev = dist.expected_value(current_price, target, stop)
+        kelly = dist.kelly_fraction(current_price, target, stop)
+
+        return Signal(
+            direction=direction,
+            size=min(kelly * 0.5, 1.0),
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=min(abs(z) / 4.0, 1.0),
+            expected_value=ev,
+            metadata={
+                "symbol": symbol,
+                "residual_z": z,
+                "cumulative_residual": cumsum_last5,
+                "rolling_std": rolling_std,
             }
         )
 
@@ -1182,6 +1565,9 @@ if __name__ == "__main__":
     print("Cross-Asset:")
     print("  MultiAssetKairosPredictor, CrossAssetRankStrategy")
     print("  CrossAssetSpreadStrategy, CrossAssetMomentumTransferStrategy")
+    print("Factor Investing:")
+    print("  MultiFactorRankStrategy, PCAResidualReversalStrategy")
+    print("  _pca_residuals (helper for PCA residuals + factor scores)")
     print("Online Tracking:")
     print("  StrategyPerformanceTracker, OnlineWeightedStrategy")
     print("  ThompsonSamplingStrategy, RegimeSwitchingStrategy")

@@ -113,7 +113,7 @@ def calendar_days_for_bars(bars_needed: float, bars_per_day: float, symbol: str,
     return int(raw_days) + buffer_days
 
 
-def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
+def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None, as_of=None) -> DataFrame:
     price_cache.configure(remote=False)
 
     from datetime import date, timedelta
@@ -131,7 +131,7 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
     bars_needed = max(min_bars or 0, lookback + pred_len)
     days_needed = min(calendar_days_for_bars(bars_needed, bars_per_day, symbol), yf_max_days)
 
-    end_dt = date.today()
+    end_dt = as_of.date() if as_of is not None else date.today()
     start_dt = end_dt - timedelta(days=days_needed)
     end_str, start_str = end_dt.isoformat(), start_dt.isoformat()
 
@@ -143,6 +143,12 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None) -> DataFrame:
     raw.columns = [c.lower() for c in raw.columns]
     idx = pd.to_datetime(raw.index)
     raw.index = idx.tz_convert(None) if idx.tz is not None else idx
+
+    if as_of is not None:
+        # Round down to the nearest bar: drop anything timestamped after
+        # the simulated "now", so intraday intervals (h12/h6/1h/30m/15m/5m)
+        # never leak a bar the caller couldn't actually have seen yet.
+        raw = raw[raw.index <= as_of]
 
     if len(raw) < lookback + pred_len:
         raise RuntimeError(
@@ -166,7 +172,10 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
     bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
     bt_model = Kronos.from_pretrained(mdl_src)
 
-    if torch.cuda.is_available():
+    from kairos_gpu import ensure_cuda
+    has_cuda = ensure_cuda()
+
+    if has_cuda:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         print("  → GPU mode: autocast FP16, TF32 matmuls enabled")
@@ -199,8 +208,12 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
 def predict_all_batch(assets: dict) -> dict:
     """Predict all assets in one batched GPU call instead of N sequential calls."""
     from kairos_meta import AssetPrediction, KairosDistribution
+    import kairos_predcache
 
     _ensure_model_loaded()
+
+    shared_cache = kairos_predcache.get_cache()
+    shared_keys = {}  # symbol -> cache key (only computed when shared_cache is active)
 
     df_list, x_ts_list, y_ts_list = [], [], []
     cached_results = {}
@@ -211,6 +224,28 @@ def predict_all_batch(assets: dict) -> dict:
         if cache_key in _prediction_cache:
             cached_results[symbol] = _prediction_cache[cache_key]
             continue
+
+        if shared_cache is not None:
+            lookback_for_hash = min(KairosSettings.lookback, len(df))
+            content_hash = kairos_predcache.content_hash_for_closes(
+                df["close"].iloc[-lookback_for_hash:]
+            )
+            shared_key = kairos_predcache.make_key(
+                symbol=symbol,
+                interval=KairosSettings.interval,
+                bar_timestamp=df.index[-1],
+                lookback_len=lookback_for_hash,
+                pred_samples=KairosSettings.pred_samples,
+                model_id=KairosSettings.model,
+                content_hash=content_hash,
+            )
+            shared_keys[symbol] = shared_key
+            shared_hit = shared_cache.get(shared_key)
+            if shared_hit is not None:
+                _prediction_cache[cache_key] = shared_hit
+                cached_results[symbol] = shared_hit
+                continue
+
         lookback = min(KairosSettings.lookback, len(df))
         x_df, x_ts = to_kronos_frame(df, lookback, amount="auto")
         y_ts = future_timestamps(x_ts.iloc[-1], KairosSettings.interval, 1, _state.calendar, _state.tz)
@@ -238,6 +273,8 @@ def predict_all_batch(assets: dict) -> dict:
                 preds = [preds]
             _prediction_cache[(symbol, assets[symbol].index[-1])] = preds
             cached_results[symbol] = preds
+            if shared_cache is not None and symbol in shared_keys:
+                shared_cache.put(shared_keys[symbol], preds)
 
     result = {}
     for symbol, preds in cached_results.items():
@@ -465,15 +502,30 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataF
     return result_list
 
 
-def _period_to_bars(period: str, interval: str) -> int:
-    """Convert a human period string (e.g. '6m', '1y') to a bar count."""
+def _parse_period(period: str) -> tuple:
+    """Parse a human period string into (count, unit).
+
+    Args:
+        period: Period string, e.g., '6m', '1y', '3m', '2w', '10d'
+
+    Returns:
+        Tuple of (count: int, unit: str)
+
+    Raises:
+        ValueError: If period format is invalid
+    """
     import re as _re
     m = _re.fullmatch(r"(\d+)(d|w|m|y)", period.strip().lower())
     if not m:
         raise ValueError(
             f"Unrecognised backtest_period {period!r}. Use e.g. '6m', '1y', '3m', '2w', '10d'."
         )
-    n, unit = int(m.group(1)), m.group(2)
+    return int(m.group(1)), m.group(2)
+
+
+def _period_to_bars(period: str, interval: str) -> int:
+    """Convert a human period string (e.g. '6m', '1y') to a bar count."""
+    n, unit = _parse_period(period)
     cal_days = {"d": n, "w": n * 7, "m": n * 30, "y": n * 365}[unit]
     bars_per_day = {
         "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
@@ -481,6 +533,24 @@ def _period_to_bars(period: str, interval: str) -> int:
         "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
     }.get(interval, 1)
     return max(1, int(cal_days * bars_per_day))
+
+
+def _period_to_weeks(period: str) -> float:
+    """Convert a human period string (e.g. '6m', '1y') to weeks.
+
+    Uses 365.25 days per year and 7 days per week.
+    Matches the period parsing from _period_to_bars.
+    """
+    n, unit = _parse_period(period)
+    # Convert to calendar days: use 365.25 days/year, 30.4375 days/month (365.25/12)
+    cal_days = {
+        "d": n,
+        "w": n * 7,
+        "m": n * 365.25 / 12,
+        "y": n * 365.25,
+    }[unit]
+    # Convert calendar days to weeks (7 days per week)
+    return cal_days / 7
 
 
 # Disabled strategies per (interval, sorted-assets-key) profile.
@@ -722,6 +792,8 @@ if __name__ == "__main__":
             "summary": _jsonable(results.get("summary", {})),
             "strategy_rankings": _jsonable(results.get("strategy_rankings", [])),
             "shadow_performance": _jsonable(results.get("shadow_performance", {})),
+            "strategy_build_stats": _jsonable(results.get("strategy_build_stats", {})),
+            "signal_firing_count": _jsonable(results.get("signal_firing_count", 0)),
         }
         with open(args.export_json, "w") as _f:
             json.dump(export_payload, _f, indent=2)

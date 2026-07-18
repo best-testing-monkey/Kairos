@@ -233,11 +233,13 @@ class KairosDistribution:
                 "pct_5": float(np.percentile(arr, 5)),
                 "pct_10": float(np.percentile(arr, 10)),
                 "pct_15": float(np.percentile(arr, 15)),
+                "pct_16": float(np.percentile(arr, 16)),
                 "pct_20": float(np.percentile(arr, 20)),
                 "pct_25": float(np.percentile(arr, 25)),
                 "pct_50": float(np.percentile(arr, 50)),
                 "pct_75": float(np.percentile(arr, 75)),
                 "pct_80": float(np.percentile(arr, 80)),
+                "pct_84": float(np.percentile(arr, 84)),
                 "pct_85": float(np.percentile(arr, 85)),
                 "pct_90": float(np.percentile(arr, 90)),
                 "pct_95": float(np.percentile(arr, 95)),
@@ -393,6 +395,92 @@ class KairosPredictor:
     def predict(self, history: pd.DataFrame) -> KairosDistribution:
         predictions = self.predict_fn(history)
         return KairosDistribution(predictions)
+
+
+# =============================================================================
+# TECHNICAL INDICATOR HELPERS
+# =============================================================================
+
+def compute_adx(history: pd.DataFrame, n: int = 14) -> float:
+    """
+    Compute ADX (Average Directional Index) from history.
+
+    ADX measures trend strength from 0-100. Values:
+    - 0-25: weak trend
+    - 25-50: moderate trend
+    - 50-75: strong trend
+    - 75-100: very strong trend
+
+    Args:
+        history: DataFrame with OHLC data (high, low, close columns required)
+        n: period for ADX calculation (default 14)
+
+    Returns:
+        ADX value (0-100), or 50.0 (neutral) if insufficient data
+    """
+    if len(history) < n + 1:
+        return 50.0  # Default neutral
+
+    high = history["high"].values
+    low = history["low"].values
+    close = history["close"].values
+
+    # Compute True Range (TR)
+    tr_values = []
+    for i in range(1, len(close)):
+        h_l = high[i] - low[i]
+        h_c = abs(high[i] - close[i - 1])
+        l_c = abs(low[i] - close[i - 1])
+        tr = max(h_l, h_c, l_c)
+        tr_values.append(tr)
+
+    if len(tr_values) == 0:
+        return 50.0
+
+    # Compute Directional Movements
+    plus_dm_values = []
+    minus_dm_values = []
+    for i in range(1, len(high)):
+        plus_dm = high[i] - high[i - 1]
+        minus_dm = low[i - 1] - low[i]
+
+        # Only count if positive and greater than the opposite
+        if plus_dm > 0 and plus_dm > minus_dm:
+            plus_dm_values.append(plus_dm)
+        else:
+            plus_dm_values.append(0.0)
+
+        if minus_dm > 0 and minus_dm > plus_dm:
+            minus_dm_values.append(minus_dm)
+        else:
+            minus_dm_values.append(0.0)
+
+    # Compute DI values using average
+    if len(tr_values) >= n:
+        # Use SMA for numerical stability
+        tr_sum = np.mean(tr_values[-n:])
+        plus_dm_sum = np.mean(plus_dm_values[-n:])
+        minus_dm_sum = np.mean(minus_dm_values[-n:])
+
+        if tr_sum > 0:
+            plus_di = 100.0 * plus_dm_sum / tr_sum
+            minus_di = 100.0 * minus_dm_sum / tr_sum
+        else:
+            return 50.0
+
+        # Compute DX
+        di_sum = plus_di + minus_di
+        if di_sum > 0:
+            dx = 100.0 * abs(plus_di - minus_di) / di_sum
+        else:
+            dx = 0.0
+
+        # ADX is smoothed DX (simplified: use current DX as approximation)
+        adx = dx
+    else:
+        adx = 50.0
+
+    return adx
 
 
 # =============================================================================
@@ -1056,6 +1144,434 @@ class MACDFilterStrategy(Strategy):
         )
 
 
+class StochasticFilterStrategy(Strategy):
+    """
+    Wraps a base strategy with a Stochastic Oscillator + ADX filter.
+
+    Veto LONG signals when %K > overbought UNLESS trend is strong (ADX > adx_trend).
+    Veto SHORT signals when %K < oversold UNLESS trend is strong (ADX > adx_trend).
+    Otherwise pass base signal through unchanged.
+
+    Uses:
+    - %K = 100 * (close - lowest_low) / (highest_high - lowest_low) over k_period bars
+    - %D = SMA(%K, d_period)
+    - ADX (Average Directional Index) over adx_period bars
+    """
+    name = "stochastic_filter"
+
+    def __init__(self, base_strategy: Strategy,
+                 k_period: int = 14, d_period: int = 3,
+                 overbought: float = 80.0, oversold: float = 20.0,
+                 adx_period: int = 14, adx_trend: float = 25.0):
+        self.base_strategy = base_strategy
+        self.k_period = k_period
+        self.d_period = d_period
+        self.overbought = overbought
+        self.oversold = oversold
+        self.adx_period = adx_period
+        self.adx_trend = adx_trend
+
+    def _compute_stochastic(self, history: pd.DataFrame) -> Tuple[float, float]:
+        """
+        Compute %K and %D from history.
+        Returns: (k_value, d_value)
+        """
+        if len(history) < self.k_period:
+            return 50.0, 50.0
+
+        # Get the last k_period bars
+        close = history["close"].values[-self.k_period:]
+        high = history["high"].values[-self.k_period:]
+        low = history["low"].values[-self.k_period:]
+
+        # Compute %K for the entire history window (need for %D)
+        all_close = history["close"].values
+        all_high = history["high"].values
+        all_low = history["low"].values
+
+        k_values = []
+        for i in range(len(all_close) - self.k_period + 1):
+            window_high = all_high[i:i + self.k_period].max()
+            window_low = all_low[i:i + self.k_period].min()
+            range_val = window_high - window_low
+            if range_val == 0:
+                k_values.append(50.0)
+            else:
+                k = 100.0 * (all_close[i + self.k_period - 1] - window_low) / range_val
+                k_values.append(k)
+
+        if len(k_values) == 0:
+            return 50.0, 50.0
+
+        # Current %K
+        k_current = k_values[-1]
+
+        # Compute %D as SMA of %K over d_period
+        if len(k_values) >= self.d_period:
+            d_current = np.mean(k_values[-self.d_period:])
+        else:
+            d_current = k_current
+
+        return k_current, d_current
+
+    def _compute_adx(self, history: pd.DataFrame) -> float:
+        """
+        Compute ADX (Average Directional Index) from history.
+        Delegates to the module-level compute_adx helper.
+        Returns: ADX value (0-100)
+        """
+        return compute_adx(history, n=self.adx_period)
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal from base strategy, then apply stochastic + ADX filter.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Compute stochastic and ADX
+        k_val, d_val = self._compute_stochastic(history)
+        adx_val = self._compute_adx(history)
+
+        # Apply veto logic
+        if base_signal.direction == Direction.LONG:
+            # Veto LONG if %K > overbought UNLESS ADX > adx_trend
+            if k_val > self.overbought and adx_val <= self.adx_trend:
+                return None
+        elif base_signal.direction == Direction.SHORT:
+            # Veto SHORT if %K < oversold UNLESS ADX > adx_trend
+            if k_val < self.oversold and adx_val <= self.adx_trend:
+                return None
+
+        # Pass through base signal unchanged
+        return base_signal
+
+
+class ADXGateStrategy(Strategy):
+    """
+    Wrapper that gates a base strategy based on trend strength (ADX).
+
+    Routes strategies by market regime:
+    - kind="trend": passes base signal only when ADX > trend_min (default 25)
+    - kind="reversion": passes base signal only when ADX < reversion_max (default 20)
+    - Otherwise returns None, blocking the signal.
+
+    This allows trend-following and mean-reversion strategies to automatically
+    adapt to market conditions.
+
+    Example:
+        trend_strat = TrendFollowingStrategy()
+        gated = ADXGateStrategy(trend_strat, kind="trend", trend_min=25.0)
+
+        reversion_strat = RangeTradingStrategy()
+        gated_reversion = ADXGateStrategy(reversion_strat, kind="reversion", reversion_max=20.0)
+    """
+    name = "adx_gate"
+
+    def __init__(self, base_strategy: Strategy, kind: str,
+                 adx_period: int = 14,
+                 trend_min: float = 25.0,
+                 reversion_max: float = 20.0):
+        """
+        Initialize ADXGateStrategy.
+
+        Args:
+            base_strategy: Strategy to wrap
+            kind: "trend" or "reversion" - determines gating behavior
+            adx_period: period for ADX calculation (default 14)
+            trend_min: ADX threshold for trend-type strategies (default 25.0)
+            reversion_max: ADX threshold for reversion-type strategies (default 20.0)
+
+        Raises:
+            ValueError: if kind is not "trend" or "reversion"
+        """
+        if kind not in ("trend", "reversion"):
+            raise ValueError(f"kind must be 'trend' or 'reversion', got {kind!r}")
+
+        self.base_strategy = base_strategy
+        self.kind = kind
+        self.adx_period = adx_period
+        self.trend_min = trend_min
+        self.reversion_max = reversion_max
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal from base strategy, then gate based on ADX.
+
+        Returns:
+            Signal from base strategy if gate condition met, None otherwise.
+            Always returns Signal or None, never dict.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Compute ADX
+        adx_val = compute_adx(history, n=self.adx_period)
+
+        # Apply gating logic
+        if self.kind == "trend":
+            # Trend strategies pass only when ADX > trend_min
+            if adx_val > self.trend_min:
+                return base_signal
+            else:
+                return None
+        else:  # kind == "reversion"
+            # Reversion strategies pass only when ADX < reversion_max
+            if adx_val < self.reversion_max:
+                return base_signal
+            else:
+                return None
+
+
+class OBVConfirmationStrategy(Strategy):
+    """
+    On-Balance Volume (OBV) confirmation filter.
+
+    Computes OBV from realized volume (cumulative volume signed by close-to-close change).
+    Calculates the slope of the last slope_window OBV values via linear regression.
+    Vetoes signals when OBV slope sign disagrees with signal direction:
+    - LONG signals vetoed if slope is negative
+    - SHORT signals vetoed if slope is positive
+    Flat/zero slope passes through; matching sign passes through unchanged.
+
+    Complements VolumeConfirmationStrategy (which uses predicted volume).
+    """
+    name = "obv_confirmation"
+
+    def __init__(self, base_strategy: Strategy, slope_window: int = 20):
+        """
+        Initialize OBVConfirmationStrategy.
+
+        Args:
+            base_strategy: Strategy to wrap
+            slope_window: Window size for OBV slope calculation (default 20)
+        """
+        self.base_strategy = base_strategy
+        self.slope_window = slope_window
+
+    def _compute_obv(self, history: pd.DataFrame) -> Tuple[List[float], float]:
+        """
+        Compute OBV values from history.
+
+        OBV is cumulative volume signed by close-to-close change:
+        - If close > previous close: add volume
+        - If close < previous close: subtract volume
+        - If close == previous close: add 0 (no change to OBV)
+
+        Returns:
+            (obv_values, current_obv) tuple
+        """
+        closes = history["close"].values
+        volumes = history["volume"].values
+
+        if len(closes) < 2:
+            return [0.0], 0.0
+
+        obv_values = [0.0]  # OBV starts at 0
+        obv = 0.0
+
+        for i in range(1, len(closes)):
+            price_change = closes[i] - closes[i - 1]
+            if price_change > 0:
+                obv += volumes[i]
+            elif price_change < 0:
+                obv -= volumes[i]
+            # If price_change == 0, add 0 to OBV (no change)
+            obv_values.append(obv)
+
+        return obv_values, obv
+
+    def _compute_obv_slope(self, history: pd.DataFrame) -> float:
+        """
+        Compute the slope of OBV over the last slope_window bars.
+
+        Uses numpy.polyfit with degree 1 (linear regression).
+        Returns the slope coefficient.
+
+        Returns:
+            slope value (positive = rising OBV, negative = falling OBV)
+        """
+        obv_values, _ = self._compute_obv(history)
+
+        if len(obv_values) < self.slope_window:
+            # Not enough data; return 0 (neutral, no veto)
+            return 0.0
+
+        # Get the last slope_window OBV values
+        obv_window = obv_values[-self.slope_window:]
+        x = np.arange(len(obv_window), dtype=float)
+        y = np.array(obv_window, dtype=float)
+
+        # Fit a degree-1 polynomial (linear)
+        try:
+            coeffs = np.polyfit(x, y, deg=1)
+            slope = coeffs[0]  # First element is the slope
+        except Exception:
+            # If polyfit fails, return 0 (neutral)
+            return 0.0
+
+        return slope
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal from base strategy, then apply OBV slope filter.
+
+        Returns:
+            Signal from base strategy if OBV slope agrees with direction, None if vetoed.
+            Always returns Signal or None, never dict.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Compute OBV slope
+        obv_slope = self._compute_obv_slope(history)
+
+        # Apply veto logic
+        if base_signal.direction == Direction.LONG:
+            # Veto LONG if slope is negative (OBV falling)
+            if obv_slope < 0:
+                return None
+        elif base_signal.direction == Direction.SHORT:
+            # Veto SHORT if slope is positive (OBV rising)
+            if obv_slope > 0:
+                return None
+
+        # Pass through base signal unchanged (flat slope or matching sign)
+        return base_signal
+
+
+class MTFConsensusStrategy(Strategy):
+    """
+    Multi-timeframe consensus filter requiring majority agreement across {1d, 3d, 1w}.
+
+    Resamples history to {1d, 3d, 1w} via simple positional resampling
+    (taking every Nth close, N=1,3,5), computes trend sign (EMA_fast vs EMA_slow
+    per frame), and requires >=min_agree frames agreeing WITH the signal direction
+    for pass-through. Frames with insufficient data (<ema_slow bars) abstain.
+    If fewer than min_agree frames have enough data, passes through unchanged
+    (insufficient evidence).
+
+    Always returns Signal or None, never dict.
+    """
+    name = "mtf_consensus"
+
+    def __init__(self, base_strategy: Strategy, ema_fast: int = 20,
+                 ema_slow: int = 50, min_agree: int = 2):
+        """
+        Initialize MTFConsensusStrategy.
+
+        Args:
+            base_strategy: Strategy to wrap
+            ema_fast: Fast EMA period (default 20)
+            ema_slow: Slow EMA period (default 50)
+            min_agree: Minimum number of frames that must agree (default 2)
+        """
+        self.base_strategy = base_strategy
+        self.ema_fast = ema_fast
+        self.ema_slow = ema_slow
+        self.min_agree = min_agree
+
+    def _resample_closes(self, closes: np.ndarray, step: int) -> np.ndarray:
+        """
+        Resample closes by taking every step-th close from the end.
+        Ensures the latest bar is always included.
+
+        Args:
+            closes: Array of closing prices
+            step: Resampling step (1=1d, 3=3d, 5=1w)
+
+        Returns:
+            Resampled closes array (latest bar always included)
+        """
+        if len(closes) == 0:
+            return np.array([])
+
+        # Simple positional resampling from the end
+        # Build indices from the end backwards, then reverse to maintain order
+        indices = []
+        idx = len(closes) - 1
+        while idx >= 0:
+            indices.append(idx)
+            idx -= step
+        indices.reverse()
+
+        return closes[indices]
+
+    def _compute_trend_sign(self, closes: np.ndarray, fast_period: int,
+                           slow_period: int) -> Optional[int]:
+        """
+        Compute trend sign from EMA comparison.
+        Returns +1 if fast EMA > slow EMA, -1 if fast EMA < slow EMA,
+        None if insufficient data.
+        """
+        if len(closes) < slow_period:
+            return None
+
+        # Convert to pandas Series for ewm calculation
+        s = pd.Series(closes)
+        ema_fast = s.ewm(span=fast_period, adjust=False).mean().iloc[-1]
+        ema_slow = s.ewm(span=slow_period, adjust=False).mean().iloc[-1]
+
+        if ema_fast > ema_slow:
+            return 1
+        else:
+            return -1
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate signal from base strategy, then apply MTF consensus filter.
+
+        Returns:
+            Signal from base strategy if >= min_agree frames agree with direction,
+            None if vetoed, or base signal unchanged if insufficient frames have data.
+            Always returns Signal or None, never dict.
+        """
+        # Get base signal first
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        closes = history["close"].values
+        if len(closes) < self.ema_slow:
+            # Not enough data; pass through unchanged
+            return base_signal
+
+        # Resample to {1d, 3d, 1w}
+        resampled_1d = self._resample_closes(closes, 1)
+        resampled_3d = self._resample_closes(closes, 3)
+        resampled_1w = self._resample_closes(closes, 5)
+
+        # Compute trend signs
+        trend_1d = self._compute_trend_sign(resampled_1d, self.ema_fast, self.ema_slow)
+        trend_3d = self._compute_trend_sign(resampled_3d, self.ema_fast, self.ema_slow)
+        trend_1w = self._compute_trend_sign(resampled_1w, self.ema_fast, self.ema_slow)
+
+        # Count frames with enough data and their agreement
+        frames_with_data = [t for t in [trend_1d, trend_3d, trend_1w] if t is not None]
+
+        if len(frames_with_data) < self.min_agree:
+            # Insufficient evidence (fewer than min_agree frames have data)
+            return base_signal
+
+        # Convert signal direction to +1 or -1
+        signal_sign = 1 if base_signal.direction == Direction.LONG else -1
+
+        # Count agreements
+        agreements = sum(1 for trend in frames_with_data if trend == signal_sign)
+
+        # Require >= min_agree frames agreeing with signal direction
+        if agreements >= self.min_agree:
+            return base_signal
+        else:
+            return None
+
+
 class BollingerValidationStrategy(Strategy):
     """
     Compare predicted range to Bollinger Band width.
@@ -1368,7 +1884,7 @@ class BacktestEngine:
         self.daily_pnl: List[Tuple[pd.Timestamp, float]] = []
 
     def run(self, df: pd.DataFrame, router: DecisionTreeRouter,
-            lookback: int = 100) -> Dict:
+            lookback: int = 100, include_tca: bool = False) -> Dict:
         capital = self.initial_capital
         position = None
         current_trade_meta = None
@@ -1442,7 +1958,7 @@ class BacktestEngine:
             self.daily_pnl.append((date, capital - prev_capital))
             prev_capital = capital
 
-        return self._compute_metrics()
+        return self._compute_metrics(include_tca=include_tca)
 
     def _check_exit(self, position: Dict, tomorrow: pd.Series) -> Tuple[Optional[float], Optional[str]]:
         direction = position["direction"]
@@ -1482,7 +1998,7 @@ class BacktestEngine:
         fee = exit_price * position["size"] * self.fee_pct
         return gross - fee
 
-    def _compute_metrics(self) -> Dict:
+    def _compute_metrics(self, include_tca: bool = False) -> Dict:
         if not self.trades:
             return {
                 "total_return": 0.0,
@@ -1512,7 +2028,7 @@ class BacktestEngine:
 
         profit_factor = float(abs(sum(wins) / sum(losses))) if sum(losses) != 0 else float("inf")
 
-        return {
+        metrics = {
             "total_return": float((equity[-1] - self.initial_capital) / self.initial_capital),
             "sharpe": sharpe,
             "max_drawdown": max_dd,
@@ -1523,6 +2039,13 @@ class BacktestEngine:
             "avg_win": float(np.mean(wins)) if wins else 0.0,
             "avg_loss": float(np.mean(losses)) if losses else 0.0,
         }
+
+        # Optionally add TCA report
+        if include_tca and self.trades:
+            from kairos_execution import compute_tca
+            metrics["tca"] = compute_tca(self.trades)
+
+        return metrics
 
     def run_strategy_comparison(self, df: pd.DataFrame, strategies: List[Strategy],
                                 lookback: int = 100) -> pd.DataFrame:
@@ -1965,3 +2488,227 @@ if __name__ == "__main__":
     # comparison = engine.run_strategy_comparison(df, all_strategies, lookback=200)
     # print(comparison)
     pass
+
+
+# =============================================================================
+# WALK-FORWARD VALIDATION
+# =============================================================================
+
+def walk_forward(
+    strategy_factory: Callable[[], Strategy],
+    data: pd.DataFrame,
+    predictor: KairosPredictor,
+    train_days: int = 250,
+    test_days: int = 60,
+    step: int = 60,
+    anchored: bool = False,
+    initial_capital: float = 10000.0,
+    fee_pct: float = 0.001,
+    slippage_pct: float = 0.0005,
+    random_seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Walk-forward validation: roll non-overlapping test windows with fresh
+    strategy instances per fold. Computes per-fold and aggregate metrics,
+    including Sharpe retention ratio as overfitting score.
+
+    Parameters
+    ----------
+    strategy_factory : Callable[[], Strategy]
+        Factory function that returns a fresh Strategy instance per call.
+    data : pd.DataFrame
+        OHLCV data with DatetimeIndex.
+    predictor : KairosPredictor
+        Predictor instance for generating distributions.
+    train_days : int
+        Number of days in training window (default 250).
+    test_days : int
+        Number of days in test window (default 60).
+    step : int
+        Window step size (default 60, non-overlapping test windows).
+    anchored : bool
+        If True: expanding window (train start fixed at 0).
+        If False: sliding window (train window also rolls).
+    initial_capital : float
+        Starting capital per fold.
+    fee_pct : float
+        Transaction fee per trade.
+    slippage_pct : float
+        Slippage per trade entry.
+    random_seed : Optional[int]
+        Fixed seed for reproducibility (affects numpy/pd random state).
+
+    Returns
+    -------
+    Dict with keys:
+        - "folds": List[Dict] per-fold results {fold_id, train_metrics, test_metrics}
+        - "aggregate_metrics": Dict of aggregate metrics across all folds
+        - "overfitting_score": Sharpe retention ratio in [0,1]; higher = healthier, < 0.5 suggests overfitting
+        - "is_sharpe_mean": In-sample (train) Sharpe mean
+        - "oos_sharpe_mean": Out-of-sample (test) Sharpe mean
+        - "sharpe_degradation": IS Sharpe - OOS Sharpe
+    """
+    if len(data) < train_days + test_days:
+        raise ValueError(
+            f"Data length ({len(data)}) must be >= train_days + test_days ({train_days + test_days})"
+        )
+    if step <= 0:
+        raise ValueError(f"step must be > 0 (got {step})")
+
+    # Seed only the local scope: save/restore the global numpy RNG state so
+    # that walk_forward()'s reproducibility guarantee doesn't leak into
+    # unrelated code (e.g. other tests) that rely on unseeded np.random.
+    _prev_random_state = np.random.get_state() if random_seed is not None else None
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    try:
+        return _walk_forward_impl(
+            strategy_factory, data, predictor, train_days, test_days, step,
+            anchored, initial_capital, fee_pct, slippage_pct,
+        )
+    finally:
+        if _prev_random_state is not None:
+            np.random.set_state(_prev_random_state)
+
+
+def _walk_forward_impl(
+    strategy_factory, data, predictor, train_days, test_days, step,
+    anchored, initial_capital, fee_pct, slippage_pct,
+):
+    folds = []
+    fold_id = 0
+    train_start = 0
+    train_end = train_start + train_days
+
+    while True:
+        test_start = train_end
+        test_end = test_start + test_days
+
+        if test_end > len(data):
+            break
+
+        train_data = data.iloc[train_start:train_end]
+        test_data = data.iloc[test_start:test_end]
+
+        # Strategy factory: fresh instance per fold
+        strategy = strategy_factory()
+
+        # In-sample (training) backtest
+        engine_is = BacktestEngine(
+            predictor=predictor,
+            fee_pct=fee_pct,
+            slippage_pct=slippage_pct,
+            initial_capital=initial_capital,
+        )
+        router_is = DecisionTreeRouter(
+            entropy_threshold=999.0,
+            custom_strategies={
+                "range": [strategy],
+                "trend": [strategy],
+                "uncertain": [strategy],
+            },
+        )
+        train_metrics = engine_is.run(train_data, router_is, lookback=10)
+
+        # Out-of-sample (test) backtest: fresh strategy instance
+        strategy_oos = strategy_factory()
+        engine_oos = BacktestEngine(
+            predictor=predictor,
+            fee_pct=fee_pct,
+            slippage_pct=slippage_pct,
+            initial_capital=initial_capital,
+        )
+        router_oos = DecisionTreeRouter(
+            entropy_threshold=999.0,
+            custom_strategies={
+                "range": [strategy_oos],
+                "trend": [strategy_oos],
+                "uncertain": [strategy_oos],
+            },
+        )
+        test_metrics = engine_oos.run(test_data, router_oos, lookback=10)
+
+        fold_result = {
+            "fold_id": fold_id,
+            "train_start": train_start,
+            "train_end": train_end,
+            "test_start": test_start,
+            "test_end": test_end,
+            "train_metrics": train_metrics,
+            "test_metrics": test_metrics,
+        }
+        folds.append(fold_result)
+
+        # Move to next fold. `train_end` (not `train_start`) is the loop
+        # variable that must strictly increase every iteration so the loop
+        # is guaranteed to terminate once test_end exceeds len(data).
+        if anchored:
+            # Expanding window: train_start stays 0, train_end grows by step.
+            train_start = 0
+            train_end = train_end + step
+        else:
+            # Sliding window: entire window rolls forward by step.
+            train_start = train_start + step
+            train_end = train_start + train_days
+
+        fold_id += 1
+
+    # Aggregate metrics
+    is_sharpes = [f["train_metrics"]["sharpe"] for f in folds]
+    oos_sharpes = [f["test_metrics"]["sharpe"] for f in folds]
+
+    is_sharpe_mean = float(np.mean(is_sharpes)) if is_sharpes else 0.0
+    oos_sharpe_mean = float(np.mean(oos_sharpes)) if oos_sharpes else 0.0
+    sharpe_degradation = is_sharpe_mean - oos_sharpe_mean
+
+    # Sharpe retention ratio: measures OOS Sharpe as a fraction of IS Sharpe.
+    # Score in [0, 1]; higher = healthier (less overfitting).
+    # Semantics: if a strategy's OOS Sharpe retained 80% of its IS Sharpe,
+    # score = 0.8. If it retained 20%, score = 0.2 (suggests overfitting).
+    # Edge case: OOS positive despite non-positive IS (not overfit) scores 1.0.
+    if is_sharpe_mean > 0:
+        overfitting_score = float(np.clip(oos_sharpe_mean / is_sharpe_mean, 0.0, 1.0))
+    elif oos_sharpe_mean > 0:
+        overfitting_score = 1.0
+    else:
+        overfitting_score = 0.0
+
+    # Aggregate metrics: mean, std, median across folds
+    all_train_metrics = [f["train_metrics"] for f in folds]
+    all_test_metrics = [f["test_metrics"] for f in folds]
+
+    def aggregate_fold_metrics(metrics_list):
+        """Compute aggregate stats across folds."""
+        keys = [
+            "total_return",
+            "sharpe",
+            "max_drawdown",
+            "win_rate",
+            "profit_factor",
+            "num_trades",
+            "avg_trade",
+            "avg_win",
+            "avg_loss",
+        ]
+        result = {}
+        for key in keys:
+            values = [m.get(key, 0.0) for m in metrics_list]
+            result[f"{key}_mean"] = float(np.mean(values))
+            result[f"{key}_std"] = float(np.std(values))
+            result[f"{key}_median"] = float(np.median(values))
+        return result
+
+    aggregate_train = aggregate_fold_metrics(all_train_metrics)
+    aggregate_test = aggregate_fold_metrics(all_test_metrics)
+
+    return {
+        "folds": folds,
+        "num_folds": len(folds),
+        "aggregate_train": aggregate_train,
+        "aggregate_test": aggregate_test,
+        "is_sharpe_mean": is_sharpe_mean,
+        "oos_sharpe_mean": oos_sharpe_mean,
+        "sharpe_degradation": sharpe_degradation,
+        "overfitting_score": float(overfitting_score),
+    }

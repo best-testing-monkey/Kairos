@@ -1199,6 +1199,619 @@ class TimeBasedStopStrategy(Strategy):
 
 
 # =============================================================================
+# VOLUME PROFILE LEVELS
+# =============================================================================
+
+def volume_profile(history, lookback=60, bins=20):
+    """
+    Build a volume-at-price histogram from historical OHLCV data.
+
+    Args:
+        history: DataFrame with columns [open, high, low, close, volume]
+        lookback: Number of bars to include (default 60)
+        bins: Number of price bins (default 20)
+
+    Returns:
+        dict with keys:
+        - "poc": Point of control (center of max-volume bin)
+        - "hvn": List of high-volume node centers (bins > mean+1std)
+        - "lvn": List of low-volume node centers (bins < mean-1std)
+        - "edges": Bin edges for the histogram
+    """
+    # Use the last 'lookback' bars
+    window = history.tail(lookback)
+    if len(window) < 2:
+        return {"poc": None, "hvn": [], "lvn": [], "edges": []}
+
+    # Compute typical price (H+L+C)/3 and extract volume
+    typical_prices = (window["high"] + window["low"] + window["close"]) / 3.0
+    volumes = window["volume"]
+
+    # Get price range from the window (use min of lows, max of highs)
+    min_price = window["low"].min()
+    max_price = window["high"].max()
+
+    if min_price == max_price:
+        return {"poc": min_price, "hvn": [], "lvn": [], "edges": []}
+
+    # Create bins and assign volumes
+    edges = np.linspace(min_price, max_price, bins + 1)
+    bin_volumes = np.zeros(bins)
+
+    for tp, vol in zip(typical_prices, volumes):
+        # Find the bin index for this typical price
+        bin_idx = np.searchsorted(edges, tp, side="right") - 1
+        # Clamp to valid range
+        bin_idx = max(0, min(bin_idx, bins - 1))
+        bin_volumes[bin_idx] += vol
+
+    # Compute bin centers
+    bin_centers = (edges[:-1] + edges[1:]) / 2.0
+
+    # Find POC (point of control) - center of highest volume bin
+    poc_idx = np.argmax(bin_volumes)
+    poc = float(bin_centers[poc_idx])
+
+    # Compute mean and std of bin volumes
+    mean_vol = np.mean(bin_volumes)
+    std_vol = np.std(bin_volumes)
+
+    # High-volume nodes: bins > mean + 1*std
+    hvn = [float(bin_centers[i]) for i in range(bins) if bin_volumes[i] > mean_vol + std_vol]
+
+    # Low-volume nodes: bins < mean - 1*std
+    lvn = [float(bin_centers[i]) for i in range(bins) if bin_volumes[i] < mean_vol - std_vol]
+
+    return {
+        "poc": poc,
+        "hvn": sorted(hvn),
+        "lvn": sorted(lvn),
+        "edges": edges.tolist()
+    }
+
+
+class VolumeProfileLevelsStrategy(Strategy):
+    """
+    Wraps a base strategy and snaps stops/targets to volume profile support/resistance levels.
+
+    - Stop snapped to nearest high-volume node (HVN) between current stop and entry,
+      but only if it makes the stop nearer to entry (tightening).
+    - Target snapped to nearest low-volume node (LVN) beyond entry in trade direction,
+      but only if it's nearer than the original target.
+    - Records chosen levels in signal.metadata["volume_profile"].
+    """
+    name = "volume_profile_levels"
+
+    def __init__(self, base_strategy: Strategy, lookback: int = 60, bins: int = 20):
+        """
+        Args:
+            base_strategy: Strategy to wrap
+            lookback: Number of bars for volume profile (default 60)
+            bins: Number of price bins (default 20)
+        """
+        self.base_strategy = base_strategy
+        self.lookback = lookback
+        self.bins = bins
+
+    def generate_signal(self, dist, current_price, history, context):
+        # Get base signal
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Build volume profile
+        vp = volume_profile(history, lookback=self.lookback, bins=self.bins)
+
+        # Initialize metadata tracking
+        metadata_vp = {
+            "poc": vp["poc"],
+            "hvn": vp["hvn"],
+            "lvn": vp["lvn"],
+            "stop_original": base_signal.stop,
+            "target_original": base_signal.target,
+            "stop_snapped": base_signal.stop,
+            "target_snapped": base_signal.target,
+        }
+
+        entry = base_signal.entry
+        original_stop = base_signal.stop
+        original_target = base_signal.target
+        new_stop = original_stop
+        new_target = original_target
+
+        # Determine trade direction
+        if base_signal.direction == Direction.LONG:
+            # LONG trade
+            # Stop: find nearest HVN that is BETWEEN current stop and entry
+            # (i.e., above the current stop but below entry)
+            # Snap only if it tightens the stop (moves it UP toward entry)
+            if vp["hvn"]:
+                hvn_between = [h for h in vp["hvn"] if original_stop < h < entry]
+                if hvn_between:
+                    hvn_nearest = max(hvn_between)  # Highest HVN below entry
+                    if hvn_nearest > original_stop:
+                        new_stop = hvn_nearest
+                        metadata_vp["stop_snapped"] = new_stop
+
+            # Target: find nearest LVN beyond entry (i.e., above entry)
+            # Snap only if it's nearer than original target
+            if vp["lvn"]:
+                lvn_beyond = [l for l in vp["lvn"] if l > entry]
+                if lvn_beyond:
+                    lvn_nearest = min(lvn_beyond)  # Lowest LVN above entry
+                    if abs(lvn_nearest - entry) < abs(original_target - entry):
+                        new_target = lvn_nearest
+                        metadata_vp["target_snapped"] = new_target
+
+        else:  # Direction.SHORT
+            # SHORT trade
+            # Stop: find nearest HVN that is BETWEEN entry and current stop
+            # (i.e., below entry but above the current stop)
+            # Snap only if it tightens the stop (moves it DOWN toward entry)
+            if vp["hvn"]:
+                hvn_between = [h for h in vp["hvn"] if entry < h < original_stop]
+                if hvn_between:
+                    hvn_nearest = min(hvn_between)  # Lowest HVN above entry
+                    if hvn_nearest < original_stop:
+                        new_stop = hvn_nearest
+                        metadata_vp["stop_snapped"] = new_stop
+
+            # Target: find nearest LVN beyond entry (i.e., below entry)
+            # Snap only if it's nearer than original target
+            if vp["lvn"]:
+                lvn_beyond = [l for l in vp["lvn"] if l < entry]
+                if lvn_beyond:
+                    lvn_nearest = max(lvn_beyond)  # Highest LVN below entry
+                    if abs(lvn_nearest - entry) < abs(original_target - entry):
+                        new_target = lvn_nearest
+                        metadata_vp["target_snapped"] = new_target
+
+        # Update signal with snapped levels
+        base_signal.stop = new_stop
+        base_signal.target = new_target
+        base_signal.metadata["volume_profile"] = metadata_vp
+
+        return base_signal
+
+
+class CVDDivergenceStrategy(Strategy):
+    """
+    Trades divergence between cumulative volume delta (CVD) and price slope.
+
+    Computes z-normalized slopes over a rolling window:
+    - CVD slope: slope of cumulative volume delta (volume signed by close-vs-open)
+    - Price slope: slope of close prices
+
+    Signals:
+    - Price slope > 0 and CVD slope < 0 → bearish divergence → SHORT
+    - Price slope < 0 and CVD slope > 0 → bullish divergence → LONG
+    - No divergence or insufficient history → None
+
+    Gate on Kronos agreement:
+    - Bearish divergence only fires if dist.mean < current_price
+    - Bullish divergence only fires if dist.mean > current_price
+    """
+    name = "cvd_divergence"
+
+    def __init__(self, slope_window: int = 20, lookback: int = 60):
+        """
+        Args:
+            slope_window: Number of bars to use for slope computation (default 20)
+            lookback: Number of bars to require in history (default 60)
+        """
+        self.slope_window = slope_window
+        self.lookback = lookback
+
+    def generate_signal(self, dist, current_price, history, context):
+        """Generate signal based on CVD/price slope divergence."""
+        # Need at least slope_window+1 bars for slope computation
+        if len(history) < self.slope_window + 1:
+            return None
+
+        # Extract OHLCV
+        closes = history["close"].values.astype(float)
+        volumes = history["volume"].values.astype(float)
+
+        # Compute CVD: cumsum of (volume * sign(close - open))
+        opens = history["open"].values.astype(float)
+        close_minus_open = closes - opens
+        volume_signed = volumes * np.sign(close_minus_open)
+        cvd = np.cumsum(volume_signed)
+
+        # Get the last slope_window bars
+        cvd_window = cvd[-self.slope_window:]
+        close_window = closes[-self.slope_window:]
+
+        # Z-normalize for comparable slopes
+        cvd_z = (cvd_window - np.mean(cvd_window)) / (np.std(cvd_window) + 1e-8)
+        close_z = (close_window - np.mean(close_window)) / (np.std(close_window) + 1e-8)
+
+        # Compute slopes via np.polyfit
+        x = np.arange(len(cvd_z))
+        cvd_slope_coeffs = np.polyfit(x, cvd_z, 1)
+        price_slope_coeffs = np.polyfit(x, close_z, 1)
+
+        cvd_slope = float(cvd_slope_coeffs[0])
+        price_slope = float(price_slope_coeffs[0])
+
+        # Detect divergence
+        dist_mean = dist.stats["close"]["mean"]
+
+        if price_slope > 0 and cvd_slope < 0:
+            # Bearish divergence: prices rising but CVD falling
+            direction = Direction.SHORT
+        elif price_slope < 0 and cvd_slope > 0:
+            # Bullish divergence: prices falling but CVD rising
+            direction = Direction.LONG
+        else:
+            # No divergence
+            return None
+
+        # Gate on Kronos agreement
+        if direction == Direction.SHORT and dist_mean >= current_price:
+            # Kronos predicts up; don't short
+            return None
+        if direction == Direction.LONG and dist_mean <= current_price:
+            # Kronos predicts down; don't go long
+            return None
+
+        # Set brackets
+        if direction == Direction.LONG:
+            stop = dist.stats["low"][f"pct_{int(15)}"]
+            target = dist.stats["high"][f"pct_{int(85)}"]
+        else:  # SHORT
+            stop = dist.stats["high"][f"pct_{int(85)}"]
+            target = dist.stats["low"][f"pct_{int(15)}"]
+
+        # Compute Kelly and size
+        kelly = dist.kelly_fraction(current_price, target, stop)
+        size = min(kelly * 0.5, 1.0)
+
+        # Confidence: sum of absolute slopes, bounded to [0, 1]
+        confidence = min(abs(cvd_slope) + abs(price_slope), 1.0)
+
+        # Expected value
+        ev = dist.expected_value(current_price, target, stop)
+
+        return Signal(
+            direction=direction,
+            size=size,
+            entry=current_price,
+            stop=stop,
+            target=target,
+            strategy_name=self.name,
+            confidence=confidence,
+            expected_value=ev,
+            metadata={
+                "cvd_slope": cvd_slope,
+                "price_slope": price_slope,
+            }
+        )
+
+
+class TWAPExecutionStrategy(Strategy):
+    """
+    Time-Weighted Average Price (TWAP) execution wrapper.
+
+    Splits entry across the first n_slices steps of the predicted path,
+    computing an effective entry as the mean of slice prices.
+    Recomputes stop/target by shifting them to preserve bracket distances
+    from the new effective entry.
+    Records per-slice prices in signal.metadata["fills"].
+
+    Usage:
+        base_strat = SomeDirectionalStrategy()
+        twap_strat = TWAPExecutionStrategy(base_strat, n_slices=4)
+        signal = twap_strat.generate_signal(dist, current_price, history, context)
+    """
+    name = "twap_execution"
+
+    def __init__(self, base_strategy: Strategy, n_slices: int = 4):
+        """
+        Args:
+            base_strategy: The underlying strategy to wrap
+            n_slices: Number of slices for TWAP execution (default 4)
+        """
+        self.base_strategy = base_strategy
+        self.n_slices = max(1, int(n_slices))
+
+    def _extract_predicted_path(self, dist: KairosDistribution, current_price: float) -> np.ndarray:
+        """
+        Extract the predicted intraday/next-period path from dist.
+
+        Tries to read individual close samples from dist.df, averaging across samples.
+        If unavailable (e.g., single-sample dist), falls back to flat path at current_price.
+
+        Args:
+            dist: KairosDistribution with predictions
+            current_price: Current market price (used as fallback)
+
+        Returns:
+            np.ndarray of predicted prices (length >= n_slices, or flat array of current_price)
+        """
+        try:
+            # Try to extract close prices from dist.df
+            if hasattr(dist, "df") and "close" in dist.df.columns:
+                close_prices = dist.df["close"].values.astype(float)
+                if len(close_prices) > 0:
+                    return close_prices
+        except Exception:
+            pass
+
+        # Fallback: flat path at current price
+        return np.full(self.n_slices, current_price, dtype=float)
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate a TWAP signal by wrapping the base strategy's signal.
+
+        Returns None if base signal is None. Otherwise, computes effective entry
+        as the mean of the first n_slices predicted path values, then recomputes
+        stop/target to preserve bracket distances.
+        """
+        # Pass through None from base strategy
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Extract predicted path
+        path = self._extract_predicted_path(dist, current_price)
+
+        # Take the first n_slices values from the path (or all if path is shorter)
+        n_slices_actual = min(self.n_slices, len(path))
+        slice_prices = path[:n_slices_actual]
+
+        # Compute effective entry as mean of slice prices
+        effective_entry = float(np.mean(slice_prices))
+
+        # Compute the shift amount
+        entry_shift = effective_entry - base_signal.entry
+
+        # Shift stop and target to preserve bracket distances
+        new_stop = base_signal.stop + entry_shift
+        new_target = base_signal.target + entry_shift
+
+        # Create a new signal with the adjusted entry and brackets
+        twap_signal = Signal(
+            direction=base_signal.direction,
+            size=base_signal.size,
+            entry=effective_entry,
+            stop=new_stop,
+            target=new_target,
+            strategy_name=self.name,
+            confidence=base_signal.confidence,
+            expected_value=base_signal.expected_value,
+            metadata=dict(base_signal.metadata)  # Copy metadata
+        )
+
+        # Record per-slice fills
+        twap_signal.metadata["fills"] = slice_prices.tolist()
+
+        return twap_signal
+
+
+class ImplementationShortfallStrategy(Strategy):
+    """
+    Adaptive execution strategy choosing between immediate-fill and TWAP
+    based on Kronos-predicted drift vs. assumed impact cost.
+
+    Per signal: estimate predicted drift over the execution horizon as
+    (mean of first n_slices predicted path closes - current_price) / current_price
+    multiplied by direction_sign (±1). Compare to impact cost in basis points.
+    If adverse drift > impact_bps / 10000, execute immediately (fast fill).
+    Otherwise, execute via TWAP (patient).
+
+    Metadata ["execution"] set to "immediate" or "twap" respectively.
+
+    Usage:
+        base_strat = SomeDirectionalStrategy()
+        impl_strat = ImplementationShortfallStrategy(base_strat, n_slices=4, impact_bps=5.0)
+        signal = impl_strat.generate_signal(dist, current_price, history, context)
+    """
+    name = "implementation_shortfall"
+
+    def __init__(self, base_strategy: Strategy, n_slices: int = 4, impact_bps: float = 5.0):
+        """
+        Args:
+            base_strategy: The underlying strategy to wrap
+            n_slices: Number of slices for TWAP execution if patient mode (default 4)
+            impact_bps: Assumed market impact in basis points (default 5.0)
+        """
+        self.base_strategy = base_strategy
+        self.n_slices = max(1, int(n_slices))
+        self.impact_bps = float(impact_bps)
+
+    def _extract_predicted_path(self, dist: KairosDistribution, current_price: float) -> np.ndarray:
+        """
+        Extract the predicted intraday/next-period path from dist.
+
+        Tries to read individual close samples from dist.df, returning them as-is.
+        If unavailable (e.g., single-sample dist), falls back to flat path at current_price.
+
+        Args:
+            dist: KairosDistribution with predictions
+            current_price: Current market price (used as fallback)
+
+        Returns:
+            np.ndarray of predicted prices (length >= n_slices, or flat array of current_price)
+        """
+        try:
+            # Try to extract close prices from dist.df
+            if hasattr(dist, "df") and "close" in dist.df.columns:
+                close_prices = dist.df["close"].values.astype(float)
+                if len(close_prices) > 0:
+                    return close_prices
+        except Exception:
+            pass
+
+        # Fallback: flat path at current price
+        return np.full(self.n_slices, current_price, dtype=float)
+
+    def generate_signal(self, dist, current_price, history, context):
+        """
+        Generate a signal choosing between immediate-fill and TWAP execution.
+
+        Returns None if base signal is None.
+        Compares predicted drift vs. impact_bps to decide execution method.
+        Immediate: entry/stop/target unchanged, metadata["execution"]="immediate".
+        TWAP: effective entry from path mean, brackets shifted, metadata["execution"]="twap".
+        """
+        # Pass through None from base strategy
+        base_signal = self.base_strategy.generate_signal(dist, current_price, history, context)
+        if base_signal is None:
+            return None
+
+        # Extract predicted path
+        path = self._extract_predicted_path(dist, current_price)
+
+        # Compute mean of first n_slices values
+        n_slices_actual = min(self.n_slices, len(path))
+        path_mean = float(np.mean(path[:n_slices_actual]))
+
+        # Compute adverse drift
+        # adverse_drift = (path_mean - current_price) / current_price * direction_sign
+        # For LONG: direction_sign = +1
+        # For SHORT: direction_sign = -1
+        if current_price == 0:
+            adverse_drift = 0.0
+        else:
+            drift = (path_mean - current_price) / current_price
+            direction_sign = 1.0 if base_signal.direction == Direction.LONG else -1.0
+            adverse_drift = drift * direction_sign
+
+        # Decision threshold: impact_bps / 10000
+        impact_threshold = self.impact_bps / 10000.0
+
+        # Decide execution method
+        if adverse_drift > impact_threshold:
+            # Execute immediately: return base signal unchanged
+            immediate_signal = Signal(
+                direction=base_signal.direction,
+                size=base_signal.size,
+                entry=base_signal.entry,
+                stop=base_signal.stop,
+                target=base_signal.target,
+                strategy_name=self.name,
+                confidence=base_signal.confidence,
+                expected_value=base_signal.expected_value,
+                metadata=dict(base_signal.metadata)
+            )
+            immediate_signal.metadata["execution"] = "immediate"
+            return immediate_signal
+        else:
+            # Execute via TWAP: compute effective entry from path mean
+            effective_entry = path_mean
+
+            # Compute the shift amount
+            entry_shift = effective_entry - base_signal.entry
+
+            # Shift stop and target to preserve bracket distances
+            new_stop = base_signal.stop + entry_shift
+            new_target = base_signal.target + entry_shift
+
+            # Create a new signal with adjusted entry and brackets
+            twap_signal = Signal(
+                direction=base_signal.direction,
+                size=base_signal.size,
+                entry=effective_entry,
+                stop=new_stop,
+                target=new_target,
+                strategy_name=self.name,
+                confidence=base_signal.confidence,
+                expected_value=base_signal.expected_value,
+                metadata=dict(base_signal.metadata)
+            )
+
+            twap_signal.metadata["execution"] = "twap"
+            # Record per-slice fills
+            twap_signal.metadata["fills"] = path[:n_slices_actual].tolist()
+
+            return twap_signal
+
+
+# =============================================================================
+# TRANSACTION COST ANALYSIS (TCA)
+# =============================================================================
+
+def compute_tca(trades: List["Trade"], impact_bps: float = 5.0) -> pd.DataFrame:
+    """
+    Post-backtest transaction cost analysis: decompose per-trade slippage
+    into timing and impact components.
+
+    Args:
+        trades: List of Trade dataclass instances (from backtest() output).
+        impact_bps: Assumed market impact cost in basis points (default 5.0).
+
+    Returns:
+        DataFrame with one row per trade and columns:
+        - entry_date: Trade entry date
+        - symbol: Strategy name (symbol if available, else strategy_name)
+        - side: 'long' or 'short' (from Direction)
+        - timing_cost: Entry price vs. day open reference (bps).
+          If no day_open field on trade, defaults to 0.0.
+        - impact_cost: Assumed impact = (impact_bps / 10000) * notional.
+        - total_slippage: timing_cost + impact_cost.
+
+        Each row asserts: timing_cost + impact_cost == total_slippage (within float precision).
+        Empty trades list returns empty DataFrame with the same columns.
+    """
+    # Define column schema upfront
+    columns = ["entry_date", "symbol", "side", "timing_cost", "impact_cost", "total_slippage"]
+
+    if not trades:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for trade in trades:
+        # Defensively extract fields using getattr with defaults
+        entry_date = getattr(trade, "entry_date", None)
+        strategy_name = getattr(trade, "strategy_name", "unknown")
+        direction = getattr(trade, "direction", None)
+        entry_price = getattr(trade, "entry_price", 0.0)
+        size = getattr(trade, "size", 0.0)
+
+        # day_open may or may not be present on Trade; default to entry_price
+        day_open = getattr(trade, "day_open", entry_price)
+
+        # Compute side string
+        if direction == Direction.LONG or direction == 1:
+            side = "long"
+        elif direction == Direction.SHORT or direction == -1:
+            side = "short"
+        else:
+            side = "flat"
+
+        # Timing cost: entry price vs. day open (in basis points)
+        # If day_open == entry_price (no reference), timing_cost = 0.0
+        if entry_price != 0.0:
+            timing_cost = ((entry_price - day_open) / entry_price) * 10000.0
+        else:
+            timing_cost = 0.0
+
+        # Impact cost: assumed bps applied to notional (entry * size)
+        notional = entry_price * size
+        impact_cost = (impact_bps / 10000.0) * notional
+
+        # Total slippage
+        total_slippage = timing_cost + impact_cost
+
+        # Assert the sum holds (within float epsilon for numerical precision)
+        assert abs((timing_cost + impact_cost) - total_slippage) < 1e-9, \
+            f"TCA row {len(rows)}: timing + impact mismatch: {timing_cost} + {impact_cost} != {total_slippage}"
+
+        rows.append({
+            "entry_date": entry_date,
+            "symbol": strategy_name,
+            "side": side,
+            "timing_cost": timing_cost,
+            "impact_cost": impact_cost,
+            "total_slippage": total_slippage,
+        })
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+# =============================================================================
 # EXAMPLE / TEST
 # =============================================================================
 

@@ -72,6 +72,19 @@ Use TF32 flags instead (`torch.backends.cuda.matmul.allow_tf32 = True`).
 automatically. TF32 is enabled in `_ensure_model_loaded()` when CUDA is available.
 CPU mode uses INT8 dynamic quantization via `torch.quantization.quantize_dynamic`.
 
+### GPU recovery (opt-out strict CUDA mode)
+`_ensure_model_loaded()` calls `kairos_gpu.ensure_cuda()` before deciding between
+the GPU and CPU/INT8 branches. By default CUDA is *required*: if torch can't see
+CUDA, `ensure_cuda()` shells out to `uv run scripts/gpu_recover.py` (an escalation
+ladder L0 diagnose -> L1 free GPU processes -> L2 UVM reload -> L3 full module
+reload -> L4 reboot+resume). Set `KAIROS_ALLOW_CPU=1` to restore the old silent
+CPU fallback instead. Set `KAIROS_GPU_ALLOW_REBOOT=1` to permit the L4 reboot
+step for unattended/overnight runs. If recovery heals the GPU but the *current*
+process still can't see it (torch caches CUDA init state), the process exits
+`75` (EX_TEMPFAIL); `kairos_pipeline.run_backtest_subprocess` retries such a
+subprocess exactly once. Run `uv run scripts/gpu_recover.py --check-only` to
+probe without side effects, or `--dry-run` to preview the full ladder.
+
 ### PRED_SAMPLES and DEMO_LOOKBACK
 `PRED_SAMPLES = 100` and `DEMO_LOOKBACK = 300` in the `__main__` block of
 `strategy/kairos_strategies.py` are hard constraints. Do not reduce them as a
