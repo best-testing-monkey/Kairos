@@ -576,6 +576,113 @@ class TestLoadWorkItemsAndGrouping:
 
 
 # ============================================================================
+# load_work_items — latest run_id PER INTERVAL
+# ============================================================================
+
+def _seed_rows(tmp_path, rows, db_name="pipeline_results.db"):
+    """Seed a fresh viability_report DB with arbitrary rows (schema-matched
+    tuples), mirroring _seed_db's column order/style."""
+    db_path = os.path.join(tmp_path, db_name)
+    conn = sqlite3.connect(db_path)
+    conn.executescript(VIABILITY_SCHEMA)
+    conn.executemany(
+        "INSERT INTO viability_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+class TestLoadWorkItemsPerInterval:
+    def test_separate_latest_run_per_interval(self, tmp_path):
+        # run 10: 1d / 6m backtest only. run 11: 1h / 3m backtest only.
+        rows = [
+            (10, "daily_strat_a", "BTC-USD,ETH-USD", "crypto", "1d", "6m",
+             23.3, 5, 0.8, 0.016, 235, 30.2, 3, 1.0, 0.023, 236, None, 0.69, 1),
+            (10, "daily_strat_b", "BTC-USD,ETH-USD", "crypto", "1d", "6m",
+             24.1, 8, 0.875, 0.014, 235, 21.7, 3, 1.0, 0.030, 236, None, 0.69, 1),
+            (11, "hourly_strat_a", "BTC-USD,ETH-USD", "crypto", "1h", "3m",
+             12.0, 4, 0.6, 0.010, 235, 10.0, 2, 0.5, 0.010, 236, None, 1.2, 1),
+        ]
+        db_path = _seed_rows(tmp_path, rows)
+
+        conn = sqlite3.connect(db_path)
+        daily_rows = load_work_items(conn, intervals=["1d"], include_all=False)
+        conn.close()
+        conn = sqlite3.connect(db_path)
+        hourly_rows = load_work_items(conn, intervals=["1h"], include_all=False)
+        conn.close()
+
+        assert len(daily_rows) > 0
+        assert {r["strategy_name"] for r in daily_rows} == {"daily_strat_a", "daily_strat_b"}
+        assert all(r["interval"] == "1d" for r in daily_rows)
+
+        assert len(hourly_rows) > 0
+        assert {r["strategy_name"] for r in hourly_rows} == {"hourly_strat_a"}
+        assert all(r["interval"] == "1h" for r in hourly_rows)
+
+    def test_no_interval_filter_returns_both_intervals(self, tmp_path):
+        rows = [
+            (10, "daily_strat_a", "BTC-USD,ETH-USD", "crypto", "1d", "6m",
+             23.3, 5, 0.8, 0.016, 235, 30.2, 3, 1.0, 0.023, 236, None, 0.69, 1),
+            (11, "hourly_strat_a", "BTC-USD,ETH-USD", "crypto", "1h", "3m",
+             12.0, 4, 0.6, 0.010, 235, 10.0, 2, 0.5, 0.010, 236, None, 1.2, 1),
+        ]
+        db_path = _seed_rows(tmp_path, rows)
+
+        conn = sqlite3.connect(db_path)
+        all_rows = load_work_items(conn, intervals=None, include_all=False)
+        conn.close()
+
+        names = {r["strategy_name"] for r in all_rows}
+        intervals = {r["interval"] for r in all_rows}
+        assert names == {"daily_strat_a", "hourly_strat_a"}
+        assert intervals == {"1d", "1h"}
+
+    def test_older_run_superseded_within_same_interval(self, tmp_path):
+        # run 20 (older) and run 21 (newer) both contain 1d rows; only the
+        # newer run's 1d rows should be returned.
+        rows = [
+            (20, "old_1d_strat", "BTC-USD", "crypto", "1d", "6m",
+             5.0, 2, 0.5, 0.01, 235, 5.0, 2, 0.5, 0.01, 236, None, 0.3, 1),
+            (21, "new_1d_strat", "BTC-USD", "crypto", "1d", "6m",
+             6.0, 3, 0.6, 0.02, 235, 6.0, 3, 0.6, 0.02, 236, None, 0.4, 1),
+        ]
+        db_path = _seed_rows(tmp_path, rows)
+
+        conn = sqlite3.connect(db_path)
+        daily_rows = load_work_items(conn, intervals=["1d"], include_all=False)
+        conn.close()
+
+        names = {r["strategy_name"] for r in daily_rows}
+        assert names == {"new_1d_strat"}
+        assert "old_1d_strat" not in names
+
+    def test_viable_filter_still_applies_within_latest_per_interval(self, tmp_path):
+        # Latest run for 1d (run 30) has one viable and one non-viable row.
+        rows = [
+            (30, "viable_1d_strat", "BTC-USD", "crypto", "1d", "6m",
+             10.0, 4, 0.7, 0.02, 235, 9.0, 3, 0.6, 0.02, 236, None, 0.5, 1),
+            (30, "not_viable_1d_strat", "BTC-USD", "crypto", "1d", "6m",
+             1.0, 1, 0.1, 0.001, 235, 1.0, 1, 0.1, 0.001, 236, None, 0.1, 0),
+        ]
+        db_path = _seed_rows(tmp_path, rows)
+
+        conn = sqlite3.connect(db_path)
+        viable_only = load_work_items(conn, intervals=["1d"], include_all=False)
+        conn.close()
+        conn = sqlite3.connect(db_path)
+        all_rows = load_work_items(conn, intervals=["1d"], include_all=True)
+        conn.close()
+
+        assert {r["strategy_name"] for r in viable_only} == {"viable_1d_strat"}
+        assert {r["strategy_name"] for r in all_rows} == {
+            "viable_1d_strat", "not_viable_1d_strat",
+        }
+
+
+# ============================================================================
 # build_strategy_index (wrapper unwrapping)
 # ============================================================================
 

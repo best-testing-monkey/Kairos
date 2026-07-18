@@ -38,12 +38,16 @@ RESULTS_DIR = os.path.join(REPO_ROOT, "results")
 # =============================================================================
 
 def load_work_items(conn, intervals=None, include_all=False):
-    """Load viability_report rows for the latest run_id.
+    """Load viability_report rows for the latest run_id, per interval.
 
     Returns a list of dicts (one per row), filtered to `viable=1` unless
     `include_all` is set, and optionally filtered to `intervals`.
     """
-    query = "SELECT * FROM viability_report WHERE run_id = (SELECT MAX(run_id) FROM viability_report)"
+    query = (
+        "SELECT * FROM viability_report WHERE run_id = ("
+        "SELECT MAX(run_id) FROM viability_report v2 "
+        "WHERE v2.interval = viability_report.interval)"
+    )
     params = []
     if not include_all:
         query += " AND viable = 1"
