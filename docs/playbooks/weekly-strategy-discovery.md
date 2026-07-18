@@ -80,6 +80,11 @@ automatically by `run_backtest_subprocess`. Full ladder details (L0–L4) are
 in [`CLAUDE.md`](../../CLAUDE.md) under "GPU recovery" — don't duplicate them
 here.
 
+> **Known issue (2026-07-18):** unattended recovery is currently unreliable —
+> the L3 step fails when restarting the window manager. Until that's fixed,
+> treat long GPU runs as needing a healthy GPU throughout; the ladder is not
+> a dependable safety net.
+
 ## Runtime expectations
 
 Base-stage backtests run at roughly 0.3–0.4 s/iteration on GPU. The 1h/3m run
