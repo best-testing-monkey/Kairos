@@ -342,6 +342,14 @@ registry row.
 
 **Orchestration** (`run_stage_finetune_next()`):
 
+0. Unless `--dry_run`, acquire the exclusive `data/finetune_next.lock`
+   (`acquire_finetune_lock()`, `fcntl.flock` `LOCK_EX | LOCK_NB`) before
+   anything else; if another instance already holds it, print a message and
+   exit cleanly with no candidate selection or registry writes. Once held,
+   sweep any `finetuned_models` rows still in `status='training'` (orphaned
+   by a crashed previous run - impossible to be a live run since this
+   process holds the lock) to `status='failed'`, one print line per row,
+   before candidate selection. See "Concurrency" below.
 1. Select the candidate (or use an explicit `--assets`/`--interval` for a
    manual re-queue - see below).
 2. Insert a `finetuned_models` row with `status='training'`, claiming the
@@ -390,6 +398,13 @@ train/backtest/compare cycle from scratch.
 forward straight to the `uv run finetune` subprocess's `--epochs`/
 `--batch-size`; `--pred_samples` (default `100`) is the same flag used
 elsewhere in the pipeline, forwarded to the backtest step.
+
+**Concurrency**: safe to fire blindly from cron/idle-GPU hooks - a second
+instance exits immediately via the `data/finetune_next.lock` `flock`
+(auto-released by the kernel if the holding process crashes, no pid-file
+staleness checks needed). A crashed run's row is auto-marked `failed` on the
+next `finetune_next` start (see orchestration step 0 above) and needs a
+manual re-queue if you want to retry it.
 
 **Not yet wired**: nothing downstream consumes `accepted` models today -
 `kairos_signals.py` and the viability report still only ever read

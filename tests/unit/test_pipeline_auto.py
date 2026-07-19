@@ -14,7 +14,7 @@ from kairos_pipeline import (
     build_viability_report, get_connection, SCHEMA, insert_oracle_row, insert_model_row,
     run_stage_auto, start_run, dump_csv,
     finetune_model_dir, compute_finetune_periods, select_finetune_candidate,
-    compare_finetuned_vs_base, run_stage_finetune_next,
+    compare_finetuned_vs_base, run_stage_finetune_next, acquire_finetune_lock,
     insert_finetune_registry_row, update_finetune_registry_row,
 )
 
@@ -2505,7 +2505,7 @@ class TestRunStageFinetuneNextOrchestrator:
     def test_no_candidate_returns_none(self, temp_db, tmp_path, monkeypatch):
         import kairos_pipeline
         monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
-        result = run_stage_finetune_next(temp_db)
+        result = run_stage_finetune_next(temp_db, lock_path=str(tmp_path / "finetune_next.lock"))
         assert result is None
 
     def test_training_failure_marks_failed_and_skips_backtest(self, temp_db, tmp_path, monkeypatch):
@@ -2516,7 +2516,10 @@ class TestRunStageFinetuneNextOrchestrator:
         with patch("kairos_pipeline.subprocess.run",
                    return_value=self._mock_subprocess(returncode=1, stderr="boom")) as mock_run, \
              patch("kairos_pipeline.run_stage_model") as mock_model:
-            row_id = run_stage_finetune_next(temp_db, ft_epochs=1, ft_batch_size=4)
+            row_id = run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
 
         mock_run.assert_called_once()
         mock_model.assert_not_called()
@@ -2549,7 +2552,10 @@ class TestRunStageFinetuneNextOrchestrator:
         with patch("kairos_pipeline.subprocess.run",
                    return_value=self._mock_subprocess(returncode=0)) as mock_run, \
              patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model) as mock_model:
-            row_id = run_stage_finetune_next(temp_db, ft_epochs=1, ft_batch_size=4)
+            row_id = run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
 
         mock_run.assert_called_once()
         mock_model.assert_called_once()
@@ -2590,7 +2596,10 @@ class TestRunStageFinetuneNextOrchestrator:
         with patch("kairos_pipeline.subprocess.run",
                    return_value=self._mock_subprocess(returncode=0)), \
              patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
-            row_id = run_stage_finetune_next(temp_db, ft_epochs=1, ft_batch_size=4)
+            row_id = run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
 
         status = temp_db.execute(
             "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
@@ -2630,6 +2639,7 @@ class TestRunStageFinetuneNextOrchestrator:
             row_id = run_stage_finetune_next(
                 temp_db, assets=["BTC-USD", "ETH-USD"], interval="1d",
                 ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
             )
 
         rows = temp_db.execute(
@@ -2653,7 +2663,10 @@ class TestRunStageFinetuneNextOrchestrator:
         with patch("kairos_pipeline.subprocess.run",
                    return_value=self._mock_subprocess(returncode=0)) as mock_run, \
              patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
-            run_stage_finetune_next(temp_db, ft_epochs=7, ft_batch_size=64)
+            run_stage_finetune_next(
+                temp_db, ft_epochs=7, ft_batch_size=64,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
 
         cmd = mock_run.call_args[0][0]
         assert "--epochs" in cmd and cmd[cmd.index("--epochs") + 1] == "7"
@@ -2661,3 +2674,129 @@ class TestRunStageFinetuneNextOrchestrator:
         assert "--symbol" in cmd
         symbol_idx = cmd.index("--symbol")
         assert cmd[symbol_idx + 1: symbol_idx + 3] == ["BTC-USD", "ETH-USD"]
+
+
+class TestAcquireFinetuneLock:
+    """fcntl.flock-based exclusive lock: second open on the same path must
+    conflict with the first while it's held, and succeed once released."""
+
+    def test_second_acquisition_fails_while_first_held(self, tmp_path):
+        lock_path = str(tmp_path / "finetune_next.lock")
+        first = acquire_finetune_lock(lock_path)
+        assert first is not None
+        try:
+            second = acquire_finetune_lock(lock_path)
+            assert second is None
+        finally:
+            first.close()
+
+    def test_acquisition_succeeds_after_first_closed(self, tmp_path):
+        lock_path = str(tmp_path / "finetune_next.lock")
+        first = acquire_finetune_lock(lock_path)
+        assert first is not None
+        first.close()
+
+        second = acquire_finetune_lock(lock_path)
+        assert second is not None
+        second.close()
+
+    def test_lock_file_contains_pid(self, tmp_path):
+        lock_path = str(tmp_path / "finetune_next.lock")
+        fd = acquire_finetune_lock(lock_path)
+        assert fd is not None
+        try:
+            fd.seek(0)
+            assert fd.read().strip() == str(os.getpid())
+        finally:
+            fd.close()
+
+
+class TestRunStageFinetuneNextLockingAndOrphanSweep:
+    """Concurrency guard: a held lock must short-circuit before any candidate
+    selection or registry writes, and an orphan 'training' row left behind by
+    a crashed previous run must be auto-marked 'failed' before selection.
+    dry_run must remain 100% side-effect free (no lock file, no sweep)."""
+
+    def _lock_path(self, tmp_path):
+        return str(tmp_path / "finetune_next.lock")
+
+    def test_held_lock_short_circuits_before_candidate_selection(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        lock_path = self._lock_path(tmp_path)
+
+        # Hold the lock ourselves first, simulating another live instance.
+        holder = acquire_finetune_lock(lock_path)
+        assert holder is not None
+        try:
+            def _raise_if_called(*args, **kwargs):
+                raise AssertionError("select_finetune_candidate must not be called "
+                                      "while the lock is held")
+
+            monkeypatch.setattr(kairos_pipeline, "select_finetune_candidate", _raise_if_called)
+
+            with patch("kairos_pipeline.subprocess.run") as mock_run, \
+                 patch("kairos_pipeline.run_stage_model") as mock_model:
+                result = run_stage_finetune_next(temp_db, lock_path=lock_path)
+
+            assert result is None
+            mock_run.assert_not_called()
+            mock_model.assert_not_called()
+            count = temp_db.execute("SELECT COUNT(*) FROM finetuned_models").fetchone()[0]
+            assert count == 0
+        finally:
+            holder.close()
+
+    def test_orphaned_training_row_marked_failed_before_selection(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+
+        row_id = insert_finetune_registry_row(temp_db, {
+            "assets": "BTC-USD,ETH-USD", "assets_raw": "BTC-USD,ETH-USD",
+            "interval": "1d", "backtest_period": "6m", "status": "training",
+        })
+
+        monkeypatch.setattr(kairos_pipeline, "select_finetune_candidate", lambda *a, **k: None)
+
+        result = run_stage_finetune_next(
+            temp_db, lock_path=self._lock_path(tmp_path),
+        )
+
+        assert result is None
+        status = temp_db.execute(
+            "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert status == "failed"
+
+    def test_dry_run_creates_no_lock_file_and_skips_sweep(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        lock_path = self._lock_path(tmp_path)
+
+        row_id = insert_finetune_registry_row(temp_db, {
+            "assets": "BTC-USD,ETH-USD", "assets_raw": "BTC-USD,ETH-USD",
+            "interval": "1d", "backtest_period": "6m", "status": "training",
+        })
+
+        with patch("kairos_pipeline.subprocess.run") as mock_run, \
+             patch("kairos_pipeline.run_stage_model") as mock_model:
+            result = run_stage_finetune_next(
+                temp_db, dry_run=True, lock_path=lock_path,
+            )
+
+        assert result is None
+        mock_run.assert_not_called()
+        mock_model.assert_not_called()
+        assert not os.path.exists(lock_path)
+
+        # The seeded 'training' row must be untouched - dry_run skips the sweep.
+        status = temp_db.execute(
+            "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert status == "training"

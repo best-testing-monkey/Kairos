@@ -35,6 +35,7 @@ sys.path.append("..")
 
 import argparse
 import csv
+import fcntl
 import json
 import sqlite3
 import subprocess
@@ -55,6 +56,7 @@ DB_PATH = os.path.join(REPO_ROOT, "data", "pipeline_results.db")
 RESULTS_DIR = os.path.join(REPO_ROOT, "results")
 STRATEGIES_SCRIPT = os.path.join(REPO_ROOT, "strategy", "kairos_strategies.py")
 MODELS_DIR = os.path.join(REPO_ROOT, "models")
+FINETUNE_LOCK_PATH = os.path.join(REPO_ROOT, "data", "finetune_next.lock")
 
 # ── Candidate universe ───────────────────────────────────────────────────────
 
@@ -1321,11 +1323,80 @@ def compare_finetuned_vs_base(conn, assets_raw, interval, backtest_period, min_s
     }
 
 
+def acquire_finetune_lock(lock_path=None):
+    """
+    Acquire the exclusive "one active finetune_next instance" lock via
+    fcntl.flock (LOCK_EX | LOCK_NB) on `lock_path` (default
+    REPO_ROOT/data/finetune_next.lock).
+
+    On success, best-effort truncates the file and writes the current pid,
+    then returns the open file object - the CALLER must keep a reference to
+    it for the lifetime of the run. The lock is released the instant the fd
+    is closed, or automatically by the kernel if the process dies for any
+    reason (crash, SIGKILL, OOM). That's the whole point of using flock here
+    instead of a pid file: a pid file can be left behind by a crashed
+    process and must be staleness-checked by hand; flock cannot go stale.
+
+    Returns None if another live process already holds the lock (raised as
+    BlockingIOError/OSError from flock) - the caller should treat this as
+    "another instance is already running" and exit cleanly.
+    """
+    path = lock_path or FINETUNE_LOCK_PATH
+    fd = open(path, "a+")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        fd.close()
+        return None
+
+    try:
+        fd.seek(0)
+        fd.truncate()
+        fd.write(str(os.getpid()))
+        fd.flush()
+    except OSError:
+        pass  # best-effort only; the lock itself is already held regardless
+
+    return fd
+
+
+def _sweep_orphaned_training_finetunes(conn):
+    """
+    Mark every finetuned_models row with status='training' as 'failed'.
+
+    Called only while the finetune_next lock is held. Since this process
+    holds the exclusive lock, any row still sitting in status='training' at
+    this point cannot belong to a live run - it is by definition a leftover
+    from a previous instance that crashed before it could update its own
+    row. Left as 'training' it would silently and permanently block
+    select_finetune_candidate from ever reconsidering that profile (which
+    excludes assets present in finetuned_models under ANY status). Marking
+    it 'failed' instead makes it eligible for a manual re-queue.
+    """
+    rows = conn.execute(
+        "SELECT id, assets_raw, interval FROM finetuned_models WHERE status = 'training'"
+    ).fetchall()
+    for row_id, assets_raw, interval in rows:
+        conn.execute("UPDATE finetuned_models SET status = 'failed' WHERE id = ?", (row_id,))
+        print(f"[finetune_next] orphaned 'training' row id={row_id} "
+              f"({assets_raw}@{interval}) marked failed (previous run crashed); "
+              f"re-queue manually if wanted.")
+    if rows:
+        conn.commit()
+
+
 def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6m",
                              pred_samples=100, ft_epochs=10, ft_batch_size=32,
-                             min_signals=3, dry_run=False):
+                             min_signals=3, dry_run=False, lock_path=None):
     """
     Orchestrate one automated finetune-and-compare cycle:
+      0. Unless dry_run, acquire the exclusive finetune_next lock
+         (acquire_finetune_lock) first, before anything else. If another
+         instance already holds it, print a message and return None
+         immediately - no candidate selection, no registry writes. Once
+         held, sweep any orphaned status='training' rows (leftovers from a
+         crashed previous run - see _sweep_orphaned_training_finetunes) to
+         'failed' before candidate selection.
       1. Select the top not-yet-finetuned candidate (select_finetune_candidate),
          or use the explicitly supplied (assets, interval) for a manual re-queue.
       2. Insert a finetuned_models row with status='training' (claims the
@@ -1352,31 +1423,56 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
 
     `dry_run=True` prints the selected candidate, computed train/test
     periods, and the planned training command, then returns immediately with
-    zero side effects: no registry row inserted, no directories created, no
-    subprocess executed.
+    zero side effects: no lock is taken, no orphan sweep runs, no registry
+    row inserted, no directories created, no subprocess executed.
+
+    `lock_path` overrides the default REPO_ROOT/data/finetune_next.lock path
+    (mainly for tests).
 
     Returns the finetuned_models row id on a real run, or None if there was
-    no candidate (nothing to do) or dry_run was set.
+    no candidate (nothing to do), another instance already holds the lock,
+    or dry_run was set.
     """
-    manual = assets is not None
-    if manual:
-        assets_list = list(assets)
-        assets_raw = ",".join(assets_list)
-        candidate = {
-            "assets_raw": assets_raw,
-            "assets_sorted": ",".join(sorted(assets_list)),
-            "interval": interval,
-            "backtest_period": backtest_period,
-            "viable_count": None,
-            "mean_sharpe": None,
-        }
-    else:
-        candidate = select_finetune_candidate(conn, min_signals=min_signals)
-        if candidate is None:
-            print("[finetune_next] no candidates found (no unregistered profile with "
-                  "both oracle data and an existing base run).")
-            return None
+    lock_file = None
+    try:
+        if not dry_run:
+            lock_file = acquire_finetune_lock(lock_path)
+            if lock_file is None:
+                print("[finetune_next] another instance is already running "
+                      "(data/finetune_next.lock held); exiting.")
+                return None
+            _sweep_orphaned_training_finetunes(conn)
 
+        manual = assets is not None
+        if manual:
+            assets_list = list(assets)
+            assets_raw = ",".join(assets_list)
+            candidate = {
+                "assets_raw": assets_raw,
+                "assets_sorted": ",".join(sorted(assets_list)),
+                "interval": interval,
+                "backtest_period": backtest_period,
+                "viable_count": None,
+                "mean_sharpe": None,
+            }
+        else:
+            candidate = select_finetune_candidate(conn, min_signals=min_signals)
+            if candidate is None:
+                print("[finetune_next] no candidates found (no unregistered profile with "
+                      "both oracle data and an existing base run).")
+                return None
+
+        return _run_finetune_next_body(
+            conn, candidate, manual, interval, backtest_period, pred_samples,
+            ft_epochs, ft_batch_size, min_signals, dry_run,
+        )
+    finally:
+        if lock_file is not None:
+            lock_file.close()
+
+
+def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
+                             pred_samples, ft_epochs, ft_batch_size, min_signals, dry_run):
     assets_raw = candidate["assets_raw"]
     assets_sorted = candidate["assets_sorted"]
     interval = candidate["interval"]

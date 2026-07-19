@@ -151,6 +151,23 @@ This deletes the existing `finetuned_models` row for that profile (matched
 on the sorted-assets key) and reruns the full train/backtest/compare cycle
 from scratch, ignoring the normal candidate-ranking step.
 
+## Concurrency
+
+It's safe to fire `--stage finetune_next` blindly from cron, a systemd timer,
+or an idle-GPU hook — no need to check whether a run is already in flight
+first. A second invocation exits immediately (`another instance is already
+running (data/finetune_next.lock held); exiting`) instead of racing the
+first for the GPU or the registry. The lock is a plain `fcntl.flock` on
+`data/finetune_next.lock`, so it's auto-released by the kernel if the
+holding process crashes or is killed — nothing to clean up by hand.
+
+A crashed run's `finetuned_models` row is left in `status='training'` by
+definition; the next `finetune_next` invocation auto-marks it `failed` as
+soon as it acquires the lock (before picking a new candidate) and prints
+one line per row it fixes up. That profile then needs a manual re-queue
+(see above) if you want to retry it — auto-selection permanently skips any
+profile already present in the registry under any status.
+
 ## Runtime expectations
 
 The predictor is Kronos-base, 102.3M parameters, tokenizer frozen during
@@ -183,9 +200,11 @@ a 5-year horizon instead. This mirrors the same `yf_max_days` table used by
 ## Automation opportunities
 
 - Nothing schedules this today — a cron job or systemd timer that runs
-  `--stage finetune_next` in a loop whenever the GPU is otherwise idle (with
-  a lock file or `nvidia-smi` check to avoid clobbering a manual backtest)
-  would let the model menagerie grow unattended.
+  `--stage finetune_next` in a loop whenever the GPU is otherwise idle would
+  let the model menagerie grow unattended. The concurrency guard (see above)
+  already makes repeated/overlapping invocations safe, so the only remaining
+  gap is an `nvidia-smi`-style check to avoid competing with a manual,
+  non-`finetune_next` backtest for the GPU.
 - **Not yet wired**: nothing downstream consumes `accepted` models today —
   `kairos_signals.py` and the viability report still only ever read
   `stage='base'` results. Wiring `finetuned_models` (status=`accepted`) into
