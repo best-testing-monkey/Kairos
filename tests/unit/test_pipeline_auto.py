@@ -7,11 +7,15 @@ import os
 import pandas as pd
 import numpy as np
 import json
+from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock, call
 from kairos_strategies import _period_to_weeks, _period_to_bars, _parse_period
 from kairos_pipeline import (
     build_viability_report, get_connection, SCHEMA, insert_oracle_row, insert_model_row,
-    run_stage_auto, start_run, dump_csv
+    run_stage_auto, start_run, dump_csv,
+    finetune_model_dir, compute_finetune_periods, select_finetune_candidate,
+    compare_finetuned_vs_base, run_stage_finetune_next,
+    insert_finetune_registry_row, update_finetune_registry_row,
 )
 
 
@@ -2243,3 +2247,417 @@ class TestRunStageAutoSingletonGroup:
 
         assert ("oracle", ["LONER-USD"], "1d") in call_log
         assert ("base", ["LONER-USD"], "1d") in call_log
+
+
+# ── --stage finetune_next: registry, ranking, accept gate, orchestration ────
+
+def _insert_oracle_strategy(conn, assets, interval, backtest_period, strategy_name,
+                             sharpe, signal_count, run_id=None):
+    """Insert a single oracle_results row for a (strategy, assets, interval,
+    backtest_period) profile, auto-creating a run if run_id is not given."""
+    if run_id is None:
+        run_id = start_run(conn, "oracle", interval, {})
+    insert_oracle_row(conn, run_id, {
+        "strategy_name": strategy_name, "sharpe": sharpe, "signal_count": signal_count,
+        "win_rate": 0.5, "avg_pnl_per_trade": 0.01,
+        "assets": assets, "interval": interval, "backtest_period": backtest_period,
+    })
+    conn.commit()
+    return run_id
+
+
+def _insert_base_strategy(conn, assets, interval, backtest_period, strategy_name,
+                           sharpe, signal_count, run_id=None, stage="base", model_path=None):
+    """Insert a single model_results row (stage='base' or 'finetuned')."""
+    if run_id is None:
+        run_id = start_run(conn, stage, interval, {})
+    insert_model_row(conn, run_id, {
+        "stage": stage, "strategy_name": strategy_name, "sharpe": sharpe,
+        "signal_count": signal_count, "win_rate": 0.5, "avg_pnl_per_trade": 0.01,
+        "assets": assets, "interval": interval, "backtest_period": backtest_period,
+        "model_path": model_path,
+    })
+    conn.commit()
+    return run_id
+
+
+class TestFinetuneModelDirNaming:
+    """Model directory naming: sorted, sanitized, interval-prefixed."""
+
+    def test_sorted_and_interval_prefixed(self):
+        import kairos_pipeline
+        path = finetune_model_dir("1h", ["ETH-USD", "BTC-USD", "SOL-USD"])
+        expected = os.path.join(kairos_pipeline.MODELS_DIR, "finetuned",
+                                 "1h__BTC-USD_ETH-USD_SOL-USD")
+        assert path == expected
+
+    def test_csv_string_input_equivalent_to_list(self):
+        from_list = finetune_model_dir("1d", ["ETH-USD", "BTC-USD"])
+        from_csv = finetune_model_dir("1d", "ETH-USD,BTC-USD")
+        assert from_list == from_csv
+
+    def test_unsorted_input_is_sorted(self):
+        path = finetune_model_dir("1d", ["SOL-USD", "ADA-USD"])
+        assert path.endswith("1d__ADA-USD_SOL-USD")
+
+    def test_keeps_dash_and_equals_dividers(self):
+        # '-' (crypto tickers) and '=' (FX tickers) are kept as-is; only commas
+        # become underscores.
+        path = finetune_model_dir("1d", ["GBPUSD=X", "EURUSD=X"])
+        assert path.endswith("1d__EURUSD=X_GBPUSD=X")
+
+
+class TestComputeFinetunePeriods:
+    """Train/test period computation for automated finetune runs."""
+
+    def test_6m_1d_boundaries(self):
+        now = datetime(2026, 7, 19)
+        periods = compute_finetune_periods("6m", "1d", now=now)
+
+        expected_test_start = (now - timedelta(days=180)).date().isoformat()
+        expected_train_start = (now - timedelta(days=180) - timedelta(days=5 * 365)).date().isoformat()
+
+        assert periods["test_end"] == now.date().isoformat()
+        assert periods["test_start"] == expected_test_start
+        assert periods["train_end"] == expected_test_start
+        assert periods["train_start"] == expected_train_start
+
+    def test_3m_1h_boundaries_use_yf_horizon_cap(self):
+        now = datetime(2026, 7, 19)
+        periods = compute_finetune_periods("3m", "1h", now=now)
+
+        expected_test_start = (now - timedelta(days=90)).date().isoformat()
+        expected_train_start = (now - timedelta(days=90) - timedelta(days=729)).date().isoformat()
+
+        assert periods["test_end"] == now.date().isoformat()
+        assert periods["test_start"] == expected_test_start
+        assert periods["train_end"] == expected_test_start
+        assert periods["train_start"] == expected_train_start
+
+    def test_all_four_timestamps_present(self):
+        periods = compute_finetune_periods("6m", "1d")
+        assert set(periods.keys()) == {"train_start", "train_end", "test_start", "test_end"}
+        for v in periods.values():
+            # YYYY-MM-DD
+            assert len(v) == 10 and v[4] == "-" and v[7] == "-"
+
+
+class TestSelectFinetuneCandidate:
+    """Ranking, exclusion, and base-run-required gating for candidate selection."""
+
+    def test_ranks_by_viable_count_desc(self, temp_db):
+        # Profile A: 2 viable strategies (sharpe>0, signals>=3)
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s2", 0.5, 5)
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+
+        # Profile B: 1 viable strategy
+        _insert_oracle_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 2.0, 10)
+        _insert_base_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 2.0, 10)
+
+        candidate = select_finetune_candidate(temp_db)
+        assert candidate is not None
+        assert candidate["assets_raw"] == "BTC-USD,ETH-USD"
+        assert candidate["viable_count"] == 2
+
+    def test_tie_break_by_mean_sharpe(self, temp_db):
+        # Both profiles have viable_count == 1, but different sharpe.
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+
+        _insert_oracle_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 3.0, 10)
+        _insert_base_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 3.0, 10)
+
+        candidate = select_finetune_candidate(temp_db)
+        assert candidate["assets_raw"] == "SOL-USD,ADA-USD"
+        assert candidate["mean_sharpe"] == 3.0
+
+    def test_excludes_profiles_registered_under_any_status(self, temp_db):
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 5.0, 10)
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 5.0, 10)
+
+        _insert_oracle_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 1.0, 5)
+        _insert_base_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 1.0, 5)
+
+        # Register the higher-scoring profile as already 'rejected' - it must
+        # never be re-selected automatically, regardless of status.
+        insert_finetune_registry_row(temp_db, {
+            "assets": "BTC-USD,ETH-USD", "assets_raw": "BTC-USD,ETH-USD",
+            "interval": "1d", "backtest_period": "6m", "status": "rejected",
+        })
+
+        candidate = select_finetune_candidate(temp_db)
+        assert candidate is not None
+        assert candidate["assets_raw"] == "SOL-USD,ADA-USD"
+
+    def test_requires_existing_base_run(self, temp_db):
+        # Oracle data exists but no base run for this profile -> not a candidate.
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 5.0, 10)
+
+        candidate = select_finetune_candidate(temp_db)
+        assert candidate is None
+
+    def test_empty_db_returns_none(self, temp_db):
+        assert select_finetune_candidate(temp_db) is None
+
+
+class TestCompareFinetunedVsBase:
+    """Accept-gate semantics: ft_count > base_count, or tie broken by mean sharpe."""
+
+    def test_more_viable_strategies_accepted(self, temp_db):
+        base_run = start_run(temp_db, "base", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10, run_id=base_run)
+
+        ft_run = start_run(temp_db, "finetuned", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10,
+                               run_id=ft_run, stage="finetuned")
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s2", 2.0, 10,
+                               run_id=ft_run, stage="finetuned")
+
+        result = compare_finetuned_vs_base(temp_db, "BTC-USD,ETH-USD", "1d", "6m")
+        assert result["ft_count"] == 2
+        assert result["base_count"] == 1
+        assert result["accepted"] is True
+
+    def test_equal_counts_higher_mean_accepted(self, temp_db):
+        base_run = start_run(temp_db, "base", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10, run_id=base_run)
+
+        ft_run = start_run(temp_db, "finetuned", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 2.0, 10,
+                               run_id=ft_run, stage="finetuned")
+
+        result = compare_finetuned_vs_base(temp_db, "BTC-USD,ETH-USD", "1d", "6m")
+        assert result["ft_count"] == result["base_count"] == 1
+        assert result["ft_mean"] > result["base_mean"]
+        assert result["accepted"] is True
+
+    def test_equal_counts_lower_mean_rejected(self, temp_db):
+        base_run = start_run(temp_db, "base", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 2.0, 10, run_id=base_run)
+
+        ft_run = start_run(temp_db, "finetuned", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10,
+                               run_id=ft_run, stage="finetuned")
+
+        result = compare_finetuned_vs_base(temp_db, "BTC-USD,ETH-USD", "1d", "6m")
+        assert result["ft_count"] == result["base_count"] == 1
+        assert result["accepted"] is False
+
+    def test_fewer_viable_strategies_rejected(self, temp_db):
+        base_run = start_run(temp_db, "base", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10, run_id=base_run)
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s2", 2.0, 10, run_id=base_run)
+
+        ft_run = start_run(temp_db, "finetuned", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10,
+                               run_id=ft_run, stage="finetuned")
+
+        result = compare_finetuned_vs_base(temp_db, "BTC-USD,ETH-USD", "1d", "6m")
+        assert result["ft_count"] == 1
+        assert result["base_count"] == 2
+        assert result["accepted"] is False
+
+    def test_no_base_run_defaults_to_zero(self, temp_db):
+        ft_run = start_run(temp_db, "finetuned", "1d", {})
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10,
+                               run_id=ft_run, stage="finetuned")
+
+        result = compare_finetuned_vs_base(temp_db, "BTC-USD,ETH-USD", "1d", "6m")
+        assert result["base_run_id"] is None
+        assert result["base_count"] == 0
+        assert result["accepted"] is True
+
+
+class TestRunStageFinetuneNextOrchestrator:
+    """Orchestrator flow: registry transitions, dry_run, training failure,
+    accept/reject verdicts, REJECTED marker + metadata.json."""
+
+    def _seed_candidate_profile(self, conn, assets="BTC-USD,ETH-USD", interval="1d",
+                                 backtest_period="6m"):
+        """Seed oracle + base data so select_finetune_candidate picks `assets`."""
+        _insert_oracle_strategy(conn, assets, interval, backtest_period, "s1", 2.0, 10)
+        _insert_base_strategy(conn, assets, interval, backtest_period, "s1", 2.0, 10)
+
+    def _mock_subprocess(self, returncode=0, stderr=""):
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = ""
+        m.stderr = stderr
+        return m
+
+    def test_dry_run_has_zero_side_effects(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+
+        with patch("kairos_pipeline.subprocess.run") as mock_run, \
+             patch("kairos_pipeline.run_stage_model") as mock_model:
+            result = run_stage_finetune_next(temp_db, dry_run=True)
+
+        assert result is None
+        mock_run.assert_not_called()
+        mock_model.assert_not_called()
+        count = temp_db.execute("SELECT COUNT(*) FROM finetuned_models").fetchone()[0]
+        assert count == 0
+        assert list(tmp_path.iterdir()) == []
+
+    def test_no_candidate_returns_none(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        result = run_stage_finetune_next(temp_db)
+        assert result is None
+
+    def test_training_failure_marks_failed_and_skips_backtest(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=1, stderr="boom")) as mock_run, \
+             patch("kairos_pipeline.run_stage_model") as mock_model:
+            row_id = run_stage_finetune_next(temp_db, ft_epochs=1, ft_batch_size=4)
+
+        mock_run.assert_called_once()
+        mock_model.assert_not_called()
+        status = temp_db.execute(
+            "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert status == "failed"
+        # Model dir is kept for post-mortem, but no REJECTED marker (that's
+        # reserved for a completed-but-rejected comparison).
+        model_dir = finetune_model_dir("1d", "BTC-USD,ETH-USD")
+        assert os.path.isdir(model_dir)
+        assert not os.path.exists(os.path.join(model_dir, "REJECTED"))
+
+    def test_accepted_flow_writes_metadata_no_rejected_marker(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+
+        # Base already has 1 viable strategy from _seed_candidate_profile.
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            # 2 viable strategies beats base's 1 -> accepted.
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   3.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s2",
+                                   1.5, 5, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)) as mock_run, \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model) as mock_model:
+            row_id = run_stage_finetune_next(temp_db, ft_epochs=1, ft_batch_size=4)
+
+        mock_run.assert_called_once()
+        mock_model.assert_called_once()
+
+        row = temp_db.execute(
+            "SELECT status, base_viable_count, ft_viable_count, train_start, train_end, "
+            "test_start, test_end, model_path FROM finetuned_models WHERE id=?", (row_id,)
+        ).fetchone()
+        status, base_count, ft_count, train_start, train_end, test_start, test_end, model_path = row
+        assert status == "accepted"
+        assert ft_count == 2 and base_count == 1
+        assert all([train_start, train_end, test_start, test_end])
+        assert model_path.endswith("best_model")
+
+        model_dir = finetune_model_dir("1d", "BTC-USD,ETH-USD")
+        assert not os.path.exists(os.path.join(model_dir, "REJECTED"))
+
+        with open(os.path.join(model_dir, "metadata.json")) as f:
+            meta = json.load(f)
+        assert meta["status"] == "accepted"
+        assert meta["ft_viable_count"] == 2
+        assert meta["base_viable_count"] == 1
+        assert meta["assets"] == "BTC-USD,ETH-USD"
+
+    def test_rejected_flow_writes_marker_and_metadata(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            # 0 viable strategies -> fewer than base's 1 -> rejected.
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   -1.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
+            row_id = run_stage_finetune_next(temp_db, ft_epochs=1, ft_batch_size=4)
+
+        status = temp_db.execute(
+            "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert status == "rejected"
+
+        model_dir = finetune_model_dir("1d", "BTC-USD,ETH-USD")
+        assert os.path.exists(os.path.join(model_dir, "REJECTED"))
+        with open(os.path.join(model_dir, "metadata.json")) as f:
+            meta = json.load(f)
+        assert meta["status"] == "rejected"
+
+    def test_manual_requeue_deletes_existing_row_and_reruns(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+
+        # Seed a base run so compare_finetuned_vs_base has something to beat,
+        # and pre-register the profile as rejected (as if from a prior run).
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+        insert_finetune_registry_row(temp_db, {
+            "assets": "BTC-USD,ETH-USD", "assets_raw": "BTC-USD,ETH-USD",
+            "interval": "1d", "backtest_period": "6m", "status": "rejected",
+        })
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   5.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s2",
+                                   4.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
+            row_id = run_stage_finetune_next(
+                temp_db, assets=["BTC-USD", "ETH-USD"], interval="1d",
+                ft_epochs=1, ft_batch_size=4,
+            )
+
+        rows = temp_db.execute(
+            "SELECT status FROM finetuned_models WHERE assets=?", ("BTC-USD,ETH-USD",)
+        ).fetchall()
+        assert len(rows) == 1  # old row replaced, not duplicated
+        assert rows[0][0] == "accepted"
+
+    def test_ft_epochs_and_batch_size_forwarded_to_training_command(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   5.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)) as mock_run, \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
+            run_stage_finetune_next(temp_db, ft_epochs=7, ft_batch_size=64)
+
+        cmd = mock_run.call_args[0][0]
+        assert "--epochs" in cmd and cmd[cmd.index("--epochs") + 1] == "7"
+        assert "--batch-size" in cmd and cmd[cmd.index("--batch-size") + 1] == "64"
+        assert "--symbol" in cmd
+        symbol_idx = cmd.index("--symbol")
+        assert cmd[symbol_idx + 1: symbol_idx + 3] == ["BTC-USD", "ETH-USD"]

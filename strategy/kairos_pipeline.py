@@ -46,7 +46,7 @@ import numpy as np
 import pandas as pd
 
 import price_cache
-from kairos_strategies import asset_class_for, _period_to_weeks
+from kairos_strategies import asset_class_for, _period_to_weeks, _parse_period
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -54,6 +54,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(REPO_ROOT, "data", "pipeline_results.db")
 RESULTS_DIR = os.path.join(REPO_ROOT, "results")
 STRATEGIES_SCRIPT = os.path.join(REPO_ROOT, "strategy", "kairos_strategies.py")
+MODELS_DIR = os.path.join(REPO_ROOT, "models")
 
 # ── Candidate universe ───────────────────────────────────────────────────────
 
@@ -197,6 +198,23 @@ CREATE TABLE IF NOT EXISTS viability_report (
     signals_per_week REAL,
     viable INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS finetuned_models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assets TEXT NOT NULL,            -- sorted CSV (canonical registry key)
+    assets_raw TEXT NOT NULL,        -- as used in oracle/model_results rows
+    interval TEXT NOT NULL,
+    backtest_period TEXT NOT NULL,
+    train_start TEXT, train_end TEXT,
+    test_start TEXT, test_end TEXT,
+    model_path TEXT,
+    status TEXT NOT NULL,            -- training | accepted | rejected | failed
+    base_run_id INTEGER, finetuned_run_id INTEGER,
+    base_viable_count INTEGER, ft_viable_count INTEGER,
+    base_mean_sharpe REAL, ft_mean_sharpe REAL,
+    created_at TEXT,
+    UNIQUE(assets, interval)
+);
 """
 
 
@@ -271,6 +289,42 @@ def insert_model_row(conn, run_id, row: dict):
          row.get("signal_count"), row.get("win_rate"), row.get("avg_pnl_per_trade"),
          row.get("assets"), row.get("interval"), row.get("backtest_period"), row.get("model_path")),
     )
+
+
+def insert_finetune_registry_row(conn, row: dict) -> int:
+    """Insert a new finetuned_models row and return its id.
+
+    `row` must supply assets (sorted CSV key), assets_raw, interval,
+    backtest_period, and status; all other columns are optional. `created_at`
+    defaults to now if not supplied.
+    """
+    cur = conn.execute(
+        """INSERT INTO finetuned_models
+           (assets, assets_raw, interval, backtest_period, train_start, train_end,
+            test_start, test_end, model_path, status, base_run_id, finetuned_run_id,
+            base_viable_count, ft_viable_count, base_mean_sharpe, ft_mean_sharpe, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (row["assets"], row["assets_raw"], row["interval"], row["backtest_period"],
+         row.get("train_start"), row.get("train_end"), row.get("test_start"), row.get("test_end"),
+         row.get("model_path"), row["status"], row.get("base_run_id"), row.get("finetuned_run_id"),
+         row.get("base_viable_count"), row.get("ft_viable_count"),
+         row.get("base_mean_sharpe"), row.get("ft_mean_sharpe"),
+         row.get("created_at") or datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_finetune_registry_row(conn, row_id: int, **fields) -> None:
+    """Update arbitrary columns of a finetuned_models row by id."""
+    if not fields:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(
+        f"UPDATE finetuned_models SET {set_clause} WHERE id = ?",
+        (*fields.values(), row_id),
+    )
+    conn.commit()
 
 
 def refresh_disabled_strategies(conn, run_id, rows, interval, assets, min_signals=5):
@@ -1058,6 +1112,377 @@ def run_stage_rebuild_disabled(conn, min_signals=5):
     return len(profiles), total_disabled
 
 
+# ── Automated finetuning (--stage finetune_next) ────────────────────────────
+
+FINETUNE_BASE_MODEL = "NeoQuasar/Kronos-base"
+
+# Yahoo Finance hard limits by interval (days of history available) - mirrors
+# kairos_strategies.fetch_data_raw's yf_max_days table.
+_YF_MAX_DAYS = {
+    "1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60,
+    "60m": 729, "90m": 60, "1h": 729,
+}
+_YF_MAX_DAYS_DEFAULT = 5 * 365
+
+
+def finetune_model_dir(interval, assets) -> str:
+    """
+    Compute the on-disk directory for a finetuned model keyed by (interval, assets).
+
+    `assets` may be a list of symbols or a comma-separated CSV string. Symbols
+    are sorted and joined with underscores; commas become underscores, but
+    '-' and '=' (e.g. BTC-USD, EURUSD=X) are kept as-is.
+
+    Returns models/finetuned/{interval}__{SORTED_ASSETS_JOINED_BY_UNDERSCORE}/
+    e.g. models/finetuned/1h__BTC-USD_ETH-USD_SOL-USD/
+    """
+    assets_list = assets.split(",") if isinstance(assets, str) else list(assets)
+    sanitized = "_".join(sorted(assets_list))
+    return os.path.join(MODELS_DIR, "finetuned", f"{interval}__{sanitized}")
+
+
+def _period_to_days(period: str) -> int:
+    """Convert a human period string (e.g. '6m', '1y') to calendar days.
+
+    Uses the same unit definitions as kairos_strategies._period_to_bars
+    (30-day months, 365-day years) for consistency with the rest of the
+    pipeline's bar-count math.
+    """
+    n, unit = _parse_period(period)
+    return {"d": n, "w": n * 7, "m": n * 30, "y": n * 365}[unit]
+
+
+def compute_finetune_periods(backtest_period: str, interval: str, now=None) -> dict:
+    """
+    Compute train/test period boundaries (YYYY-MM-DD strings) for an
+    automated finetune run.
+
+    test_end = now; test_start = now - period_days(backtest_period) - the
+    same window length as the base run being compared against, re-anchored
+    to "now" (the pipeline doesn't track a base run's exact calendar dates,
+    only its period label, so an exact-window replay isn't possible - see
+    Out of scope in the plan).
+
+    train_end = test_start (no leakage; the model's inference lookback
+    overlapping the train tail is standard walk-forward and acceptable).
+
+    train_start = train_end minus the data-source horizon for this interval
+    (5 years for daily-ish intervals, capped at 729 days for 1h/60m, mirroring
+    kairos_strategies.fetch_data_raw's yf_max_days) - the trainer's fetch
+    just gets whatever history actually exists within that window.
+
+    Returns {"train_start", "train_end", "test_start", "test_end"}.
+    """
+    if now is None:
+        now = datetime.now()
+    days = _period_to_days(backtest_period)
+    test_end = now
+    test_start = now - timedelta(days=days)
+    train_end = test_start
+    horizon_days = _YF_MAX_DAYS.get(interval, _YF_MAX_DAYS_DEFAULT)
+    train_start = train_end - timedelta(days=horizon_days)
+
+    return {
+        "train_start": train_start.date().isoformat(),
+        "train_end": train_end.date().isoformat(),
+        "test_start": test_start.date().isoformat(),
+        "test_end": test_end.date().isoformat(),
+    }
+
+
+def select_finetune_candidate(conn, min_signals=3):
+    """
+    Select the top-ranked (assets, interval, backtest_period) profile for
+    automated finetuning.
+
+    Score = count of that profile's latest oracle strategies with
+    sharpe > 0 AND signal_count >= min_signals ("viable-bar"); ties broken by
+    the mean sharpe of those same viable-bar strategies. A profile is only a
+    candidate if:
+      - a stage='base' model_results run exists for the identical
+        (assets, interval, backtest_period) triple (raw assets string, not
+        sorted - the finetuned backtest must be comparable to something), and
+      - it is not already present in finetuned_models under ANY status
+        (training/accepted/rejected/failed), matched on the sorted-assets key -
+        rejected/failed profiles are excluded permanently; manual re-queue
+        (run_stage_finetune_next with explicit assets/interval) is the only
+        way to retry one.
+
+    Returns a dict {assets_raw, assets_sorted, interval, backtest_period,
+    viable_count, mean_sharpe} for the top candidate, or None if none qualify.
+    """
+    latest_q = """
+        SELECT strategy_name, assets, interval, backtest_period, sharpe, signal_count
+        FROM oracle_results
+        WHERE stage = 'oracle'
+        AND run_id = (
+            SELECT MAX(run_id) FROM oracle_results o2
+            WHERE o2.strategy_name = oracle_results.strategy_name
+              AND o2.assets = oracle_results.assets
+              AND o2.interval = oracle_results.interval
+              AND o2.backtest_period = oracle_results.backtest_period
+              AND o2.stage = 'oracle'
+        )
+    """
+    rows = conn.execute(latest_q).fetchall()
+
+    profiles = {}
+    for strategy_name, assets, interval, backtest_period, sharpe, signal_count in rows:
+        key = (assets, interval, backtest_period)
+        profiles.setdefault(key, []).append((sharpe, signal_count))
+
+    already_registered = {
+        r[0] for r in conn.execute("SELECT assets FROM finetuned_models").fetchall()
+    }
+
+    candidates = []
+    for (assets, interval, backtest_period), strat_rows in profiles.items():
+        assets_sorted = ",".join(sorted(assets.split(",")))
+        if assets_sorted in already_registered:
+            continue
+
+        base_exists = conn.execute(
+            "SELECT 1 FROM model_results WHERE assets=? AND interval=? "
+            "AND backtest_period=? AND stage='base' LIMIT 1",
+            (assets, interval, backtest_period),
+        ).fetchone()
+        if not base_exists:
+            continue
+
+        viable = [
+            s for s, n in strat_rows
+            if s is not None and s > 0 and (n or 0) >= min_signals
+        ]
+        candidates.append({
+            "assets_raw": assets,
+            "assets_sorted": assets_sorted,
+            "interval": interval,
+            "backtest_period": backtest_period,
+            "viable_count": len(viable),
+            "mean_sharpe": float(np.mean(viable)) if viable else 0.0,
+        })
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: (c["viable_count"], c["mean_sharpe"]), reverse=True)
+    return candidates[0]
+
+
+def compare_finetuned_vs_base(conn, assets_raw, interval, backtest_period, min_signals=3):
+    """
+    Compare the latest stage='finetuned' backtest against the latest
+    stage='base' backtest for the same (assets_raw, interval, backtest_period)
+    profile - matched on the RAW assets string as stored in model_results
+    (the same string used to invoke each subprocess), per the registry's
+    sorted-key/raw-string split.
+
+    viable-bar strategy = sharpe > 0 AND signal_count >= min_signals (same
+    gate as select_finetune_candidate). Accept iff:
+        ft_count > base_count
+        OR (ft_count == base_count AND ft_mean > base_mean)
+
+    Returns {base_run_id, base_count, base_mean, ft_run_id, ft_count, ft_mean,
+    accepted}. If a stage has no matching rows, its run_id is None and its
+    count/mean default to 0/0.0.
+    """
+    def _latest_stage_stats(stage):
+        q = """
+            SELECT sharpe, signal_count, run_id
+            FROM model_results
+            WHERE assets = ? AND interval = ? AND backtest_period = ? AND stage = ?
+            AND run_id = (
+                SELECT MAX(run_id) FROM model_results
+                WHERE assets = ? AND interval = ? AND backtest_period = ? AND stage = ?
+            )
+        """
+        rows = conn.execute(
+            q, (assets_raw, interval, backtest_period, stage,
+                assets_raw, interval, backtest_period, stage),
+        ).fetchall()
+        if not rows:
+            return None, 0, 0.0
+        run_id = rows[0][2]
+        viable = [
+            s for s, n, _ in rows
+            if s is not None and s > 0 and (n or 0) >= min_signals
+        ]
+        return run_id, len(viable), (float(np.mean(viable)) if viable else 0.0)
+
+    base_run_id, base_count, base_mean = _latest_stage_stats("base")
+    ft_run_id, ft_count, ft_mean = _latest_stage_stats("finetuned")
+
+    accepted = ft_count > base_count or (ft_count == base_count and ft_mean > base_mean)
+
+    return {
+        "base_run_id": base_run_id, "base_count": base_count, "base_mean": base_mean,
+        "ft_run_id": ft_run_id, "ft_count": ft_count, "ft_mean": ft_mean,
+        "accepted": accepted,
+    }
+
+
+def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6m",
+                             pred_samples=100, ft_epochs=10, ft_batch_size=32,
+                             min_signals=3, dry_run=False):
+    """
+    Orchestrate one automated finetune-and-compare cycle:
+      1. Select the top not-yet-finetuned candidate (select_finetune_candidate),
+         or use the explicitly supplied (assets, interval) for a manual re-queue.
+      2. Insert a finetuned_models row with status='training' (claims the
+         UNIQUE(assets, interval) slot immediately).
+      3. Train via `uv run finetune --model NeoQuasar/Kronos-base --symbol
+         <raw assets...> --interval I --start TRAIN_START --end TRAIN_END
+         --device cuda --epochs E --batch-size B --output-model DIR` as a
+         subprocess. A non-zero exit marks the row 'failed' and stops (the
+         model dir is kept for post-mortem).
+      4. Backtest the trained checkpoint via run_stage_model(stage="finetuned"),
+         parameter-identical (assets/interval/backtest_period/pred_samples) to
+         the last base run for this profile.
+      5. Compare via compare_finetuned_vs_base; accept iff ft_count > base_count
+         OR (ft_count == base_count AND ft_mean > base_mean).
+      6. Update the registry row (accepted/rejected + run ids + counts/means),
+         write an empty REJECTED marker file on rejection, write
+         <dir>/metadata.json mirroring the registry row, and print a verdict.
+
+    Manual re-queue: pass `assets` (a list of raw symbols, in the same order
+    used by the base run's model_results.assets) to bypass ranking entirely
+    and force this exact profile. Any existing finetuned_models row for it
+    (matched on the sorted-assets key) is deleted first - this is the only
+    way to retry a previously rejected/failed profile.
+
+    `dry_run=True` prints the selected candidate, computed train/test
+    periods, and the planned training command, then returns immediately with
+    zero side effects: no registry row inserted, no directories created, no
+    subprocess executed.
+
+    Returns the finetuned_models row id on a real run, or None if there was
+    no candidate (nothing to do) or dry_run was set.
+    """
+    manual = assets is not None
+    if manual:
+        assets_list = list(assets)
+        assets_raw = ",".join(assets_list)
+        candidate = {
+            "assets_raw": assets_raw,
+            "assets_sorted": ",".join(sorted(assets_list)),
+            "interval": interval,
+            "backtest_period": backtest_period,
+            "viable_count": None,
+            "mean_sharpe": None,
+        }
+    else:
+        candidate = select_finetune_candidate(conn, min_signals=min_signals)
+        if candidate is None:
+            print("[finetune_next] no candidates found (no unregistered profile with "
+                  "both oracle data and an existing base run).")
+            return None
+
+    assets_raw = candidate["assets_raw"]
+    assets_sorted = candidate["assets_sorted"]
+    interval = candidate["interval"]
+    backtest_period = candidate["backtest_period"]
+    assets_list = assets_raw.split(",")
+
+    periods = compute_finetune_periods(backtest_period, interval)
+    model_dir = finetune_model_dir(interval, assets_list)
+    best_model_path = os.path.join(model_dir, "best_model")
+
+    train_cmd = [
+        "uv", "run", "finetune",
+        "--model", FINETUNE_BASE_MODEL,
+        "--symbol", *assets_list,
+        "--interval", interval,
+        "--start", periods["train_start"],
+        "--end", periods["train_end"],
+        "--device", "cuda",
+        "--epochs", str(ft_epochs),
+        "--batch-size", str(ft_batch_size),
+        "--output-model", model_dir,
+    ]
+
+    print(f"[finetune_next] candidate: assets={assets_raw!r} interval={interval} "
+          f"backtest_period={backtest_period} viable_count={candidate['viable_count']} "
+          f"mean_sharpe={candidate['mean_sharpe']}")
+    print(f"[finetune_next] periods: {periods}")
+    print(f"[finetune_next] planned training command: {' '.join(train_cmd)}")
+
+    if dry_run:
+        print("[finetune_next] --dry_run: no side effects.")
+        return None
+
+    if manual:
+        conn.execute("DELETE FROM finetuned_models WHERE assets = ?", (assets_sorted,))
+        conn.commit()
+
+    os.makedirs(model_dir, exist_ok=True)
+
+    row_id = insert_finetune_registry_row(conn, {
+        "assets": assets_sorted, "assets_raw": assets_raw, "interval": interval,
+        "backtest_period": backtest_period, "status": "training", **periods,
+    })
+    print(f"[finetune_next] registered id={row_id} status=training model_dir={model_dir}")
+
+    def _write_metadata(extra: dict):
+        meta = {
+            "id": row_id, "assets": assets_sorted, "assets_raw": assets_raw,
+            "interval": interval, "backtest_period": backtest_period, **periods,
+        }
+        meta.update(extra)
+        with open(os.path.join(model_dir, "metadata.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+    proc = subprocess.run(train_cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    print(proc.stdout)
+    if proc.returncode != 0:
+        print(proc.stderr)
+        update_finetune_registry_row(conn, row_id, status="failed")
+        _write_metadata({"status": "failed", "model_path": None})
+        print(f"\n[finetune_next] VERDICT: FAILED (training subprocess exit "
+              f"{proc.returncode}). id={row_id}. Model dir kept for post-mortem: {model_dir}")
+        return row_id
+
+    update_finetune_registry_row(conn, row_id, model_path=best_model_path)
+
+    ft_run_id = run_stage_model(
+        conn, stage="finetuned", assets=assets_list, interval=interval,
+        backtest_period=backtest_period, pred_samples=pred_samples,
+        model_path=best_model_path,
+    )
+
+    comparison = compare_finetuned_vs_base(
+        conn, assets_raw, interval, backtest_period, min_signals=min_signals,
+    )
+    status = "accepted" if comparison["accepted"] else "rejected"
+
+    update_finetune_registry_row(
+        conn, row_id, status=status,
+        base_run_id=comparison["base_run_id"], finetuned_run_id=ft_run_id,
+        base_viable_count=comparison["base_count"], ft_viable_count=comparison["ft_count"],
+        base_mean_sharpe=comparison["base_mean"], ft_mean_sharpe=comparison["ft_mean"],
+    )
+
+    _write_metadata({
+        "status": status, "model_path": best_model_path,
+        "base_run_id": comparison["base_run_id"], "finetuned_run_id": ft_run_id,
+        "base_viable_count": comparison["base_count"], "ft_viable_count": comparison["ft_count"],
+        "base_mean_sharpe": comparison["base_mean"], "ft_mean_sharpe": comparison["ft_mean"],
+    })
+
+    if not comparison["accepted"]:
+        open(os.path.join(model_dir, "REJECTED"), "w").close()
+
+    print(f"\n[finetune_next] VERDICT: {status.upper()}")
+    print(f"  assets={assets_raw} interval={interval} backtest_period={backtest_period}")
+    print(f"  base: viable_count={comparison['base_count']} mean_sharpe={comparison['base_mean']:.4f} "
+          f"(run_id={comparison['base_run_id']})")
+    print(f"  ft:   viable_count={comparison['ft_count']} mean_sharpe={comparison['ft_mean']:.4f} "
+          f"(run_id={comparison['ft_run_id']})")
+    print(f"  model_path={best_model_path}")
+    print(f"  registry id={row_id}")
+
+    return row_id
+
+
 # ── Viability report ─────────────────────────────────────────────────────────
 
 def _get_metric_columns(conn, table_name):
@@ -1509,7 +1934,7 @@ def _build_parser():
     parser = argparse.ArgumentParser(description="Kairos staged asset-discovery pipeline")
     parser.add_argument("--stage", required=True,
                          choices=["universe", "correlation", "oracle", "base", "finetuned", "auto",
-                                  "rebuild_disabled"])
+                                  "rebuild_disabled", "finetune_next"])
     parser.add_argument("--interval", default="1d")
     parser.add_argument("--intervals", nargs="+", default=None,
                          help="Bar intervals for --stage auto (e.g. 1d 1h)")
@@ -1541,6 +1966,13 @@ def _build_parser():
     # --model for the local checkpoint path, which we forward as model_path here.
     parser.add_argument("--model_path", default=None,
                          help="Finetuned Kronos checkpoint path (stage=finetuned only)")
+    parser.add_argument("--ft_epochs", type=int, default=10,
+                         help="Training epochs for the finetune subprocess (--stage finetune_next only)")
+    parser.add_argument("--ft_batch_size", type=int, default=32,
+                         help="Training batch size for the finetune subprocess (--stage finetune_next only)")
+    parser.add_argument("--dry_run", action="store_true",
+                         help="Print the selected candidate/periods/planned command without "
+                              "executing anything (--stage finetune_next only)")
     return parser
 
 
@@ -1575,6 +2007,13 @@ def main(argv=None):
     disable_min_signals_flag = "--disable_min_signals" in actual_argv
     if args.stage not in ("oracle", "auto", "rebuild_disabled") and disable_min_signals_flag:
         parser.error("--disable_min_signals is only valid with --stage oracle, auto, or rebuild_disabled")
+
+    finetune_next_only_flags = ["ft_epochs", "ft_batch_size", "dry_run"]
+    for flag_name in finetune_next_only_flags:
+        flag_hyphen = f"--{flag_name.replace('_', '-')}"
+        flag_underscore = f"--{flag_name}"
+        if args.stage != "finetune_next" and (flag_hyphen in actual_argv or flag_underscore in actual_argv):
+            parser.error(f"{flag_underscore} is only valid with --stage finetune_next")
 
     try:
         min_abs_corr = _parse_min_abs_corr(args.min_abs_corr)
@@ -1629,6 +2068,13 @@ def main(argv=None):
                          model_path=args.model_path if args.stage == "finetuned" else None)
     elif args.stage == "rebuild_disabled":
         run_stage_rebuild_disabled(conn, min_signals=args.disable_min_signals)
+    elif args.stage == "finetune_next":
+        run_stage_finetune_next(
+            conn, assets=args.assets, interval=args.interval,
+            backtest_period=args.backtest_period, pred_samples=args.pred_samples,
+            ft_epochs=args.ft_epochs, ft_batch_size=args.ft_batch_size,
+            min_signals=args.min_signals, dry_run=args.dry_run,
+        )
 
     conn.close()
 

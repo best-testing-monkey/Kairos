@@ -137,4 +137,4 @@ smoke test first, then the full 3m run to supersede it.
 - Auto-prune stale `viability_report` runs / old `results/auto_viability_report_*.csv`
   snapshots once superseded.
 
-See also: [daily-signals.md](daily-signals.md), [hourly-signals.md](hourly-signals.md).
+See also: [daily-signals.md](daily-signals.md), [hourly-signals.md](hourly-signals.md), [model-finetuning.md](model-finetuning.md).

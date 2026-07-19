@@ -44,10 +44,14 @@ table in the SQLite DB (e.g. `correlation` reads `MAX(run_id)` from
 after which stages 3-5 can be re-run repeatedly with different
 `--assets`/`--group_id`/`--interval` combinations without re-running 1-2.
 
-Two additional stage modes sit outside this 1-5 chain: `auto` (chains stages
-1-4 automatically per interval, see "Stage auto" below) and
-`rebuild_disabled` (DB-maintenance only - recomputes the `disabled_strategies`
-table from existing `oracle_results`, see "Auto-disabled strategies" below).
+Three additional stage modes sit outside this 1-5 chain: `auto` (chains stages
+1-4 automatically per interval, see "Stage auto" below), `rebuild_disabled`
+(DB-maintenance only - recomputes the `disabled_strategies` table from
+existing `oracle_results`, see "Auto-disabled strategies" below), and
+`finetune_next` (the automated counterpart to manual stage 5: selects the
+best not-yet-finetuned profile, trains and backtests a group-specific
+checkpoint, and accepts/rejects it against the existing base result - see
+"Stage: `finetune_next`" below).
 
 ## 2. Storage
 
@@ -90,6 +94,17 @@ connection by `get_connection()`. Tables (columns as declared in `SCHEMA` in
 `source_run_id`, `updated_at`, with `PRIMARY KEY (interval, assets,
 strategy_name)`. Fully replaced (deleted + re-inserted) per profile on every
 `oracle` run - see "Auto-disabled strategies" below.
+
+**`finetuned_models`** - the registry for automated finetuning
+(`--stage finetune_next`), one row per `(assets, interval)` profile ever
+claimed: `id` (PK), `assets` (sorted CSV, canonical key), `assets_raw` (as
+used in `oracle_results`/`model_results`), `interval`, `backtest_period`,
+`train_start`/`train_end`, `test_start`/`test_end`, `model_path`, `status`
+(`training`/`accepted`/`rejected`/`failed`), `base_run_id`/
+`finetuned_run_id`, `base_viable_count`/`ft_viable_count`,
+`base_mean_sharpe`/`ft_mean_sharpe`, `created_at`, with
+`UNIQUE(assets, interval)`. See "Stage: `finetune_next`" below for the full
+lifecycle.
 
 ### CSV dumps: `results/`
 
@@ -266,6 +281,120 @@ its own default (`NeoQuasar/Kronos-base`).
 uv run ./strategy/kairos_pipeline.py --stage finetuned --assets BTC-USD ETH-USD SOL-USD \
     --model_path /path/to/finetuned_kronos_checkpoint
 ```
+
+Note the distinction from `finetune_next` below: manual `--stage finetuned`
+just backtests a checkpoint you already have, on assets/interval/period you
+choose yourself - it never trains anything and never touches the
+`finetuned_models` registry. `finetune_next` is the automated path that
+picks the candidate, trains the checkpoint, backtests it via this same
+`run_stage_model(stage="finetuned")` code path, and records the outcome.
+
+### Stage: `finetune_next` (automated finetuning and comparison)
+
+```
+uv run ./strategy/kairos_pipeline.py --stage finetune_next \
+    [--pred_samples N] [--ft_epochs N] [--ft_batch_size N] [--dry_run] \
+    [--assets SYM [SYM ...] --interval INTERVAL --backtest_period PERIOD]
+```
+
+The automated counterpart to manual stage 5: closes the loop from oracle
+discovery to a trained, evaluated, accepted-or-rejected group-specific
+Kronos model, one candidate per invocation - meant to be run repeatedly
+during idle GPU time. Full narrative walkthrough (when to run, how to read
+the verdict, runtime expectations, the yfinance 1h/729-day horizon caveat):
+[`docs/playbooks/model-finetuning.md`](../docs/playbooks/model-finetuning.md).
+
+**Selection criteria** (`select_finetune_candidate()`): among
+`(assets, interval, backtest_period)` profiles that have both an
+`oracle_results` row set and an existing `stage='base'` `model_results` run,
+and that are **not** already present in `finetuned_models` under any status
+(training/accepted/rejected/failed - matched on the sorted-assets key),
+score each by the count of its latest oracle strategies with
+`sharpe > 0 AND signal_count >= 3` ("viable-bar" count), tie-broken by the
+mean Sharpe of those same strategies. The single top-ranked profile is
+selected; if none qualify, `finetune_next` prints a message and exits
+cleanly (nothing to do).
+
+**Model directory naming** (`finetune_model_dir()`):
+`models/finetuned/{interval}__{SORTED_ASSETS_JOINED_BY_UNDERSCORE}/`, e.g.
+`models/finetuned/1h__BTC-USD_ETH-USD_SOL-USD/` - assets are sorted and
+joined with `_` (commas become `_`; `-` and `=` are kept as-is, e.g.
+`BTC-USD`, `EURUSD=X`). The trainer writes `best_model/` and `final_model/`
+inside this directory; the registry's `model_path` records
+`<dir>/best_model`. A `metadata.json` mirroring the registry row is also
+written here.
+
+**Registry schema**: see the `finetuned_models` table under "Storage" above.
+Canonical key is `UNIQUE(assets, interval)` on the *sorted* assets CSV;
+`assets_raw` preserves the original ordering used in `oracle_results`/
+`model_results` and in the subprocess invocation.
+
+**Train/test periods** (`compute_finetune_periods()`): `test_end = now`,
+`test_start = now - backtest_period` (the same window length as the base
+run being compared against, re-anchored to "now" - the pipeline doesn't
+track a base run's exact calendar dates, only its period label). `train_end
+= test_start` (no leakage). `train_start = train_end` minus the data-source
+horizon for the interval - 5 years for daily-ish intervals, capped at 729
+days for `1h`/`60m` (mirrors `kairos_strategies.fetch_data_raw`'s
+`yf_max_days`; the trainer's fetch just returns whatever history actually
+exists within that window). All four timestamps are recorded on the
+registry row.
+
+**Orchestration** (`run_stage_finetune_next()`):
+
+1. Select the candidate (or use an explicit `--assets`/`--interval` for a
+   manual re-queue - see below).
+2. Insert a `finetuned_models` row with `status='training'`, claiming the
+   `UNIQUE(assets, interval)` slot immediately.
+3. Train via a `uv run finetune` subprocess: `--model NeoQuasar/Kronos-base
+   --symbol <raw assets...> --interval I --start TRAIN_START --end
+   TRAIN_END --device cuda --epochs <--ft_epochs> --batch-size
+   <--ft_batch_size> --output-model <model_dir>` - tokenizer frozen, one
+   multi-symbol training run covering every asset in the group. A non-zero
+   exit marks the row `status='failed'` and stops (the partial model dir is
+   kept for post-mortem); the backtest step never runs on failure.
+4. Backtest the trained checkpoint via
+   `run_stage_model(stage="finetuned", ...)`, using parameters identical to
+   the last base run for this profile (same assets/interval/
+   backtest_period/`--pred_samples`).
+5. **Accept gate** (`compare_finetuned_vs_base()`): compares viable-bar
+   counts (`sharpe > 0 AND signal_count >= 3`) and their mean Sharpes
+   between the latest `stage='finetuned'` and `stage='base'` runs for this
+   profile. Accepted iff `ft_count > base_count`, or
+   `ft_count == base_count AND ft_mean_sharpe > base_mean_sharpe`. Otherwise
+   rejected.
+6. Update the registry row (`status='accepted'`/`'rejected'`, run ids,
+   viable counts, mean sharpes), write `<model_dir>/metadata.json`, write an
+   empty `<model_dir>/REJECTED` marker file on rejection, and print a
+   verdict block.
+
+**`--dry_run`**: prints the selected candidate, computed periods, and the
+planned training command, then returns immediately - no registry row, no
+directory, no subprocess. Safe to run any time as a sanity check.
+
+**No auto-retry, manual re-queue only**: rejected and failed profiles stay
+in `finetuned_models` under that status permanently and are excluded from
+future candidate selection. The only way to retry one is to pass the exact
+profile explicitly:
+
+```
+uv run ./strategy/kairos_pipeline.py --stage finetune_next \
+    --assets BTC-USD ETH-USD SOL-USD --interval 1h
+```
+
+This bypasses ranking entirely, deletes the existing `finetuned_models` row
+for that profile (matched on the sorted-assets key), and reruns the full
+train/backtest/compare cycle from scratch.
+
+**Flags**: `--ft_epochs` (default `10`) and `--ft_batch_size` (default `32`)
+forward straight to the `uv run finetune` subprocess's `--epochs`/
+`--batch-size`; `--pred_samples` (default `100`) is the same flag used
+elsewhere in the pipeline, forwarded to the backtest step.
+
+**Not yet wired**: nothing downstream consumes `accepted` models today -
+`kairos_signals.py` and the viability report still only ever read
+`stage='base'` results. Wiring accepted `finetuned_models` rows into live
+signal generation is a declared next step, not part of this stage.
 
 ### Stage: `rebuild_disabled` (DB maintenance, no backtest)
 
@@ -462,9 +591,22 @@ This runs the chain twice: once for daily bars, once for hourly bars. Both inter
 
 ### Stage 5 (finetuned) and future extensions
 
-Stage 5 (finetuned) remains **manual only** — it is not part of the auto chain, as finetuned checkpoints vary per experiment and are not part of the standard discovery flow.
+Manual `--stage finetuned` remains **manual only** — it is not part of the
+`--stage auto` chain, since it backtests a checkpoint you already have and
+supply via `--model_path`, on assets/interval/period you choose by hand.
 
-The viability report schema is designed to accept a future `finetuned_sharpe`, `finetuned_signals`, etc. column without schema changes. When a finetuned discovery workflow is established, `persist_viability_report()` can be extended to outer-join on `stage='finetuned'` rows alongside oracle and base, adding those columns to the report while keeping the same database table.
+This is now distinct from the **automated** `--stage finetune_next` path
+(see "Stage: `finetune_next`" above), which *does* run on its own schedule
+(one candidate per invocation, meant to be looped/cron'd during idle GPU
+time): it selects the candidate itself, trains the checkpoint itself, then
+backtests it via the same underlying `run_stage_model(stage="finetuned")`
+call manual stage 5 uses, and records accept/reject in the `finetuned_models`
+registry. Neither path is part of the `--stage auto` chain — `finetune_next`
+has its own invocation path precisely because it needs the `finetuned_models`
+registry state (which candidates are already claimed) that `auto` has no
+concept of.
+
+The viability report schema is designed to accept a future `finetuned_sharpe`, `finetuned_signals`, etc. column without schema changes. When a finetuned discovery workflow is established, `persist_viability_report()` can be extended to outer-join on `stage='finetuned'` rows alongside oracle and base, adding those columns to the report while keeping the same database table. This is still open — `finetune_next` currently records its own accept/reject verdict in `finetuned_models` rather than folding into the viability report.
 
 ## 4. Screening criteria (from `kairos_pipeline.py` constants)
 

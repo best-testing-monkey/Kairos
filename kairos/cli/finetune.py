@@ -4,6 +4,7 @@ Usage:
     uv run finetune --model kronos-base --symbol AAPL --output-model ./aapl-model
     uv run finetune --model kronos-small --symbol MSFT --device cuda:0 --epochs 10
     uv run finetune --model kronos-base  --symbol TSLA --start 2020-01-01 --end 2024-06-14
+    uv run finetune --model kronos-base  --symbol BTC-USD ETH-USD SOL-USD --output-model ./group-model
 """
 from __future__ import annotations
 
@@ -30,8 +31,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--model", required=True,
                    help="Base model name (kronos-mini | kronos-small | kronos-base) or HF repo ID.")
-    p.add_argument("--symbol", required=True,
-                   help="Ticker symbol to fetch training data for, e.g. AAPL.")
+    p.add_argument("--symbol", required=True, nargs="+",
+                   help="Ticker symbol(s) to fetch training data for, e.g. AAPL. "
+                        "Accepts one or more symbols; each symbol's windows are built "
+                        "independently so no training window spans a symbol boundary.")
     p.add_argument("--interval", default="1d",
                    help="Bar interval (default: 1d).")
     p.add_argument("--start", default=None,
@@ -69,7 +72,7 @@ def _build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 
 class _OHLCVDataset(Dataset):
@@ -110,7 +113,7 @@ class _OHLCVDataset(Dataset):
         if "amount" not in df.columns:
             df["amount"] = df["close"] * df["volume"]
 
-        data = df[self.FEATURES + self.TIME_FEATURES].fillna(method="ffill")
+        data = df[self.FEATURES + self.TIME_FEATURES].ffill()
 
         n = len(data)
         train_end = int(n * train_ratio)
@@ -158,6 +161,17 @@ class _OHLCVDataset(Dataset):
 # Training loop
 # ---------------------------------------------------------------------------
 
+def _set_epoch_seed(dataset, epoch: int) -> None:
+    """Propagate set_epoch_seed to every underlying _OHLCVDataset, whether
+    `dataset` is a plain _OHLCVDataset (single symbol) or a ConcatDataset
+    wrapping one per symbol (multi-symbol --symbol)."""
+    if isinstance(dataset, ConcatDataset):
+        for sub in dataset.datasets:
+            sub.set_epoch_seed(epoch)
+    else:
+        dataset.set_epoch_seed(epoch)
+
+
 def _train(model, tokenizer, device, train_loader, val_loader,
            epochs: int, lr: float, output_dir: str, log_interval: int,
            train_dataset, val_dataset) -> None:
@@ -178,7 +192,7 @@ def _train(model, tokenizer, device, train_loader, val_loader,
 
     for epoch in range(epochs):
         model.train()
-        train_dataset.set_epoch_seed(epoch * 10_000)
+        _set_epoch_seed(train_dataset, epoch * 10_000)
         epoch_loss = 0.0
         n_batches = 0
 
@@ -211,7 +225,7 @@ def _train(model, tokenizer, device, train_loader, val_loader,
 
         # Validation
         model.eval()
-        val_dataset.set_epoch_seed(0)
+        _set_epoch_seed(val_dataset, 0)
         val_loss = 0.0
         val_n = 0
         with torch.no_grad():
@@ -274,49 +288,69 @@ def main(argv: list[str] | None = None) -> None:
         else end_date - timedelta(days=5 * 365)
     )
 
-    print(f"Fetching {args.symbol} ({args.interval})  "
+    symbols = args.symbol
+    print(f"Fetching {', '.join(symbols)} ({args.interval})  "
           f"{start_date.date()} → {end_date.date()} …")
 
-    raw = pc.get_price_data(
-        args.symbol,
-        start_date.strftime("%Y-%m-%d"),
-        end_date.strftime("%Y-%m-%d"),
-        interval=args.interval,
-        db_path=pc.DB_PATH,
-    )
-
-    if raw is None or raw.empty:
-        print(f"ERROR: no data returned for {args.symbol!r}. "
-              "Check the symbol and date range.", file=sys.stderr)
-        sys.exit(1)
-
-    # Rename price_cache columns → lowercase
-    raw = raw.rename(columns={
-        "Open": "open", "High": "high", "Low": "low",
-        "Close": "close", "Volume": "volume",
-    })
-    print(f"Fetched {len(raw)} bars  "
-          f"({raw.index[0].date()} – {raw.index[-1].date()})")
-
     min_required = args.lookback_window + args.predict_window + 1
-    if len(raw) < min_required:
-        print(
-            f"ERROR: need at least {min_required} bars "
-            f"(lookback {args.lookback_window} + predict {args.predict_window} + 1) "
-            f"but only got {len(raw)}.",
-            file=sys.stderr,
+
+    train_datasets = []
+    val_datasets = []
+    for symbol in symbols:
+        raw = pc.get_price_data(
+            symbol,
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d"),
+            interval=args.interval,
+            db_path=pc.DB_PATH,
         )
-        sys.exit(1)
 
-    # ------------------------------------------------------- build datasets
-    train_ds = _OHLCVDataset(raw, "train", args.lookback_window, args.predict_window,
-                              seed=args.seed, train_ratio=args.train_ratio,
-                              val_ratio=args.val_ratio)
-    val_ds = _OHLCVDataset(raw, "val", args.lookback_window, args.predict_window,
-                            seed=args.seed + 1, train_ratio=args.train_ratio,
-                            val_ratio=args.val_ratio)
+        if raw is None or raw.empty:
+            print(f"ERROR: no data returned for {symbol!r}. "
+                  "Check the symbol and date range.", file=sys.stderr)
+            sys.exit(1)
 
-    if train_ds.n_samples == 0 or val_ds.n_samples == 0:
+        # Rename price_cache columns → lowercase
+        raw = raw.rename(columns={
+            "Open": "open", "High": "high", "Low": "low",
+            "Close": "close", "Volume": "volume",
+        })
+        print(f"  [{symbol}] fetched {len(raw)} bars  "
+              f"({raw.index[0].date()} – {raw.index[-1].date()})")
+
+        if len(raw) < min_required:
+            print(
+                f"ERROR: {symbol!r} needs at least {min_required} bars "
+                f"(lookback {args.lookback_window} + predict {args.predict_window} + 1) "
+                f"but only got {len(raw)}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # ------------------------------------------------- per-symbol datasets
+        sym_train_ds = _OHLCVDataset(raw, "train", args.lookback_window, args.predict_window,
+                                      seed=args.seed, train_ratio=args.train_ratio,
+                                      val_ratio=args.val_ratio)
+        sym_val_ds = _OHLCVDataset(raw, "val", args.lookback_window, args.predict_window,
+                                    seed=args.seed + 1, train_ratio=args.train_ratio,
+                                    val_ratio=args.val_ratio)
+        print(f"  [{symbol}] train_samples={sym_train_ds.n_samples}  "
+              f"val_samples={sym_val_ds.n_samples}")
+        train_datasets.append(sym_train_ds)
+        val_datasets.append(sym_val_ds)
+
+    # ------------------------------------------------------- combine per split
+    # ConcatDataset per split (not a single concatenated DataFrame) so no
+    # sliding window ever spans a symbol boundary.
+    train_ds = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    val_ds = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
+
+    total_train_samples = sum(ds.n_samples for ds in train_datasets)
+    total_val_samples = sum(ds.n_samples for ds in val_datasets)
+    print(f"Combined: train_samples={total_train_samples}  val_samples={total_val_samples} "
+          f"across {len(symbols)} symbol(s)")
+
+    if total_train_samples == 0 or total_val_samples == 0:
         print("ERROR: not enough data to build training/validation splits. "
               "Fetch more history or reduce --lookback-window.", file=sys.stderr)
         sys.exit(1)

@@ -26,6 +26,11 @@ the latest viability report and turns viable strategies into a **signals
 report** (entries/stops/targets, expected value, an Allocation sheet). A
 human reviews the report, edits the Allocation sheet's Enabled column as a
 veto, and places orders by hand — nothing downstream is automated yet.
+Separately, an idle-time `finetune_next` stage automatically finetunes and
+backtests a group-specific Kronos model for the best not-yet-finetuned
+profile, accepting or rejecting it against the existing base result — but
+nothing downstream consumes an accepted model yet (see
+[model-finetuning.md](model-finetuning.md)).
 
 ## Cadence
 
@@ -35,6 +40,7 @@ veto, and places orders by hand — nothing downstream is automated yet.
 | Daily signals | [daily-signals.md](daily-signals.md) | `kairos_signals.py --intervals 1d --xlsx` | Daily, after 00:00 UTC (crypto) / after close (equities-FX) | Yes |
 | Hourly signals | [hourly-signals.md](hourly-signals.md) | `kairos_signals.py --intervals 1h --xlsx` | Hourly, a few minutes past the top of the hour | Yes |
 | Signal handling | [signal-handling.md](signal-handling.md) | n/a — reviewing report + Allocation sheet | After every signals run | No |
+| Idle: model finetuning | [model-finetuning.md](model-finetuning.md) | `kairos_pipeline.py --stage finetune_next` | Whenever the GPU is idle, soon after the weekly refresh | Yes |
 
 ## Prerequisites (all playbooks)
 
