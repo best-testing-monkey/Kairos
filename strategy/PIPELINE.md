@@ -406,10 +406,13 @@ staleness checks needed). A crashed run's row is auto-marked `failed` on the
 next `finetune_next` start (see orchestration step 0 above) and needs a
 manual re-queue if you want to retry it.
 
-**Not yet wired**: nothing downstream consumes `accepted` models today -
-`kairos_signals.py` and the viability report still only ever read
-`stage='base'` results. Wiring accepted `finetuned_models` rows into live
-signal generation is a declared next step, not part of this stage.
+**Consumed by `kairos_signals.py`**: `accepted` rows are picked up
+automatically, in-process, the next time `kairos_signals.py` runs — no
+manual wiring step. It matches on sorted assets + interval, so ordering the
+`--assets` list differently doesn't matter. See "Current signals report"
+(§7) below for the two-pass mechanics. The viability report itself is
+unaffected — `persist_viability_report()` still only ever reads
+`stage='base'` results; only the signals report overlays `finetuned_models`.
 
 ### Stage: `rebuild_disabled` (DB maintenance, no backtest)
 
@@ -788,13 +791,25 @@ group and reports what each strategy would do *right now*.
 ```bash
 uv run ./strategy/kairos_signals.py \
     [--db data/pipeline_results.db] [--out results/] \
-    [--intervals 1d ...] [--pred_samples 100] [--all]
+    [--intervals 1d ...] [--pred_samples 100] [--all] [--base_only]
 ```
 
 - Reads `viability_report` for `run_id = MAX(run_id)`; filters to `viable=1`
   unless `--all` is passed. `--intervals` filters to a subset of intervals.
 - Groups viable rows by `(assets, interval)` so the GPU/model does one batched
   prediction (`predict_all_batch`) per group, not one call per strategy.
+- **Two passes.** Pass 1 predicts every `(assets, interval)` group with the
+  base Kronos model, exactly as above. Pass 2 then re-checks the
+  `finetuned_models` registry for each group: any group with a
+  `status='accepted'` row matching its sorted assets + interval is
+  re-predicted using that row's checkpoint (`model_path`), and the
+  finetuned result *replaces* the group's rows from pass 1. `--base_only`
+  skips pass 2 entirely (every row stays `Base`); a missing
+  `finetuned_models` table (fresh DB) or no accepted match for a group is
+  silently treated as base-only for that group. Rejected/failed/training
+  registry rows are never used. Model switching happens in-process per
+  group, so the only added GPU cost is one extra prediction pass per group
+  that has an accepted model.
 - Per group: fetches the latest bars for each symbol, predicts once, builds
   the same per-symbol context `_run_day` uses (`returns_window`,
   `realized_vol`, `capital`, etc.), applies the orchestrator's meta-filters,
@@ -803,11 +818,20 @@ uv run ./strategy/kairos_signals.py \
   (unknown strategy name not in the registry, or a signal blocked by
   meta-filters) are isolated and reported in `## Failures` / `## Skipped`
   footers rather than aborting the whole run.
+- Every stats/signals/Allocation row carries a `model` value: `Base` or
+  `Finetuned(<assets in group>)`. In the `.xlsx`/`.ods` Allocation sheet this
+  is a trailing plain-value `Model` column at sheet column `AO`.
 - Writes `results/kairos_signals_<YYYYmmddHHMM>.md` with:
   - `## Stats` - a table of every strategy that produced >=1 signal (entry,
     stop, target, confidence, expected value, plus the oracle/base viability
-    stats carried over from the DB row).
-  - `## Signals` - plain-English bullets, e.g. *"Strategy dfa_persistence
+    stats carried over from the DB row, plus `model`).
+  - `## Signals` - plain-English advice, e.g. *"Strategy dfa_persistence
     advised **Long** position on BTC-USD for 12% liquidity with SL at
     58,900.00 (-3.1%) and TP at 63,400.00 (+4.2%). Exit by TP/SL."*
+  - `## Replaced base signals (comparison)` - present only when pass 2
+    replaced at least one group; the displaced base-model stats rows for
+    those groups, in the same format as `## Stats`, so base-vs-finetuned
+    divergence stays visible every run.
+- With `--xlsx`/`--ods`/`--gsheets`, a `base_shadow` sheet/worksheet mirrors
+  the same replaced-rows comparison whenever pass 2 replaced anything.
 - The report path is printed to stdout when the run finishes.

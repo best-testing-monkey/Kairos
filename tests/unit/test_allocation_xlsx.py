@@ -41,7 +41,7 @@ def _make_candidate(**kwargs):
     return Candidate(**defaults)
 
 
-def _make_row(candidate, config, status, flags=None, alloc=None):
+def _make_row(candidate, config, status, flags=None, alloc=None, model=None):
     """Construct a result row dict from a Candidate."""
     derived = compute_derived(candidate, config)
     row = {
@@ -60,6 +60,7 @@ def _make_row(candidate, config, status, flags=None, alloc=None):
         "derived": derived,
         "status": status,
         "flags": list(flags or []),
+        "model": model,
     }
     if alloc is not None:
         row["alloc"] = alloc
@@ -89,8 +90,8 @@ def result(config):
     )
 
     rows = [
-        _make_row(selected, config, "SELECTED", ["DATA_MISMATCH"], selected_alloc),
-        _make_row(rejected, config, "BELOW_TOPK", []),
+        _make_row(selected, config, "SELECTED", ["DATA_MISMATCH"], selected_alloc, model="Base"),
+        _make_row(rejected, config, "BELOW_TOPK", [], model="Finetuned(NG)"),
     ]
     return AllocationResult(
         rows=rows,
@@ -202,6 +203,11 @@ class TestHeaderRow:
         assert ws["AM20"].value == "enabled_flag"
         assert ws["AN20"].value == "base_alloc_pct"
 
+    def test_header_row_model_column(self, workbook):
+        """Model is a trailing plain-value column appended at AO (never inserted A-AN)."""
+        ws = workbook["Allocation"]
+        assert ws["AO20"].value == "Model"
+
 
 class TestDataRows:
     """Checks for the per-candidate data rows."""
@@ -238,6 +244,13 @@ class TestDataRows:
         assert ws["AL21"].value == render_formula("AL", 21, "xlsx")
         assert ws["AM21"].value == render_formula("AM", 21, "xlsx")
         assert ws["AN21"].value == render_formula("AN", 21, "xlsx")
+
+    def test_model_column_value(self, workbook, result):
+        """AO holds the plain-value Model string from the row dict (not a formula)."""
+        ws = workbook["Allocation"]
+        sorted_rows = _sorted_for_sheet(result.rows)
+        assert ws["AO21"].value == sorted_rows[0]["model"]
+        assert ws["AO22"].value == sorted_rows[1]["model"]
 
 
 class TestProtection:
@@ -379,7 +392,7 @@ class TestAutofilter:
     def test_auto_filter_ref(self, workbook, result):
         ws = workbook["Allocation"]
         data_end_row = 20 + len(result.rows)
-        assert ws.auto_filter.ref == f"A20:AN{data_end_row}"
+        assert ws.auto_filter.ref == f"A20:AO{data_end_row}"
 
 
 class TestEvTotalSummaryRow:

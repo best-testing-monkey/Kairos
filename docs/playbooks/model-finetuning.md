@@ -5,7 +5,11 @@ not-yet-finetuned `(asset group, interval)` candidate, backtest it, and
 accept or reject it against the existing base-model result. Designed to be
 run repeatedly whenever the machine is otherwise idle — one candidate per
 invocation, so a menagerie of specialized models builds up incrementally
-over time. Full stage reference: [`strategy/PIPELINE.md`](../../strategy/PIPELINE.md#stage-finetune_next-automated-finetuning-and-comparison).
+over time. Accepted models aren't just a registry entry — they're picked up
+automatically by the [daily](daily-signals.md)/[hourly](hourly-signals.md)
+signal reports the next time they run, replacing the base model's rows for
+that group (see [daily-signals.md](daily-signals.md#finetuned-models)). Full
+stage reference: [`strategy/PIPELINE.md`](../../strategy/PIPELINE.md#stage-finetune_next-automated-finetuning-and-comparison).
 
 ## Prerequisites
 
@@ -103,6 +107,13 @@ with ties broken by mean Sharpe of those strategies. Otherwise it's
 **rejected**. A non-zero exit from the training subprocess marks the
 candidate **failed** instead (backtest never runs) — the partial model
 directory is kept for post-mortem.
+
+An `ACCEPTED` verdict takes effect automatically on the *next*
+[daily](daily-signals.md)/[hourly](daily-signals.md#finetuned-models)
+signals run — no manual wiring step needed. `kairos_signals.py` checks the
+`finetuned_models` registry for a `status='accepted'` row matching a
+group's sorted assets + interval every time it runs, so there's no delay
+beyond the next scheduled (or manual) `kairos_signals.py` invocation.
 
 Rejected and failed candidates are **never automatically retried** — they
 stay in `finetuned_models` under that status permanently, so future
@@ -205,11 +216,11 @@ a 5-year horizon instead. This mirrors the same `yf_max_days` table used by
   already makes repeated/overlapping invocations safe, so the only remaining
   gap is an `nvidia-smi`-style check to avoid competing with a manual,
   non-`finetune_next` backtest for the GPU.
-- **Not yet wired**: nothing downstream consumes `accepted` models today —
-  `kairos_signals.py` and the viability report still only ever read
-  `stage='base'` results. Wiring `finetuned_models` (status=`accepted`) into
-  `kairos_signals`/viability so an accepted group actually gets used for
-  live signals is the declared next step, not yet built.
+- **Done**: `kairos_signals.py` automatically consumes `accepted`
+  `finetuned_models` rows — see
+  [daily-signals.md](daily-signals.md#finetuned-models). The viability
+  report itself is unchanged and still only ever reflects `stage='base'`
+  results; only the signals report overlays the finetuned checkpoint.
 - A notification (Telegram, email, or similar) on each `ACCEPTED`/`REJECTED`/
   `FAILED` verdict, so a human doesn't have to remember to check
   `finetuned_models` after an overnight run — see the Phase 3 delivery layer

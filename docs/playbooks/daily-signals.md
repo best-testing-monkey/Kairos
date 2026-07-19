@@ -42,6 +42,10 @@ pass `--all`.
   Google Sheet, local `.xlsx`, or local `.ods` file respectively.
 - `--cluster_map` — CSV mapping ticker → cluster name, used by the Allocation
   sheet's cluster caps.
+- `--base_only` — skip the accepted-finetuned-model overlay pass entirely:
+  every row is labeled `Base` and no `## Replaced base signals (comparison)`
+  section or `base_shadow` tab is produced. Useful while debugging a bad
+  finetuned model.
 - `--effective_per "YYYYMMDD [HHnn]"` — simulate "now" as a fixed timestamp,
   for backtesting/QA the report instead of using the real current time.
 - `--bars_backtest N` — generate N reports stepping backward bar-by-bar from
@@ -50,16 +54,43 @@ pass `--all`.
 ## Output
 
 `results/kairos_signals_<YYYYMMDDHHMM>.md`, plus (with `--xlsx`/`--ods`/`--gsheets`)
-a spreadsheet with `strategies`, `signals`, and `Allocation` tabs. The
-markdown report has a `## Stats` table (per strategy: direction, size, entry,
-stop, target, expected value, oracle/base viability stats) and a `## Signals`
-section of plain-English advice sentences, e.g. *"Strategy dfa_persistence
-advised **Long** position on BTC-USD for 12% liquidity with SL at 58,900.00
-(-3.1%) and TP at 63,400.00 (+4.2%). Exit by TP/SL."*
+a spreadsheet with `strategies`, `signals`, and `Allocation` tabs (plus
+`base_shadow` when a finetuned overlay replaced any rows — see "Finetuned
+models" below). The markdown report has a `## Stats` table (per strategy:
+direction, size, entry, stop, target, expected value, oracle/base viability
+stats) and a `## Signals` section of plain-English advice sentences, e.g.
+*"Strategy dfa_persistence advised **Long** position on BTC-USD for 12%
+liquidity with SL at 58,900.00 (-3.1%) and TP at 63,400.00 (+4.2%). Exit by
+TP/SL."*
 
 Signal fields include: strategy, symbol, interval, direction, size, entry,
 stop, target, expected_value, ev_pct, oracle_sharpe, base_sharpe, win rates,
-and signals_per_week.
+signals_per_week, and `model` — `Base` or `Finetuned(<assets in group>)`,
+depending on which model produced that row (see below). The Allocation
+tab/section carries the same `model` value in a trailing `Model` column
+(sheet column `AO` in the `.xlsx`/`.ods` output).
+
+## Finetuned models
+
+`kairos_signals.py` runs in two passes. Pass 1 predicts every `(assets,
+interval)` group with the base Kronos model, as above. Pass 2 then checks
+the `finetuned_models` registry (see
+[model-finetuning.md](model-finetuning.md)) for each group: if there's a
+`status='accepted'` row matching that group's sorted assets + interval, the
+group is re-predicted with that row's checkpoint, and the finetuned result
+**replaces** the base result for that group in the `## Stats`/`## Signals`
+tables and the Allocation tab. The displaced base-model rows aren't
+discarded — they're preserved in a `## Replaced base signals (comparison)`
+markdown section and a `base_shadow` sheet/worksheet (xlsx/ods/gsheets), so
+you can see how the finetuned model's advice diverges from what the base
+model would have said, every run.
+
+A missing `finetuned_models` table (fresh DB, nothing finetuned yet) or no
+matching accepted row means the group just stays on the base model — no
+special handling needed. Pass `--base_only` to skip pass 2 entirely and
+force every row to `Base`. Switching models happens in-process per group;
+the only extra cost is one additional prediction pass per group that has an
+accepted finetuned model.
 
 ## Empty-report troubleshooting
 

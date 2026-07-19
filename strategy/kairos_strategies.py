@@ -54,9 +54,14 @@ OUTPUT_DIR = KairosSettings.output_dir
 bt_tokenizer = None
 bt_model = None
 bt_predictor = None
+_loaded_model_src = None  # (tokenizer_src, model_src) of the currently loaded model, or None
 
 _prediction_cache: dict = {}  # (symbol, last_bar_ts) -> List[pd.DataFrame]
 _dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
+# NOTE: neither cache carries model identity. Whenever _ensure_model_loaded
+# switches to a different (tokenizer_src, model_src) pair, both caches MUST
+# be cleared or a two-pass (base -> finetuned) flow would silently reuse
+# base-model predictions for the finetuned pass.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,15 +165,47 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None, as_of=None) -> D
 
 # ── Prediction ────────────────────────────────────────────────────────────────
 
+def _model_switch_needed(requested_src, loaded_src) -> bool:
+    """Pure decision: does the requested (tokenizer_src, model_src) pair
+    require a (re)load?
+
+    True when nothing is loaded yet (`loaded_src is None`) or when the
+    requested pair differs from what's currently loaded. Kept as a pure
+    function (no globals, no I/O) so it's unit-testable without touching
+    the actual model-loading path.
+    """
+    return loaded_src is None or requested_src != loaded_src
+
+
 def _ensure_model_loaded(model_path=None, tokenizer_path=None):
-    global bt_tokenizer, bt_model, bt_predictor
-    if bt_predictor is not None:
+    global bt_tokenizer, bt_model, bt_predictor, _loaded_model_src
+
+    tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
+    mdl_src = model_path or "NeoQuasar/Kronos-base"
+    requested_src = (tok_src, mdl_src)
+
+    if bt_predictor is not None and not _model_switch_needed(requested_src, _loaded_model_src):
         return
 
     import torch
     from model import Kronos, KronosTokenizer, KronosPredictor
-    tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
-    mdl_src = model_path or "NeoQuasar/Kronos-base"
+
+    if bt_predictor is not None:
+        # Switching to a different model: unload the old one first and clear
+        # the prediction caches (no model identity in their keys — see the
+        # note by _prediction_cache/_dist_cache above) so the next batch call
+        # can't silently reuse predictions from the previous model.
+        print(f"Switching Kronos model: {_loaded_model_src} -> {requested_src}")
+        old_model, old_tokenizer, old_predictor = bt_model, bt_tokenizer, bt_predictor
+        bt_model = bt_tokenizer = bt_predictor = None
+        del old_model, old_tokenizer, old_predictor
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _prediction_cache.clear()
+        _dist_cache.clear()
+
     print(f"Loading Kronos model from {mdl_src} ...")
     bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
     bt_model = Kronos.from_pretrained(mdl_src)
@@ -188,6 +225,7 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
         print(f"  → CPU mode: INT8 dynamic quantisation, {torch.get_num_threads()} threads")
 
     bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=512)
+    _loaded_model_src = requested_src
 
 
 def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
@@ -206,12 +244,18 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
     )
 
 
-def predict_all_batch(assets: dict) -> dict:
-    """Predict all assets in one batched GPU call instead of N sequential calls."""
+def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dict:
+    """Predict all assets in one batched GPU call instead of N sequential calls.
+
+    model_path / tokenizer_path: optional HF repo id or local path forwarded to
+    _ensure_model_loaded(). Passing a different model_path than what's
+    currently loaded triggers an in-process model swap (see
+    _ensure_model_loaded / _model_switch_needed).
+    """
     from kairos_meta import AssetPrediction, KairosDistribution
     import kairos_predcache
 
-    _ensure_model_loaded()
+    _ensure_model_loaded(model_path, tokenizer_path)
 
     shared_cache = kairos_predcache.get_cache()
     shared_keys = {}  # symbol -> cache key (only computed when shared_cache is active)

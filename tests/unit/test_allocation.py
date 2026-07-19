@@ -80,6 +80,43 @@ class TestCandidateDataclass:
         assert c.avg_loss_pct == 1.5
         assert c.avg_holding_days == 3.5
 
+    def test_candidate_model_defaults_to_none(self):
+        """Candidate.model defaults to None when not supplied (back-compat)."""
+        c = Candidate(
+            strategy="strategy1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+        )
+        assert c.model is None
+
+    def test_candidate_model_field_settable(self):
+        """Candidate.model holds the model label string when supplied."""
+        c = Candidate(
+            strategy="strategy1",
+            ticker="TEST",
+            direction="long",
+            entry=100.0,
+            stop=95.0,
+            target=110.0,
+            ev_pct=5.0,
+            base_win_rate=0.55,
+            n=100,
+            backtest_period="period",
+            sharpe=1.0,
+            advised_liquidity_pct=10.0,
+            model="Base",
+        )
+        assert c.model == "Base"
+
 
 class TestFetchSignals:
     """Test fetch_signals() adapter function."""
@@ -649,6 +686,71 @@ class TestFetchSignals:
         assert candidates[0].avg_win_pct is None
         assert candidates[0].avg_loss_pct is None
         assert candidates[0].avg_holding_days is None
+
+    def test_model_field_passed_through(self):
+        """stats_row['model'] (e.g. 'Base' or 'Finetuned(...)') rides along onto Candidate.model."""
+        stats_rows = [
+            {
+                "strategy": "s1",
+                "symbol": "TEST",
+                "direction": "LONG",
+                "entry": 100.0,
+                "stop": 95.0,
+                "target": 110.0,
+                "expected_value": 5.0,
+                "base_sharpe": 1.0,
+                "base_win_rate": 0.55,
+                "backtest_period": "p",
+                "size": 0.1,
+                "model": "Finetuned(ADA-USD,ETH-USD)",
+            }
+        ]
+        advice_rows = [
+            {
+                "expected_value": 5.0,
+                "entry": 100.0,
+                "base_win_rate": 0.55,
+                "base_signals": 50,
+                "oracle_signals": None,
+                "signal": "Buy TEST",
+            }
+        ]
+        candidates = fetch_signals(stats_rows, advice_rows)
+
+        assert len(candidates) == 1
+        assert candidates[0].model == "Finetuned(ADA-USD,ETH-USD)"
+
+    def test_model_field_defaults_to_empty_string(self):
+        """A stats_row with no 'model' key yields Candidate.model == ''."""
+        stats_rows = [
+            {
+                "strategy": "s1",
+                "symbol": "TEST",
+                "direction": "LONG",
+                "entry": 100.0,
+                "stop": 95.0,
+                "target": 110.0,
+                "expected_value": 5.0,
+                "base_sharpe": 1.0,
+                "base_win_rate": 0.55,
+                "backtest_period": "p",
+                "size": 0.1,
+            }
+        ]
+        advice_rows = [
+            {
+                "expected_value": 5.0,
+                "entry": 100.0,
+                "base_win_rate": 0.55,
+                "base_signals": 50,
+                "oracle_signals": None,
+                "signal": "Buy TEST",
+            }
+        ]
+        candidates = fetch_signals(stats_rows, advice_rows)
+
+        assert len(candidates) == 1
+        assert candidates[0].model == ""
 
 
 class TestValidateCandidate:

@@ -42,7 +42,7 @@ def _make_candidate(**kwargs):
     return Candidate(**defaults)
 
 
-def _make_row(candidate, config, status, flags=None, alloc=None):
+def _make_row(candidate, config, status, flags=None, alloc=None, model=None):
     """Construct a result row dict from a Candidate."""
     derived = compute_derived(candidate, config)
     row = {
@@ -61,6 +61,7 @@ def _make_row(candidate, config, status, flags=None, alloc=None):
         "derived": derived,
         "status": status,
         "flags": list(flags or []),
+        "model": model,
     }
     if alloc is not None:
         row["alloc"] = alloc
@@ -130,8 +131,8 @@ def result(config):
     )
 
     rows = [
-        _make_row(selected, config, "SELECTED", ["DATA_MISMATCH"], selected_alloc),
-        _make_row(rejected, config, "BELOW_TOPK", []),
+        _make_row(selected, config, "SELECTED", ["DATA_MISMATCH"], selected_alloc, model="Base"),
+        _make_row(rejected, config, "BELOW_TOPK", [], model="Finetuned(NG)"),
     ]
     return AllocationResult(
         rows=rows,
@@ -264,6 +265,12 @@ class TestHeaderRow:
         assert _cell_value(header_cells[38]) == "enabled_flag"
         assert _cell_value(header_cells[39]) == "base_alloc_pct"
 
+    def test_header_row_model_column(self, document):
+        """Model is a trailing plain-value column appended at AO (index 40)."""
+        rows = _get_rows(document)
+        header_cells = rows[19].getElementsByType(TableCell)
+        assert _cell_value(header_cells[40]) == "Model"
+
 
 class TestDataRows:
     """Checks for the per-candidate data rows."""
@@ -300,6 +307,13 @@ class TestDataRows:
         assert _cell_value(_get_cell(rows[20], 37)) == render_formula("AL", 21, "ods")
         assert _cell_value(_get_cell(rows[20], 38)) == render_formula("AM", 21, "ods")
         assert _cell_value(_get_cell(rows[20], 39)) == render_formula("AN", 21, "ods")
+
+    def test_model_column_value(self, document, result):
+        """Column index 40 (AO) holds the plain-value Model string, not a formula."""
+        rows = _get_rows(document)
+        sorted_rows = _sorted_for_sheet(result.rows)
+        assert _cell_value(_get_cell(rows[20], 40)) == sorted_rows[0]["model"]
+        assert _cell_value(_get_cell(rows[21], 40)) == sorted_rows[1]["model"]
 
 
 class TestClusterExposure:
@@ -351,6 +365,16 @@ class TestAutofilter:
         assert "Allocation" in target
         assert "A20" in target
         assert ranges[0].getAttribute("displayfilterbuttons") == "true"
+
+    def test_database_range_extends_to_model_column(self, document, result):
+        """The range now ends at AO (Model), not AN, per the append-only column."""
+        from odf.table import DatabaseRange
+
+        ranges = document.spreadsheet.getElementsByType(DatabaseRange)
+        target = ranges[0].getAttribute("targetrangeaddress")
+        data_end_row = 20 + len(result.rows)
+        assert f"AO{data_end_row}" in target
+        assert f"AN{data_end_row}" not in target
 
 
 class TestAllocPctRedistribution:

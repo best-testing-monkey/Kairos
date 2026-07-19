@@ -22,9 +22,11 @@ down to the last closed bar, so running too early just repeats the previous
 hour's bar.
 
 For the full flag reference (`--min_ev_pct`, `--pred_samples`, `--all`,
-`--gsheets`/`--xlsx`/`--ods`, `--cluster_map`, `--effective_per`,
-`--bars_backtest`) and output format, see
-[daily-signals.md](daily-signals.md) — it's identical for `1h`.
+`--gsheets`/`--xlsx`/`--ods`, `--cluster_map`, `--base_only`,
+`--effective_per`, `--bars_backtest`) and output format — including the
+`model` column and the automatic accepted-finetuned-model overlay/
+`base_shadow` comparison tab — see [daily-signals.md](daily-signals.md), the
+"Finetuned models" section — it's identical for `1h`.
 
 ## Hourly-specific caveats
 

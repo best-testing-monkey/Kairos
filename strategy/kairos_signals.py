@@ -74,6 +74,28 @@ def group_items(rows):
     return groups
 
 
+def load_accepted_finetuned(conn):
+    """Load the accepted-finetuned-model registry.
+
+    Returns {(sorted_assets_csv, interval): model_path} for every
+    status='accepted' row in the finetuned_models table (UNIQUE(assets,
+    interval) means at most one row per key, so this is a safe dict).
+
+    Returns {} on any sqlite3.Error -- in particular when the
+    finetuned_models table doesn't exist yet (fresh clones / older test
+    DBs), so callers never need to special-case old databases.
+    """
+    try:
+        cur = conn.execute(
+            "SELECT assets, interval, model_path FROM finetuned_models "
+            "WHERE status = 'accepted'"
+        )
+        rows = cur.fetchall()
+    except sqlite3.Error:
+        return {}
+    return {(row[0], row[1]): row[2] for row in rows}
+
+
 # =============================================================================
 # Advice formatting
 # =============================================================================
@@ -222,7 +244,7 @@ STATS_COLUMNS = [
     "strategy", "symbol", "interval", "backtest_period", "direction", "size",
     "entry", "stop", "target", "expected_value", "ev_pct",
     "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
-    "signals_per_week",
+    "signals_per_week", "model",
 ]
 
 
@@ -270,8 +292,8 @@ def build_stats_table(stats_rows):
     return STATS_COLUMNS, align, formatted_stats
 
 
-SIGNALS_COLUMNS = ["ev_pct", "base_win_rate", "signals/backtest", "signal"]
-SIGNALS_ALIGN = ["r", "r", "r", "l"]
+SIGNALS_COLUMNS = ["ev_pct", "base_win_rate", "signals/backtest", "signal", "model"]
+SIGNALS_ALIGN = ["r", "r", "r", "l", "l"]
 
 
 def build_signals_table(advice_rows):
@@ -300,12 +322,14 @@ def build_signals_table(advice_rows):
             "base_win_rate": _format_numeric_cell(row.get("base_win_rate"), decimals=2),
             "signals/backtest": signals_backtest,
             "signal": str(row.get("signal", "")),
+            "model": str(row.get("model", "")),
         })
     return SIGNALS_COLUMNS, SIGNALS_ALIGN, signals_table
 
 
 def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
-                  min_ev_pct=0.10, allocation_section=None) -> str:
+                  min_ev_pct=0.10, allocation_section=None,
+                  replaced_stats_rows=None) -> str:
     """Assemble the full markdown report from pre-computed pieces.
 
     stats_rows: list of dicts with keys from STATS_COLUMNS (only strategies
@@ -323,6 +347,12 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
     timestamp: datetime used for the header.
     allocation_section: optional markdown string (e.g. from allocation.py
         write_md_section) to append after the Signals section, per RFC §6.
+    replaced_stats_rows: optional list of stats_rows (same shape as
+        stats_rows) that were displaced from the base pass by an accepted
+        finetuned-model rerun. When non-empty, rendered as a
+        "## Replaced base signals (comparison)" section via
+        build_stats_table so the base-model numbers stay visible even
+        though the finetuned rows replaced them in the main tables.
     """
     lines = []
     lines.append(f"# Kairos Signals Report {timestamp.strftime('%Y-%m-%d %H%Mh')}")
@@ -353,6 +383,13 @@ def render_report(stats_rows, advice_rows, failures, skipped, timestamp,
     else:
         lines.append("_No signals generated._")
     lines.append("")
+
+    if replaced_stats_rows:
+        lines.append("## Replaced base signals (comparison)")
+        lines.append("")
+        headers, align, formatted_stats = build_stats_table(replaced_stats_rows)
+        lines.extend(format_table(headers, formatted_stats, align))
+        lines.append("")
 
     if allocation_section:
         lines.append(allocation_section.rstrip("\n"))
@@ -424,13 +461,18 @@ def _get_gsheets_credentials(credentials_path, token_path):
 
 
 def upload_to_gsheets(stats_rows, advice_rows, timestamp,
-                      credentials_path=None, token_path=None) -> str:
+                      credentials_path=None, token_path=None,
+                      replaced_stats_rows=None) -> str:
     """Create a new Google Sheet with 'strategies' and 'signals' tabs mirroring
     the markdown report's Stats and Signals tables. Returns the spreadsheet URL.
 
     First run (or no cached token) opens a browser window for OAuth consent;
     the resulting token is cached to `token_path` for subsequent non-interactive
     runs. See strategy/README.md for one-time Google Cloud setup steps.
+
+    replaced_stats_rows: optional list of stats_rows displaced by an
+        accepted finetuned-model rerun; when non-empty, adds a
+        'base_shadow' worksheet mirroring the markdown comparison section.
     """
     import gspread
 
@@ -453,12 +495,20 @@ def upload_to_gsheets(stats_rows, advice_rows, timestamp,
     else:
         strategies_ws.update([["No strategies produced a signal in this run."]])
 
-    signals_ws = spreadsheet.add_worksheet(title="signals", rows=max(len(advice_rows) + 1, 2), cols=4)
+    signals_ws = spreadsheet.add_worksheet(
+        title="signals", rows=max(len(advice_rows) + 1, 2), cols=len(SIGNALS_COLUMNS))
     if advice_rows:
         headers, _, rows = build_signals_table(advice_rows)
         signals_ws.update([headers] + [[row.get(h, "") for h in headers] for row in rows])
     else:
         signals_ws.update([["No signals generated."]])
+
+    if replaced_stats_rows:
+        shadow_ws = spreadsheet.add_worksheet(
+            title="base_shadow", rows=max(len(replaced_stats_rows) + 1, 2),
+            cols=len(STATS_COLUMNS))
+        headers, _, rows = build_stats_table(replaced_stats_rows)
+        shadow_ws.update([headers] + [[row.get(h, "") for h in headers] for row in rows])
 
     return spreadsheet.url
 
@@ -472,13 +522,18 @@ SPREADSHEET_ENGINES = {"xlsx": "openpyxl", "ods": "odf"}
 
 def write_spreadsheet(stats_rows, advice_rows, out_path, fmt,
                       allocation_result=None, allocation_config=None,
-                      report_date=None, generator_version=None) -> str:
-    """Write a spreadsheet ('strategies', 'signals', and optionally 'Allocation') to out_path.
+                      report_date=None, generator_version=None,
+                      replaced_stats_rows=None) -> str:
+    """Write a spreadsheet ('strategies', 'signals', and optionally 'base_shadow'
+    and 'Allocation') to out_path.
 
     fmt: 'xlsx' or 'ods'. Mirrors the Stats/Signals tables from the markdown
     report and the Google Sheets export (same build_stats_table /
     build_signals_table helpers). When allocation_result and allocation_config
     are provided, adds an 'Allocation' sheet via allocation.py's writer.
+    replaced_stats_rows: optional list of stats_rows displaced by an
+        accepted finetuned-model rerun; when non-empty, adds a
+        'base_shadow' sheet mirroring the markdown comparison section.
     Returns out_path.
     """
     engine = SPREADSHEET_ENGINES[fmt]
@@ -499,6 +554,11 @@ def write_spreadsheet(stats_rows, advice_rows, out_path, fmt,
     with pd.ExcelWriter(out_path, engine=engine) as writer:
         strategies_df.to_excel(writer, sheet_name="strategies", index=False)
         signals_df.to_excel(writer, sheet_name="signals", index=False)
+
+        if replaced_stats_rows:
+            headers, _, rows = build_stats_table(replaced_stats_rows)
+            shadow_df = pd.DataFrame(rows, columns=headers)
+            shadow_df.to_excel(writer, sheet_name="base_shadow", index=False)
 
         if allocation_result is not None and allocation_config is not None:
             if engine == "openpyxl":
@@ -521,10 +581,14 @@ def write_spreadsheet(stats_rows, advice_rows, out_path, fmt,
 # Orchestration
 # =============================================================================
 
-def _real_predict_fn(assets_dict):
-    """Default predict_fn: batched Kronos prediction (GPU/network required)."""
+def _real_predict_fn(assets_dict, model_path=None):
+    """Default predict_fn: batched Kronos prediction (GPU/network required).
+
+    model_path: optional HF repo id or local path for an accepted finetuned
+    model (see load_accepted_finetuned); None means the base Kronos model.
+    """
     from kairos_strategies import predict_all_batch
-    return predict_all_batch(assets_dict)
+    return predict_all_batch(assets_dict, model_path=model_path)
 
 
 def build_strategy_index(strategies):
@@ -571,10 +635,143 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
     }
 
 
+def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label,
+               data, pred_samples, min_ev_pct):
+    """Generate stats/advice rows for one (assets, interval) group against
+    already-fetched `data`.
+
+    Shared by both the base pass and the accepted-finetuned overlay pass
+    (see run()) so the predict -> meta-filter -> generate-signal -> build-row
+    pipeline isn't duplicated; only the model used to predict and the label
+    stamped onto each row differ between passes.
+
+    model_path: forwarded to predict_fn(data, model_path=...); None for the
+        base model.
+    model_label: stamped into every stats_row/advice_row's "model" key
+        ("Base" or "Finetuned(<assets>)").
+    Returns (stats_rows, advice_rows, skipped) for this group. Raises on
+    unexpected errors -- the caller wraps each pass in try/except and
+    records group-level failures.
+    """
+    from kairos_backtest import KairosSettings, Direction
+    from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
+    from kairos_strategies import resolve_disabled_strategies
+
+    KairosSettings.interval = interval
+    KairosSettings.pred_samples = pred_samples
+
+    stats_rows = []
+    advice_rows = []
+    skipped = []
+
+    multi_preds = predict_fn(data, model_path=model_path)
+
+    disabled = resolve_disabled_strategies(interval, assets)
+    config = OrchestratorConfig(disabled_strategies=disabled)
+
+    def _dummy_predict(*a, **kw):
+        return []
+
+    orchestrator = KairosOrchestrator(
+        predict_fn=_dummy_predict, assets=assets, config=config,
+    )
+    strategies_by_name = build_strategy_index(orchestrator.strategies)
+
+    for row in group_rows:
+        strategy_name = row["strategy_name"]
+        # Each viable row targets the group's assets collectively but a
+        # signal is generated per-symbol below; try every symbol in the
+        # group's asset list and keep whichever fires.
+        strat = strategies_by_name.get(strategy_name)
+        if strat is None:
+            skipped.append(f"{strategy_name}: unknown strategy (not in registry)")
+            continue
+
+        for sym in assets:
+            pred = multi_preds.get(sym)
+            if pred is None:
+                continue
+            dist = pred.dist
+            current_price = pred.current_price
+            history = pred.history
+
+            if orchestrator._apply_meta_filters(dist, current_price):
+                skipped.append(
+                    f"{strategy_name}/{sym}: blocked by meta-filters"
+                )
+                continue
+
+            context = _build_context(orchestrator, sym, current_price, multi_preds, history)
+
+            try:
+                sig = strat.generate_signal(dist, current_price, history, context)
+            except Exception as e:
+                skipped.append(f"{strategy_name}/{sym}: signal generation error ({e})")
+                continue
+
+            if sig is None:
+                continue
+
+            # Match the backtest's gate (kairos_orchestrator._run_day:
+            # `sig.size > 0`): zero-size non-FLAT signals are legit
+            # strategy output (Kelly fraction clamped at 0) but never
+            # traded, so they must not appear as advice. FLAT signals
+            # are exit advice and naturally size 0 — keep them.
+            if sig.direction != Direction.FLAT and sig.size <= 0:
+                skipped.append(
+                    f"{strategy_name}/{sym}: zero-size signal dropped (no Kelly edge)"
+                )
+                continue
+
+            # Minimum-EV filter: non-FLAT signals must clear
+            # min_ev_pct (expected value as percent of entry).
+            # FLAT/exit signals are never filtered by this.
+            if sig.direction != Direction.FLAT and min_ev_pct > 0:
+                ev_pct_val = _ev_pct_value(sig.expected_value, sig.entry)
+                if ev_pct_val is None or ev_pct_val < min_ev_pct:
+                    ev_str = (f"{ev_pct_val:.2f}%" if ev_pct_val is not None
+                              else "n/a")
+                    skipped.append(
+                        f"{strategy_name}/{sym}: ev_pct below threshold "
+                        f"({ev_str} < {min_ev_pct:.2f}%)"
+                    )
+                    continue
+
+            stats_rows.append({
+                "strategy": strategy_name,
+                "symbol": sym,
+                "interval": interval,
+                "backtest_period": row.get("backtest_period"),
+                "direction": sig.direction.name,
+                "size": sig.size,
+                "entry": sig.entry,
+                "stop": sig.stop,
+                "target": sig.target,
+                "expected_value": sig.expected_value,
+                "oracle_sharpe": row.get("oracle_sharpe"),
+                "base_sharpe": row.get("base_sharpe"),
+                "oracle_win_rate": row.get("oracle_win_rate"),
+                "base_win_rate": row.get("base_win_rate"),
+                "signals_per_week": row.get("signals_per_week"),
+                "model": model_label,
+            })
+            advice_rows.append({
+                "expected_value": sig.expected_value,
+                "entry": sig.entry,
+                "base_win_rate": row.get("base_win_rate"),
+                "base_signals": row.get("base_signals"),
+                "oracle_signals": row.get("oracle_signals"),
+                "signal": signal_to_advice(strategy_name, sym, sig),
+                "model": model_label,
+            })
+
+    return stats_rows, advice_rows, skipped
+
+
 def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None,
         min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False,
-        cluster_map_path=None):
+        cluster_map_path=None, base_only=False):
     """Run the full signals-report flow. Returns the path to the written report.
 
     now: the moment treated as "now" — stamps output filenames/report
@@ -591,6 +788,10 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         write_spreadsheet); the path is printed to stdout.
     cluster_map_path: optional path to a CSV file mapping ticker -> cluster
         name for the portfolio allocation sheet/section.
+    base_only: if True, skip the accepted-finetuned-model overlay pass
+        entirely (every row is labeled "Base", no comparison section/tab).
+        Useful for debugging a bad finetuned model, or to force a
+        base-only run regardless of the finetuned_models registry.
     """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
@@ -606,16 +807,18 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     conn = sqlite3.connect(db_path)
     try:
         rows = load_work_items(conn, intervals=intervals, include_all=include_all)
+        accepted_finetuned = {} if base_only else load_accepted_finetuned(conn)
     finally:
         conn.close()
 
     groups = group_items(rows)
 
-    stats_rows = []
-    advice_rows = []
+    group_results = {}  # (assets_str, interval) -> {"stats": [...], "advice": [...]}
+    fetched_data_cache = {}  # (assets_str, interval) -> {symbol: DataFrame}
     failures = []
     skipped = []
 
+    # Pass 1: base model, every group.
     for (assets_str, interval), group_rows in groups.items():
         assets = assets_str.split(",")
         try:
@@ -626,108 +829,66 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                 sym: fetch_data_raw(sym, lookback, as_of=now).tail(lookback)
                 for sym in assets
             }
+            fetched_data_cache[(assets_str, interval)] = data
 
-            multi_preds = predict_fn(data)
-
-            disabled = resolve_disabled_strategies(interval, assets)
-            config = OrchestratorConfig(disabled_strategies=disabled)
-
-            def _dummy_predict(*a, **kw):
-                return []
-
-            orchestrator = KairosOrchestrator(
-                predict_fn=_dummy_predict, assets=assets, config=config,
+            group_stats, group_advice, group_skipped = _run_group(
+                assets, interval, group_rows, predict_fn,
+                model_path=None, model_label="Base",
+                data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
             )
-            strategies_by_name = build_strategy_index(orchestrator.strategies)
-
-            for row in group_rows:
-                strategy_name = row["strategy_name"]
-                # Each viable row targets the group's assets collectively but a
-                # signal is generated per-symbol below; try every symbol in the
-                # group's asset list and keep whichever fires.
-                strat = strategies_by_name.get(strategy_name)
-                if strat is None:
-                    skipped.append(f"{strategy_name}: unknown strategy (not in registry)")
-                    continue
-
-                for sym in assets:
-                    pred = multi_preds.get(sym)
-                    if pred is None:
-                        continue
-                    dist = pred.dist
-                    current_price = pred.current_price
-                    history = pred.history
-
-                    if orchestrator._apply_meta_filters(dist, current_price):
-                        skipped.append(
-                            f"{strategy_name}/{sym}: blocked by meta-filters"
-                        )
-                        continue
-
-                    context = _build_context(orchestrator, sym, current_price, multi_preds, history)
-
-                    try:
-                        sig = strat.generate_signal(dist, current_price, history, context)
-                    except Exception as e:
-                        skipped.append(f"{strategy_name}/{sym}: signal generation error ({e})")
-                        continue
-
-                    if sig is None:
-                        continue
-
-                    # Match the backtest's gate (kairos_orchestrator._run_day:
-                    # `sig.size > 0`): zero-size non-FLAT signals are legit
-                    # strategy output (Kelly fraction clamped at 0) but never
-                    # traded, so they must not appear as advice. FLAT signals
-                    # are exit advice and naturally size 0 — keep them.
-                    if sig.direction != Direction.FLAT and sig.size <= 0:
-                        skipped.append(
-                            f"{strategy_name}/{sym}: zero-size signal dropped (no Kelly edge)"
-                        )
-                        continue
-
-                    # Minimum-EV filter: non-FLAT signals must clear
-                    # min_ev_pct (expected value as percent of entry).
-                    # FLAT/exit signals are never filtered by this.
-                    if sig.direction != Direction.FLAT and min_ev_pct > 0:
-                        ev_pct_val = _ev_pct_value(sig.expected_value, sig.entry)
-                        if ev_pct_val is None or ev_pct_val < min_ev_pct:
-                            ev_str = (f"{ev_pct_val:.2f}%" if ev_pct_val is not None
-                                      else "n/a")
-                            skipped.append(
-                                f"{strategy_name}/{sym}: ev_pct below threshold "
-                                f"({ev_str} < {min_ev_pct:.2f}%)"
-                            )
-                            continue
-
-                    stats_rows.append({
-                        "strategy": strategy_name,
-                        "symbol": sym,
-                        "interval": interval,
-                        "backtest_period": row.get("backtest_period"),
-                        "direction": sig.direction.name,
-                        "size": sig.size,
-                        "entry": sig.entry,
-                        "stop": sig.stop,
-                        "target": sig.target,
-                        "expected_value": sig.expected_value,
-                        "oracle_sharpe": row.get("oracle_sharpe"),
-                        "base_sharpe": row.get("base_sharpe"),
-                        "oracle_win_rate": row.get("oracle_win_rate"),
-                        "base_win_rate": row.get("base_win_rate"),
-                        "signals_per_week": row.get("signals_per_week"),
-                    })
-                    advice_rows.append({
-                        "expected_value": sig.expected_value,
-                        "entry": sig.entry,
-                        "base_win_rate": row.get("base_win_rate"),
-                        "base_signals": row.get("base_signals"),
-                        "oracle_signals": row.get("oracle_signals"),
-                        "signal": signal_to_advice(strategy_name, sym, sig),
-                    })
+            group_results[(assets_str, interval)] = {
+                "stats": group_stats, "advice": group_advice,
+            }
+            skipped.extend(group_skipped)
         except Exception as e:
             failures.append(f"group assets={assets_str} interval={interval}: {e}")
             continue
+
+    # Pass 2: overlay accepted-finetuned groups (skipped entirely under
+    # --base_only, or when nothing in the registry matches). Reuses pass 1's
+    # fetched data (no refetch); displaced base rows move to the
+    # replaced_*_rows comparison buckets.
+    replaced_stats_rows = []
+    replaced_advice_rows = []
+    if not base_only and accepted_finetuned:
+        for (assets_str, interval), group_rows in groups.items():
+            key = (assets_str, interval)
+            if key not in group_results:
+                continue  # pass 1 failed this group entirely; nothing to overlay
+            sorted_key = ",".join(sorted(assets_str.split(",")))
+            model_path = accepted_finetuned.get((sorted_key, interval))
+            if model_path is None:
+                continue
+
+            assets = assets_str.split(",")
+            try:
+                data = fetched_data_cache[key]
+                model_label = f"Finetuned({assets_str})"
+                group_stats, group_advice, group_skipped = _run_group(
+                    assets, interval, group_rows, predict_fn,
+                    model_path=model_path, model_label=model_label,
+                    data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
+                )
+                # Displace pass 1's base rows for this group into the
+                # comparison buckets, then swap in the finetuned rerun.
+                replaced_stats_rows.extend(group_results[key]["stats"])
+                replaced_advice_rows.extend(group_results[key]["advice"])
+                group_results[key] = {"stats": group_stats, "advice": group_advice}
+                skipped.extend(group_skipped)
+            except Exception as e:
+                failures.append(
+                    f"group assets={assets_str} interval={interval} (finetuned overlay): {e}"
+                )
+                continue
+
+    stats_rows = []
+    advice_rows = []
+    for key in groups:
+        result = group_results.get(key)
+        if result is None:
+            continue
+        stats_rows.extend(result["stats"])
+        advice_rows.extend(result["advice"])
 
     # Portfolio allocation: derive from structured signal rows when available.
     allocation_result = None
@@ -746,12 +907,14 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     out_path = os.path.join(out_dir, f"kairos_signals_{stamp}.md")
     report = render_report(stats_rows, advice_rows, failures, skipped, now,
                            min_ev_pct=min_ev_pct,
-                           allocation_section=allocation_section)
+                           allocation_section=allocation_section,
+                           replaced_stats_rows=replaced_stats_rows)
     with open(out_path, "w") as f:
         f.write(report)
 
     if gsheets:
-        sheet_url = upload_to_gsheets(stats_rows, advice_rows, now)
+        sheet_url = upload_to_gsheets(stats_rows, advice_rows, now,
+                                      replaced_stats_rows=replaced_stats_rows)
         print(sheet_url)
 
     report_date = now.strftime("%Y-%m-%d")
@@ -765,6 +928,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                 allocation_config=allocation_config,
                 report_date=report_date,
                 generator_version=generator_version,
+                replaced_stats_rows=replaced_stats_rows,
             )
             print(sheet_path)
 
@@ -797,8 +961,8 @@ def run_bars_backtest(base_now, interval, bars_backtest, **run_kwargs) -> list:
 
     `run_kwargs` is forwarded to each `run()` call unchanged (db_path,
     out_dir, pred_samples, include_all, predict_fn, lookback, min_ev_pct,
-    gsheets, xlsx, ods, cluster_map_path); `now` and `intervals` are set per
-    iteration.
+    gsheets, xlsx, ods, cluster_map_path, base_only); `now` and `intervals`
+    are set per iteration.
     """
     step = _interval_to_timedelta(interval)
     out_paths = []
@@ -833,6 +997,11 @@ def main(argv=None):
     parser.add_argument("--cluster_map", default=None,
                         help="Optional path to a CSV file mapping ticker -> "
                              "cluster name for the Allocation sheet/section.")
+    parser.add_argument("--base_only", action="store_true", default=False,
+                        help="Skip the accepted-finetuned-model overlay pass "
+                             "entirely: every row is labeled 'Base' and no "
+                             "comparison section/tab is produced. Useful "
+                             "while debugging a bad finetuned model.")
     parser.add_argument("--effective_per", default=None,
                         help='Treat this moment as "now": \'YYYYMMDD [HHnn]\' '
                              '(e.g. "20260615 1430" or "20260615"; time '
@@ -865,6 +1034,7 @@ def main(argv=None):
             min_ev_pct=args.min_ev_pct, gsheets=args.gsheets,
             xlsx=args.xlsx, ods=args.ods,
             cluster_map_path=args.cluster_map,
+            base_only=args.base_only,
         )
         for p in out_paths:
             print(p)
@@ -876,6 +1046,7 @@ def main(argv=None):
         min_ev_pct=args.min_ev_pct, gsheets=args.gsheets,
         xlsx=args.xlsx, ods=args.ods, now=now,
         cluster_map_path=args.cluster_map,
+        base_only=args.base_only,
     )
     print(out_path)
     return out_path

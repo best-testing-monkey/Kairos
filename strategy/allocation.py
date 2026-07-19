@@ -38,6 +38,7 @@ class Candidate:
     avg_win_pct: Optional[float] = None
     avg_loss_pct: Optional[float] = None
     avg_holding_days: Optional[float] = None
+    model: Optional[str] = None
 
 
 @dataclass
@@ -291,6 +292,7 @@ def fetch_signals(stats_rows, advice_rows):
             avg_win_pct=None,  # Not present in current data; v1 nullable
             avg_loss_pct=None,  # Not present in current data; v1 nullable
             avg_holding_days=None,  # Not present in current data; v1 nullable
+            model=stats_row.get("model", ""),
         )
 
         candidates.append(candidate)
@@ -452,6 +454,7 @@ def _candidate_to_dict(c: Candidate) -> dict:
         "avg_win_pct": c.avg_win_pct,
         "avg_loss_pct": c.avg_loss_pct,
         "avg_holding_days": c.avg_holding_days,
+        "model": c.model,
         "derived": {},  # Filled in by select_candidates
         "status": None,  # Filled in by select_candidates
         "flags": [],  # Filled in by select_candidates
@@ -938,6 +941,12 @@ _FORMULA_COLS = [
     "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK", "AL", "AM", "AN",
 ]
 
+# Trailing plain-value Model column, appended one position to the right of the
+# formula/helper block (AN). This is NOT part of _FORMULA_COLS: it carries a
+# plain string value (no formula) and must never shift the position-sensitive
+# A-AN layout (see module docstring on column AM/AN redistribution formulas).
+_MODEL_COL = "AO"
+
 # Column letters (percent-labeled) that receive "0.0%" number format / ODS
 # percent cell style: visible Risk %, Reward %, EV raw %, EV net %, EV total,
 # Alloc %, plus helper risk_pct, reward_pct, loss_pct, alloc_raw_pct, and the
@@ -1021,7 +1030,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
         count, EV total, and the gross scale factor in $E$14).
       - Row 18: blank spacer row.
       - Row 19: instruction line.
-      - Row 20: header row A-AN.
+      - Row 20: header row A-AO (Model in AO is a trailing plain value).
       - Rows 21..N: one row per candidate, sorted by EV total descending
         (``_sorted_for_sheet``).
       - Below the data: Section B cluster-exposure table.
@@ -1108,6 +1117,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
         _STATIC_HEADERS
         + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:8]]
         + _HELPER_HEADERS
+        + ["Model"]
     )
     for col_idx, header in enumerate(headers, start=1):
         ws.cell(row=_HEADER_ROW, column=col_idx, value=header)
@@ -1152,6 +1162,11 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
             ws.cell(row=excel_row, column=col_idx,
                     value=render_formula(col_letter, excel_row, "xlsx"))
 
+        # Trailing plain-value Model column, appended after all A-AN columns.
+        model_col_idx = _xlsx_column_letter_to_index(_MODEL_COL)
+        ws.cell(row=excel_row, column=model_col_idx,
+                value=row_data.get("model") or "")
+
     # -------------------------------------------------------------------------
     # Percent number formatting: visible + helper percent-labeled columns,
     # over the data rows, plus config/summary cells noted above.
@@ -1169,7 +1184,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     # -------------------------------------------------------------------------
     # Autofilter over header + data rows
     # -------------------------------------------------------------------------
-    ws.auto_filter.ref = f"A{_HEADER_ROW}:{_FORMULA_COLS[-1]}{data_end_row}"
+    ws.auto_filter.ref = f"A{_HEADER_ROW}:{_MODEL_COL}{data_end_row}"
 
     # -------------------------------------------------------------------------
     # Section B: cluster exposure table
@@ -1358,7 +1373,7 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
         count, EV total, and the gross scale factor in $E$14).
       - Row 18: blank spacer row.
       - Row 19: instruction line.
-      - Row 20: header row A-AN.
+      - Row 20: header row A-AO (Model in AO is a trailing plain value).
       - Rows 21..N: one row per candidate in ``result.rows`` in the order given.
       - Below the data: Section B cluster-exposure table and Section C rejected
         signals table.
@@ -1480,6 +1495,7 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
         _STATIC_HEADERS
         + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:8]]
         + _HELPER_HEADERS
+        + ["Model"]
     )
     _ods_add_row(table, headers)
 
@@ -1531,7 +1547,8 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
             col_idx = _xlsx_column_letter_to_index(col_letter) - 1
             formulas[col_idx] = render_formula(col_letter, excel_row, "ods")
 
-        values = static_values + [""] * len(_FORMULA_COLS)
+        # Trailing plain-value Model column, appended after all A-AN columns.
+        values = static_values + [""] * len(_FORMULA_COLS) + [row_data.get("model") or ""]
         percent_cols = static_percent_cols | formula_percent_cols
         _ods_add_row(table, values, formulas=formulas, percent_cols=percent_cols)
 
@@ -1551,7 +1568,7 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
         DatabaseRange(
             name="AllocationFilter",
             targetrangeaddress=(
-                f"'Allocation'.A{_HEADER_ROW}:'Allocation'.{_FORMULA_COLS[-1]}{data_end_row}"
+                f"'Allocation'.A{_HEADER_ROW}:'Allocation'.{_MODEL_COL}{data_end_row}"
             ),
             displayfilterbuttons="true",
         )
@@ -1657,8 +1674,8 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
     lines.append("")
 
     # Selected-position table via kairos_signals.format_table
-    headers = ["Ticker", "Dir", "Strategy", "Entry", "Stop", "Target", "EV net", "Score", "Alloc"]
-    align = ["l", "l", "l", "r", "r", "r", "r", "r", "r"]
+    headers = ["Ticker", "Dir", "Strategy", "Entry", "Stop", "Target", "EV net", "Score", "Alloc", "Model"]
+    align = ["l", "l", "l", "r", "r", "r", "r", "r", "r", "l"]
 
     selected_rows = [row for row in result.rows if row.get("status") == "SELECTED"]
     table_rows = []
@@ -1683,6 +1700,7 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
             "EV net": f"{ev_net:.2f}%" if ev_net is not None else "",
             "Score": f"{score:.2f}" if score is not None else "",
             "Alloc": f"{alloc:.1f}%",
+            "Model": row.get("model") or "",
         })
 
     table_lines = format_table(headers, table_rows, align)

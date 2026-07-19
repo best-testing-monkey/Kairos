@@ -13,6 +13,7 @@ from kairos_signals import (
     render_report,
     load_work_items,
     group_items,
+    load_accepted_finetuned,
     build_strategy_index,
     run,
     format_table,
@@ -24,6 +25,7 @@ from kairos_signals import (
     write_spreadsheet,
     STATS_COLUMNS,
     SIGNALS_COLUMNS,
+    SIGNALS_ALIGN,
     _interval_to_timedelta,
     run_bars_backtest,
 )
@@ -547,7 +549,7 @@ class TestLoadWorkItemsAndGrouping:
 
         call_count = {"n": 0}
 
-        def fake_predict_fn(assets_dict):
+        def fake_predict_fn(assets_dict, model_path=None):
             call_count["n"] += 1
             from kairos_meta import AssetPrediction, KairosDistribution
             frames = [fake_history.iloc[[i]] for i in range(len(fake_history))]
@@ -592,6 +594,47 @@ def _seed_rows(tmp_path, rows, db_name="pipeline_results.db"):
     conn.commit()
     conn.close()
     return db_path
+
+
+FINETUNED_SCHEMA = """
+CREATE TABLE finetuned_models (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    assets TEXT NOT NULL,
+    assets_raw TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    backtest_period TEXT NOT NULL,
+    train_start TEXT, train_end TEXT,
+    test_start TEXT, test_end TEXT,
+    model_path TEXT,
+    status TEXT NOT NULL,
+    base_run_id INTEGER, finetuned_run_id INTEGER,
+    base_viable_count INTEGER, ft_viable_count INTEGER,
+    base_mean_sharpe REAL, ft_mean_sharpe REAL,
+    created_at TEXT,
+    UNIQUE(assets, interval)
+);
+"""
+
+
+def _seed_finetuned_models(db_path, rows):
+    """Insert rows into a finetuned_models table (creating it first).
+
+    rows: list of (assets_sorted_csv, assets_raw_csv, interval, status,
+        model_path) tuples. Other columns (backtest_period, sharpe stats,
+        etc.) aren't relevant to the signals-report overlay logic and get
+        placeholder/NULL values.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.executescript(FINETUNED_SCHEMA)
+    for assets, assets_raw, interval, status, model_path in rows:
+        conn.execute(
+            "INSERT INTO finetuned_models "
+            "(assets, assets_raw, interval, backtest_period, model_path, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (assets, assets_raw, interval, "1m", model_path, status),
+        )
+    conn.commit()
+    conn.close()
 
 
 class TestLoadWorkItemsPerInterval:
@@ -761,7 +804,7 @@ class TestBuildStrategyIndex:
             lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
         )
 
-        def fake_predict_fn(assets_dict):
+        def fake_predict_fn(assets_dict, model_path=None):
             from kairos_meta import AssetPrediction, KairosDistribution
             frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
             dist = KairosDistribution(frames)
@@ -840,7 +883,7 @@ class TestZeroSizeSignalGate:
             lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
         )
 
-        def fake_predict_fn(assets_dict):
+        def fake_predict_fn(assets_dict, model_path=None):
             from kairos_meta import AssetPrediction, KairosDistribution
             frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
             dist = KairosDistribution(frames)
@@ -928,7 +971,7 @@ class TestMinEvPctFilter:
             lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
         )
 
-        def fake_predict_fn(assets_dict):
+        def fake_predict_fn(assets_dict, model_path=None):
             from kairos_meta import AssetPrediction, KairosDistribution
             frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
             dist = KairosDistribution(frames)
@@ -1472,7 +1515,7 @@ class TestAllocationIntegration:
             lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
         )
 
-        def fake_predict_fn(assets_dict):
+        def fake_predict_fn(assets_dict, model_path=None):
             from kairos_meta import AssetPrediction, KairosDistribution
             frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
             dist = KairosDistribution(frames)
@@ -1566,3 +1609,315 @@ class TestAllocationIntegration:
             "--cluster_map", "/tmp/clusters.csv",
         ])
         assert captured["cluster_map_path"] == "/tmp/clusters.csv"
+
+
+# ============================================================================
+# load_accepted_finetuned (pure DB read)
+# ============================================================================
+
+class TestLoadAcceptedFinetuned:
+    def test_returns_accepted_rows_keyed_by_sorted_assets_and_interval(self, tmp_path):
+        db_path = os.path.join(tmp_path, "pipeline_results.db")
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "ETH-USD,BTC-USD", "1d", "accepted", "models/a"),
+            ("AAPL", "AAPL", "1d", "rejected", "models/b"),
+        ])
+        conn = sqlite3.connect(db_path)
+        result = load_accepted_finetuned(conn)
+        conn.close()
+
+        assert result == {("BTC-USD,ETH-USD", "1d"): "models/a"}
+
+    def test_missing_table_returns_empty_dict(self, tmp_path):
+        db_path = os.path.join(tmp_path, "pipeline_results.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(VIABILITY_SCHEMA)  # no finetuned_models table
+        conn.commit()
+
+        result = load_accepted_finetuned(conn)
+        conn.close()
+
+        assert result == {}
+
+    @pytest.mark.parametrize("status", ["training", "failed", "rejected"])
+    def test_non_accepted_statuses_excluded(self, tmp_path, status):
+        db_path = os.path.join(tmp_path, "pipeline_results.db")
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD", "BTC-USD", "1d", status, "models/a"),
+        ])
+        conn = sqlite3.connect(db_path)
+        result = load_accepted_finetuned(conn)
+        conn.close()
+
+        assert result == {}
+
+
+# ============================================================================
+# Finetuned-model overlay (two-pass + comparison log)
+# ============================================================================
+
+class _CapturingLongSignalStrategy:
+    """Fake strategy that returns a valid LONG signal for any symbol."""
+
+    def __init__(self, name="ft_strat", expected_value=0.5):
+        self.name = name
+        self.expected_value = expected_value
+
+    def generate_signal(self, dist, current_price, history, context):
+        return Signal(
+            direction=Direction.LONG, size=0.10, entry=current_price,
+            stop=current_price * 0.97, target=current_price * 1.05,
+            strategy_name=self.name, confidence=0.7,
+            expected_value=self.expected_value,
+        )
+
+
+class TestFinetunedOverlay:
+    """Two-pass (base -> accepted-finetuned overlay) + comparison log.
+
+    Group 1 (BTC-USD,ETH-USD / 1d) gets an accepted finetuned model in most
+    tests; Group 2 (AAPL / 1d) never has a registry match, so it's the
+    control group that must always stay on "Base".
+    """
+
+    def _seed_two_groups(self, tmp_path, strategy_name="ft_strat"):
+        db_path = os.path.join(tmp_path, "pipeline_results.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(VIABILITY_SCHEMA)
+        conn.executemany(
+            "INSERT INTO viability_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (20, strategy_name, "BTC-USD,ETH-USD", "crypto", "1d", "1m",
+                 23.3, 5, 0.8, 0.016, 235, 30.2, 3, 1.0, 0.023, 236, None, 0.69, 1),
+                (20, strategy_name, "AAPL", "equity", "1d", "1m",
+                 10.0, 4, 0.7, 0.02, 235, 9.0, 3, 0.6, 0.02, 236, None, 0.5, 1),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _make_predict_fn(self, fake_history, calls):
+        from kairos_meta import AssetPrediction, KairosDistribution
+
+        def fake_predict_fn(assets_dict, model_path=None):
+            calls.append((frozenset(assets_dict.keys()), model_path))
+            frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
+            dist = KairosDistribution(frames)
+            return {
+                sym: AssetPrediction(symbol=sym, dist=dist, current_price=100.0, history=fake_history)
+                for sym in assets_dict
+            }
+        return fake_predict_fn
+
+    def _run(self, tmp_path, monkeypatch, db_path, strategy, calls, **run_kwargs):
+        import pandas as pd
+        import numpy as np
+
+        idx = pd.date_range("2024-01-01", periods=310, freq="D")
+        fake_history = pd.DataFrame({
+            "open": np.full(310, 100.0), "high": np.full(310, 101.0),
+            "low": np.full(310, 99.0), "close": np.full(310, 100.0),
+            "volume": np.full(310, 1e6),
+        }, index=idx)
+
+        import kairos_strategies
+        monkeypatch.setattr(
+            kairos_strategies, "fetch_data_raw",
+            lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
+        )
+
+        import kairos_orchestrator
+        monkeypatch.setattr(
+            kairos_orchestrator.StrategyRegistry, "build_all",
+            classmethod(lambda cls, config: [strategy]),
+        )
+        monkeypatch.setattr(
+            kairos_orchestrator.KairosOrchestrator, "_apply_meta_filters",
+            lambda self, dist, current_price: False,
+        )
+
+        fake_predict_fn = self._make_predict_fn(fake_history, calls)
+
+        out_path = run(
+            db_path=db_path, out_dir=str(tmp_path), intervals=None,
+            pred_samples=5, include_all=False, predict_fn=fake_predict_fn,
+            lookback=300, now=datetime(2026, 7, 10, 8, 0), **run_kwargs,
+        )
+        return out_path
+
+    def test_accepted_model_reruns_group_and_replaces_rows(self, tmp_path, monkeypatch):
+        db_path = self._seed_two_groups(tmp_path)
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "BTC-USD,ETH-USD", "1d", "accepted", "models/ft-btc-eth"),
+        ])
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
+        report = open(out_path).read()
+
+        # Base pass ran for both groups; finetuned pass ran only for the
+        # accepted group, reusing pass 1's cached fetched data.
+        assert len(calls) == 3
+        assert (frozenset({"BTC-USD", "ETH-USD"}), None) in calls
+        assert (frozenset({"AAPL"}), None) in calls
+        assert (frozenset({"BTC-USD", "ETH-USD"}), "models/ft-btc-eth") in calls
+
+        assert "Finetuned(BTC-USD,ETH-USD)" in report
+        assert "## Replaced base signals (comparison)" in report
+        # AAPL's group never had a registry match, so it stays "Base" and
+        # is never labeled Finetuned.
+        assert "Finetuned(AAPL)" not in report
+
+    def test_rejected_model_produces_no_overlay(self, tmp_path, monkeypatch):
+        db_path = self._seed_two_groups(tmp_path)
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "BTC-USD,ETH-USD", "1d", "rejected", "models/ft-btc-eth"),
+        ])
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
+        report = open(out_path).read()
+
+        assert len(calls) == 2
+        assert all(model_path is None for _, model_path in calls)
+        assert "Finetuned(" not in report
+        assert "## Replaced base signals (comparison)" not in report
+
+    @pytest.mark.parametrize("status", ["failed", "training"])
+    def test_non_accepted_statuses_produce_no_overlay(self, tmp_path, monkeypatch, status):
+        db_path = self._seed_two_groups(tmp_path)
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "BTC-USD,ETH-USD", "1d", status, "models/ft-btc-eth"),
+        ])
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
+        report = open(out_path).read()
+
+        assert all(model_path is None for _, model_path in calls)
+        assert "Finetuned(" not in report
+
+    def test_missing_finetuned_table_no_overlay_no_crash(self, tmp_path, monkeypatch):
+        # _seed_two_groups doesn't create a finetuned_models table at all --
+        # mirrors a fresh clone / pre-existing test DB without the table.
+        db_path = self._seed_two_groups(tmp_path)
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
+        report = open(out_path).read()
+
+        assert len(calls) == 2
+        assert all(model_path is None for _, model_path in calls)
+        assert "Finetuned(" not in report
+        assert "## Replaced base signals (comparison)" not in report
+
+    def test_base_only_flag_skips_overlay_even_if_accepted(self, tmp_path, monkeypatch):
+        db_path = self._seed_two_groups(tmp_path)
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "BTC-USD,ETH-USD", "1d", "accepted", "models/ft-btc-eth"),
+        ])
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls, base_only=True)
+        report = open(out_path).read()
+
+        assert len(calls) == 2
+        assert all(model_path is None for _, model_path in calls)
+        assert "Finetuned(" not in report
+        assert "## Replaced base signals (comparison)" not in report
+
+    def test_comparison_section_contains_exactly_replaced_base_rows(self, tmp_path, monkeypatch):
+        db_path = self._seed_two_groups(tmp_path)
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "BTC-USD,ETH-USD", "1d", "accepted", "models/ft-btc-eth"),
+        ])
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
+        report = open(out_path).read()
+
+        comparison_start = report.index("## Replaced base signals (comparison)")
+        next_heading = report.find("\n## ", comparison_start + 1)
+        if next_heading == -1:
+            next_heading = len(report)
+        comparison_section = report[comparison_start:next_heading]
+
+        # Displaced rows are the BTC-USD/ETH-USD base-model rows only; the
+        # AAPL group was never replaced and must not appear here.
+        assert "Base" in comparison_section
+        assert "BTC-USD" in comparison_section
+        assert "ETH-USD" in comparison_section
+        assert "AAPL" not in comparison_section
+        assert "Finetuned(" not in comparison_section
+
+    def test_xlsx_gets_base_shadow_sheet_when_replaced(self, tmp_path, monkeypatch):
+        db_path = self._seed_two_groups(tmp_path)
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "BTC-USD,ETH-USD", "1d", "accepted", "models/ft-btc-eth"),
+        ])
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls, xlsx=True)
+        sheet_path = out_path.replace(".md", ".xlsx")
+
+        sheets = pd.read_excel(sheet_path, sheet_name=None)
+        assert "base_shadow" in sheets
+        assert "model" in sheets["strategies"].columns
+        assert "model" in sheets["signals"].columns
+        assert set(sheets["base_shadow"]["model"]) == {"Base"}
+
+    def test_base_only_xlsx_has_no_base_shadow_sheet(self, tmp_path, monkeypatch):
+        db_path = self._seed_two_groups(tmp_path)
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "BTC-USD,ETH-USD", "1d", "accepted", "models/ft-btc-eth"),
+        ])
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(
+            tmp_path, monkeypatch, db_path, strategy, calls, xlsx=True, base_only=True)
+        sheet_path = out_path.replace(".md", ".xlsx")
+
+        sheets = pd.read_excel(sheet_path, sheet_name=None)
+        assert "base_shadow" not in sheets
+        assert (sheets["strategies"]["model"] == "Base").all()
+
+    def test_model_column_appended_to_stats_and_signals_columns(self):
+        assert STATS_COLUMNS[-1] == "model"
+        assert SIGNALS_COLUMNS[-1] == "model"
+        assert SIGNALS_ALIGN[-1] == "l"
+        assert len(SIGNALS_ALIGN) == len(SIGNALS_COLUMNS)
+
+    def test_cli_parser_accepts_base_only_flag(self, monkeypatch):
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main(["--db", "unused.db", "--out", "/tmp", "--base_only"])
+        assert captured["base_only"] is True
+
+    def test_cli_parser_base_only_defaults_false(self, monkeypatch):
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main(["--db", "unused.db", "--out", "/tmp"])
+        assert captured["base_only"] is False

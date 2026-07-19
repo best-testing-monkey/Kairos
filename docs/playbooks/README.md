@@ -28,9 +28,13 @@ human reviews the report, edits the Allocation sheet's Enabled column as a
 veto, and places orders by hand — nothing downstream is automated yet.
 Separately, an idle-time `finetune_next` stage automatically finetunes and
 backtests a group-specific Kronos model for the best not-yet-finetuned
-profile, accepting or rejecting it against the existing base result — but
-nothing downstream consumes an accepted model yet (see
-[model-finetuning.md](model-finetuning.md)).
+profile, accepting or rejecting it against the existing base result. Once a
+model is `accepted`, `kairos_signals.py` picks it up automatically on its
+next run — re-predicting that group with the finetuned checkpoint and
+replacing its rows in the signals report, with the displaced base-model
+rows kept visible in a comparison section/tab (see
+[model-finetuning.md](model-finetuning.md) and
+[daily-signals.md](daily-signals.md#finetuned-models)).
 
 ## Cadence
 

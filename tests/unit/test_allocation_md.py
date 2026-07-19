@@ -138,7 +138,7 @@ class TestWriteMdSection:
         result = self._make_result()
         output = write_md_section(result, config)
 
-        assert "| Ticker | Dir   | Strategy        |  Entry |   Stop | Target | EV net | Score | Alloc |" in output
+        assert "| Ticker | Dir   | Strategy        |  Entry |   Stop | Target | EV net | Score | Alloc | Model |" in output
         assert "| NG=F" in output
         assert "| V" in output
         assert "| REMX" in output
@@ -196,17 +196,39 @@ Config: n0=100 min_n=50 cost=0.15% kelly_mult=0.35 top_k=12 max_pos=15% max_clus
 
 Selected 3 of 6 signals. Gross exposure: 18.8%. EV total: 0.00%.
 
-| Ticker | Dir   | Strategy        |  Entry |   Stop | Target | EV net | Score | Alloc |
-| ------ | ----- | --------------- | ------ | ------ | ------ | ------ | ----- | ----- |
-| NG=F   | Long  | close_direction |   2.95 |   2.90 |   3.14 |  0.61% |  1.01 | 13.9% |
-| V      | Long  | trend_following | 230.00 | 226.00 | 234.00 |  0.68% |  0.43 |  2.4% |
-| REMX   | Short | path_execution  |  79.73 |  84.51 |  73.71 |  2.34% |  0.39 |  2.5% |
+| Ticker | Dir   | Strategy        |  Entry |   Stop | Target | EV net | Score | Alloc | Model |
+| ------ | ----- | --------------- | ------ | ------ | ------ | ------ | ----- | ----- | ----- |
+| NG=F   | Long  | close_direction |   2.95 |   2.90 |   3.14 |  0.61% |  1.01 | 13.9% |       |
+| V      | Long  | trend_following | 230.00 | 226.00 | 234.00 |  0.68% |  0.43 |  2.4% |       |
+| REMX   | Short | path_execution  |  79.73 |  84.51 |  73.71 |  2.34% |  0.39 |  2.5% |       |
 
 Cluster exposure: energy_commodities 13.9%, metals_miners 2.5%, healthcare 2.4%
 
 Rejected: 3 total -- BELOW_TOPK 1, LOW_N 1, NEG_EV_NET 1"""
 
         assert output == expected
+
+    def test_model_column_renders_row_values(self):
+        """When rows carry a 'model' key, its value appears in the Model column."""
+        config = self._make_config()
+        result = self._make_result()
+        for row in result.rows:
+            if row["ticker"] == "NG=F":
+                row["model"] = "Base"
+            elif row["ticker"] == "V":
+                row["model"] = "Finetuned(V)"
+
+        output = write_md_section(result, config)
+
+        lines = output.splitlines()
+        ng_line = next(line for line in lines if line.startswith("| NG=F"))
+        v_line = next(line for line in lines if line.startswith("| V "))
+        remx_line = next(line for line in lines if line.startswith("| REMX"))
+
+        assert ng_line.rstrip("| ").endswith("Base")
+        assert v_line.rstrip("| ").endswith("Finetuned(V)")
+        # REMX has no 'model' key -> blank cell, not "None"
+        assert "None" not in remx_line
 
     def test_empty_selected_table_renders_header_only(self):
         """When no rows are selected, the table still has headers and no data rows."""
@@ -233,6 +255,6 @@ Rejected: 3 total -- BELOW_TOPK 1, LOW_N 1, NEG_EV_NET 1"""
         output = write_md_section(result, config)
 
         assert "Selected 0 of 1 signals. Gross exposure: 0.0%." in output
-        assert "| Ticker | Dir | Strategy | Entry | Stop | Target | EV net | Score | Alloc |" in output
+        assert "| Ticker | Dir | Strategy | Entry | Stop | Target | EV net | Score | Alloc | Model |" in output
         assert "Cluster exposure: none" in output
         assert "Rejected: 1 total -- NEG_EV_NET 1" in output
