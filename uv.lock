@@ -1884,7 +1884,7 @@ wheels = [
 [[package]]
 name = "price-cache"
 version = "0.1.0"
-source = { git = "https://github.com/best-testing-monkey/price_cache.git#8f5e112713d2733ff6120b565a1945c77bd9d611" }
+source = { git = "https://github.com/best-testing-monkey/price_cache.git#11f9176b8f09fee5ac68740af5f3d92b1eee5209" }
 dependencies = [
     { name = "json5" },
     { name = "pandas" },
