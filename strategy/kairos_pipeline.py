@@ -48,6 +48,9 @@ import pandas as pd
 
 import price_cache
 from kairos_strategies import asset_class_for, _period_to_weeks, _parse_period
+from kairos.ops import (
+    DEFAULT_GPU_UTIL_THRESHOLD, GpuLock, OpsError, is_gpu_idle, require_gpu, send_telegram,
+)
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 
@@ -1118,6 +1121,31 @@ def run_stage_rebuild_disabled(conn, min_signals=5):
 
 FINETUNE_BASE_MODEL = "NeoQuasar/Kronos-base"
 
+
+def _notify(text: str, enabled: bool = True) -> None:
+    """Send a Telegram message, never letting a notification failure crash
+    the caller.
+
+    Thin wrapper around kairos.ops.send_telegram mirroring the `_notify`
+    helper in scripts/kairos_idle_finetune.py: catches OpsError (missing
+    TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID credentials, or a Telegram API
+    failure) and prints a warning to stderr instead of raising. Credentials
+    are read from the environment by kairos.ops.send_telegram itself - see
+    .env.example (loaded from ~/.config/kairos/kairos.env in production) for
+    the documented source. `enabled=False` is a silent no-op, used by
+    --stage finetune_next's --no-telegram flag.
+
+    Currently only wired into --stage finetune_next; other strategy/ scripts
+    can reuse this helper directly once they grow Telegram notifications too.
+    """
+    if not enabled:
+        return
+    try:
+        send_telegram(text)
+    except OpsError as exc:
+        print(f"[finetune_next] WARNING: Telegram notification failed: {exc}", file=sys.stderr)
+
+
 # Yahoo Finance hard limits by interval (days of history available) - mirrors
 # kairos_strategies.fetch_data_raw's yf_max_days table.
 _YF_MAX_DAYS = {
@@ -1387,7 +1415,9 @@ def _sweep_orphaned_training_finetunes(conn):
 
 def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6m",
                              pred_samples=100, ft_epochs=10, ft_batch_size=32,
-                             min_signals=3, dry_run=False, lock_path=None):
+                             min_signals=3, dry_run=False, lock_path=None,
+                             check_gpu_idle=True, util_threshold=DEFAULT_GPU_UTIL_THRESHOLD,
+                             no_gpu_recovery=False, allow_reboot=False, notify=True):
     """
     Orchestrate one automated finetune-and-compare cycle:
       0. Unless dry_run, acquire the exclusive finetune_next lock
@@ -1397,6 +1427,17 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
          held, sweep any orphaned status='training' rows (leftovers from a
          crashed previous run - see _sweep_orphaned_training_finetunes) to
          'failed' before candidate selection.
+      0.5. Unless dry_run or check_gpu_idle=False, check that the GPU is
+         actually idle (kairos.ops.is_gpu_idle, same mechanism
+         scripts/kairos_idle_finetune.py uses) before doing any real work. If
+         the GPU is busy, print a message and return None immediately - no
+         candidate selection, no registry writes. This only checks whether
+         the *current* moment looks idle; the actual training/backtest
+         subprocesses below additionally acquire the shared kairos.ops.GpuLock
+         (used by kairos_daily_signals.py and kairos_idle_finetune.py) so this
+         invocation still waits its turn (up to GpuLock's 5-minute timeout)
+         rather than colliding with another Kairos GPU job that starts in the
+         gap between this check and actually running.
       1. Select the top not-yet-finetuned candidate (select_finetune_candidate),
          or use the explicitly supplied (assets, interval) for a manual re-queue.
       2. Insert a finetuned_models row with status='training' (claims the
@@ -1404,7 +1445,10 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
       3. Train via `uv run finetune --model NeoQuasar/Kronos-base --symbol
          <raw assets...> --interval I --start TRAIN_START --end TRAIN_END
          --device cuda --epochs E --batch-size B --output-model DIR` as a
-         subprocess. A non-zero exit marks the row 'failed' and stops (the
+         subprocess, and back-test the resulting checkpoint (step 4 below),
+         both inside a single `with GpuLock(): require_gpu(...)` block so
+         this whole GPU-bound cycle is serialized against other Kairos GPU
+         jobs. A non-zero training exit marks the row 'failed' and stops (the
          model dir is kept for post-mortem).
       4. Backtest the trained checkpoint via run_stage_model(stage="finetuned"),
          parameter-identical (assets/interval/backtest_period/pred_samples) to
@@ -1423,15 +1467,41 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
 
     `dry_run=True` prints the selected candidate, computed train/test
     periods, and the planned training command, then returns immediately with
-    zero side effects: no lock is taken, no orphan sweep runs, no registry
-    row inserted, no directories created, no subprocess executed.
+    zero side effects: no lock is taken, no idle check runs, no orphan sweep
+    runs, no registry row inserted, no directories created, no subprocess
+    executed.
+
+    `check_gpu_idle=False` skips the idle check entirely (e.g. for a manual
+    run where the caller already knows the GPU is free) - the shared GpuLock
+    around the training/backtest subprocesses in step 3 above still applies
+    regardless of this flag. `util_threshold` is the max GPU utilization
+    percent (nvidia-smi) still considered idle. `no_gpu_recovery`/
+    `allow_reboot` are forwarded to require_gpu() for the health check done
+    once the shared lock is held.
 
     `lock_path` overrides the default REPO_ROOT/data/finetune_next.lock path
     (mainly for tests).
 
+    Telegram notifications (mirroring scripts/kairos_idle_finetune.py's
+    style/emoji conventions, via kairos.ops.send_telegram - credentials read
+    from the TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID environment variables, see
+    .env.example / ~/.config/kairos/kairos.env) are sent at these points only:
+      - training start, once a candidate is resolved and the GPU lock/health
+        check has passed (🟢);
+      - training subprocess failure, with a truncated stderr tail (❌);
+      - the final accept (✅) or reject (⚠️) verdict, with the same
+        viable_count/mean_sharpe numbers printed to stdout.
+    Skips (lock already held, GPU busy, no candidate found) and `dry_run`
+    stay silent - no notification is sent for any of them, matching
+    kairos_idle_finetune.py's default-silent-on-skip philosophy. Pass
+    `notify=False` (`--no-telegram` on the CLI) to disable all notifications
+    for this stage, e.g. for a quiet manual run without Telegram credentials
+    configured. A Telegram outage or missing credentials never raises out of
+    this function - see `_notify`.
+
     Returns the finetuned_models row id on a real run, or None if there was
-    no candidate (nothing to do), another instance already holds the lock,
-    or dry_run was set.
+    no candidate (nothing to do), another instance already holds the
+    finetune_next lock, the GPU doesn't look idle, or dry_run was set.
     """
     lock_file = None
     try:
@@ -1442,6 +1512,12 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
                       "(data/finetune_next.lock held); exiting.")
                 return None
             _sweep_orphaned_training_finetunes(conn)
+
+            if check_gpu_idle and not is_gpu_idle(threshold=util_threshold):
+                print(f"[finetune_next] GPU utilization at/above {util_threshold}% "
+                      f"threshold; not starting a new training run this invocation "
+                      f"(pass check_gpu_idle=False / --skip-idle-check to override).")
+                return None
 
         manual = assets is not None
         if manual:
@@ -1465,6 +1541,7 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
         return _run_finetune_next_body(
             conn, candidate, manual, interval, backtest_period, pred_samples,
             ft_epochs, ft_batch_size, min_signals, dry_run,
+            no_gpu_recovery=no_gpu_recovery, allow_reboot=allow_reboot, notify=notify,
         )
     finally:
         if lock_file is not None:
@@ -1472,7 +1549,17 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
 
 
 def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
-                             pred_samples, ft_epochs, ft_batch_size, min_signals, dry_run):
+                             pred_samples, ft_epochs, ft_batch_size, min_signals, dry_run,
+                             no_gpu_recovery=False, allow_reboot=False, notify=True):
+    """Run the training/backtest/compare body for one finetune_next candidate.
+
+    See run_stage_finetune_next's docstring for the full contract, including
+    the Telegram notification points (start/failure/accept/reject via the
+    module-level `_notify` helper -> kairos.ops.send_telegram, credentials
+    from TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID, see .env.example). `notify=False`
+    suppresses all of them for this call; `dry_run=True` returns before any
+    notification would be sent regardless of `notify`.
+    """
     assets_raw = candidate["assets_raw"]
     assets_sorted = candidate["assets_sorted"]
     interval = candidate["interval"]
@@ -1527,23 +1614,45 @@ def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
         with open(os.path.join(model_dir, "metadata.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-    proc = subprocess.run(train_cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-    print(proc.stdout)
-    if proc.returncode != 0:
-        print(proc.stderr)
-        update_finetune_registry_row(conn, row_id, status="failed")
-        _write_metadata({"status": "failed", "model_path": None})
-        print(f"\n[finetune_next] VERDICT: FAILED (training subprocess exit "
-              f"{proc.returncode}). id={row_id}. Model dir kept for post-mortem: {model_dir}")
-        return row_id
+    # Both the training subprocess and the backtest below are GPU-bound, so
+    # hold the SHARED kairos.ops.GpuLock (not just this function's own
+    # finetune_next-instance lock) across both -- the same lock
+    # kairos_daily_signals.py and kairos_idle_finetune.py use -- so this
+    # invocation serializes against those other Kairos GPU jobs instead of
+    # running concurrently with them on the one GPU.
+    with GpuLock():
+        require_gpu(allow_recover=not no_gpu_recovery, allow_reboot=allow_reboot)
 
-    update_finetune_registry_row(conn, row_id, model_path=best_model_path)
+        _notify(
+            f"🟢 Kairos finetune_next starting: assets={assets_raw} interval={interval} "
+            f"backtest_period={backtest_period}",
+            enabled=notify,
+        )
 
-    ft_run_id = run_stage_model(
-        conn, stage="finetuned", assets=assets_list, interval=interval,
-        backtest_period=backtest_period, pred_samples=pred_samples,
-        model_path=best_model_path,
-    )
+        proc = subprocess.run(train_cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+        print(proc.stdout)
+        if proc.returncode != 0:
+            print(proc.stderr)
+            update_finetune_registry_row(conn, row_id, status="failed")
+            _write_metadata({"status": "failed", "model_path": None})
+            stderr_tail = (proc.stderr or "")[-2000:]
+            _notify(
+                f"❌ Kairos finetune_next FAILED (training subprocess exit "
+                f"{proc.returncode}): assets={assets_raw} id={row_id}\n"
+                f"```\n{stderr_tail}\n```",
+                enabled=notify,
+            )
+            print(f"\n[finetune_next] VERDICT: FAILED (training subprocess exit "
+                  f"{proc.returncode}). id={row_id}. Model dir kept for post-mortem: {model_dir}")
+            return row_id
+
+        update_finetune_registry_row(conn, row_id, model_path=best_model_path)
+
+        ft_run_id = run_stage_model(
+            conn, stage="finetuned", assets=assets_list, interval=interval,
+            backtest_period=backtest_period, pred_samples=pred_samples,
+            model_path=best_model_path,
+        )
 
     comparison = compare_finetuned_vs_base(
         conn, assets_raw, interval, backtest_period, min_signals=min_signals,
@@ -1575,6 +1684,15 @@ def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
           f"(run_id={comparison['ft_run_id']})")
     print(f"  model_path={best_model_path}")
     print(f"  registry id={row_id}")
+
+    verdict_emoji = "✅" if comparison["accepted"] else "⚠️"
+    _notify(
+        f"{verdict_emoji} Kairos finetune_next {status.upper()}: assets={assets_raw} "
+        f"interval={interval} base viable_count={comparison['base_count']} "
+        f"mean_sharpe={comparison['base_mean']:.4f} -> ft viable_count={comparison['ft_count']} "
+        f"mean_sharpe={comparison['ft_mean']:.4f}",
+        enabled=notify,
+    )
 
     return row_id
 
@@ -2069,6 +2187,29 @@ def _build_parser():
     parser.add_argument("--dry_run", action="store_true",
                          help="Print the selected candidate/periods/planned command without "
                               "executing anything (--stage finetune_next only)")
+    parser.add_argument("--skip-idle-check", dest="check_gpu_idle", action="store_false",
+                         default=True,
+                         help="Skip the GPU-idle check and start training immediately, even if "
+                              "the GPU looks busy (--stage finetune_next only; the shared GPU "
+                              "lock still applies regardless of this flag)")
+    parser.add_argument("--util-threshold", dest="util_threshold", type=int,
+                         default=DEFAULT_GPU_UTIL_THRESHOLD,
+                         help=f"Max GPU utilization percent still considered idle "
+                              f"(default: {DEFAULT_GPU_UTIL_THRESHOLD}; --stage finetune_next only)")
+    parser.add_argument("--no-gpu-recovery", dest="no_gpu_recovery", action="store_true",
+                         default=False,
+                         help="Abort if CUDA is not healthy instead of running the recovery "
+                              "ladder (--stage finetune_next only)")
+    parser.add_argument("--allow-reboot", dest="allow_reboot", action="store_true",
+                         default=False,
+                         help="Allow the GPU recovery ladder to reboot the machine "
+                              "(--stage finetune_next only)")
+    parser.add_argument("--no-telegram", dest="notify", action="store_false",
+                         default=True,
+                         help="Disable Telegram notifications for this run (default: "
+                              "notifications enabled, sent via kairos.ops.send_telegram using "
+                              "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID from the environment - see "
+                              ".env.example; --stage finetune_next only)")
     return parser
 
 
@@ -2110,6 +2251,14 @@ def main(argv=None):
         flag_underscore = f"--{flag_name}"
         if args.stage != "finetune_next" and (flag_hyphen in actual_argv or flag_underscore in actual_argv):
             parser.error(f"{flag_underscore} is only valid with --stage finetune_next")
+
+    finetune_next_only_gpu_flags = [
+        "--skip-idle-check", "--util-threshold", "--no-gpu-recovery", "--allow-reboot",
+        "--no-telegram",
+    ]
+    for flag_str in finetune_next_only_gpu_flags:
+        if args.stage != "finetune_next" and flag_str in actual_argv:
+            parser.error(f"{flag_str} is only valid with --stage finetune_next")
 
     try:
         min_abs_corr = _parse_min_abs_corr(args.min_abs_corr)
@@ -2170,6 +2319,9 @@ def main(argv=None):
             backtest_period=args.backtest_period, pred_samples=args.pred_samples,
             ft_epochs=args.ft_epochs, ft_batch_size=args.ft_batch_size,
             min_signals=args.min_signals, dry_run=args.dry_run,
+            check_gpu_idle=args.check_gpu_idle, util_threshold=args.util_threshold,
+            no_gpu_recovery=args.no_gpu_recovery, allow_reboot=args.allow_reboot,
+            notify=args.notify,
         )
 
     conn.close()

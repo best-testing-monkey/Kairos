@@ -1,0 +1,15 @@
+[Unit]
+Description=Kairos daily signals runner
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/media/baz/MonkeyWorks/PycharmProjects/Kairos
+ExecStart=/home/baz/.local/bin/uv run scripts/kairos_daily_signals.py
+EnvironmentFile=-%h/.config/kairos/kairos.env
+
+# GPU recovery may reboot; don't restart automatically.
+Restart=no
+
+[Install]
+WantedBy=default.target

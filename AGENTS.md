@@ -89,7 +89,15 @@ Key external Python dependency: `price_cache` installed directly from Git (`git+
 ├── finetune/               # Upstream-style Kronos finetuning utilities
 ├── finetune_csv/           # Custom CSV finetuning pipeline + configs
 ├── webui/                  # Flask web interface
-├── scripts/                # gpu_recover.py, smoke.py
+├── scripts/                # gpu_recover.py, smoke.py, automation runners
+│   ├── kairos_daily_signals.py     # daily signals runner + Telegram alerts
+│   ├── kairos_weekly_discovery.py  # weekly discovery runner + Telegram alerts
+│   ├── kairos_idle_finetune.py     # idle-GPU fine-tuning runner + Telegram alerts
+│   └── gpu_recover.py              # GPU recovery ladder
+├── systemd/                # User systemd service/timer files for automation
+├── kairos/                 # Main installable Python package
+│   ├── ops.py              # GPU lock, GPU health/utilization, Telegram notifications
+│   └── ...
 ├── data/                   # SQLite databases (ignored by git)
 ├── results/                # Pipeline CSV reports (ignored by git)
 ├── output/                 # Example / report outputs (ignored by git)
@@ -169,6 +177,35 @@ python train_sequential.py --config configs/config_ali09988_candle-5min.yaml
 python generate_distilled_tokens.py --config configs/my_large_run.yaml
 python train_large_model.py --config configs/my_large_run.yaml
 ```
+
+### Scheduled automation runners
+
+```bash
+# Daily signals report (after daily bar close)
+uv run ./scripts/kairos_daily_signals.py
+
+# Weekly strategy-discovery pass
+uv run ./scripts/kairos_weekly_discovery.py
+
+# Weekly discovery, daily interval only (default; add --include-hourly for 1h pass)
+uv run ./scripts/kairos_weekly_discovery.py
+
+# Include hourly discovery pass as well
+uv run ./scripts/kairos_weekly_discovery.py --include-hourly
+
+# Idle-GPU fine-tuning (runs only when GPU is idle and lock is free)
+uv run ./scripts/kairos_idle_finetune.py
+```
+
+Both runners:
+
+- Acquire a shared GPU lock so only one Kairos GPU job runs at a time.
+- Verify CUDA health (and run the recovery ladder if needed).
+- Send Telegram alerts on actionable signals, failures, or completions.
+
+The idle fine-tuning runner also samples GPU utilization and skips silently when the GPU is busy or the lock is held.
+
+Install the systemd timers from `systemd/`; see `systemd/README.md` for copy/paste commands. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `~/.config/kairos/kairos.env`.
 
 ---
 

@@ -771,7 +771,7 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
 def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None,
         min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False,
-        cluster_map_path=None, base_only=False):
+        cluster_map_path=None, base_only=False, return_rows=False):
     """Run the full signals-report flow. Returns the path to the written report.
 
     now: the moment treated as "now" — stamps output filenames/report
@@ -792,6 +792,9 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         entirely (every row is labeled "Base", no comparison section/tab).
         Useful for debugging a bad finetuned model, or to force a
         base-only run regardless of the finetuned_models registry.
+    return_rows: if True, return (out_path, stats_rows, advice_rows) instead
+        of just out_path. Default False preserves the exact old return value
+        for every existing caller.
     """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
@@ -932,6 +935,8 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
             )
             print(sheet_path)
 
+    if return_rows:
+        return out_path, stats_rows, advice_rows
     return out_path
 
 

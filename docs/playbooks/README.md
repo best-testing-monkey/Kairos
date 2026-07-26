@@ -34,7 +34,11 @@ next run — re-predicting that group with the finetuned checkpoint and
 replacing its rows in the signals report, with the displaced base-model
 rows kept visible in a comparison section/tab (see
 [model-finetuning.md](model-finetuning.md) and
-[daily-signals.md](daily-signals.md#finetuned-models)).
+[daily-signals.md](daily-signals.md#finetuned-models)). A monthly paper-trade
+replay of the historical signals stream through Phantom Ledger, a separate
+accounting ledger library, now validates the report's expected performance
+before any real capital follows it (Phase 4.1; see
+[signals_validation.md](signals_validation.md)).
 
 ## Cadence
 
@@ -45,6 +49,7 @@ rows kept visible in a comparison section/tab (see
 | Hourly signals | [hourly-signals.md](hourly-signals.md) | `kairos_signals.py --intervals 1h --xlsx` | Hourly, a few minutes past the top of the hour | Yes |
 | Signal handling | [signal-handling.md](signal-handling.md) | n/a — reviewing report + Allocation sheet | After every signals run | No |
 | Idle: model finetuning | [model-finetuning.md](model-finetuning.md) | `kairos_pipeline.py --stage finetune_next` | Whenever the GPU is idle, soon after the weekly refresh | Yes |
+| Signals validation (paper-trading) | [signals_validation.md](signals_validation.md) | `kairos_papertrade.py --months-back 6 --html` | Monthly | Yes |
 
 ## Prerequisites (all playbooks)
 

@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Kairos weekly strategy discovery every Sunday at 04:00 UTC
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

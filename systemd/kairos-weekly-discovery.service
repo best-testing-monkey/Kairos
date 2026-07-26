@@ -1,0 +1,15 @@
+[Unit]
+Description=Kairos weekly strategy discovery runner
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/media/baz/MonkeyWorks/PycharmProjects/Kairos
+ExecStart=/home/baz/.local/bin/uv run scripts/kairos_weekly_discovery.py
+EnvironmentFile=-%h/.config/kairos/kairos.env
+
+# Long GPU job; don't restart automatically.
+Restart=no
+
+[Install]
+WantedBy=default.target

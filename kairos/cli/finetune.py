@@ -18,6 +18,30 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import price_cache as pc
+
+
+# ---------------------------------------------------------------------------
+# Symbol aliases
+# ---------------------------------------------------------------------------
+
+SYMBOL_ALIASES: dict[str, list[str]] = {
+    "BTC-USD": ["BTCUSDT"],
+    "ETH-USD": ["ETHUSDT"],
+    "SOL-USD": ["SOLUSDT"],
+    "BTCUSDT": ["BTC-USD"],
+    "ETHUSDT": ["ETH-USD"],
+    "SOLUSDT": ["SOL-USD"],
+}
+
+
+def _candidate_symbols(symbol: str) -> list[str]:
+    """Return the requested symbol plus any known aliases to try."""
+    candidates = [symbol]
+    for alias in SYMBOL_ALIASES.get(symbol, []):
+        if alias not in candidates:
+            candidates.append(alias)
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +89,68 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-interval", type=int, default=10,
                    help="Print training loss every N steps (default: 10).")
     return p
+
+
+def _fetch_price_data_local(
+    symbol: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    interval: str,
+    db_path: str | Path,
+) -> pd.DataFrame | None:
+    """Fallback read from the local SQLite prices table if get_price_data returns None.
+
+    price_cache marks a whole ticker as no-data in the no_data_tickers table when a
+    single fetch fails, which can hide data that is already in the prices table.
+    This fallback reads the local table directly, bypassing that guard.
+    """
+    import sqlite3
+
+    _INTERVAL_MINUTES = {
+        "1m": 1,
+        "2m": 2,
+        "5m": 5,
+        "15m": 15,
+        "30m": 30,
+        "60m": 60,
+        "90m": 90,
+        "1h": 60,
+        "1d": 1440,
+        "5d": 7200,
+        "1wk": 10080,
+        "1mo": 43200,
+        "3mo": 129600,
+    }
+    interval_minutes = _INTERVAL_MINUTES.get(interval.lower())
+    if interval_minutes is None:
+        raise ValueError(f"Unsupported interval {interval!r}")
+
+    path = Path(db_path).resolve()
+    if not path.exists():
+        return None
+
+    conn = sqlite3.connect(path, check_same_thread=False)
+    try:
+        rows = conn.execute(
+            """SELECT date, open, high, low, close, volume, dividends, stock_splits, market_cap
+               FROM prices
+               WHERE ticker=? AND date >= ? AND date <= ? AND interval_minutes=?
+               ORDER BY date""",
+            (symbol, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), interval_minutes),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(
+        rows,
+        columns=["Date", "Open", "High", "Low", "Close", "Volume", "Dividends", "Stock Splits", "market_cap"],
+    )
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize("America/New_York")
+    df.set_index("Date", inplace=True)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +362,6 @@ def main(argv: list[str] | None = None) -> None:
 
     # ----------------------------------------------------------- fetch history
     import kairos
-    import price_cache as pc
 
     kairos.configure(remote=args.remote)
 
@@ -297,18 +382,32 @@ def main(argv: list[str] | None = None) -> None:
     train_datasets = []
     val_datasets = []
     for symbol in symbols:
-        raw = pc.get_price_data(
-            symbol,
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-            interval=args.interval,
-            db_path=pc.DB_PATH,
-        )
-
+        raw = None
+        tried = []
+        resolved_symbol = symbol
+        for candidate in _candidate_symbols(symbol):
+            tried.append(candidate)
+            raw = pc.get_price_data(
+                candidate,
+                start_date.strftime("%Y-%m-%d"),
+                end_date.strftime("%Y-%m-%d"),
+                interval=args.interval,
+                db_path=pc.DB_PATH,
+            )
+            if raw is None and not args.remote:
+                raw = _fetch_price_data_local(
+                    candidate, start_date, end_date, args.interval, pc.DB_PATH
+                )
+                if raw is not None and not raw.empty:
+                    print(f"  [{candidate}] price_cache returned None; using direct local SQLite fallback")
+            if raw is not None and not raw.empty:
+                resolved_symbol = candidate
+                break
         if raw is None or raw.empty:
-            print(f"ERROR: no data returned for {symbol!r}. "
+            print(f"ERROR: no data returned for {symbol!r} (tried: {', '.join(tried)}). "
                   "Check the symbol and date range.", file=sys.stderr)
             sys.exit(1)
+        symbol = resolved_symbol
 
         # Rename price_cache columns → lowercase
         raw = raw.rename(columns={

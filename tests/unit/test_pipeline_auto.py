@@ -17,6 +17,44 @@ from kairos_pipeline import (
     compare_finetuned_vs_base, run_stage_finetune_next, acquire_finetune_lock,
     insert_finetune_registry_row, update_finetune_registry_row,
 )
+from kairos.ops import OpsError
+
+
+class _FakeGpuLock:
+    """Stand-in for kairos.ops.GpuLock that never touches the real lock file
+    or blocks -- used to keep tests off real GPU hardware."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _mock_gpu_gating(monkeypatch):
+    """run_stage_finetune_next gates training on a real GPU-idle check
+    (kairos.ops.is_gpu_idle) and wraps the training/backtest subprocesses in
+    the shared kairos.ops.GpuLock + require_gpu(). None of these tests are
+    about real GPU hardware state, so autouse-mock all three for every test
+    in this module -- otherwise tests would depend on this machine's actual
+    GPU utilization and could even trigger the GPU recovery ladder via
+    require_gpu()'s default allow_recover=True.
+
+    Also autouse-mock send_telegram to a no-op: --stage finetune_next now
+    sends Telegram notifications (kairos.ops.send_telegram), and no test in
+    this module -- existing or new -- should ever attempt a real network
+    call. Tests that specifically exercise notification behavior override
+    this with their own MagicMock via monkeypatch/patch."""
+    import kairos_pipeline
+
+    monkeypatch.setattr(kairos_pipeline, "is_gpu_idle", lambda **kwargs: True)
+    monkeypatch.setattr(kairos_pipeline, "require_gpu", lambda **kwargs: None)
+    monkeypatch.setattr(kairos_pipeline, "GpuLock", _FakeGpuLock)
+    monkeypatch.setattr(kairos_pipeline, "send_telegram", lambda *a, **kw: None)
 
 
 class TestPeriodToWeeks:
@@ -2800,3 +2838,394 @@ class TestRunStageFinetuneNextLockingAndOrphanSweep:
             "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
         ).fetchone()[0]
         assert status == "training"
+
+
+class TestRunStageFinetuneNextGpuGating:
+    """GPU-idle check (kairos.ops.is_gpu_idle) and the shared kairos.ops.GpuLock
+    around the training/backtest subprocesses (ported from
+    scripts/kairos_idle_finetune.py's idle-detection/locking so a manually- or
+    cron-invoked --stage finetune_next doesn't collide with another Kairos GPU
+    job on the same machine)."""
+
+    def _seed_candidate_profile(self, conn, assets="BTC-USD,ETH-USD", interval="1d",
+                                 backtest_period="6m"):
+        _insert_oracle_strategy(conn, assets, interval, backtest_period, "s1", 2.0, 10)
+        _insert_base_strategy(conn, assets, interval, backtest_period, "s1", 2.0, 10)
+
+    def _mock_subprocess(self, returncode=0, stderr=""):
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = ""
+        m.stderr = stderr
+        return m
+
+    def test_busy_gpu_short_circuits_before_candidate_selection(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        monkeypatch.setattr(kairos_pipeline, "is_gpu_idle", lambda **kwargs: False)
+        self._seed_candidate_profile(temp_db)
+
+        def _raise_if_called(*args, **kwargs):
+            raise AssertionError("select_finetune_candidate must not be called "
+                                  "while the GPU looks busy")
+
+        monkeypatch.setattr(kairos_pipeline, "select_finetune_candidate", _raise_if_called)
+
+        with patch("kairos_pipeline.subprocess.run") as mock_run, \
+             patch("kairos_pipeline.run_stage_model") as mock_model:
+            result = run_stage_finetune_next(
+                temp_db, lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        assert result is None
+        mock_run.assert_not_called()
+        mock_model.assert_not_called()
+        count = temp_db.execute("SELECT COUNT(*) FROM finetuned_models").fetchone()[0]
+        assert count == 0
+
+    def test_skip_idle_check_proceeds_despite_busy_gpu(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        monkeypatch.setattr(kairos_pipeline, "is_gpu_idle", lambda **kwargs: False)
+        self._seed_candidate_profile(temp_db)
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            return start_run(temp_db, stage, interval, {})
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)) as mock_run, \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model) as mock_model:
+            row_id = run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4, check_gpu_idle=False,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        assert row_id is not None
+        mock_run.assert_called_once()
+        mock_model.assert_called_once()
+
+    def test_dry_run_never_checks_gpu_idle(self, temp_db, tmp_path, monkeypatch):
+        """dry_run's documented zero-side-effects contract extends to the new
+        gate too -- it must not even query GPU state."""
+        import kairos_pipeline
+        self._seed_candidate_profile(temp_db)
+
+        def _raise_if_called(**kwargs):
+            raise AssertionError("dry_run must not check GPU idle state")
+
+        monkeypatch.setattr(kairos_pipeline, "is_gpu_idle", _raise_if_called)
+
+        result = run_stage_finetune_next(temp_db, dry_run=True)
+        assert result is None
+
+    def test_util_threshold_forwarded_to_idle_check(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        captured = {}
+
+        def _capture_threshold(**kwargs):
+            captured.update(kwargs)
+            return False
+
+        monkeypatch.setattr(kairos_pipeline, "select_finetune_candidate", lambda *a, **k: None)
+        monkeypatch.setattr(kairos_pipeline, "is_gpu_idle", _capture_threshold)
+
+        run_stage_finetune_next(
+            temp_db, util_threshold=42, lock_path=str(tmp_path / "finetune_next.lock"),
+        )
+
+        assert captured.get("threshold") == 42
+
+    def test_training_and_backtest_run_inside_shared_gpu_lock(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        """The training subprocess and run_stage_model backtest must both
+        happen while the shared GpuLock is held (not just this function's own
+        finetune_next-instance lock), and require_gpu() must be checked once
+        the lock is held."""
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+
+        events = []
+
+        class _RecordingGpuLock(_FakeGpuLock):
+            def __enter__(self):
+                events.append("lock_acquired")
+                return self
+
+            def __exit__(self, *exc_info):
+                events.append("lock_released")
+                return False
+
+        def _recording_require_gpu(**kwargs):
+            events.append("require_gpu")
+
+        def _recording_subprocess_run(*args, **kwargs):
+            events.append("train_subprocess")
+            return self._mock_subprocess(returncode=0)
+
+        def _recording_run_stage_model(*args, **kwargs):
+            events.append("backtest")
+            run_id = start_run(temp_db, "finetuned", "1d", {})
+            _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 3.0, 10,
+                                   run_id=run_id, stage="finetuned")
+            return run_id
+
+        monkeypatch.setattr(kairos_pipeline, "GpuLock", _RecordingGpuLock)
+        monkeypatch.setattr(kairos_pipeline, "require_gpu", _recording_require_gpu)
+
+        with patch("kairos_pipeline.subprocess.run", side_effect=_recording_subprocess_run), \
+             patch("kairos_pipeline.run_stage_model", side_effect=_recording_run_stage_model):
+            run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        # Both GPU-bound steps happened strictly between lock acquire/release.
+        assert events == [
+            "lock_acquired", "require_gpu", "train_subprocess", "backtest", "lock_released",
+        ]
+
+
+class TestRunStageFinetuneNextNotifications:
+    """Telegram notifications for --stage finetune_next (start/failure/verdict),
+    mirroring scripts/kairos_idle_finetune.py's _notify helper and emoji/style
+    conventions. The module-level autouse `_mock_gpu_gating` fixture already
+    stubs kairos_pipeline.send_telegram to a no-op for every test in this file;
+    these tests override it with a MagicMock (or an OpsError-raising stub) to
+    assert on notification content, or the absence of one."""
+
+    def _seed_candidate_profile(self, conn, assets="BTC-USD,ETH-USD", interval="1d",
+                                 backtest_period="6m"):
+        _insert_oracle_strategy(conn, assets, interval, backtest_period, "s1", 2.0, 10)
+        _insert_base_strategy(conn, assets, interval, backtest_period, "s1", 2.0, 10)
+
+    def _mock_subprocess(self, returncode=0, stderr=""):
+        m = MagicMock()
+        m.returncode = returncode
+        m.stdout = ""
+        m.stderr = stderr
+        return m
+
+    def test_start_notification_fires(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model") as mock_model:
+            mock_model.return_value = start_run(temp_db, "finetuned", "1d", {})
+            run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        start_messages = [c.args[0] for c in mock_notify.call_args_list if "🟢" in c.args[0]]
+        assert len(start_messages) == 1
+        assert "BTC-USD,ETH-USD" in start_messages[0]
+        assert "finetune_next starting" in start_messages[0]
+
+    def test_training_failure_notification_fires(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=1, stderr="boom")), \
+             patch("kairos_pipeline.run_stage_model") as mock_model:
+            row_id = run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        mock_model.assert_not_called()
+        fail_messages = [c.args[0] for c in mock_notify.call_args_list if "❌" in c.args[0]]
+        assert len(fail_messages) == 1
+        assert "FAILED" in fail_messages[0]
+        assert "BTC-USD,ETH-USD" in fail_messages[0]
+        assert f"id={row_id}" in fail_messages[0]
+        assert "boom" in fail_messages[0]
+
+    def test_accept_notification_fires(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   3.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s2",
+                                   1.5, 5, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
+            run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        verdict_messages = [c.args[0] for c in mock_notify.call_args_list if "✅" in c.args[0]]
+        assert len(verdict_messages) == 1
+        assert "ACCEPTED" in verdict_messages[0]
+        assert "BTC-USD,ETH-USD" in verdict_messages[0]
+        assert "viable_count=2" in verdict_messages[0]
+
+    def test_reject_notification_fires(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   -1.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
+            run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        verdict_messages = [c.args[0] for c in mock_notify.call_args_list if "⚠️" in c.args[0]]
+        assert len(verdict_messages) == 1
+        assert "REJECTED" in verdict_messages[0]
+        assert "BTC-USD,ETH-USD" in verdict_messages[0]
+
+    def test_no_notification_for_dry_run(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        with patch("kairos_pipeline.subprocess.run") as mock_run, \
+             patch("kairos_pipeline.run_stage_model") as mock_model:
+            result = run_stage_finetune_next(temp_db, dry_run=True)
+
+        assert result is None
+        mock_run.assert_not_called()
+        mock_model.assert_not_called()
+        mock_notify.assert_not_called()
+
+    def test_no_notification_when_gpu_busy(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        monkeypatch.setattr(kairos_pipeline, "is_gpu_idle", lambda **kwargs: False)
+        self._seed_candidate_profile(temp_db)
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        result = run_stage_finetune_next(
+            temp_db, lock_path=str(tmp_path / "finetune_next.lock"),
+        )
+
+        assert result is None
+        mock_notify.assert_not_called()
+
+    def test_no_notification_when_lock_held(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        lock_path = str(tmp_path / "finetune_next.lock")
+        holder = acquire_finetune_lock(lock_path)
+        assert holder is not None
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+        try:
+            result = run_stage_finetune_next(temp_db, lock_path=lock_path)
+        finally:
+            holder.close()
+
+        assert result is None
+        mock_notify.assert_not_called()
+
+    def test_no_notification_when_no_candidate(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        result = run_stage_finetune_next(
+            temp_db, lock_path=str(tmp_path / "finetune_next.lock"),
+        )
+
+        assert result is None
+        mock_notify.assert_not_called()
+
+    def test_no_telegram_flag_suppresses_all_notifications(self, temp_db, tmp_path, monkeypatch):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   3.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
+            run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4, notify=False,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        mock_notify.assert_not_called()
+
+    def test_telegram_failure_does_not_crash_run(self, temp_db, tmp_path, monkeypatch):
+        """A missing-credentials/OpsError from send_telegram must be caught by
+        _notify and never propagate out of run_stage_finetune_next -- the
+        function should still complete and return normally."""
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+
+        def _raise_ops_error(*args, **kwargs):
+            raise OpsError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set")
+
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", _raise_ops_error)
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   3.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
+            row_id = run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        assert row_id is not None
+        status = temp_db.execute(
+            "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert status == "accepted"

@@ -1,0 +1,9 @@
+[Unit]
+Description=Probe for idle GPU and run Kairos fine-tuning every 30 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00,30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

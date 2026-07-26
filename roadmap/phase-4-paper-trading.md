@@ -16,6 +16,14 @@ collecting data.
   stream**, and per-strategy attribution.
 - Owner: 1 Sonnet subagent.
 
+**Status: implemented**, via `strategy/kairos_papertrade.py` +
+[`docs/playbooks/signals_validation.md`](../docs/playbooks/signals_validation.md).
+Positions and account state live in the external Phantom Ledger library
+(`phantom`, a separate sibling package with its own SQLite store) rather
+than a bespoke `data/positions.db`; it is run as a monthly validation
+routine (not nightly) that replays ~6 months of historical
+`kairos_signals.py` reports through a Phantom Ledger paper-trading account.
+
 ### 4.2 Live vs backtest drift monitor
 - Weekly job comparing live-signal performance against the backtest expectation
   for the same profile.

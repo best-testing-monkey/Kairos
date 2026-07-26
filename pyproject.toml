@@ -1,7 +1,7 @@
 [project]
 name = "kairos"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 description = "price_cache × Kronos integration layer for exchange-aware OHLCV forecasting"
 dependencies = [
     "pandas>=2.0",
@@ -12,7 +12,7 @@ dependencies = [
     "einops>=0.7",
     "tqdm>=4.60",
     "exchange-calendars>=4.0",
-    "price-cache @ git+https://github.com/best-testing-monkey/price_cache.git",
+    "price-cache",
     "pandas-stubs~=3.0.3",
     "plotly>=5.0",
     "matplotlib>=3.7",
@@ -23,6 +23,7 @@ dependencies = [
     "gspread>=6.2.1",
     "openpyxl>=3.1.5",
     "odfpy>=1.4.1",
+    "phantom-ledger @ git+https://github.com/best-testing-monkey/phantom_ledger.git",
 ]
 
 [project.optional-dependencies]
@@ -58,6 +59,7 @@ max-line-length = 120
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu121" }]
+price-cache = { git = "https://github.com/best-testing-monkey/phantom_ledger.git", subdirectory = "src/phantom/data/price_cache" }
 
 [[tool.uv.index]]
 name = "pytorch-cu121"

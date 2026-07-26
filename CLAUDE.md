@@ -85,6 +85,23 @@ process still can't see it (torch caches CUDA init state), the process exits
 subprocess exactly once. Run `uv run scripts/gpu_recover.py --check-only` to
 probe without side effects, or `--dry-run` to preview the full ladder.
 
+### Telegram credentials aren't loaded for manual runs
+`kairos.ops.send_telegram()` reads `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` from
+`os.environ` — it never reads `~/.config/kairos/kairos.env` itself. Only the
+systemd units (`systemd/*.service`, via `EnvironmentFile=-%h/.config/kairos/kairos.env`)
+load that file automatically. Running any of `strategy/kairos_pipeline.py
+--stage finetune_next`, `scripts/kairos_daily_signals.py`,
+`scripts/kairos_weekly_discovery.py`, or `scripts/kairos_idle_finetune.py`
+directly from a shell will silently fail every Telegram notification
+(`OpsError` is caught and only logged as a `WARNING:` line, easy to miss in a
+long training run) unless you source the file into that shell first:
+```bash
+set -a && source ~/.config/kairos/kairos.env && set +a
+```
+Also double-check the token's shape if notifications ever 404 instead of
+"must be set": a real bot token looks like `<digits>:<~35 alnum chars>`, not
+a copy-pasted placeholder.
+
 ### PRED_SAMPLES and DEMO_LOOKBACK
 `PRED_SAMPLES = 100` and `DEMO_LOOKBACK = 300` in the `__main__` block of
 `strategy/kairos_strategies.py` are hard constraints. Do not reduce them as a
