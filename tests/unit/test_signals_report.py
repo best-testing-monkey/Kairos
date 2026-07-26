@@ -833,7 +833,8 @@ class TestBuildStrategyIndex:
             lookback=300, now=datetime(2026, 7, 9, 7, 0),
         )
 
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
         assert "unknown strategy" not in report
         assert "inner_x" in report
         assert "**Long**" in report
@@ -907,7 +908,8 @@ class TestZeroSizeSignalGate:
             pred_samples=5, include_all=False, predict_fn=fake_predict_fn,
             lookback=300, now=datetime(2026, 7, 9, 8, 0),
         )
-        return open(out_path).read()
+        with open(out_path) as f:
+            return f.read()
 
     def test_zero_size_long_dropped_to_skipped(self, tmp_path, monkeypatch):
         sig = Signal(
@@ -995,7 +997,8 @@ class TestMinEvPctFilter:
             pred_samples=5, include_all=False, predict_fn=fake_predict_fn,
             lookback=300, now=datetime(2026, 7, 9, 9, 0), **run_kwargs,
         )
-        return open(out_path).read()
+        with open(out_path) as f:
+            return f.read()
 
     def _long_signal(self, expected_value):
         return Signal(
@@ -1543,9 +1546,11 @@ class TestAllocationIntegration:
         return out_path
 
     def test_run_appends_portfolio_allocation_to_markdown(self, tmp_path, monkeypatch):
-        report = open(self._run_with_strategy(
+        out_path = self._run_with_strategy(
             tmp_path, monkeypatch, _LongSignalStrategy(expected_value=0.5)
-        )).read()
+        )
+        with open(out_path) as f:
+            report = f.read()
 
         assert "## Portfolio Allocation" in report
         assert "Selected 2 of 2 signals" in report
@@ -1573,7 +1578,8 @@ class TestAllocationIntegration:
         out_path = self._run_with_strategy(
             tmp_path, monkeypatch, _FixedSignalStrategy("zero_kelly", sig), xlsx=True)
 
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
         assert "## Portfolio Allocation" not in report
 
         sheet_path = out_path.replace(".md", ".xlsx")
@@ -1589,7 +1595,8 @@ class TestAllocationIntegration:
             tmp_path, monkeypatch, _LongSignalStrategy(expected_value=0.5),
             cluster_map_path=cluster_csv,
         )
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
 
         assert "## Portfolio Allocation" in report
         assert "Cluster exposure: crypto" in report
@@ -1755,7 +1762,8 @@ class TestFinetunedOverlay:
         strategy = _CapturingLongSignalStrategy()
 
         out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
 
         # Base pass ran for both groups; finetuned pass ran only for the
         # accepted group, reusing pass 1's cached fetched data.
@@ -1779,7 +1787,8 @@ class TestFinetunedOverlay:
         strategy = _CapturingLongSignalStrategy()
 
         out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
 
         assert len(calls) == 2
         assert all(model_path is None for _, model_path in calls)
@@ -1796,7 +1805,8 @@ class TestFinetunedOverlay:
         strategy = _CapturingLongSignalStrategy()
 
         out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
 
         assert all(model_path is None for _, model_path in calls)
         assert "Finetuned(" not in report
@@ -1809,7 +1819,8 @@ class TestFinetunedOverlay:
         strategy = _CapturingLongSignalStrategy()
 
         out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
 
         assert len(calls) == 2
         assert all(model_path is None for _, model_path in calls)
@@ -1825,7 +1836,8 @@ class TestFinetunedOverlay:
         strategy = _CapturingLongSignalStrategy()
 
         out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls, base_only=True)
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
 
         assert len(calls) == 2
         assert all(model_path is None for _, model_path in calls)
@@ -1841,7 +1853,8 @@ class TestFinetunedOverlay:
         strategy = _CapturingLongSignalStrategy()
 
         out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
-        report = open(out_path).read()
+        with open(out_path) as f:
+            report = f.read()
 
         comparison_start = report.index("## Replaced base signals (comparison)")
         next_heading = report.find("\n## ", comparison_start + 1)

@@ -220,15 +220,49 @@ class KairosDistribution:
         self._compute_stats()
 
     def _compute_stats(self):
+        # scipy's finfo(float).eps * 10 threshold for the "catastrophic
+        # cancellation" precision-loss warning (see
+        # scipy.stats._stats_py._demean). Replicated here so we can
+        # detect the exact same degenerate-array condition ourselves and
+        # short-circuit *before* calling scipy, instead of suppressing
+        # the warning after the fact.
+        cancellation_eps = np.finfo(float).eps * 10
         for col in ["open", "high", "low", "close"]:
             if col not in self.df.columns:
                 continue
             arr = self.df[col].values.astype(float)
+            mean = float(np.mean(arr))
+            std = float(np.std(arr))
+
+            # When every value in `arr` is the same (or differs only by
+            # float rounding), the mean-centered values scipy.stats.skew/
+            # kurtosis operate on are dominated by floating-point noise.
+            # scipy detects this internally and emits a RuntimeWarning
+            # ("Precision loss occurred in moment calculation due to
+            # catastrophic cancellation ... data are nearly identical").
+            # For a genuinely constant distribution, skew and kurtosis
+            # are mathematically 0 by definition, so short-circuit to
+            # that instead of handing scipy a degenerate input. This
+            # uses scipy's own criterion (max relative deviation from the
+            # mean vs. float64 epsilon) so it only fires in exactly the
+            # cases scipy would have warned on -- real, non-degenerate
+            # data still goes through stats.skew/stats.kurtosis unchanged.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rel_diff = np.max(np.abs(arr - mean)) / abs(mean)
+            near_constant = len(arr) > 1 and rel_diff < cancellation_eps
+
+            if near_constant:
+                skew = 0.0
+                kurt = 0.0
+            else:
+                skew = float(stats.skew(arr))
+                kurt = float(stats.kurtosis(arr))
+
             self.stats[col] = {
-                "mean": float(np.mean(arr)),
-                "std": float(np.std(arr)),
-                "skew": float(stats.skew(arr)),
-                "kurt": float(stats.kurtosis(arr)),
+                "mean": mean,
+                "std": std,
+                "skew": skew,
+                "kurt": kurt,
                 "median": float(np.median(arr)),
                 "pct_5": float(np.percentile(arr, 5)),
                 "pct_10": float(np.percentile(arr, 10)),
