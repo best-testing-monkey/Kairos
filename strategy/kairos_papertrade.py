@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kairos_signals import DB_PATH, RESULTS_DIR, _interval_to_timedelta
 import kairos_signals as _kairos_signals_mod
-from kairos.ops import OpsError, send_telegram
+from kairos.ops import GpuLock, OpsError, send_telegram
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PHANTOM_DATA_DIR = os.path.join(REPO_ROOT, "data", "phantom_ledger")
@@ -833,9 +833,23 @@ def main(argv=None):
             base_only=args.base_only,
         )
 
-        dated_rows = generate_and_dedupe_reports(
-            base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
-        )
+        # Hold the SHARED kairos.ops.GpuLock (the same one daily_signals,
+        # weekly_discovery, and finetune_next all respect) across the whole
+        # model-inference loop, not just this function's own bookkeeping --
+        # a papertrade run can take hours, and without this lock
+        # finetune_next's is_gpu_idle() preflight (which only samples
+        # nvidia-smi *utilization*, not VRAM) can see this process sitting
+        # idle between calls and barge in, colliding on the GPU's limited
+        # VRAM (observed in production: a concurrent finetune_next crashed
+        # with torch.OutOfMemoryError while papertrade was running). This
+        # necessarily means finetune_next/daily_signals/weekly_discovery
+        # will block (and, if the lock isn't freed within GpuLock's 5-minute
+        # timeout, fail with OpsError) for as long as this loop runs --
+        # accepted tradeoff over the alternative of colliding outright.
+        with GpuLock():
+            dated_rows = generate_and_dedupe_reports(
+                base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
+            )
         if not dated_rows:
             raise RuntimeError("No kairos_signals reports were generated in the requested window.")
 
