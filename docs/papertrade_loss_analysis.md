@@ -374,11 +374,12 @@ base vs. finetuned — the exact stat the accept gate already tracks in
   the finetuned overlay by default) actually recommends. The old base-only run was
   described above; a finetuned-overlay run would provide the comparison point needed
   to measure the impact of this lever.
-- Broaden `kairos_idle_finetune.py`'s finetuning candidate coverage — right now the
-  accept-gate pipeline only finetunes asset groups that `select_finetune_candidate`
-  ranks, but the idle-GPU trigger script separately only rotates through a hardcoded
-  `["BTC-USD","ETH-USD","SOL-USD"]` default list, which doesn't include several of this
-  run's biggest losing tickers (see Factor 8).
+- Broaden finetuning candidate coverage beyond a hardcoded rotation list (see Factor 8)
+  so several of this run's biggest losing tickers get considered. *(Note: the
+  `kairos_idle_finetune.py` wrapper this originally referred to — which rotated
+  through a hardcoded `["BTC-USD","ETH-USD","SOL-USD"]` default — has since been
+  removed; `--stage finetune_next`'s own `select_finetune_candidate` ranking, with no
+  hardcoded list, is the mechanism now.)*
 
 ### 7. Signal generation & strategy filtering
 
@@ -420,9 +421,8 @@ for the tickers that actually dominate this run's losses.
 **4.2 Concrete changes:**
 - Prioritize finetuning specifically for `LDO-USD`, `AAVE-USD`, `FIL-USD`, `ATOM-USD`,
   `XTZ-USD`, `AXS-USD` (the top losing tickers here, none of which — except indirectly
-  via `BTC-USD` — currently have an accepted finetuned model or are in
-  `kairos_idle_finetune.py`'s default rotation), instead of continuing to only rotate
-  through the hardcoded `BTC-USD/ETH-USD/SOL-USD` list.
+  via `BTC-USD` — currently have an accepted finetuned model), instead of continuing
+  to only rotate through the hardcoded `BTC-USD/ETH-USD/SOL-USD` list.
 - Feed `select_finetune_candidate`'s ranking (already in `kairos_pipeline.py`) with a
   wider `min_signals` sample if these tickers currently don't have enough oracle-viable
   strategies to be considered — otherwise they may simply never surface as finetune

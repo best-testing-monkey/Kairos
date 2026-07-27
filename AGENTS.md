@@ -92,7 +92,6 @@ Key external Python dependency: `price_cache` installed directly from Git (`git+
 ├── scripts/                # gpu_recover.py, smoke.py, automation runners
 │   ├── kairos_daily_signals.py     # daily signals runner + Telegram alerts
 │   ├── kairos_weekly_discovery.py  # weekly discovery runner + Telegram alerts
-│   ├── kairos_idle_finetune.py     # idle-GPU fine-tuning runner + Telegram alerts
 │   └── gpu_recover.py              # GPU recovery ladder
 ├── systemd/                # User systemd service/timer files for automation
 ├── kairos/                 # Main installable Python package
@@ -192,9 +191,6 @@ uv run ./scripts/kairos_weekly_discovery.py
 
 # Include hourly discovery pass as well
 uv run ./scripts/kairos_weekly_discovery.py --include-hourly
-
-# Idle-GPU fine-tuning (runs only when GPU is idle and lock is free)
-uv run ./scripts/kairos_idle_finetune.py
 ```
 
 Both runners:
@@ -202,8 +198,6 @@ Both runners:
 - Acquire a shared GPU lock so only one Kairos GPU job runs at a time.
 - Verify CUDA health (and run the recovery ladder if needed).
 - Send Telegram alerts on actionable signals, failures, or completions.
-
-The idle fine-tuning runner also samples GPU utilization and skips silently when the GPU is busy or the lock is held.
 
 Install the systemd timers from `systemd/`; see `systemd/README.md` for copy/paste commands. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `~/.config/kairos/kairos.env`.
 

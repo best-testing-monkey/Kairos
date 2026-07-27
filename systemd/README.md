@@ -23,10 +23,8 @@ chmod 0644 "$UNIT_DIR"/kairos-*.service "$UNIT_DIR"/kairos-*.timer
 systemctl --user daemon-reload
 systemctl --user enable kairos-daily-signals.timer
 systemctl --user enable kairos-weekly-discovery.timer
-systemctl --user enable kairos-idle-finetune.timer
 systemctl --user start kairos-daily-signals.timer
 systemctl --user start kairos-weekly-discovery.timer
-systemctl --user start kairos-idle-finetune.timer
 ```
 
 ## Verify
@@ -35,7 +33,6 @@ systemctl --user start kairos-idle-finetune.timer
 systemctl --user list-timers
 systemctl --user status kairos-daily-signals.timer
 systemctl --user status kairos-weekly-discovery.timer
-systemctl --user status kairos-idle-finetune.timer
 ```
 
 ## Run manually
@@ -60,13 +57,7 @@ uv run /media/baz/MonkeyWorks/PycharmProjects/Kairos/scripts/kairos_weekly_disco
 # Weekly discovery with hourly pass as well
 uv run /media/baz/MonkeyWorks/PycharmProjects/Kairos/scripts/kairos_weekly_discovery.py --include-hourly
 
-# Idle-GPU fine-tuning (checks GPU util and lock; exits 0 if skipped)
-uv run /media/baz/MonkeyWorks/PycharmProjects/Kairos/scripts/kairos_idle_finetune.py
-
-# Idle fine-tuning with skip notifications
-uv run /media/baz/MonkeyWorks/PycharmProjects/Kairos/scripts/kairos_idle_finetune.py --notify-skip
-
-# finetune_next directly via the pipeline (also Telegram-enabled)
+# finetune_next: GPU-idle check + shared GpuLock built in (also Telegram-enabled)
 uv run /media/baz/MonkeyWorks/PycharmProjects/Kairos/strategy/kairos_pipeline.py --stage finetune_next
 ```
 
@@ -75,38 +66,16 @@ uv run /media/baz/MonkeyWorks/PycharmProjects/Kairos/strategy/kairos_pipeline.py
 ```bash
 journalctl --user -u kairos-daily-signals.service -f
 journalctl --user -u kairos-weekly-discovery.service -f
-journalctl --user -u kairos-idle-finetune.service -f
 ```
 
 Logs are also written to:
 
 - `~/.local/state/kairos/daily_signals.log`
 - `~/.local/state/kairos/weekly_discovery.log`
-- `~/.local/state/kairos/idle_finetune.log`
 
 ## Scheduling
 
 - **Daily signals:** every day at 02:00 UTC (`kairos-daily-signals.timer`).
 - **Weekly discovery:** every Sunday at 04:00 UTC (`kairos-weekly-discovery.timer`).
-- **Idle fine-tuning:** every 30 minutes (`kairos-idle-finetune.timer`).
 
 Edit the `OnCalendar=` lines to change times.
-
-## Idle fine-tuning configuration
-
-The idle fine-tuning runner rotates through the configured symbols so the same
-instrument is not retrained repeatedly. It also enforces a cooldown between
-training runs for the same symbol (default 24 hours).
-
-Useful environment variables (set them in `~/.config/kairos/kairos.env` or pass
-them on the command line):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `KAIROS_IDLE_FINETUNE_SYMBOLS` | *(all tickers in local price cache DB)* | Space/comma-separated symbols to rotate through; overrides DB lookup |
-| `KAIROS_IDLE_FINETUNE_SYMBOL` | *(none)* | Single symbol (legacy; use `KAIROS_IDLE_FINETUNE_SYMBOLS` instead) |
-| `KAIROS_IDLE_FINETUNE_COOLDOWN_SECONDS` | `86400` (24h) | Seconds before retraining the same symbol |
-| `KAIROS_IDLE_NOTIFY_SKIP` | `0` | Send Telegram when a cycle is skipped (cooldown, busy GPU, etc.) |
-
-State is persisted in `~/.local/state/kairos/idle_finetune_state.json` so
-rotation and cooldown survive reboots.

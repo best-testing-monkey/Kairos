@@ -2842,10 +2842,9 @@ class TestRunStageFinetuneNextLockingAndOrphanSweep:
 
 class TestRunStageFinetuneNextGpuGating:
     """GPU-idle check (kairos.ops.is_gpu_idle) and the shared kairos.ops.GpuLock
-    around the training/backtest subprocesses (ported from
-    scripts/kairos_idle_finetune.py's idle-detection/locking so a manually- or
-    cron-invoked --stage finetune_next doesn't collide with another Kairos GPU
-    job on the same machine)."""
+    around the training/backtest subprocesses, so a manually- or cron-invoked
+    --stage finetune_next doesn't collide with another Kairos GPU job on the
+    same machine."""
 
     def _seed_candidate_profile(self, conn, assets="BTC-USD,ETH-USD", interval="1d",
                                  backtest_period="6m"):
@@ -2992,9 +2991,9 @@ class TestRunStageFinetuneNextGpuGating:
 
 
 class TestRunStageFinetuneNextNotifications:
-    """Telegram notifications for --stage finetune_next (start/failure/verdict),
-    mirroring scripts/kairos_idle_finetune.py's _notify helper and emoji/style
-    conventions. The module-level autouse `_mock_gpu_gating` fixture already
+    """Telegram notifications for --stage finetune_next
+    (start/failure/verdict/crash). The module-level autouse `_mock_gpu_gating`
+    fixture already
     stubs kairos_pipeline.send_telegram to a no-op for every test in this file;
     these tests override it with a MagicMock (or an OpsError-raising stub) to
     assert on notification content, or the absence of one."""
@@ -3111,6 +3110,46 @@ class TestRunStageFinetuneNextNotifications:
         assert len(verdict_messages) == 1
         assert "REJECTED" in verdict_messages[0]
         assert "BTC-USD,ETH-USD" in verdict_messages[0]
+
+    def test_crash_after_training_notification_fires_and_marks_failed(
+        self, temp_db, tmp_path, monkeypatch,
+    ):
+        """A post-training crash (e.g. the backtest subprocess in
+        run_stage_model raising) must not disappear silently: it should fire
+        a distinct crash notification, mark the registry row failed right
+        away instead of leaving it at status='training', and still
+        propagate so the caller/systemd sees the failure."""
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_pipeline, "send_telegram", mock_notify)
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model",
+                   side_effect=RuntimeError("kairos_strategies.py subprocess failed with code 1")):
+            with pytest.raises(RuntimeError, match="subprocess failed with code 1"):
+                run_stage_finetune_next(
+                    temp_db, ft_epochs=1, ft_batch_size=4,
+                    lock_path=str(tmp_path / "finetune_next.lock"),
+                )
+
+        row_id = temp_db.execute(
+            "SELECT id FROM finetuned_models WHERE assets=?", ("BTC-USD,ETH-USD",)
+        ).fetchone()[0]
+        status = temp_db.execute(
+            "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert status == "failed"
+
+        crash_messages = [c.args[0] for c in mock_notify.call_args_list if "💥" in c.args[0]]
+        assert len(crash_messages) == 1
+        assert "CRASHED" in crash_messages[0]
+        assert "RuntimeError" in crash_messages[0]
+        assert "BTC-USD,ETH-USD" in crash_messages[0]
+        assert f"id={row_id}" in crash_messages[0]
+        assert "subprocess failed with code 1" in crash_messages[0]
 
     def test_no_notification_for_dry_run(self, temp_db, tmp_path, monkeypatch):
         import kairos_pipeline

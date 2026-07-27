@@ -127,3 +127,73 @@ def test_no_as_of_preserves_existing_behavior(monkeypatch):
     raw = fetch_data_raw("BTC-USD", lookback=3)
 
     assert len(raw) == 10
+
+
+def _seed_local_prices_db(db_path, ticker="CRV-USD", start="2025-06-01", n_bars=20, interval_minutes=1440):
+    """Create a throwaway local price_cache-shaped SQLite DB with real rows for
+    `ticker`, mimicking the `prices` table fetch_price_data_local_fallback reads."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """CREATE TABLE prices (
+             ticker TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL,
+             volume REAL, dividends REAL, stock_splits REAL, market_cap REAL,
+             interval_minutes INTEGER
+        )"""
+    )
+    idx = pd.date_range(start, periods=n_bars, freq="D")
+    for i, d in enumerate(idx):
+        conn.execute(
+            "INSERT INTO prices VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (ticker, d.strftime("%Y-%m-%d"), 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i,
+             1000.0, 0.0, 0.0, None, interval_minutes),
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestFetchDataRawLocalSqliteFallback:
+    """price_cache can mark a ticker no-data after one failed remote fetch even
+    though its local prices table already has good history -- observed in
+    production: a finetune_next backtest crashed with "No price data returned
+    for CRV-USD" moments after that exact symbol's *training* fetch succeeded
+    via this same local-SQLite fallback earlier in the same run. fetch_data_raw
+    must fall back to reading the local prices table directly before giving up,
+    same as kairos/cli/finetune.py's training-data fetch already does."""
+
+    def test_falls_back_to_local_sqlite_when_price_cache_returns_none(self, tmp_path, monkeypatch, capsys):
+        import kairos_strategies
+
+        as_of = datetime(2026, 1, 5, 12, 0)
+        db_path = str(tmp_path / "prices.db")
+        # fetch_data_raw's fallback window ends at as_of and reaches back
+        # ~33 calendar days (lookback=3 + 30-day buffer, no weekend padding
+        # for a 24/7 crypto symbol) -- seed inside that window.
+        _seed_local_prices_db(db_path, ticker="CRV-USD", start="2025-12-10", n_bars=20)
+
+        monkeypatch.setattr(kairos_strategies.price_cache, "get_price_data", lambda *a, **k: None)
+        monkeypatch.setattr(kairos_strategies.price_cache, "DB_PATH", db_path)
+        monkeypatch.setattr(KairosSettings, "interval", "1d")
+
+        raw = fetch_data_raw("CRV-USD", lookback=3, as_of=as_of)
+
+        assert len(raw) == 20
+        assert "close" in raw.columns
+        assert "using direct local SQLite fallback" in capsys.readouterr().out
+
+    def test_raises_when_local_sqlite_also_has_no_data(self, tmp_path, monkeypatch):
+        import kairos_strategies
+
+        as_of = datetime(2026, 1, 5, 12, 0)
+        db_path = str(tmp_path / "empty_prices.db")
+        _seed_local_prices_db(db_path, ticker="SOME-OTHER-USD", start="2025-12-10", n_bars=5)
+
+        monkeypatch.setattr(kairos_strategies.price_cache, "get_price_data", lambda *a, **k: None)
+        monkeypatch.setattr(kairos_strategies.price_cache, "DB_PATH", db_path)
+        monkeypatch.setattr(KairosSettings, "interval", "1d")
+
+        try:
+            fetch_data_raw("CRV-USD", lookback=3, as_of=as_of)
+            assert False, "expected RuntimeError"
+        except RuntimeError as exc:
+            assert "No price data returned for CRV-USD" in str(exc)

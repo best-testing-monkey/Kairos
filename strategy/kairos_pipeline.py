@@ -41,6 +41,7 @@ import sqlite3
 import subprocess
 import sys as _sys
 import tempfile
+import traceback
 from datetime import datetime, date, timedelta
 
 import numpy as np
@@ -1126,10 +1127,9 @@ def _notify(text: str, enabled: bool = True) -> None:
     """Send a Telegram message, never letting a notification failure crash
     the caller.
 
-    Thin wrapper around kairos.ops.send_telegram mirroring the `_notify`
-    helper in scripts/kairos_idle_finetune.py: catches OpsError (missing
-    TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID credentials, or a Telegram API
-    failure) and prints a warning to stderr instead of raising. Credentials
+    Catches OpsError (missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+    credentials, or a Telegram API failure) and prints a warning to stderr
+    instead of raising. Credentials
     are read from the environment by kairos.ops.send_telegram itself - see
     .env.example (loaded from ~/.config/kairos/kairos.env in production) for
     the documented source. `enabled=False` is a silent no-op, used by
@@ -1137,11 +1137,20 @@ def _notify(text: str, enabled: bool = True) -> None:
 
     Currently only wired into --stage finetune_next; other strategy/ scripts
     can reuse this helper directly once they grow Telegram notifications too.
+
+    Sends with `parse_mode=None` (plain text): these messages embed dynamic,
+    uncontrolled content (asset symbols, stderr/traceback tails), and a
+    single unbalanced Markdown special character anywhere in that content --
+    including the literal underscore in "finetune_next" itself -- makes
+    Telegram's legacy Markdown parser reject the whole message with a 400
+    "can't parse entities" error (observed in production: the plain
+    "starting" message failed this way with no asset-name content to blame
+    at all). Plain text can never fail to parse.
     """
     if not enabled:
         return
     try:
-        send_telegram(text)
+        send_telegram(text, parse_mode=None)
     except OpsError as exc:
         print(f"[finetune_next] WARNING: Telegram notification failed: {exc}", file=sys.stderr)
 
@@ -1428,14 +1437,13 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
          crashed previous run - see _sweep_orphaned_training_finetunes) to
          'failed' before candidate selection.
       0.5. Unless dry_run or check_gpu_idle=False, check that the GPU is
-         actually idle (kairos.ops.is_gpu_idle, same mechanism
-         scripts/kairos_idle_finetune.py uses) before doing any real work. If
+         actually idle (kairos.ops.is_gpu_idle) before doing any real work. If
          the GPU is busy, print a message and return None immediately - no
          candidate selection, no registry writes. This only checks whether
          the *current* moment looks idle; the actual training/backtest
          subprocesses below additionally acquire the shared kairos.ops.GpuLock
-         (used by kairos_daily_signals.py and kairos_idle_finetune.py) so this
-         invocation still waits its turn (up to GpuLock's 5-minute timeout)
+         (used by kairos_daily_signals.py and kairos_weekly_discovery.py) so
+         this invocation still waits its turn (up to GpuLock's 5-minute timeout)
          rather than colliding with another Kairos GPU job that starts in the
          gap between this check and actually running.
       1. Select the top not-yet-finetuned candidate (select_finetune_candidate),
@@ -1482,18 +1490,22 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
     `lock_path` overrides the default REPO_ROOT/data/finetune_next.lock path
     (mainly for tests).
 
-    Telegram notifications (mirroring scripts/kairos_idle_finetune.py's
-    style/emoji conventions, via kairos.ops.send_telegram - credentials read
+    Telegram notifications (via kairos.ops.send_telegram - credentials read
     from the TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID environment variables, see
     .env.example / ~/.config/kairos/kairos.env) are sent at these points only:
       - training start, once a candidate is resolved and the GPU lock/health
         check has passed (🟢);
       - training subprocess failure, with a truncated stderr tail (❌);
       - the final accept (✅) or reject (⚠️) verdict, with the same
-        viable_count/mean_sharpe numbers printed to stdout.
+        viable_count/mean_sharpe numbers printed to stdout;
+      - any other unhandled exception after the row is registered (GPU
+        error, backtest-subprocess crash, comparison bug, ...) with a
+        truncated traceback tail (💥) -- the row is marked failed
+        immediately rather than left at status='training' for the next
+        invocation's orphan-sweep to find, and the exception is re-raised
+        so systemd/journald still record the failure.
     Skips (lock already held, GPU busy, no candidate found) and `dry_run`
-    stay silent - no notification is sent for any of them, matching
-    kairos_idle_finetune.py's default-silent-on-skip philosophy. Pass
+    stay silent - no notification is sent for any of them. Pass
     `notify=False` (`--no-telegram` on the CLI) to disable all notifications
     for this stage, e.g. for a quiet manual run without Telegram credentials
     configured. A Telegram outage or missing credentials never raises out of
@@ -1614,87 +1626,112 @@ def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
         with open(os.path.join(model_dir, "metadata.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-    # Both the training subprocess and the backtest below are GPU-bound, so
-    # hold the SHARED kairos.ops.GpuLock (not just this function's own
-    # finetune_next-instance lock) across both -- the same lock
-    # kairos_daily_signals.py and kairos_idle_finetune.py use -- so this
-    # invocation serializes against those other Kairos GPU jobs instead of
-    # running concurrently with them on the one GPU.
-    with GpuLock():
-        require_gpu(allow_recover=not no_gpu_recovery, allow_reboot=allow_reboot)
+    # Everything from here through the final verdict is wrapped in a
+    # catch-all: any unhandled exception (GPU error, backtest subprocess
+    # crash, comparison bug, ...) used to propagate straight out of this
+    # function, killing the process with only a stderr traceback and *no*
+    # Telegram notification at all -- the registry row was left stuck at
+    # status='training' until the *next* invocation's orphan-sweep noticed
+    # it, up to one full timer interval later. Observed in production: a
+    # training run completed fine but the post-training backtest subprocess
+    # crashed on a data-fetch error, and the only Telegram message anyone
+    # ever saw for that run was "starting". Catch, notify, mark the row
+    # failed immediately, then re-raise so systemd/journald still record the
+    # failure as before.
+    try:
+        # Both the training subprocess and the backtest below are GPU-bound,
+        # so hold the SHARED kairos.ops.GpuLock (not just this function's
+        # own finetune_next-instance lock) across both -- the same lock
+        # kairos_daily_signals.py and kairos_weekly_discovery.py use -- so
+        # this invocation serializes against those other Kairos GPU jobs
+        # instead of running concurrently with them on the one GPU.
+        with GpuLock():
+            require_gpu(allow_recover=not no_gpu_recovery, allow_reboot=allow_reboot)
 
+            _notify(
+                f"🟢 Kairos finetune_next starting: assets={assets_raw} interval={interval} "
+                f"backtest_period={backtest_period}",
+                enabled=notify,
+            )
+
+            proc = subprocess.run(train_cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+            print(proc.stdout)
+            if proc.returncode != 0:
+                print(proc.stderr)
+                update_finetune_registry_row(conn, row_id, status="failed")
+                _write_metadata({"status": "failed", "model_path": None})
+                stderr_tail = (proc.stderr or "")[-2000:]
+                _notify(
+                    f"❌ Kairos finetune_next FAILED (training subprocess exit "
+                    f"{proc.returncode}): assets={assets_raw} id={row_id}\n"
+                    f"```\n{stderr_tail}\n```",
+                    enabled=notify,
+                )
+                print(f"\n[finetune_next] VERDICT: FAILED (training subprocess exit "
+                      f"{proc.returncode}). id={row_id}. Model dir kept for post-mortem: {model_dir}")
+                return row_id
+
+            update_finetune_registry_row(conn, row_id, model_path=best_model_path)
+
+            ft_run_id = run_stage_model(
+                conn, stage="finetuned", assets=assets_list, interval=interval,
+                backtest_period=backtest_period, pred_samples=pred_samples,
+                model_path=best_model_path,
+            )
+
+        comparison = compare_finetuned_vs_base(
+            conn, assets_raw, interval, backtest_period, min_signals=min_signals,
+        )
+        status = "accepted" if comparison["accepted"] else "rejected"
+
+        update_finetune_registry_row(
+            conn, row_id, status=status,
+            base_run_id=comparison["base_run_id"], finetuned_run_id=ft_run_id,
+            base_viable_count=comparison["base_count"], ft_viable_count=comparison["ft_count"],
+            base_mean_sharpe=comparison["base_mean"], ft_mean_sharpe=comparison["ft_mean"],
+        )
+
+        _write_metadata({
+            "status": status, "model_path": best_model_path,
+            "base_run_id": comparison["base_run_id"], "finetuned_run_id": ft_run_id,
+            "base_viable_count": comparison["base_count"], "ft_viable_count": comparison["ft_count"],
+            "base_mean_sharpe": comparison["base_mean"], "ft_mean_sharpe": comparison["ft_mean"],
+        })
+
+        if not comparison["accepted"]:
+            open(os.path.join(model_dir, "REJECTED"), "w").close()
+
+        print(f"\n[finetune_next] VERDICT: {status.upper()}")
+        print(f"  assets={assets_raw} interval={interval} backtest_period={backtest_period}")
+        print(f"  base: viable_count={comparison['base_count']} mean_sharpe={comparison['base_mean']:.4f} "
+              f"(run_id={comparison['base_run_id']})")
+        print(f"  ft:   viable_count={comparison['ft_count']} mean_sharpe={comparison['ft_mean']:.4f} "
+              f"(run_id={comparison['ft_run_id']})")
+        print(f"  model_path={best_model_path}")
+        print(f"  registry id={row_id}")
+
+        verdict_emoji = "✅" if comparison["accepted"] else "⚠️"
         _notify(
-            f"🟢 Kairos finetune_next starting: assets={assets_raw} interval={interval} "
-            f"backtest_period={backtest_period}",
+            f"{verdict_emoji} Kairos finetune_next {status.upper()}: assets={assets_raw} "
+            f"interval={interval} base viable_count={comparison['base_count']} "
+            f"mean_sharpe={comparison['base_mean']:.4f} -> ft viable_count={comparison['ft_count']} "
+            f"mean_sharpe={comparison['ft_mean']:.4f}",
             enabled=notify,
         )
 
-        proc = subprocess.run(train_cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-        print(proc.stdout)
-        if proc.returncode != 0:
-            print(proc.stderr)
-            update_finetune_registry_row(conn, row_id, status="failed")
-            _write_metadata({"status": "failed", "model_path": None})
-            stderr_tail = (proc.stderr or "")[-2000:]
-            _notify(
-                f"❌ Kairos finetune_next FAILED (training subprocess exit "
-                f"{proc.returncode}): assets={assets_raw} id={row_id}\n"
-                f"```\n{stderr_tail}\n```",
-                enabled=notify,
-            )
-            print(f"\n[finetune_next] VERDICT: FAILED (training subprocess exit "
-                  f"{proc.returncode}). id={row_id}. Model dir kept for post-mortem: {model_dir}")
-            return row_id
-
-        update_finetune_registry_row(conn, row_id, model_path=best_model_path)
-
-        ft_run_id = run_stage_model(
-            conn, stage="finetuned", assets=assets_list, interval=interval,
-            backtest_period=backtest_period, pred_samples=pred_samples,
-            model_path=best_model_path,
+        return row_id
+    except Exception as exc:
+        tb_tail = traceback.format_exc()[-2000:]
+        update_finetune_registry_row(conn, row_id, status="failed")
+        _write_metadata({"status": "failed", "model_path": None, "error": str(exc)})
+        _notify(
+            f"💥 Kairos finetune_next CRASHED ({type(exc).__name__}): "
+            f"assets={assets_raw} id={row_id}\n```\n{tb_tail}\n```",
+            enabled=notify,
         )
-
-    comparison = compare_finetuned_vs_base(
-        conn, assets_raw, interval, backtest_period, min_signals=min_signals,
-    )
-    status = "accepted" if comparison["accepted"] else "rejected"
-
-    update_finetune_registry_row(
-        conn, row_id, status=status,
-        base_run_id=comparison["base_run_id"], finetuned_run_id=ft_run_id,
-        base_viable_count=comparison["base_count"], ft_viable_count=comparison["ft_count"],
-        base_mean_sharpe=comparison["base_mean"], ft_mean_sharpe=comparison["ft_mean"],
-    )
-
-    _write_metadata({
-        "status": status, "model_path": best_model_path,
-        "base_run_id": comparison["base_run_id"], "finetuned_run_id": ft_run_id,
-        "base_viable_count": comparison["base_count"], "ft_viable_count": comparison["ft_count"],
-        "base_mean_sharpe": comparison["base_mean"], "ft_mean_sharpe": comparison["ft_mean"],
-    })
-
-    if not comparison["accepted"]:
-        open(os.path.join(model_dir, "REJECTED"), "w").close()
-
-    print(f"\n[finetune_next] VERDICT: {status.upper()}")
-    print(f"  assets={assets_raw} interval={interval} backtest_period={backtest_period}")
-    print(f"  base: viable_count={comparison['base_count']} mean_sharpe={comparison['base_mean']:.4f} "
-          f"(run_id={comparison['base_run_id']})")
-    print(f"  ft:   viable_count={comparison['ft_count']} mean_sharpe={comparison['ft_mean']:.4f} "
-          f"(run_id={comparison['ft_run_id']})")
-    print(f"  model_path={best_model_path}")
-    print(f"  registry id={row_id}")
-
-    verdict_emoji = "✅" if comparison["accepted"] else "⚠️"
-    _notify(
-        f"{verdict_emoji} Kairos finetune_next {status.upper()}: assets={assets_raw} "
-        f"interval={interval} base viable_count={comparison['base_count']} "
-        f"mean_sharpe={comparison['base_mean']:.4f} -> ft viable_count={comparison['ft_count']} "
-        f"mean_sharpe={comparison['ft_mean']:.4f}",
-        enabled=notify,
-    )
-
-    return row_id
+        print(f"\n[finetune_next] VERDICT: CRASHED ({type(exc).__name__}: {exc}). "
+              f"id={row_id}. Model dir kept for post-mortem: {model_dir}", file=sys.stderr)
+        raise
 
 
 # ── Viability report ─────────────────────────────────────────────────────────

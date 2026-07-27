@@ -175,24 +175,23 @@ lock only ever prevents two `finetune_next` instances from clobbering each
 other's registry writes — it is separate from the GPU coordination below.
 
 `--stage finetune_next` also won't collide with `kairos_daily_signals.py` or
-`scripts/kairos_idle_finetune.py` for the actual GPU: before doing any real
+`kairos_weekly_discovery.py` for the actual GPU: before doing any real
 work it checks that `nvidia-smi` utilization has stayed below
 `--util-threshold` (default 10%) for 3 consecutive samples 10s apart
-(`kairos.ops.is_gpu_idle` — the same check `kairos_idle_finetune.py` uses),
-printing `GPU utilization at/above N% threshold; not starting a new training
-run this invocation` and returning if the GPU looks busy. Pass
-`--skip-idle-check` to bypass this for a manual run where you already know
-the GPU is free. Once past that check, the training subprocess and the
-subsequent backtest are both run inside the same shared `kairos.ops.GpuLock`
-(`/tmp/kairos_gpu.lock`) that `kairos_daily_signals.py` and
-`kairos_idle_finetune.py` hold during their own GPU work, so a `finetune_next`
-invocation that starts just as one of those begins waits its turn (up to
-`GpuLock`'s 5-minute timeout) instead of running concurrently on the one GPU.
-`--no-gpu-recovery`/`--allow-reboot` mirror `kairos_idle_finetune.py`'s own
-flags, forwarded to `require_gpu()`'s health check once the lock is held.
+(`kairos.ops.is_gpu_idle`), printing `GPU utilization at/above N% threshold;
+not starting a new training run this invocation` and returning if the GPU
+looks busy. Pass `--skip-idle-check` to bypass this for a manual run where
+you already know the GPU is free. Once past that check, the training
+subprocess and the subsequent backtest are both run inside the same shared
+`kairos.ops.GpuLock` (`/tmp/kairos_gpu.lock`) that `kairos_daily_signals.py`
+and `kairos_weekly_discovery.py` hold during their own GPU work, so a
+`finetune_next` invocation that starts just as one of those begins waits its
+turn (up to `GpuLock`'s 5-minute timeout) instead of running concurrently on
+the one GPU. `--no-gpu-recovery`/`--allow-reboot` are forwarded to
+`require_gpu()`'s health check once the lock is held.
 
 Note this shared lock is currently only honored by `kairos_daily_signals.py`,
-`kairos_idle_finetune.py`, and now `--stage finetune_next` — a manually-run
+`kairos_weekly_discovery.py`, and now `--stage finetune_next` — a manually-run
 `kairos_signals.py` or `kairos_papertrade.py` invocation does not acquire it,
 so it's still possible to collide with one of those on the GPU by hand.
 
@@ -205,10 +204,8 @@ profile already present in the registry under any status.
 
 ## Notifications
 
-`--stage finetune_next` sends Telegram alerts at four points, mirroring
-`scripts/kairos_idle_finetune.py`'s `_notify` helper and emoji conventions
-(via `kairos.ops.send_telegram`, the same primitive `kairos_idle_finetune.py`
-and `scripts/kairos_weekly_discovery.py` use — nothing new was built here):
+`--stage finetune_next` sends Telegram alerts (via `kairos.ops.send_telegram`,
+plain text — see below) at five points:
 
 - 🟢 **start** — once a candidate is resolved (auto-selected or manually
   supplied via `--assets`) and the GPU lock/health check has passed, right
@@ -218,20 +215,38 @@ and `scripts/kairos_weekly_discovery.py` use — nothing new was built here):
 - ✅ **accepted** / ⚠️ **rejected** — the final verdict, with the same
   `viable_count`/`mean_sharpe` numbers for base vs. finetuned printed to
   stdout.
+- 💥 **crashed** — any other unhandled exception once the row is registered
+  (GPU error, backtest-subprocess crash, comparison bug, ...), with a
+  truncated traceback tail. The row is marked `failed` immediately rather
+  than left at `status='training'` for the next invocation's orphan-sweep to
+  find, and the exception is re-raised so systemd/journald still record the
+  failure. Added after a production run's post-training backtest subprocess
+  crashed on a data-fetch error and no notification was ever sent for it —
+  the only message anyone saw was "start".
 
-Skips stay silent by design, matching `kairos_idle_finetune.py`'s
-default-silent-on-skip philosophy: another instance already holding the
+Skips stay silent by design: another instance already holding the
 `finetune_next` lock, the GPU looking busy, no candidate found, and
 `--dry_run` (which remains 100% side-effect free, notifications included)
 never send anything.
 
+All of the above are sent with `parse_mode=None` (plain text), not Markdown:
+these messages embed dynamic, uncontrolled content (asset symbols, stderr/
+traceback tails), and a single unbalanced Markdown special character anywhere
+in that content -- including the literal underscore in "finetune_next"
+itself -- makes Telegram's legacy Markdown parser reject the whole message
+with a 400 "can't parse entities" error (observed in production on a plain
+start message with no asset-name content to blame at all).
+
 Credentials are read from the `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`
 environment variables — see `.env.example` at the repo root, normally sourced
-from `~/.config/kairos/kairos.env`, the same source `kairos_idle_finetune.py`
-and `kairos_weekly_discovery.py` use. A Telegram outage or missing
-credentials never crashes the run: failures are caught and logged as a
-warning to stderr. Pass `--no-telegram` to turn off all notifications for a
-given invocation (e.g. a manual run without Telegram configured).
+from `~/.config/kairos/kairos.env`, the same source `kairos_daily_signals.py`
+and `kairos_weekly_discovery.py` use. Note that `--stage finetune_next` run
+directly (not via a systemd unit) does **not** source that file itself — see
+CLAUDE.md's "Telegram credentials aren't loaded for manual runs" gotcha. A
+Telegram outage or missing credentials never crashes the run: failures are
+caught and logged as a warning to stderr. Pass `--no-telegram` to turn off
+all notifications for a given invocation (e.g. a manual run without Telegram
+configured).
 
 ## Runtime expectations
 

@@ -28,7 +28,7 @@ warnings.filterwarnings('ignore')
 
 sys.path.append("../")
 import price_cache
-from kairos.data import get_forecast_window
+from kairos.data import get_forecast_window, fetch_price_data_local_fallback
 # model imports are deferred to _ensure_model_loaded() so --no-prediction
 # runs never touch HuggingFace Hub or trigger its auth warning.
 from typing import List
@@ -142,6 +142,16 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None, as_of=None) -> D
     end_str, start_str = end_dt.isoformat(), start_dt.isoformat()
 
     raw = price_cache.get_price_data(symbol, start_date=start_str, end_date=end_str, interval=interval)
+    if raw is None or raw.empty:
+        # price_cache marks a whole ticker as no-data in its no_data_tickers
+        # table after a single failed fetch (e.g. a keyless provider), which
+        # can hide data that is already sitting in the local prices table --
+        # observed in production: a finetune_next backtest crashed here for a
+        # symbol whose *training* fetch, moments earlier in the same run, had
+        # already succeeded via this exact fallback. Try it before giving up.
+        raw = fetch_price_data_local_fallback(symbol, start_dt, end_dt, interval, price_cache.DB_PATH)
+        if raw is not None and not raw.empty:
+            print(f"  [{symbol}] price_cache returned None; using direct local SQLite fallback")
     if raw is None or raw.empty:
         raise RuntimeError(f"No price data returned for {symbol}")
 

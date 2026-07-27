@@ -161,9 +161,8 @@ def is_gpu_idle(
     confirm the GPU is actually free. Returns as soon as one sample is over
     threshold, without waiting out the remaining samples.
 
-    Shared by scripts/kairos_idle_finetune.py and kairos_pipeline.py's
-    --stage finetune_next, so both the idle-triggered and manually-invoked
-    fine-tuning paths respect the same "don't start on a busy GPU" rule.
+    Used by kairos_pipeline.py's --stage finetune_next so it doesn't start
+    training on a busy GPU.
     """
     for i in range(samples):
         util = util_fn()
@@ -178,13 +177,20 @@ def send_telegram(
     text: str,
     bot_token: Optional[str] = None,
     chat_id: Optional[str] = None,
-    parse_mode: str = "Markdown",
+    parse_mode: Optional[str] = "Markdown",
 ) -> None:
     """Send a plain-text Telegram message using the Bot API.
 
     Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from the environment unless
     overridden. Raises OpsError if credentials are missing or the API call
     fails.
+
+    Pass `parse_mode=None` to send as plain text (the `parse_mode` field is
+    omitted from the request entirely, not sent as a JSON null): callers
+    embedding dynamic/uncontrolled content -- asset symbols, stderr tails,
+    tracebacks -- should do this, since a single unbalanced Markdown special
+    character anywhere in that content makes Telegram reject the whole
+    message with a 400 "can't parse entities" error.
     """
     bot_token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
@@ -197,9 +203,10 @@ def send_telegram(
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
         url,
