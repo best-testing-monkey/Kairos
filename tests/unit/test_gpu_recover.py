@@ -266,6 +266,109 @@ class TestEnsureCuda:
                     kairos_gpu.ensure_cuda(resume_cmd=["x.py"])
 
 
+class TestEnsureCudaTelegramNotifications:
+    """ensure_cuda() is the ONLY GPU-recovery path every Kairos script (incl.
+    kairos_papertrade.py's multi-hour runs, transitively via
+    model/kronos.py's _ensure_model_loaded()) goes through when CUDA drops
+    mid-run. Verify the three notification points fire on the right branch,
+    with the right emoji, and that a failing send_telegram (OpsError) never
+    propagates out of ensure_cuda()."""
+
+    def test_start_and_failure_notifications_fire(self, monkeypatch):
+        monkeypatch.delenv("KAIROS_ALLOW_CPU", raising=False)
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = False
+        fake_result = MagicMock()
+        fake_result.returncode = 2
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_gpu, "send_telegram", mock_notify)
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            with patch("subprocess.run", return_value=fake_result):
+                with pytest.raises(RuntimeError):
+                    kairos_gpu.ensure_cuda(resume_cmd=["my_script.py", "--foo"])
+
+        start_msgs = [c.args[0] for c in mock_notify.call_args_list if "🔧" in c.args[0]]
+        fail_msgs = [c.args[0] for c in mock_notify.call_args_list if "❌" in c.args[0]]
+        assert len(start_msgs) == 1
+        assert "starting" in start_msgs[0]
+        assert "my_script.py --foo" in start_msgs[0]
+        assert len(fail_msgs) == 1
+        assert "FAILED" in fail_msgs[0]
+        assert "exit 2" in fail_msgs[0]
+        assert "my_script.py --foo" in fail_msgs[0]
+        # Every call must use parse_mode=None (plain text).
+        for c in mock_notify.call_args_list:
+            assert c.kwargs.get("parse_mode") is None
+
+    def test_start_and_success_notifications_fire_on_exit_75(self, monkeypatch):
+        monkeypatch.delenv("KAIROS_ALLOW_CPU", raising=False)
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = False
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_gpu, "send_telegram", mock_notify)
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            with patch("subprocess.run", return_value=fake_result):
+                with pytest.raises(SystemExit) as exc_info:
+                    kairos_gpu.ensure_cuda(resume_cmd=["my_script.py"])
+
+        assert exc_info.value.code == 75
+        start_msgs = [c.args[0] for c in mock_notify.call_args_list if "🔧" in c.args[0]]
+        ok_msgs = [c.args[0] for c in mock_notify.call_args_list if "✅" in c.args[0]]
+        assert len(start_msgs) == 1
+        assert len(ok_msgs) == 1
+        assert "recovered" in ok_msgs[0]
+        assert "my_script.py" in ok_msgs[0]
+
+    def test_cuda_already_available_sends_no_notification(self, monkeypatch):
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = True
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_gpu, "send_telegram", mock_notify)
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            result = kairos_gpu.ensure_cuda()
+
+        assert result is True
+        mock_notify.assert_not_called()
+
+    def test_allow_cpu_sends_no_notification(self, monkeypatch):
+        monkeypatch.setenv("KAIROS_ALLOW_CPU", "1")
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = False
+        mock_notify = MagicMock()
+        monkeypatch.setattr(kairos_gpu, "send_telegram", mock_notify)
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            result = kairos_gpu.ensure_cuda()
+
+        assert result is False
+        mock_notify.assert_not_called()
+        monkeypatch.delenv("KAIROS_ALLOW_CPU", raising=False)
+
+    def test_ops_error_from_send_telegram_does_not_propagate(self, monkeypatch):
+        from kairos.ops import OpsError
+
+        monkeypatch.delenv("KAIROS_ALLOW_CPU", raising=False)
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = False
+        fake_result = MagicMock()
+        fake_result.returncode = 0
+        mock_notify = MagicMock(side_effect=OpsError("no creds"))
+        monkeypatch.setattr(kairos_gpu, "send_telegram", mock_notify)
+
+        with patch.dict(sys.modules, {"torch": fake_torch}):
+            with patch("subprocess.run", return_value=fake_result):
+                # Must still exit 75 -- the notification failure must not
+                # crash ensure_cuda() or change its own control flow.
+                with pytest.raises(SystemExit) as exc_info:
+                    kairos_gpu.ensure_cuda(resume_cmd=["x.py"])
+        assert exc_info.value.code == 75
+
+
 # ── kairos_pipeline retry-on-75 ──────────────────────────────────────────────
 
 import kairos_pipeline

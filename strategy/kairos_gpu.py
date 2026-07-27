@@ -16,10 +16,33 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from kairos.ops import OpsError, send_telegram
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GPU_RECOVER_SCRIPT = str(REPO_ROOT / "scripts" / "gpu_recover.py")
 
 EX_TEMPFAIL = 75
+
+
+def _notify(text: str) -> None:
+    """Send a Telegram message, never letting a notification failure crash
+    the caller.
+
+    Catches OpsError (missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+    credentials, or a Telegram API failure) and prints a warning to stderr
+    instead of raising. No `enabled` flag here -- ensure_cuda() is reached
+    from deep inside every Kairos script that loads the Kronos model (via
+    model/kronos.py's _ensure_model_loaded()), too deep a call chain to
+    thread a CLI flag through, so notification is always attempted and
+    silently degrades if credentials are missing. Sends with
+    `parse_mode=None` (plain text) -- see kairos_pipeline.py's `_notify` for
+    the full rationale (dynamic content can contain unbalanced Markdown
+    special characters that make Telegram reject the whole message).
+    """
+    try:
+        send_telegram(text, parse_mode=None)
+    except OpsError as exc:
+        print(f"[kairos_gpu] WARNING: Telegram notification failed: {exc}", file=sys.stderr)
 
 
 def cuda_available_fresh() -> bool:
@@ -55,10 +78,17 @@ def ensure_cuda(resume_cmd: Optional[List[str]] = None) -> bool:
     if os.environ.get("KAIROS_GPU_ALLOW_REBOOT") == "1":
         cmd.append("--allow-reboot")
 
+    caller_desc = ' '.join(resume) if resume else 'unknown'
+
     print(f"CUDA unavailable and KAIROS_ALLOW_CPU is not set; invoking recovery: {' '.join(cmd)}")
+    _notify(f"🔧 Kairos GPU recovery starting (caller: {caller_desc})")
     result = subprocess.run(cmd)
 
     if result.returncode != 0:
+        _notify(
+            f"❌ Kairos GPU recovery FAILED (exit {result.returncode}), KAIROS_ALLOW_CPU not "
+            f"set. Caller: {caller_desc}"
+        )
         raise RuntimeError(
             f"GPU recovery failed (exit {result.returncode}) and KAIROS_ALLOW_CPU is not set. "
             "Set KAIROS_ALLOW_CPU=1 to fall back to CPU, or resolve the GPU issue."
@@ -69,5 +99,9 @@ def ensure_cuda(resume_cmd: Optional[List[str]] = None) -> bool:
     print(
         "GPU recovered by scripts/gpu_recover.py, but this process's torch state is stale. "
         "Exiting with code 75 (EX_TEMPFAIL) so the caller can retry in a fresh process."
+    )
+    _notify(
+        f"✅ Kairos GPU recovered by scripts/gpu_recover.py; caller process retrying fresh. "
+        f"Caller: {caller_desc}"
     )
     sys.exit(EX_TEMPFAIL)

@@ -35,6 +35,8 @@ import json
 import os
 import re
 import sys
+import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -45,6 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kairos_signals import DB_PATH, RESULTS_DIR, _interval_to_timedelta
 import kairos_signals as _kairos_signals_mod
+from kairos.ops import OpsError, send_telegram
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PHANTOM_DATA_DIR = os.path.join(REPO_ROOT, "data", "phantom_ledger")
@@ -56,6 +59,12 @@ DEFAULT_PHANTOM_DATA_DIR = os.path.join(REPO_ROOT, "data", "phantom_ledger")
 # real options, so the ladder is 1m -> 15m -> 30m -> 1h -> 1d.
 _INTRADAY_FALLBACK_LADDER = ["1m", "15m", "30m", "1h"]
 
+# Watchdog threshold for per-iteration Telegram notifications during the
+# long-running report-generation and day-by-day backtest loops (a single
+# iteration/day taking this long is treated as an outlier worth a heads-up,
+# not a full every-iteration spam).
+_SLOW_ITERATION_THRESHOLD_SECONDS = 300.0
+
 # Mirrors the private `_configured`/`_ensure_configured` pattern in
 # phantom/data/yahoo.py (not importable -- it's private) so we only call
 # price_cache.configure() once per db_path.
@@ -66,6 +75,33 @@ def _ensure_configured_db(db_path: str) -> None:
     if db_path not in _configured_dbs:
         price_cache.configure(remote=False, local_mirror_path=db_path)
         _configured_dbs.add(db_path)
+
+
+def _notify(text: str, enabled: bool = True) -> None:
+    """Send a Telegram message, never letting a notification failure crash
+    the caller.
+
+    Catches OpsError (missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+    credentials, or a Telegram API failure) and prints a warning to stderr
+    instead of raising. Credentials are read from the environment by
+    kairos.ops.send_telegram itself -- see .env.example (loaded from
+    ~/.config/kairos/kairos.env in production) for the documented source.
+    `enabled=False` (--no-telegram on the CLI) is a silent no-op.
+
+    Sends with `parse_mode=None` (plain text): these messages embed dynamic,
+    uncontrolled content (asset symbols, stderr/traceback tails), and a
+    single unbalanced Markdown special character anywhere in that content --
+    including the literal underscore in "finetune_next" -- makes Telegram's
+    legacy Markdown parser reject the whole message with a 400 "can't parse
+    entities" error (see CLAUDE.md's "Telegram notifications" section).
+    Plain text can never fail to parse.
+    """
+    if not enabled:
+        return
+    try:
+        send_telegram(text, parse_mode=None)
+    except OpsError as exc:
+        print(f"[kairos_papertrade] WARNING: Telegram notification failed: {exc}", file=sys.stderr)
 
 
 class _IntradayFallbackProvider:
@@ -155,7 +191,7 @@ def parse_report_effective_dt(report_path):
     return datetime.strptime(m.group(1), "%Y-%m-%d %H%Mh")
 
 
-def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs):
+def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, notify: bool = True):
     """Generate a window of kairos_signals reports, stepping backward from
     `base_now`, and de-dupe by each report's true effective datetime.
 
@@ -167,6 +203,12 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs):
     (first-seen wins -- e.g. weekend/holiday reports that all resolve to the
     same last-closed-bar date).
 
+    Watchdog: times each `kairos_signals.run()` call. If a single call takes
+    longer than `_SLOW_ITERATION_THRESHOLD_SECONDS` (5 minutes), sends a
+    Telegram heads-up via `_notify` (enabled=`notify`) so a run that's stuck
+    or unusually slow (e.g. a finetuned-overlay pass) is visible without
+    spamming a message per iteration -- only outliers notify.
+
     Returns a list of (effective_dt, stats_rows, advice_rows) tuples, sorted
     oldest-first.
     """
@@ -177,9 +219,18 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs):
     seen = {}
     for i in range(n_iterations):
         iter_now = base_now - i * step
+        start_t = time.monotonic()
         out_path, stats_rows, advice_rows = _kairos_signals_mod.run(
             now=iter_now, intervals=[interval], return_rows=True, **run_kwargs
         )
+        elapsed = time.monotonic() - start_t
+        if elapsed > _SLOW_ITERATION_THRESHOLD_SECONDS:
+            _notify(
+                f"⏱️ Kairos papertrade: report {i + 1}/{n_iterations} "
+                f"(date {iter_now:%Y-%m-%d}) took {elapsed / 60:.1f}min (>5min) — "
+                f"still running",
+                enabled=notify,
+            )
         effective_dt = parse_report_effective_dt(out_path)
         if effective_dt not in seen:
             seen[effective_dt] = (effective_dt, stats_rows, advice_rows)
@@ -689,6 +740,37 @@ def _report_filename(end_dt, start_dt, interval, months_back, ext):
     )
 
 
+def _format_start_message(base_now, args) -> str:
+    """🟢 start-of-run notification text, sent right before the expensive
+    (potentially multi-hour) generate_and_dedupe_reports() call."""
+    return (
+        f"🟢 Kairos papertrade starting: window ending {base_now.strftime('%Y-%m-%d %H:%M')}, "
+        f"interval={args.interval}, months_back={args.months_back}, top_n={args.top_n}, "
+        f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}"
+    )
+
+
+def _format_finish_message(metrics: dict, report_filename: str) -> str:
+    """✅ success notification text, summarizing the final metrics dict
+    returned by compute_final_metrics()."""
+    return (
+        f"✅ Kairos papertrade finished: total_profit_eur="
+        f"{metrics.get('total_profit_eur', 0.0):.2f}, pct_profit="
+        f"{metrics.get('pct_profit', 0.0):.2f}%, sharpe={metrics.get('sharpe', 0.0):.2f}, "
+        f"num_trades={metrics.get('num_trades', 0)}. Report: {report_filename}"
+    )
+
+
+def _format_crash_message(exc: Exception, base_now, args) -> str:
+    """💥 unhandled-crash notification text, with a traceback tail."""
+    tb_tail = traceback.format_exc()[-2000:]
+    return (
+        f"💥 Kairos papertrade CRASHED ({type(exc).__name__}): window ending "
+        f"{base_now.strftime('%Y-%m-%d %H:%M')}, interval={args.interval}, "
+        f"months_back={args.months_back}\n```\n{tb_tail}\n```"
+    )
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser for main()."""
     parser = argparse.ArgumentParser(
@@ -714,6 +796,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effective_per", default=None,
                         help='Override "now" (end of window): \'YYYYMMDD [HHnn]\'')
     parser.add_argument("--account-name", dest="account_name", default=None)
+    parser.add_argument("--no-telegram", dest="notify", action="store_false",
+                         default=True,
+                         help="Disable Telegram notifications for this run (default: "
+                              "notifications enabled, sent via kairos.ops.send_telegram using "
+                              "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID from the environment - see "
+                              ".env.example)")
     return parser
 
 
@@ -726,142 +814,164 @@ def main(argv=None):
         now = datetime.strptime(args.effective_per, fmt)
     base_now = now if now is not None else datetime.now()
 
-    # PHANTOM_DATA must be set BEFORE `import phantom` so its DB/price-cache
-    # lookups land in an isolated directory, not Kairos's own data/ tree.
-    os.makedirs(args.phantom_data_dir, exist_ok=True)
-    os.environ["PHANTOM_DATA"] = args.phantom_data_dir
+    _notify(_format_start_message(base_now, args), enabled=args.notify)
 
-    import phantom as ph
-    from phantom.models.order import Order
-    from allocation import fetch_signals, allocate, AllocationConfig, load_cluster_map
+    try:
+        # PHANTOM_DATA must be set BEFORE `import phantom` so its DB/price-cache
+        # lookups land in an isolated directory, not Kairos's own data/ tree.
+        os.makedirs(args.phantom_data_dir, exist_ok=True)
+        os.environ["PHANTOM_DATA"] = args.phantom_data_dir
 
-    run_kwargs = dict(
-        db_path=args.db, out_dir=args.out,
-        min_ev_pct=args.min_ev_pct,
-        cluster_map_path=args.cluster_map,
-        base_only=args.base_only,
-    )
+        import phantom as ph
+        from phantom.models.order import Order
+        from allocation import fetch_signals, allocate, AllocationConfig, load_cluster_map
 
-    dated_rows = generate_and_dedupe_reports(base_now, args.interval, args.months_back, run_kwargs)
-    if not dated_rows:
-        raise RuntimeError("No kairos_signals reports were generated in the requested window.")
+        run_kwargs = dict(
+            db_path=args.db, out_dir=args.out,
+            min_ev_pct=args.min_ev_pct,
+            cluster_map_path=args.cluster_map,
+            base_only=args.base_only,
+        )
 
-    cluster_map = load_cluster_map(args.cluster_map) if args.cluster_map else {}
+        dated_rows = generate_and_dedupe_reports(
+            base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
+        )
+        if not dated_rows:
+            raise RuntimeError("No kairos_signals reports were generated in the requested window.")
 
-    client = ph.Phantom(data_dir=args.phantom_data_dir)
-    intraday_provider = _IntradayFallbackProvider(args.phantom_data_dir)
-    _ensure_broker_profile(client, args.broker)
-    account_name = args.account_name or f"kairos_papertrade_{base_now.strftime('%Y%m%d%H%M')}"
-    account = client.accounts.create(
-        name=account_name, account_type="algorithm", broker=args.broker,
-        capital=args.capital, currency="EUR", algorithm_id="kairos_papertrade",
-        algorithm_version=args.interval,
-    )
-    account_id = account.id
+        cluster_map = load_cluster_map(args.cluster_map) if args.cluster_map else {}
 
-    equity_curve = []
-    prev_candidates = None
-    for effective_dt, stats_rows, advice_rows in dated_rows:
-        if prev_candidates:
-            open_positions = client.positions.list(account_name=account_name, status="open")
-            open_tickers = {p.ticker for p in open_positions}
-            cash = client.accounts.get(account_id).cash
-            alloc_config = AllocationConfig(
-                top_k=args.top_n, gross_cap_pct=100, equity=cash, cluster_map=cluster_map,
-            )
-            enabled_mask = {c.ticker: (c.ticker not in open_tickers) for c in prev_candidates}
-            alloc_result = allocate(prev_candidates, alloc_config, enabled_mask=enabled_mask)
+        client = ph.Phantom(data_dir=args.phantom_data_dir)
+        intraday_provider = _IntradayFallbackProvider(args.phantom_data_dir)
+        _ensure_broker_profile(client, args.broker)
+        account_name = args.account_name or f"kairos_papertrade_{base_now.strftime('%Y%m%d%H%M')}"
+        account = client.accounts.create(
+            name=account_name, account_type="algorithm", broker=args.broker,
+            capital=args.capital, currency="EUR", algorithm_id="kairos_papertrade",
+            algorithm_version=args.interval,
+        )
+        account_id = account.id
 
-            for row in selected_rows(alloc_result):
-                entry = row.get("entry")
-                if not entry:
-                    continue
-                alloc_eur = row["alloc"] / 100.0 * cash
-                quantity = alloc_eur / entry
-                if quantity <= 0:
-                    continue
-                order = Order(
-                    account_id=account_id, ticker=row["ticker"],
-                    instrument_type=map_instrument_type(row),
-                    direction=row["direction"], order_type="market",
-                    quantity=quantity, take_profit=row.get("target"),
-                    stop_loss=row.get("stop"), created_at=effective_dt,
+        equity_curve = []
+        prev_candidates = None
+        for effective_dt, stats_rows, advice_rows in dated_rows:
+            if prev_candidates:
+                open_positions = client.positions.list(account_name=account_name, status="open")
+                open_tickers = {p.ticker for p in open_positions}
+                cash = client.accounts.get(account_id).cash
+                alloc_config = AllocationConfig(
+                    top_k=args.top_n, gross_cap_pct=100, equity=cash, cluster_map=cluster_map,
                 )
-                client.orders.place(account_id, order)
+                enabled_mask = {c.ticker: (c.ticker not in open_tickers) for c in prev_candidates}
+                alloc_result = allocate(prev_candidates, alloc_config, enabled_mask=enabled_mask)
 
-        all_open_tickers = {p.ticker for p in client.positions.list(account_name=account_name, status="open")}
-        new_tickers = {c.ticker for c in (prev_candidates or [])}
-        tickers = sorted(all_open_tickers | new_tickers)
-        if tickers:
-            # end must be the START OF THE NEXT DAY, not the same midnight,
-            # or the daily bar (timestamped ~04-05h UTC) gets filtered out
-            # by HistoricalProvider's `df.index <= end_ts` check and
-            # nothing fills/evaluates.
-            day_start = datetime(effective_dt.year, effective_dt.month, effective_dt.day)
-            day_end = day_start + timedelta(days=1)
-            try:
-                result = client.runner.backtest(
-                    account_id=account_id, tickers=tickers, start=day_start, end=day_end,
-                    data_provider=intraday_provider,
+                for row in selected_rows(alloc_result):
+                    entry = row.get("entry")
+                    if not entry:
+                        continue
+                    alloc_eur = row["alloc"] / 100.0 * cash
+                    quantity = alloc_eur / entry
+                    if quantity <= 0:
+                        continue
+                    order = Order(
+                        account_id=account_id, ticker=row["ticker"],
+                        instrument_type=map_instrument_type(row),
+                        direction=row["direction"], order_type="market",
+                        quantity=quantity, take_profit=row.get("target"),
+                        stop_loss=row.get("stop"), created_at=effective_dt,
+                    )
+                    client.orders.place(account_id, order)
+
+            all_open_tickers = {p.ticker for p in client.positions.list(account_name=account_name, status="open")}
+            new_tickers = {c.ticker for c in (prev_candidates or [])}
+            tickers = sorted(all_open_tickers | new_tickers)
+            if tickers:
+                # end must be the START OF THE NEXT DAY, not the same midnight,
+                # or the daily bar (timestamped ~04-05h UTC) gets filtered out
+                # by HistoricalProvider's `df.index <= end_ts` check and
+                # nothing fills/evaluates.
+                day_start = datetime(effective_dt.year, effective_dt.month, effective_dt.day)
+                day_end = day_start + timedelta(days=1)
+                backtest_start_t = time.monotonic()
+                try:
+                    result = client.runner.backtest(
+                        account_id=account_id, tickers=tickers, start=day_start, end=day_end,
+                        data_provider=intraday_provider,
+                    )
+                    equity_curve = result.equity_curve
+                except Exception as e:
+                    print(
+                        f"WARNING: runner.backtest failed for {effective_dt} "
+                        f"(tickers={tickers}): {e}", file=sys.stderr,
+                    )
+                finally:
+                    backtest_elapsed = time.monotonic() - backtest_start_t
+                    if backtest_elapsed > _SLOW_ITERATION_THRESHOLD_SECONDS:
+                        _notify(
+                            f"⏱️ Kairos papertrade: backtest for {effective_dt:%Y-%m-%d} "
+                            f"took {backtest_elapsed / 60:.1f}min (>5min) — still running",
+                            enabled=args.notify,
+                        )
+
+            prev_candidates = fetch_signals(stats_rows, advice_rows)
+
+        last_effective_dt = dated_rows[-1][0]
+        start_dt, end_dt = dated_rows[0][0], last_effective_dt
+        remove_all_open_positions(client, account_id, account_name)
+
+        # Reflect the window-end removal in our in-memory equity_curve for the
+        # HTML chart (no public API exposes a raw EquityPoint re-query;
+        # reconstruct in memory from the account's post-removal cash). Unlike
+        # the old force-close behavior, there's no "closed at price X" story
+        # here -- removed positions are refunded and simply excluded -- so this
+        # just appends the final actual cash as the chart's closing point.
+        final_cash = client.accounts.get(account_id).cash
+        if equity_curve:
+            from phantom.models.equity_point import EquityPoint as ModelEquityPoint
+            final_ts = last_effective_dt
+            if final_ts.tzinfo is None:
+                final_ts = final_ts.replace(tzinfo=timezone.utc)
+            equity_curve = list(equity_curve) + [
+                ModelEquityPoint(
+                    account_id=account_id,
+                    timestamp=final_ts.isoformat(),
+                    equity=final_cash, cash=final_cash, unrealized_pnl=0.0,
                 )
-                equity_curve = result.equity_curve
-            except Exception as e:
-                print(
-                    f"WARNING: runner.backtest failed for {effective_dt} "
-                    f"(tickers={tickers}): {e}", file=sys.stderr,
-                )
+            ]
 
-        prev_candidates = fetch_signals(stats_rows, advice_rows)
+        metrics = compute_final_metrics(
+            client, account_id, account_name, args.capital, start_dt=start_dt,
+        )
+        closed_positions = client.positions.list(account_name=account_name, status="closed")
 
-    last_effective_dt = dated_rows[-1][0]
-    start_dt, end_dt = dated_rows[0][0], last_effective_dt
-    remove_all_open_positions(client, account_id, account_name)
+        meta = {
+            "account_name": account_name,
+            "start": start_dt.isoformat(), "end": end_dt.isoformat(),
+            "interval": args.interval, "months_back": args.months_back,
+            "capital": args.capital, "currency": "EUR", "broker": args.broker,
+            "base_only": args.base_only, "top_n": args.top_n,
+            "num_days": len(dated_rows),
+        }
 
-    # Reflect the window-end removal in our in-memory equity_curve for the
-    # HTML chart (no public API exposes a raw EquityPoint re-query;
-    # reconstruct in memory from the account's post-removal cash). Unlike
-    # the old force-close behavior, there's no "closed at price X" story
-    # here -- removed positions are refunded and simply excluded -- so this
-    # just appends the final actual cash as the chart's closing point.
-    final_cash = client.accounts.get(account_id).cash
-    if equity_curve:
-        from phantom.models.equity_point import EquityPoint as ModelEquityPoint
-        final_ts = last_effective_dt
-        if final_ts.tzinfo is None:
-            final_ts = final_ts.replace(tzinfo=timezone.utc)
-        equity_curve = list(equity_curve) + [
-            ModelEquityPoint(
-                account_id=account_id,
-                timestamp=final_ts.isoformat(),
-                equity=final_cash, cash=final_cash, unrealized_pnl=0.0,
-            )
-        ]
+        os.makedirs(args.out, exist_ok=True)
+        json_path = os.path.join(args.out, _report_filename(end_dt, start_dt, args.interval, args.months_back, "json"))
+        write_json_report(metrics, meta, json_path)
+        print(json_path)
 
-    metrics = compute_final_metrics(
-        client, account_id, account_name, args.capital, start_dt=start_dt,
-    )
-    closed_positions = client.positions.list(account_name=account_name, status="closed")
+        if args.html:
+            html_path = os.path.join(args.out, _report_filename(end_dt, start_dt, args.interval, args.months_back, "html"))
+            write_html_report(equity_curve, closed_positions, metrics, meta, html_path)
+            print(html_path)
 
-    meta = {
-        "account_name": account_name,
-        "start": start_dt.isoformat(), "end": end_dt.isoformat(),
-        "interval": args.interval, "months_back": args.months_back,
-        "capital": args.capital, "currency": "EUR", "broker": args.broker,
-        "base_only": args.base_only, "top_n": args.top_n,
-        "num_days": len(dated_rows),
-    }
+        _notify(
+            _format_finish_message(metrics, os.path.basename(json_path)),
+            enabled=args.notify,
+        )
 
-    os.makedirs(args.out, exist_ok=True)
-    json_path = os.path.join(args.out, _report_filename(end_dt, start_dt, args.interval, args.months_back, "json"))
-    write_json_report(metrics, meta, json_path)
-    print(json_path)
-
-    if args.html:
-        html_path = os.path.join(args.out, _report_filename(end_dt, start_dt, args.interval, args.months_back, "html"))
-        write_html_report(equity_curve, closed_positions, metrics, meta, html_path)
-        print(html_path)
-
-    return metrics
+        return metrics
+    except Exception as exc:
+        _notify(_format_crash_message(exc, base_now, args), enabled=args.notify)
+        raise
 
 
 if __name__ == "__main__":

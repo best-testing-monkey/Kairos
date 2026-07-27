@@ -17,8 +17,13 @@ from kairos_papertrade import (
     _build_arg_parser,
     _IntradayFallbackProvider,
     _INTRADAY_FALLBACK_LADDER,
+    _notify,
+    _format_start_message,
+    _format_finish_message,
+    _format_crash_message,
 )
 import kairos_papertrade as kp
+from kairos.ops import OpsError
 
 
 # ============================================================================
@@ -113,6 +118,86 @@ class TestGenerateAndDedupeReports:
         base_now = datetime(2026, 7, 19, 0, 0)
         result = generate_and_dedupe_reports(base_now, "1d", months_back=0.0, run_kwargs={})
         assert result == []
+
+    def _fake_run_factory(self, tmp_path):
+        calls = []
+
+        def fake_run(now, intervals, return_rows, **kwargs):
+            calls.append(now)
+            report_path = tmp_path / f"report_{len(calls)}.md"
+            report_path.write_text(
+                f"# Kairos Signals Report {now:%Y-%m-%d} 0000h\n"
+            )
+            return str(report_path), [{"call": len(calls)}], [{"call": len(calls)}]
+
+        return calls, fake_run
+
+    def test_slow_iteration_sends_watchdog_notification(self, tmp_path, monkeypatch):
+        import kairos_papertrade as kp
+
+        calls, fake_run = self._fake_run_factory(tmp_path)
+        monkeypatch.setattr(kp._kairos_signals_mod, "run", fake_run)
+        mock_send = MagicMock()
+        monkeypatch.setattr(kp, "send_telegram", mock_send)
+
+        # Each iteration's elapsed = monotonic() (after call) - monotonic()
+        # (before call). Two monotonic() reads happen per loop iteration;
+        # feed pairs that are exactly 301s apart so every iteration is "slow".
+        times = iter(t for pair in ((0.0, 301.0), (301.0, 602.0), (602.0, 903.0))
+                      for t in pair)
+        monkeypatch.setattr(kp.time, "monotonic", lambda: next(times))
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        result = generate_and_dedupe_reports(
+            base_now, "1d", months_back=0.1, run_kwargs={}, notify=True,
+        )
+
+        assert len(calls) == 3
+        assert mock_send.call_count == 3
+        for c in mock_send.call_args_list:
+            msg = c.args[0]
+            assert msg.startswith("⏱️")
+            assert "5.0min" in msg
+            assert c.kwargs.get("parse_mode") is None
+
+    def test_fast_iteration_sends_no_watchdog_notification(self, tmp_path, monkeypatch):
+        import kairos_papertrade as kp
+
+        calls, fake_run = self._fake_run_factory(tmp_path)
+        monkeypatch.setattr(kp._kairos_signals_mod, "run", fake_run)
+        mock_send = MagicMock()
+        monkeypatch.setattr(kp, "send_telegram", mock_send)
+
+        # 1 second per iteration -- well under the 300s threshold.
+        times = iter(t for pair in ((0.0, 1.0), (1.0, 2.0), (2.0, 3.0)) for t in pair)
+        monkeypatch.setattr(kp.time, "monotonic", lambda: next(times))
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        result = generate_and_dedupe_reports(
+            base_now, "1d", months_back=0.1, run_kwargs={}, notify=True,
+        )
+
+        assert len(calls) == 3
+        mock_send.assert_not_called()
+
+    def test_slow_iteration_notification_suppressed_when_notify_false(self, tmp_path, monkeypatch):
+        import kairos_papertrade as kp
+
+        calls, fake_run = self._fake_run_factory(tmp_path)
+        monkeypatch.setattr(kp._kairos_signals_mod, "run", fake_run)
+        mock_send = MagicMock()
+        monkeypatch.setattr(kp, "send_telegram", mock_send)
+
+        times = iter(t for pair in ((0.0, 301.0), (301.0, 602.0), (602.0, 903.0))
+                      for t in pair)
+        monkeypatch.setattr(kp.time, "monotonic", lambda: next(times))
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        generate_and_dedupe_reports(
+            base_now, "1d", months_back=0.1, run_kwargs={}, notify=False,
+        )
+
+        mock_send.assert_not_called()
 
 
 # ============================================================================
@@ -331,3 +416,104 @@ class TestIntradayFallbackProvider:
         result = provider.get_dividends("AAPL", start, end)
         assert result == []
         provider._fallback.get_dividends.assert_called_once_with("AAPL", start, end)
+
+
+# ============================================================================
+# _notify (Telegram helper) and --no-telegram flag
+# ============================================================================
+
+class TestNotify:
+    def test_enabled_calls_send_telegram_with_plain_text(self, monkeypatch):
+        mock_send = MagicMock()
+        monkeypatch.setattr(kp, "send_telegram", mock_send)
+        _notify("hello", enabled=True)
+        mock_send.assert_called_once_with("hello", parse_mode=None)
+
+    def test_disabled_is_a_silent_noop(self, monkeypatch):
+        mock_send = MagicMock()
+        monkeypatch.setattr(kp, "send_telegram", mock_send)
+        _notify("hello", enabled=False)
+        mock_send.assert_not_called()
+
+    def test_ops_error_is_swallowed_not_raised(self, monkeypatch):
+        mock_send = MagicMock(side_effect=OpsError("no creds"))
+        monkeypatch.setattr(kp, "send_telegram", mock_send)
+        # Must not raise.
+        _notify("hello", enabled=True)
+        mock_send.assert_called_once()
+
+    def test_default_enabled_is_true(self, monkeypatch):
+        mock_send = MagicMock()
+        monkeypatch.setattr(kp, "send_telegram", mock_send)
+        _notify("hello")
+        mock_send.assert_called_once_with("hello", parse_mode=None)
+
+
+class TestNoTelegramFlag:
+    def test_notify_defaults_true(self):
+        args = _build_arg_parser().parse_args([])
+        assert args.notify is True
+
+    def test_no_telegram_sets_notify_false(self):
+        args = _build_arg_parser().parse_args(["--no-telegram"])
+        assert args.notify is False
+
+
+# ============================================================================
+# Message formatting helpers
+# ============================================================================
+
+class TestFormatStartMessage:
+    def test_contains_emoji_and_key_params(self):
+        args = _build_arg_parser().parse_args(
+            ["--interval", "1d", "--months-back", "3", "--top-n", "5",
+             "--capital", "500", "--broker", "IBKR"]
+        )
+        base_now = datetime(2026, 7, 27, 12, 30)
+        msg = _format_start_message(base_now, args)
+        assert msg.startswith("🟢")
+        assert "starting" in msg
+        assert "2026-07-27 12:30" in msg
+        assert "interval=1d" in msg
+        assert "months_back=3.0" in msg
+        assert "top_n=5" in msg
+        assert "capital=500.0" in msg
+        assert "broker=IBKR" in msg
+
+
+class TestFormatFinishMessage:
+    def test_contains_emoji_and_rounded_metrics(self):
+        metrics = {
+            "total_profit_eur": 12.3456,
+            "pct_profit": 6.789,
+            "pct_profit_per_trade": 1.5,
+            "pct_max_drawdown": 3.2,
+            "sharpe": 0.812345,
+            "num_trades": 7,
+        }
+        msg = _format_finish_message(metrics, "kairos_signals_papertrade_x.json")
+        assert msg.startswith("✅")
+        assert "finished" in msg
+        assert "12.35" in msg
+        assert "6.79" in msg
+        assert "0.81" in msg
+        assert "num_trades=7" in msg
+        assert "kairos_signals_papertrade_x.json" in msg
+        # Must not leak a full path -- caller passes os.path.basename already.
+        assert "/" not in msg.split("Report: ")[1]
+
+
+class TestFormatCrashMessage:
+    def test_contains_emoji_exception_type_and_traceback_tail(self):
+        args = _build_arg_parser().parse_args(["--interval", "1h"])
+        base_now = datetime(2026, 7, 27, 8, 0)
+        try:
+            raise ValueError("boom")
+        except ValueError as exc:
+            msg = _format_crash_message(exc, base_now, args)
+        assert msg.startswith("💥")
+        assert "CRASHED" in msg
+        assert "ValueError" in msg
+        assert "interval=1h" in msg
+        assert "boom" in msg
+        assert "```" in msg
