@@ -1229,7 +1229,10 @@ def compute_finetune_periods(backtest_period: str, interval: str, now=None) -> d
     }
 
 
-def select_finetune_candidate(conn, min_signals=3):
+FINETUNE_PRIORITY_TICKERS = {"LDO-USD", "AAVE-USD", "FIL-USD", "ATOM-USD", "XTZ-USD", "AXS-USD"}
+
+
+def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priority_min_signals=1):
     """
     Select the top-ranked (assets, interval, backtest_period) profile for
     automated finetuning.
@@ -1246,6 +1249,16 @@ def select_finetune_candidate(conn, min_signals=3):
         rejected/failed profiles are excluded permanently; manual re-queue
         (run_stage_finetune_next with explicit assets/interval) is the only
         way to retry one.
+
+    `priority_assets`, if given (a set/collection of ticker strings), selects
+    among profiles that include any of those tickers using the same
+    already_registered/base_exists gates but a more lenient viable-bar of
+    signal_count >= priority_min_signals (default 1) instead of min_signals.
+    If any priority profile qualifies, the top-ranked one (by the same
+    (viable_count, mean_sharpe) sort) is returned outright, regardless of how
+    it compares to the standard ranking. If priority_assets is None (default)
+    or no priority profile qualifies, falls back to the standard ranking -
+    fully backward compatible with the no-argument call.
 
     Returns a dict {assets_raw, assets_sorted, interval, backtest_period,
     viable_count, mean_sharpe} for the top candidate, or None if none qualify.
@@ -1301,8 +1314,42 @@ def select_finetune_candidate(conn, min_signals=3):
             "mean_sharpe": float(np.mean(viable)) if viable else 0.0,
         })
 
-    if not candidates:
+    priority_candidates = []
+    if priority_assets:
+        for (assets, interval, backtest_period), strat_rows in profiles.items():
+            assets_sorted = ",".join(sorted(assets.split(",")))
+            if assets_sorted in already_registered:
+                continue
+            if not (set(assets.split(",")) & set(priority_assets)):
+                continue
+
+            base_exists = conn.execute(
+                "SELECT 1 FROM model_results WHERE assets=? AND interval=? "
+                "AND backtest_period=? AND stage='base' LIMIT 1",
+                (assets, interval, backtest_period),
+            ).fetchone()
+            if not base_exists:
+                continue
+
+            viable = [
+                s for s, n in strat_rows
+                if s is not None and s > 0 and (n or 0) >= priority_min_signals
+            ]
+            priority_candidates.append({
+                "assets_raw": assets,
+                "assets_sorted": assets_sorted,
+                "interval": interval,
+                "backtest_period": backtest_period,
+                "viable_count": len(viable),
+                "mean_sharpe": float(np.mean(viable)) if viable else 0.0,
+            })
+
+    if not candidates and not priority_candidates:
         return None
+
+    if priority_candidates:
+        priority_candidates.sort(key=lambda c: (c["viable_count"], c["mean_sharpe"]), reverse=True)
+        return priority_candidates[0]
 
     candidates.sort(key=lambda c: (c["viable_count"], c["mean_sharpe"]), reverse=True)
     return candidates[0]
@@ -1544,7 +1591,9 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
                 "mean_sharpe": None,
             }
         else:
-            candidate = select_finetune_candidate(conn, min_signals=min_signals)
+            candidate = select_finetune_candidate(
+                conn, min_signals=min_signals, priority_assets=FINETUNE_PRIORITY_TICKERS
+            )
             if candidate is None:
                 print("[finetune_next] no candidates found (no unregistered profile with "
                       "both oracle data and an existing base run).")

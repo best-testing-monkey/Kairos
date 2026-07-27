@@ -2438,6 +2438,65 @@ class TestSelectFinetuneCandidate:
     def test_empty_db_returns_none(self, temp_db):
         assert select_finetune_candidate(temp_db) is None
 
+    def test_priority_ticker_wins_over_higher_ranked_standard_candidate(self, temp_db):
+        # Standard top candidate: 2 viable strategies, no priority ticker.
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s2", 0.5, 5)
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+
+        # Priority profile: only 1 viable strategy, but includes AAVE-USD.
+        _insert_oracle_strategy(temp_db, "AAVE-USD,SOL-USD", "1d", "6m", "s1", 2.0, 10)
+        _insert_base_strategy(temp_db, "AAVE-USD,SOL-USD", "1d", "6m", "s1", 2.0, 10)
+
+        candidate = select_finetune_candidate(temp_db, priority_assets={"AAVE-USD"})
+        assert candidate is not None
+        assert candidate["assets_raw"] == "AAVE-USD,SOL-USD"
+
+    def test_priority_ticker_qualifies_only_at_priority_min_signals(self, temp_db):
+        # Priority profile has only 1 signal - below the default min_signals=3,
+        # so it would not appear as a standard candidate at all.
+        _insert_oracle_strategy(temp_db, "AAVE-USD,SOL-USD", "1d", "6m", "s1", 2.0, 1)
+        _insert_base_strategy(temp_db, "AAVE-USD,SOL-USD", "1d", "6m", "s1", 2.0, 1)
+
+        # Confirm it's absent from the standard ranking at min_signals=3.
+        standard_only = select_finetune_candidate(temp_db)
+        assert standard_only is not None
+        assert standard_only["viable_count"] == 0
+
+        candidate = select_finetune_candidate(temp_db, priority_assets={"AAVE-USD"})
+        assert candidate is not None
+        assert candidate["assets_raw"] == "AAVE-USD,SOL-USD"
+        assert candidate["viable_count"] == 1
+
+    def test_priority_assets_no_match_falls_back_to_standard_ranking(self, temp_db):
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s2", 0.5, 5)
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+
+        _insert_oracle_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 2.0, 10)
+        _insert_base_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 2.0, 10)
+
+        # No profile contains any priority ticker.
+        candidate = select_finetune_candidate(temp_db, priority_assets={"AAVE-USD"})
+        assert candidate is not None
+        assert candidate["assets_raw"] == "BTC-USD,ETH-USD"
+        assert candidate["viable_count"] == 2
+
+    def test_priority_assets_none_behaves_identically_to_before(self, temp_db):
+        # Same setup/assertions as test_ranks_by_viable_count_desc, confirming
+        # the default (priority_assets=None) path is untouched.
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s2", 0.5, 5)
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 1.0, 10)
+
+        _insert_oracle_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 2.0, 10)
+        _insert_base_strategy(temp_db, "SOL-USD,ADA-USD", "1d", "6m", "s1", 2.0, 10)
+
+        candidate = select_finetune_candidate(temp_db, priority_assets=None)
+        assert candidate is not None
+        assert candidate["assets_raw"] == "BTC-USD,ETH-USD"
+        assert candidate["viable_count"] == 2
+
 
 class TestCompareFinetunedVsBase:
     """Accept-gate semantics: ft_count > base_count, or tie broken by mean sharpe."""
@@ -2809,6 +2868,28 @@ class TestRunStageFinetuneNextLockingAndOrphanSweep:
             "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
         ).fetchone()[0]
         assert status == "failed"
+
+    def test_automatic_path_passes_priority_assets(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+
+        calls = []
+
+        def _capture(*args, **kwargs):
+            calls.append(kwargs)
+            return None
+
+        monkeypatch.setattr(kairos_pipeline, "select_finetune_candidate", _capture)
+
+        result = run_stage_finetune_next(
+            temp_db, lock_path=self._lock_path(tmp_path),
+        )
+
+        assert result is None
+        assert len(calls) == 1
+        assert calls[0].get("priority_assets") == kairos_pipeline.FINETUNE_PRIORITY_TICKERS
 
     def test_dry_run_creates_no_lock_file_and_skips_sweep(
         self, temp_db, tmp_path, monkeypatch
