@@ -3,7 +3,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy
 
 import json
 from datetime import datetime
+from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 from kairos_papertrade import (
@@ -12,7 +14,11 @@ from kairos_papertrade import (
     map_instrument_type,
     compute_pct_profit_per_trade,
     write_json_report,
+    _build_arg_parser,
+    _IntradayFallbackProvider,
+    _INTRADAY_FALLBACK_LADDER,
 )
+import kairos_papertrade as kp
 
 
 # ============================================================================
@@ -212,3 +218,116 @@ class TestWriteJsonReport:
         out_path = tmp_path / "nested" / "dir" / "report.json"
         write_json_report({"num_trades": 0}, {}, out_path)
         assert out_path.exists()
+
+
+# ============================================================================
+# _build_arg_parser
+# ============================================================================
+
+class TestBuildArgParser:
+    def test_min_ev_pct_default_is_015(self):
+        # Verify that the --min_ev_pct default matches the measured realized
+        # cost, per docs/papertrade_loss_analysis.md Factor 7.
+        args = _build_arg_parser().parse_args([])
+        assert args.min_ev_pct == 0.15
+
+
+# ============================================================================
+# _IntradayFallbackProvider
+# ============================================================================
+
+def _make_bars_df(hour_utc_naive_ny=10):
+    # A single bar timestamped mid-day in naive America/New_York local time,
+    # matching what price_cache.get_price_data returns before the
+    # tz-localize/convert post-processing in get_bars().
+    idx = pd.DatetimeIndex([datetime(2026, 7, 20, hour_utc_naive_ny, 0)])
+    return pd.DataFrame(
+        {
+            "Open": [100.0], "High": [101.0], "Low": [99.0],
+            "Close": [100.5], "Volume": [1000],
+        },
+        index=idx,
+    )
+
+
+class TestIntradayFallbackProvider:
+    def test_first_ladder_interval_returned_directly_single_call(self, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_get_price_data(ticker, start_date, end_date, interval="1d", db_path=None):
+            calls.append(interval)
+            return _make_bars_df()
+
+        monkeypatch.setattr(kp.price_cache, "get_price_data", fake_get_price_data)
+        monkeypatch.setattr(kp.price_cache, "configure", lambda **kw: None)
+
+        provider = _IntradayFallbackProvider(str(tmp_path))
+        start = datetime(2026, 7, 20)
+        end = datetime(2026, 7, 21)
+        result = provider.get_bars("AAPL", start, end)
+
+        assert calls == ["1m"]
+        assert list(result.columns) == ["Open", "High", "Low", "Close", "Volume"]
+        assert str(result.index.tz) == "UTC"
+        assert len(result) == 1
+        assert result["Close"].iloc[0] == pytest.approx(100.5)
+
+    def test_falls_through_ladder_to_first_interval_with_data(self, tmp_path, monkeypatch):
+        calls = []
+
+        def fake_get_price_data(ticker, start_date, end_date, interval="1d", db_path=None):
+            calls.append(interval)
+            if interval == "1h":
+                return _make_bars_df()
+            return None
+
+        monkeypatch.setattr(kp.price_cache, "get_price_data", fake_get_price_data)
+        monkeypatch.setattr(kp.price_cache, "configure", lambda **kw: None)
+
+        provider = _IntradayFallbackProvider(str(tmp_path))
+        start = datetime(2026, 7, 20)
+        end = datetime(2026, 7, 21)
+        result = provider.get_bars("AAPL", start, end)
+
+        assert calls == _INTRADAY_FALLBACK_LADDER  # walked the full ladder in order
+        assert len(result) == 1
+        assert result["Close"].iloc[0] == pytest.approx(100.5)
+
+    def test_all_intraday_empty_delegates_to_fallback_1d(self, tmp_path, monkeypatch):
+        def fake_get_price_data(ticker, start_date, end_date, interval="1d", db_path=None):
+            return None  # every intraday interval comes back empty
+
+        monkeypatch.setattr(kp.price_cache, "get_price_data", fake_get_price_data)
+        monkeypatch.setattr(kp.price_cache, "configure", lambda **kw: None)
+
+        provider = _IntradayFallbackProvider(str(tmp_path))
+        sentinel = pd.DataFrame({"Open": [1.0]})
+        provider._fallback.get_bars = MagicMock(return_value=sentinel)
+
+        start = datetime(2026, 7, 20)
+        end = datetime(2026, 7, 21)
+        result = provider.get_bars("AAPL", start, end)
+
+        provider._fallback.get_bars.assert_called_once_with("AAPL", start, end)
+        assert result is sentinel
+
+    def test_get_current_price_delegates_to_fallback(self, tmp_path):
+        provider = _IntradayFallbackProvider(str(tmp_path))
+        provider._fallback.get_current_price = MagicMock(return_value=42.0)
+        assert provider.get_current_price("AAPL") == 42.0
+        provider._fallback.get_current_price.assert_called_once_with("AAPL")
+
+    def test_get_bid_ask_delegates_to_fallback(self, tmp_path):
+        provider = _IntradayFallbackProvider(str(tmp_path))
+        provider._fallback.get_bid_ask = MagicMock(return_value=(99.5, 100.5))
+        assert provider.get_bid_ask("AAPL") == (99.5, 100.5)
+        provider._fallback.get_bid_ask.assert_called_once_with("AAPL")
+
+    def test_get_dividends_delegates_to_fallback(self, tmp_path):
+        provider = _IntradayFallbackProvider(str(tmp_path))
+        start = datetime(2026, 7, 1)
+        end = datetime(2026, 7, 31)
+        provider._fallback.get_dividends = MagicMock(return_value=[])
+        result = provider.get_dividends("AAPL", start, end)
+        assert result == []
+        provider._fallback.get_dividends.assert_called_once_with("AAPL", start, end)

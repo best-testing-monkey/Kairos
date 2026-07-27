@@ -38,6 +38,9 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
+import price_cache
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kairos_signals import DB_PATH, RESULTS_DIR, _interval_to_timedelta
@@ -45,6 +48,83 @@ import kairos_signals as _kairos_signals_mod
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PHANTOM_DATA_DIR = os.path.join(REPO_ROOT, "data", "phantom_ledger")
+
+# Finest-to-coarsest intraday intervals to try, in order, before falling
+# back to phantom's own daily ("1d") behavior. 3h/12h were requested but
+# price_cache/yfinance-style intervals don't support them (kairos/data.py's
+# `_SUPPORTED_INTERVALS` has no 3h/12h entry) -- only 1m/15m/30m/1h/1d are
+# real options, so the ladder is 1m -> 15m -> 30m -> 1h -> 1d.
+_INTRADAY_FALLBACK_LADDER = ["1m", "15m", "30m", "1h"]
+
+# Mirrors the private `_configured`/`_ensure_configured` pattern in
+# phantom/data/yahoo.py (not importable -- it's private) so we only call
+# price_cache.configure() once per db_path.
+_configured_dbs: set[str] = set()
+
+
+def _ensure_configured_db(db_path: str) -> None:
+    if db_path not in _configured_dbs:
+        price_cache.configure(remote=False, local_mirror_path=db_path)
+        _configured_dbs.add(db_path)
+
+
+class _IntradayFallbackProvider:
+    """Wraps phantom's HistoricalProvider, trying finer intervals first for
+    get_bars() so order fills/TP/SL evaluate against real intraday bars
+    when available, falling back to phantom's own daily behavior otherwise.
+    Only affects fill/TP/SL evaluation inside runner.backtest() -- report
+    generation cadence (--interval) is untouched."""
+
+    def __init__(self, data_dir):
+        from phantom.data.yahoo import HistoricalProvider
+
+        self._fallback = HistoricalProvider(data_dir)
+        self._db_path = str(Path(data_dir) / "yfd_prices.db")
+
+    def get_bars(self, ticker, start, end) -> pd.DataFrame:
+        _ensure_configured_db(self._db_path)
+        for interval in _INTRADAY_FALLBACK_LADDER:
+            try:
+                df = price_cache.get_price_data(
+                    ticker,
+                    start.strftime("%Y-%m-%d"),
+                    end.strftime("%Y-%m-%d"),
+                    interval=interval,
+                    db_path=self._db_path,
+                )
+            except Exception as exc:
+                print(
+                    f"WARNING: intraday fetch failed for {ticker} at "
+                    f"interval={interval}: {exc}", file=sys.stderr,
+                )
+                continue
+
+            if df is None or df.empty:
+                continue
+
+            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("America/New_York")
+            df.index = df.index.tz_convert("UTC")
+
+            start_ts = pd.Timestamp(start, tz="UTC")
+            end_ts = pd.Timestamp(end, tz="UTC")
+            sliced = df.loc[(df.index >= start_ts) & (df.index <= end_ts)]
+            if not sliced.empty:
+                return sliced
+            # Empty after slicing to [start, end] -- try the next, coarser
+            # interval rather than returning an empty frame early.
+
+        return self._fallback.get_bars(ticker, start, end)
+
+    def get_current_price(self, ticker):
+        return self._fallback.get_current_price(ticker)
+
+    def get_bid_ask(self, ticker):
+        return self._fallback.get_bid_ask(ticker)
+
+    def get_dividends(self, ticker, start, end):
+        return self._fallback.get_dividends(ticker, start, end)
 
 
 # =============================================================================
@@ -609,7 +689,8 @@ def _report_filename(end_dt, start_dt, interval, months_back, ext):
     )
 
 
-def main(argv=None):
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser for main()."""
     parser = argparse.ArgumentParser(
         description="Paper-trade Kairos signals through Phantom Ledger (roadmap Phase 4.1)"
     )
@@ -624,7 +705,8 @@ def main(argv=None):
                         help="Skip the accepted-finetuned overlay pass and use only the base model (default: off — finetuned overlay is used when an accepted model exists)")
     parser.add_argument("--include-finetuned", dest="base_only", action="store_false",
                         help="Include the accepted-finetuned overlay pass (default: on)")
-    parser.add_argument("--min_ev_pct", type=float, default=0.10)
+    # Matches the measured realized cost per docs/papertrade_loss_analysis.md Factor 7
+    parser.add_argument("--min_ev_pct", type=float, default=0.15)
     parser.add_argument("--cluster_map", default=None)
     parser.add_argument("--phantom-data-dir", dest="phantom_data_dir",
                         default=DEFAULT_PHANTOM_DATA_DIR)
@@ -632,7 +714,11 @@ def main(argv=None):
     parser.add_argument("--effective_per", default=None,
                         help='Override "now" (end of window): \'YYYYMMDD [HHnn]\'')
     parser.add_argument("--account-name", dest="account_name", default=None)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    args = _build_arg_parser().parse_args(argv)
 
     now = None
     if args.effective_per is not None:
@@ -663,6 +749,7 @@ def main(argv=None):
     cluster_map = load_cluster_map(args.cluster_map) if args.cluster_map else {}
 
     client = ph.Phantom(data_dir=args.phantom_data_dir)
+    intraday_provider = _IntradayFallbackProvider(args.phantom_data_dir)
     _ensure_broker_profile(client, args.broker)
     account_name = args.account_name or f"kairos_papertrade_{base_now.strftime('%Y%m%d%H%M')}"
     account = client.accounts.create(
@@ -715,6 +802,7 @@ def main(argv=None):
             try:
                 result = client.runner.backtest(
                     account_id=account_id, tickers=tickers, start=day_start, end=day_end,
+                    data_provider=intraday_provider,
                 )
                 equity_curve = result.equity_curve
             except Exception as e:
