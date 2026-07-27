@@ -85,7 +85,23 @@ process still can't see it (torch caches CUDA init state), the process exits
 subprocess exactly once. Run `uv run scripts/gpu_recover.py --check-only` to
 probe without side effects, or `--dry-run` to preview the full ladder.
 
-### Telegram credentials aren't loaded for manual runs
+### Telegram notifications
+Only two things send Telegram alerts: `strategy/kairos_pipeline.py --stage
+finetune_next` (via the module-level `_notify` helper — 🟢 start, ❌ training
+failure, ✅/⚠️ accept/reject verdict, 💥 any other unhandled crash after the
+row is registered) and the two standalone wrapper scripts
+`scripts/kairos_daily_signals.py`/`scripts/kairos_weekly_discovery.py` (their
+own actionable-signal/failure/summary alerts). No other `--stage` of
+`kairos_pipeline.py` sends anything — that's by design, not a bug, if you go
+looking for a notification from `universe`/`correlation`/`oracle`/`base`/
+`finetuned`. All of these send with `parse_mode=None` (plain text): dynamic
+content (asset symbols, stderr/traceback tails) can contain an unbalanced
+Markdown special character — including the literal underscore in
+"finetune_next" itself, which alone broke a plain "starting" message in
+production — and Telegram's legacy Markdown parser rejects the *whole*
+message over a single one. See `docs/playbooks/model-finetuning.md`'s
+"Notifications" section for the full per-message-type contract.
+
 `kairos.ops.send_telegram()` reads `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` from
 `os.environ` — it never reads `~/.config/kairos/kairos.env` itself. Only the
 systemd units (`systemd/*.service`, via `EnvironmentFile=-%h/.config/kairos/kairos.env`)
