@@ -494,14 +494,23 @@ it spawns; `strategy/kairos_predcache.py` implements a disk-backed cache
 (one `.npz` file per key, so it survives across subprocess boundaries) with
 an in-memory LRU on top bounded by a fraction of `/proc/meminfo`'s
 `MemAvailable`. The cache key is `(symbol, interval, bar_timestamp,
-lookback_len, pred_samples, model_id, content_hash)`, where `content_hash`
-is a cheap hash of the lookback window's close prices - so a different or
-stale input window for the "same" symbol/bar never collides with an
-existing cache entry. The cache directory is deleted (`shutil.rmtree`) when
-the auto run finishes, success or failure. Single-stage invocations (e.g.
-`--stage base` on its own) never set `KAIROS_PRED_CACHE_DIR`, so behavior is
-unchanged when caching isn't in play. The oracle stage (`--no-prediction`)
-never calls the prediction path at all, so it is unaffected either way.
+lookback_len, pred_len, pred_samples, model_id, content_hash)`, where
+`content_hash` is a cheap hash of the lookback window's close prices - so a
+different or stale input window for the "same" symbol/bar never collides
+with an existing cache entry, and `model_id` is the resolved model source
+(base HF repo id or finetuned checkpoint path) so base and finetuned
+predictions for the same symbol/bar never collide either. The cache
+directory is deleted (`shutil.rmtree`) when the auto run finishes, success
+or failure. Single-stage invocations (e.g. `--stage base` on its own) never
+set `KAIROS_PRED_CACHE_DIR`, so behavior is unchanged when caching isn't in
+play. The oracle stage (`--no-prediction`) never calls the prediction path
+at all, so it is unaffected either way.
+
+`kairos_papertrade.py` reuses this same `kairos_predcache` module
+independently (its own ephemeral cache dir, its own model-major
+`prewarm_prediction_cache()` sweep — see CLAUDE.md's "Model-major
+prediction prewarm (papertrade)" section) — unrelated to `--stage auto`'s
+usage above beyond sharing the module.
 
 ### Resumability and `--force`
 

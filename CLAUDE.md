@@ -86,12 +86,22 @@ subprocess exactly once. Run `uv run scripts/gpu_recover.py --check-only` to
 probe without side effects, or `--dry-run` to preview the full ladder.
 
 ### Telegram notifications
-Only two things send Telegram alerts: `strategy/kairos_pipeline.py --stage
+Four things send Telegram alerts: `strategy/kairos_pipeline.py --stage
 finetune_next` (via the module-level `_notify` helper — 🟢 start, ❌ training
 failure, ✅/⚠️ accept/reject verdict, 💥 any other unhandled crash after the
-row is registered) and the two standalone wrapper scripts
+row is registered); the two standalone wrapper scripts
 `scripts/kairos_daily_signals.py`/`scripts/kairos_weekly_discovery.py` (their
-own actionable-signal/failure/summary alerts). No other `--stage` of
+own actionable-signal/failure/summary alerts); `strategy/kairos_papertrade.py`
+(own `_notify` helper, gated by `--no-telegram`/`args.notify` — 🟢 start,
+✅ finish, 💥 unhandled crash, ⏱️ any single `kairos_signals.run()` call or
+Phantom day-backtest that exceeds `_SLOW_ITERATION_THRESHOLD_SECONDS` (5min),
+and 🧠 a heads-up right before `prewarm_prediction_cache()` actually loads a
+Kronos model for one sweep unit — base, or one finetuned group — naming the
+model and the date range it's about to cover; suppressed entirely when that
+unit's whole period is already a `kairos_predcache` hit, so a fully-warm
+prewarm is silent); and `strategy/kairos_gpu.py`'s `ensure_cuda()` (own
+`_notify`, always attempted, no enable flag — 🔧 recovery starting, ❌
+recovery failed, ✅ recovered/caller retrying). No other `--stage` of
 `kairos_pipeline.py` sends anything — that's by design, not a bug, if you go
 looking for a notification from `universe`/`correlation`/`oracle`/`base`/
 `finetuned`. All of these send with `parse_mode=None` (plain text): dynamic
@@ -100,7 +110,9 @@ Markdown special character — including the literal underscore in
 "finetune_next" itself, which alone broke a plain "starting" message in
 production — and Telegram's legacy Markdown parser rejects the *whole*
 message over a single one. See `docs/playbooks/model-finetuning.md`'s
-"Notifications" section for the full per-message-type contract.
+"Notifications" section for the full per-message-type contract (that
+playbook covers the `finetune_next`/daily/weekly trio specifically — the
+papertrade and GPU-recovery notifications above aren't part of it).
 
 `kairos.ops.send_telegram()` reads `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` from
 `os.environ` — it never reads `~/.config/kairos/kairos.env` itself. Only the
@@ -128,6 +140,35 @@ The key optimization in `auto_regressive_inference`: run `tokenizer.encode` and
 `model.decode_s1` once at the original batch size (3 assets), then expand to
 `batch_orig × sample_count` only for the stochastic sampling step. This gives
 ~0.3s/iteration on GPU vs. 89s before.
+
+### Model-major prediction prewarm (papertrade)
+`kairos_strategies.py` has a single global model slot
+(`bt_model`/`bt_predictor`) — loading a different `model_path` always
+unloads+reloads (`_materialize_model`). `kairos_signals.run()`'s per-date
+loop visits base → finetuned-group-1 → ... → finetuned-group-G → (next date)
+→ base again, so naively that's `G+1` reloads *per backtest date*.
+`kairos_papertrade.py`'s `main()` avoids this by wrapping the whole
+`generate_and_dedupe_reports()` loop in an ephemeral `KAIROS_PRED_CACHE_DIR`
+(a fresh `tempfile.mkdtemp`, torn down in `finally` — same one-run-only
+pattern `kairos_pipeline.py`'s `run_stage_auto` already uses for
+`--stage auto`) and running `prewarm_prediction_cache()` first: it sweeps
+**model-major** — every date for the base model, then every date for each
+finetuned group's model, in `strategy/kairos_predcache.py`'s shared disk
+cache — so each model loads exactly once for the whole run. The date-major
+`run()` loop that follows then finds every `(symbol, bar, model)` prediction
+already cached and never reloads at all
+(`kairos_strategies.predict_all_batch` defers `_materialize_model` until
+*after* the shared-cache lookup, and skips it entirely on a full hit).
+Do NOT make this cache persist across separate `kairos_papertrade.py`
+invocations — the cache key has no checksum/mtime of the checkpoint file, so
+a finetuned model retrained in place at the same `model_path` between two
+runs would silently serve stale predictions under a persistent cache. Use
+`--no-pred-cache` to disable prewarm/reuse for a run if you need to debug
+around it. `kairos_predcache.make_key()`'s key includes `pred_len` — always
+`1` today (papertrade only predicts one bar ahead), but if that horizon
+becomes configurable, thread the real value through `predict_all_batch`
+rather than hardcoding it, or longer-horizon runs will silently collide
+with cached 1-bar predictions.
 
 ## Test suite
 

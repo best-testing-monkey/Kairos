@@ -39,10 +39,16 @@ def test_content_hash_differs_for_different_input():
 
 
 def test_make_key_is_stable_string():
-    k1 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123")
-    k2 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123")
+    k1 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123", 1)
+    k2 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123", 1)
     assert k1 == k2
     assert isinstance(k1, str)
+
+
+def test_make_key_differs_by_pred_len_alone():
+    k1 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123", 1)
+    k2 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123", 5)
+    assert k1 != k2
 
 
 # ── PredictionCache: disk + memory roundtrip ────────────────────────────────
@@ -66,9 +72,9 @@ def test_get_miss_on_different_content_hash_key(tmp_path):
     cache = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024)
     samples = _make_samples(2)
     key_a = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base",
-                         pc.content_hash_for_closes([100.0, 101.0]))
+                         pc.content_hash_for_closes([100.0, 101.0]), 1)
     key_b = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base",
-                         pc.content_hash_for_closes([200.0, 201.0]))
+                         pc.content_hash_for_closes([200.0, 201.0]), 1)
     cache.put(key_a, samples)
     assert cache.get(key_b) is None
     assert cache.get(key_a) is not None

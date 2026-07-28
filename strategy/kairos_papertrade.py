@@ -34,11 +34,15 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import sqlite3
 
 import pandas as pd
 import price_cache
@@ -236,6 +240,168 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, not
             seen[effective_dt] = (effective_dt, stats_rows, advice_rows)
 
     return [seen[key] for key in sorted(seen.keys())]
+
+
+def _format_prewarm_load_message(model_label: str, dates: list) -> str:
+    """🧠 pre-load heads-up notification text, sent right before
+    prewarm_prediction_cache triggers a real Kronos model load for one
+    sweep unit (the base sweep, or one finetuned group's sweep) -- i.e.
+    only when that unit has at least one genuine kairos_predcache miss.
+
+    Distinct emoji from this file's other notifications (🟢 start, ✅
+    success, ⚠️ soft-fail, ❌ hard failure, 💥 crash, ⏱️ slow-iteration
+    watchdog) so a model-load heads-up reads differently from those."""
+    start = min(dates).strftime("%Y-%m-%d")
+    end = max(dates).strftime("%Y-%m-%d")
+    return (
+        f"🧠 Kairos papertrade prewarm: loading {model_label} model — "
+        f"period {start} → {end} ({len(dates)} dates)"
+    )
+
+
+def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify: bool = True):
+    """Populate kairos_predcache's shared disk/memory cache MODEL-MAJOR
+    (all dates for the base model, then all dates for each finetuned group's
+    model) instead of the DATE-MAJOR order generate_and_dedupe_reports'
+    day-by-day kairos_signals.run() calls use.
+
+    Motivation: kairos_strategies._ensure_model_loaded() is a single global
+    slot -- reloading a different model_path triggers a full unload+reload
+    (HF from_pretrained + GPU move). run()'s date-major loop visits
+    base -> finetuned-group-1 -> ... -> next date -> base again, reloading
+    the model G+1 times PER DATE for G finetuned groups. Sweeping
+    model-major here means the actual generate_and_dedupe_reports() call
+    that follows finds every (symbol, bar, model) prediction already cached
+    (see kairos_strategies.predict_all_batch's cache-before-load path), so
+    its date-major loop never triggers a real reload.
+
+    Discards predict_all_batch's return value -- the only purpose of this
+    sweep is the kairos_predcache disk-cache side effect (requires
+    KAIROS_PRED_CACHE_DIR to already be set in the environment; see main()).
+
+    Each sweep unit -- the base sweep (one unit covering every group) and
+    each finetuned group's sweep (its own unit, since each has a distinct
+    model_path) -- runs as two passes:
+      1. A fetch+cache-check pass: fetch every (group, date)'s data (each
+         fetch wrapped in its own try/except, mirroring kairos_signals.run()'s
+         Pass 1/Pass 2 loops, so one bad date/symbol never aborts the whole
+         sweep) and check it against kairos_strategies.is_batch_cached() --
+         a read-only lookup that never loads a model. If ANY fetched entry
+         in the unit is not fully covered by the shared cache, a real model
+         load is about to happen for this unit.
+      2. If step 1 found a genuine miss, send one _notify() heads-up (via
+         _format_prewarm_load_message) naming the model and the sweep's
+         date range/count, BEFORE the model actually loads -- then a real
+         predict pass over every successfully-fetched entry (each call
+         wrapped in its own try/except, same error-message shape as
+         before). If the whole unit was already warm, no notification is
+         sent and predict_all_batch still runs per entry as a no-op-load
+         cache confirmation pass.
+
+    Returns the list of (context, error) failure strings collected along
+    the way (empty list if nothing failed).
+    """
+    import kairos_strategies
+
+    step = _interval_to_timedelta(interval)
+    days_per_step = step.total_seconds() / 86400.0
+    n_iterations = round(months_back * 30.44 / days_per_step)
+    dates = [base_now - i * step for i in range(n_iterations)]
+
+    db_path = run_kwargs.get("db_path", DB_PATH)
+    base_only = run_kwargs.get("base_only", False)
+    lookback = kairos_strategies.LOOKBACK
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = _kairos_signals_mod.load_work_items(conn, intervals=[interval])
+        groups = _kairos_signals_mod.group_items(rows)
+        accepted_finetuned = (
+            {} if base_only else _kairos_signals_mod.load_accepted_finetuned(conn)
+        )
+    finally:
+        conn.close()
+
+    failures = []
+
+    # ── Base sweep: one unit covering every group, every date. ─────────────
+    base_entries = []  # (assets_str, grp_interval, date, data)
+    base_needs_load = False
+    for (assets_str, grp_interval), _group_rows in groups.items():
+        assets = assets_str.split(",")
+        for date in dates:
+            try:
+                data = {
+                    sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
+                    for sym in assets
+                }
+            except Exception as e:
+                failures.append(
+                    f"prewarm base group assets={assets_str} interval={grp_interval} "
+                    f"date={date}: {e}"
+                )
+                continue
+            base_entries.append((assets_str, grp_interval, date, data))
+            if not kairos_strategies.is_batch_cached(data, model_path=None):
+                base_needs_load = True
+
+    if base_needs_load and dates:
+        _notify(_format_prewarm_load_message("Base", dates), enabled=notify)
+
+    for assets_str, grp_interval, date, data in base_entries:
+        try:
+            kairos_strategies.predict_all_batch(data, model_path=None)
+        except Exception as e:
+            failures.append(
+                f"prewarm base group assets={assets_str} interval={grp_interval} "
+                f"date={date}: {e}"
+            )
+            continue
+
+    # ── Finetuned sweep: each group with an accepted finetuned model is its
+    # own unit (own fetch+check pass, own possible notification, own
+    # predict pass) -- distinct model_path means a distinct load event. ────
+    if not base_only and accepted_finetuned:
+        for (assets_str, grp_interval), _group_rows in groups.items():
+            sorted_key = ",".join(sorted(assets_str.split(",")))
+            model_path = accepted_finetuned.get((sorted_key, grp_interval))
+            if model_path is None:
+                continue
+
+            assets = assets_str.split(",")
+            group_entries = []  # (date, data)
+            group_needs_load = False
+            for date in dates:
+                try:
+                    data = {
+                        sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
+                        for sym in assets
+                    }
+                except Exception as e:
+                    failures.append(
+                        f"prewarm finetuned group assets={assets_str} interval={grp_interval} "
+                        f"date={date} (model_path={model_path}): {e}"
+                    )
+                    continue
+                group_entries.append((date, data))
+                if not kairos_strategies.is_batch_cached(data, model_path=model_path):
+                    group_needs_load = True
+
+            if group_needs_load and dates:
+                model_label = f"Finetuned({assets_str})"
+                _notify(_format_prewarm_load_message(model_label, dates), enabled=notify)
+
+            for date, data in group_entries:
+                try:
+                    kairos_strategies.predict_all_batch(data, model_path=model_path)
+                except Exception as e:
+                    failures.append(
+                        f"prewarm finetuned group assets={assets_str} interval={grp_interval} "
+                        f"date={date} (model_path={model_path}): {e}"
+                    )
+                    continue
+
+    return failures
 
 
 _CFD_TICKER_RE = re.compile(r"(=F|=X|-USD)$")
@@ -802,6 +968,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                               "notifications enabled, sent via kairos.ops.send_telegram using "
                               "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID from the environment - see "
                               ".env.example)")
+    parser.add_argument("--no-pred-cache", dest="pred_cache", action="store_false",
+                         default=True,
+                         help="Disable the shared kairos_predcache prewarm/reuse pass for this "
+                              "run (default: enabled -- an ephemeral KAIROS_PRED_CACHE_DIR is "
+                              "created, model-major prewarm_prediction_cache() populates it, and "
+                              "generate_and_dedupe_reports() reuses it so kairos_strategies' "
+                              "single-slot model loader isn't reloaded once per (date, group))")
     return parser
 
 
@@ -847,9 +1020,33 @@ def main(argv=None):
         # timeout, fail with OpsError) for as long as this loop runs --
         # accepted tradeoff over the alternative of colliding outright.
         with GpuLock():
-            dated_rows = generate_and_dedupe_reports(
-                base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
-            )
+            if args.pred_cache:
+                # Ephemeral, this-run-only shared prediction cache dir (same
+                # pattern as kairos_pipeline.py's run_stage_auto): populate it
+                # model-major via prewarm_prediction_cache() BEFORE the
+                # date-major generate_and_dedupe_reports() loop runs, so every
+                # (symbol, bar, model) prediction it needs is already cached
+                # and kairos_strategies never reloads the model mid-loop.
+                cache_dir = tempfile.mkdtemp(prefix="kairos_predcache_papertrade_")
+                prev_cache_dir = os.environ.get("KAIROS_PRED_CACHE_DIR")
+                os.environ["KAIROS_PRED_CACHE_DIR"] = cache_dir
+                try:
+                    prewarm_prediction_cache(
+                        base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
+                    )
+                    dated_rows = generate_and_dedupe_reports(
+                        base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
+                    )
+                finally:
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                    if prev_cache_dir is None:
+                        os.environ.pop("KAIROS_PRED_CACHE_DIR", None)
+                    else:
+                        os.environ["KAIROS_PRED_CACHE_DIR"] = prev_cache_dir
+            else:
+                dated_rows = generate_and_dedupe_reports(
+                    base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
+                )
         if not dated_rows:
             raise RuntimeError("No kairos_signals reports were generated in the requested window.")
 

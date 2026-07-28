@@ -2,7 +2,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -201,6 +201,338 @@ class TestGenerateAndDedupeReports:
 
 
 # ============================================================================
+# prewarm_prediction_cache
+# ============================================================================
+
+class TestPrewarmPredictionCache:
+    def test_model_major_ordering(self, monkeypatch):
+        import kairos_strategies
+
+        calls = []
+
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+            calls.append((model_path, tuple(sorted(data.keys()))))
+            return {}
+
+        def fake_fetch_data_raw(sym, lookback, as_of=None):
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch", fake_predict_all_batch)
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+
+        # 2 groups; only "AAA,BBB" has an accepted finetuned model.
+        groups = {
+            ("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}],
+            ("CCC", "1d"): [{"assets": "CCC", "interval": "1d"}],
+        }
+        accepted_finetuned = {("AAA,BBB", "1d"): "repo/finetuned-ab"}
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned",
+                             lambda conn: accepted_finetuned)
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        # 0.1 months * 30.44 / 1 day-per-step ~= 3.044 -> round() -> 3 dates.
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert failures == []
+        # Base sweep: 2 groups x 3 dates = 6 calls. Finetuned sweep: 1 group x 3 dates = 3 calls.
+        assert len(calls) == 9
+
+        base_positions = [i for i, c in enumerate(calls) if c[0] is None]
+        finetuned_positions = [i for i, c in enumerate(calls) if c[0] is not None]
+        assert len(base_positions) == 6
+        assert len(finetuned_positions) == 3
+        assert all(c[0] == "repo/finetuned-ab" for i, c in enumerate(calls) if i in finetuned_positions)
+
+        # Model-major: every base call precedes every finetuned call.
+        assert max(base_positions) < min(finetuned_positions)
+        # The finetuned group's 3 calls are contiguous (not interleaved).
+        assert finetuned_positions == list(range(min(finetuned_positions), min(finetuned_positions) + 3))
+
+    def test_base_only_skips_finetuned_sweep(self, monkeypatch):
+        import kairos_strategies
+
+        calls = []
+
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+            calls.append(model_path)
+            return {}
+
+        def fake_fetch_data_raw(sym, lookback, as_of=None):
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch", fake_predict_all_batch)
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+
+        groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
+
+        def _boom_load_accepted_finetuned(conn):
+            raise AssertionError("load_accepted_finetuned should be skipped under base_only")
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned",
+                             _boom_load_accepted_finetuned)
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(
+            base_now, "1d", months_back=0.1, run_kwargs={"base_only": True},
+        )
+
+        assert failures == []
+        assert calls == [None, None, None]
+
+    def test_bad_date_does_not_abort_sweep(self, monkeypatch):
+        import kairos_strategies
+
+        calls = []
+        fetch_attempts = {"n": 0}
+
+        def flaky_fetch_data_raw(sym, lookback, as_of=None):
+            fetch_attempts["n"] += 1
+            if fetch_attempts["n"] == 2:
+                raise RuntimeError("simulated fetch failure")
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+            calls.append(model_path)
+            return {}
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch", fake_predict_all_batch)
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", flaky_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+
+        groups = {("AAA", "1d"): [{"assets": "AAA", "interval": "1d"}]}
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda conn: {})
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        # 3 dates total; 1 fails, 2 succeed -- the failure must not abort the sweep.
+        assert len(failures) == 1
+        assert "simulated fetch failure" in failures[0]
+        assert len(calls) == 2
+
+    def _common_prewarm_mocks(self, monkeypatch, groups, accepted_finetuned=None):
+        """Shared plumbing for the notify-gating tests below: fake
+        fetch_data_raw/LOOKBACK, a fake sqlite3 connection, and
+        group_items/load_work_items/load_accepted_finetuned stubs -- mirrors
+        the setup already used by test_model_major_ordering etc."""
+        import kairos_strategies
+
+        def fake_fetch_data_raw(sym, lookback, as_of=None):
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned",
+                             lambda conn: accepted_finetuned or {})
+
+    def test_notify_skipped_when_sweep_fully_cached(self, monkeypatch):
+        """Every (symbol, date) for both the base sweep and the finetuned
+        group's sweep is already a shared-cache hit -> no _notify call for
+        either unit."""
+        import kairos_strategies
+
+        groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
+        accepted_finetuned = {("AAA,BBB", "1d"): "repo/finetuned-ab"}
+        self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned)
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
+                             lambda data, model_path=None, tokenizer_path=None: {})
+        # Fully warm regardless of which model_path is being checked.
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached",
+                             lambda data, model_path=None, pred_len=1: True)
+
+        notify_calls = []
+        monkeypatch.setattr(kp, "_notify", lambda text, enabled=True: notify_calls.append(text))
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert failures == []
+        assert notify_calls == []
+
+    def test_notify_fires_on_genuine_cache_miss_base_sweep(self, monkeypatch):
+        """The base sweep has at least one genuine miss (finetuned model_path
+        is fully warm) -> exactly one _notify call, labeled "Base", with the
+        correct min/max date-range boundaries and date count."""
+        import kairos_strategies
+
+        groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
+        accepted_finetuned = {("AAA,BBB", "1d"): "repo/finetuned-ab"}
+        self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned)
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
+                             lambda data, model_path=None, tokenizer_path=None: {})
+
+        def fake_is_batch_cached(data, model_path=None, pred_len=1):
+            # Base (model_path=None) is never cached; the finetuned group is
+            # already fully warm.
+            return model_path is not None
+
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached", fake_is_batch_cached)
+
+        notify_calls = []
+        monkeypatch.setattr(kp, "_notify", lambda text, enabled=True: notify_calls.append(text))
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert failures == []
+        assert len(notify_calls) == 1
+        msg = notify_calls[0]
+        assert "Base" in msg
+        assert "Finetuned" not in msg
+
+        # dates = [base_now - i*1day for i in range(3)] (0.1 * 30.44 / 1 ~= 3.044 -> 3)
+        expected_start = (base_now - timedelta(days=2)).strftime("%Y-%m-%d")
+        expected_end = base_now.strftime("%Y-%m-%d")
+        assert expected_start in msg
+        assert expected_end in msg
+        assert "3 dates" in msg
+
+    def test_notify_fires_on_genuine_cache_miss_finetuned_sweep(self, monkeypatch):
+        """The finetuned group's sweep has a genuine miss (base is fully
+        warm) -> exactly one _notify call, labeled Finetuned(<assets>)."""
+        import kairos_strategies
+
+        groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
+        accepted_finetuned = {("AAA,BBB", "1d"): "repo/finetuned-ab"}
+        self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned)
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
+                             lambda data, model_path=None, tokenizer_path=None: {})
+
+        def fake_is_batch_cached(data, model_path=None, pred_len=1):
+            # Base is already fully warm; the finetuned group is never cached.
+            return model_path is None
+
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached", fake_is_batch_cached)
+
+        notify_calls = []
+        monkeypatch.setattr(kp, "_notify", lambda text, enabled=True: notify_calls.append(text))
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert failures == []
+        assert len(notify_calls) == 1
+        msg = notify_calls[0]
+        assert "Finetuned(AAA,BBB)" in msg
+
+        expected_start = (base_now - timedelta(days=2)).strftime("%Y-%m-%d")
+        expected_end = base_now.strftime("%Y-%m-%d")
+        assert expected_start in msg
+        assert expected_end in msg
+        assert "3 dates" in msg
+
+    def test_notify_respects_notify_false(self, monkeypatch):
+        """notify=False must reach _notify's own enabled= gate (mirrors
+        generate_and_dedupe_reports' notify plumbing) -- assert _notify is
+        invoked with enabled=False rather than skipped outright, matching
+        the existing enabled= convention in this file."""
+        import kairos_strategies
+
+        groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
+        self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned={})
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
+                             lambda data, model_path=None, tokenizer_path=None: {})
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached",
+                             lambda data, model_path=None, pred_len=1: False)
+
+        notify_calls = []
+
+        def fake_notify(text, enabled=True):
+            notify_calls.append((text, enabled))
+
+        monkeypatch.setattr(kp, "_notify", fake_notify)
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={}, notify=False)
+
+        assert len(notify_calls) == 1
+        assert notify_calls[0][1] is False
+
+    def test_notify_fires_before_model_load(self, monkeypatch):
+        """The pre-load notification must be sent before predict_all_batch
+        (the thing that actually triggers a real Kronos model load) is
+        called for that sweep unit -- verified via a shared call-order list
+        that both the _notify spy and the predict_all_batch fake append to."""
+        import kairos_strategies
+
+        order = []
+
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+            order.append(("predict", model_path))
+            return {}
+
+        def fake_notify(text, enabled=True):
+            order.append(("notify", text))
+
+        groups = {("AAA", "1d"): [{"assets": "AAA", "interval": "1d"}]}
+        self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned={})
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch", fake_predict_all_batch)
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached",
+                             lambda data, model_path=None, pred_len=1: False)
+        monkeypatch.setattr(kp, "_notify", fake_notify)
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(
+            base_now, "1d", months_back=0.1, run_kwargs={"base_only": True},
+        )
+
+        assert failures == []
+        notify_positions = [i for i, entry in enumerate(order) if entry[0] == "notify"]
+        predict_positions = [i for i, entry in enumerate(order) if entry[0] == "predict"]
+        assert len(notify_positions) == 1
+        assert len(predict_positions) == 3  # 3 dates, base_only
+        assert notify_positions[0] < min(predict_positions)
+
+
+# ============================================================================
 # map_instrument_type
 # ============================================================================
 
@@ -315,6 +647,14 @@ class TestBuildArgParser:
         # cost, per docs/papertrade_loss_analysis.md Factor 7.
         args = _build_arg_parser().parse_args([])
         assert args.min_ev_pct == 0.15
+
+    def test_pred_cache_defaults_true(self):
+        args = _build_arg_parser().parse_args([])
+        assert args.pred_cache is True
+
+    def test_no_pred_cache_sets_pred_cache_false(self):
+        args = _build_arg_parser().parse_args(["--no-pred-cache"])
+        assert args.pred_cache is False
 
 
 # ============================================================================

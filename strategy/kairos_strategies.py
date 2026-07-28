@@ -54,7 +54,10 @@ OUTPUT_DIR = KairosSettings.output_dir
 bt_tokenizer = None
 bt_model = None
 bt_predictor = None
-_loaded_model_src = None  # (tokenizer_src, model_src) of the currently loaded model, or None
+_loaded_model_src = None  # (tokenizer_src, model_src) requested/resolved by the most recent
+                          # _prepare_model_switch() call -- used for cache-clearing bookkeeping.
+                          # NOT necessarily materialized into bt_predictor yet; see _weights_loaded_src.
+_weights_loaded_src = None  # (tokenizer_src, model_src) actually materialized into bt_predictor, or None
 
 _prediction_cache: dict = {}  # (symbol, last_bar_ts) -> List[pd.DataFrame]
 _dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
@@ -187,25 +190,58 @@ def _model_switch_needed(requested_src, loaded_src) -> bool:
     return loaded_src is None or requested_src != loaded_src
 
 
-def _ensure_model_loaded(model_path=None, tokenizer_path=None):
-    global bt_tokenizer, bt_model, bt_predictor, _loaded_model_src
+def _prepare_model_switch(model_path=None, tokenizer_path=None):
+    """Cheap, pure bookkeeping: resolve the requested (tokenizer_src,
+    model_src) pair and, if it differs from what's currently "loaded"
+    (`_loaded_model_src`), clear the prediction/dist caches and update
+    `_loaded_model_src`.
+
+    Does NOT touch disk/HF/GPU -- no from_pretrained, no KronosPredictor
+    construction. Safe to call speculatively (e.g. before a cache lookup)
+    without paying any model-load cost. Actually materializing the weights
+    into `bt_predictor` is `_materialize_model`'s job.
+
+    Returns the resolved (tok_src, mdl_src) tuple.
+    """
+    global _loaded_model_src
 
     tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
     mdl_src = model_path or "NeoQuasar/Kronos-base"
     requested_src = (tok_src, mdl_src)
 
-    if bt_predictor is not None and not _model_switch_needed(requested_src, _loaded_model_src):
+    if _model_switch_needed(requested_src, _loaded_model_src):
+        # No model identity in these caches' keys -- see the note by
+        # _prediction_cache/_dist_cache above. Clear them the moment we know
+        # the caller wants a different model, even though the weights for
+        # that model may not be materialized until _materialize_model runs.
+        _prediction_cache.clear()
+        _dist_cache.clear()
+        _loaded_model_src = requested_src
+
+    return requested_src
+
+
+def _materialize_model(requested_src):
+    """Ensure `bt_predictor` actually holds the weights for `requested_src`.
+
+    No-op if `bt_predictor` is already materialized for this exact src
+    tuple (`_weights_loaded_src == requested_src`). Otherwise unloads
+    whatever's currently loaded (if any) and does the heavy from_pretrained
+    / GPU-move / TF32-or-INT8-quant / KronosPredictor construction.
+    """
+    global bt_tokenizer, bt_model, bt_predictor, _weights_loaded_src
+
+    if bt_predictor is not None and _weights_loaded_src == requested_src:
         return
+
+    tok_src, mdl_src = requested_src
 
     import torch
     from model import Kronos, KronosTokenizer, KronosPredictor
 
     if bt_predictor is not None:
-        # Switching to a different model: unload the old one first and clear
-        # the prediction caches (no model identity in their keys — see the
-        # note by _prediction_cache/_dist_cache above) so the next batch call
-        # can't silently reuse predictions from the previous model.
-        print(f"Switching Kronos model: {_loaded_model_src} -> {requested_src}")
+        # Switching to a different model: unload the old one first.
+        print(f"Switching Kronos model: {_weights_loaded_src} -> {requested_src}")
         old_model, old_tokenizer, old_predictor = bt_model, bt_tokenizer, bt_predictor
         bt_model = bt_tokenizer = bt_predictor = None
         del old_model, old_tokenizer, old_predictor
@@ -213,8 +249,6 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        _prediction_cache.clear()
-        _dist_cache.clear()
 
     print(f"Loading Kronos model from {mdl_src} ...")
     bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
@@ -235,7 +269,16 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
         print(f"  → CPU mode: INT8 dynamic quantisation, {torch.get_num_threads()} threads")
 
     bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=512)
-    _loaded_model_src = requested_src
+    _weights_loaded_src = requested_src
+
+
+def _ensure_model_loaded(model_path=None, tokenizer_path=None):
+    """Thin wrapper preserving the original single-call behavior: resolve +
+    prepare the requested src (cache-clear bookkeeping), then materialize it
+    into bt_predictor if not already loaded. Used directly by run_model()
+    and any other caller that always needs weights ready immediately."""
+    requested_src = _prepare_model_switch(model_path, tokenizer_path)
+    _materialize_model(requested_src)
 
 
 def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
@@ -254,18 +297,74 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
     )
 
 
+def _shared_cache_key(symbol, df, mdl_src, pred_len):
+    """Build the shared-disk `kairos_predcache` key for one (symbol, df,
+    model, pred_len) combination.
+
+    Extracted from predict_all_batch's per-symbol loop so both that
+    function's real cache-lookup path and is_batch_cached's read-only
+    precheck build byte-identical keys off a single source of truth.
+    """
+    import kairos_predcache
+
+    lookback_for_hash = min(KairosSettings.lookback, len(df))
+    content_hash = kairos_predcache.content_hash_for_closes(
+        df["close"].iloc[-lookback_for_hash:]
+    )
+    return kairos_predcache.make_key(
+        symbol=symbol,
+        interval=KairosSettings.interval,
+        bar_timestamp=df.index[-1],
+        lookback_len=lookback_for_hash,
+        pred_samples=KairosSettings.pred_samples,
+        model_id=mdl_src,
+        content_hash=content_hash,
+        pred_len=pred_len,
+    )
+
+
+def is_batch_cached(assets: dict, model_path=None, pred_len=1) -> bool:
+    """Read-only precheck: True iff every symbol in `assets` already has a
+    shared-disk `kairos_predcache` hit for the resolved model id, i.e. a
+    predict_all_batch(assets, model_path=model_path) call would trigger no
+    real model load.
+
+    False if the shared cache is inactive (kairos_predcache.get_cache()
+    returns None -- KAIROS_PRED_CACHE_DIR unset) or if any symbol is a
+    miss. Never loads a model, never touches _prediction_cache, never
+    writes to the shared cache -- purely a lookup.
+    """
+    import kairos_predcache
+
+    shared_cache = kairos_predcache.get_cache()
+    if shared_cache is None:
+        return False
+
+    mdl_src = model_path or "NeoQuasar/Kronos-base"
+    for symbol, df in assets.items():
+        key = _shared_cache_key(symbol, df, mdl_src, pred_len)
+        if shared_cache.get(key) is None:
+            return False
+    return True
+
+
 def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dict:
     """Predict all assets in one batched GPU call instead of N sequential calls.
 
     model_path / tokenizer_path: optional HF repo id or local path forwarded to
-    _ensure_model_loaded(). Passing a different model_path than what's
-    currently loaded triggers an in-process model swap (see
-    _ensure_model_loaded / _model_switch_needed).
+    _prepare_model_switch()/_materialize_model(). Passing a different
+    model_path than what's currently loaded triggers an in-process model
+    swap (see _model_switch_needed) -- but only if at least one requested
+    symbol isn't already satisfied by the (per-process or shared-disk)
+    prediction cache: _materialize_model() (the actual from_pretrained /
+    GPU-move work) is deferred until after the cache-lookup loop below, and
+    skipped entirely when every symbol is a cache hit.
     """
     from kairos_meta import AssetPrediction, KairosDistribution
     import kairos_predcache
 
-    _ensure_model_loaded(model_path, tokenizer_path)
+    pred_len = 1
+    requested_src = _prepare_model_switch(model_path, tokenizer_path)
 
     shared_cache = kairos_predcache.get_cache()
     shared_keys = {}  # symbol -> cache key (only computed when shared_cache is active)
@@ -281,19 +380,7 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
             continue
 
         if shared_cache is not None:
-            lookback_for_hash = min(KairosSettings.lookback, len(df))
-            content_hash = kairos_predcache.content_hash_for_closes(
-                df["close"].iloc[-lookback_for_hash:]
-            )
-            shared_key = kairos_predcache.make_key(
-                symbol=symbol,
-                interval=KairosSettings.interval,
-                bar_timestamp=df.index[-1],
-                lookback_len=lookback_for_hash,
-                pred_samples=KairosSettings.pred_samples,
-                model_id=KairosSettings.model,
-                content_hash=content_hash,
-            )
+            shared_key = _shared_cache_key(symbol, df, requested_src[1], pred_len)
             shared_keys[symbol] = shared_key
             shared_hit = shared_cache.get(shared_key)
             if shared_hit is not None:
@@ -310,16 +397,17 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
         uncached_symbols.append(symbol)
 
     if uncached_symbols:
+        _materialize_model(requested_src)
         seq_lens = [x.shape[0] for x in df_list]
         return_samples = KairosSettings.pred_samples > 1
         if len(set(seq_lens)) == 1:
             pred_lists = bt_predictor.predict_batch(
                 df_list, x_ts_list, y_ts_list,
-                pred_len=1, sample_count=KairosSettings.pred_samples, return_samples=return_samples, verbose=False
+                pred_len=pred_len, sample_count=KairosSettings.pred_samples, return_samples=return_samples, verbose=False
             )
         else:
             pred_lists = [
-                bt_predictor.predict(df, x_ts, y_ts, pred_len=1, sample_count=KairosSettings.pred_samples,
+                bt_predictor.predict(df, x_ts, y_ts, pred_len=pred_len, sample_count=KairosSettings.pred_samples,
                                      return_samples=return_samples, verbose=False)
                 for df, x_ts, y_ts in zip(df_list, x_ts_list, y_ts_list)
             ]

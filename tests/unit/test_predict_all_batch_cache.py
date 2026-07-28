@@ -63,7 +63,10 @@ class _StubPredictor:
 
 def _patch_common(monkeypatch, stub_predictor):
     monkeypatch.setattr(ks, "bt_predictor", stub_predictor)
-    monkeypatch.setattr(ks, "_ensure_model_loaded", lambda *a, **kw: None)
+    # predict_all_batch now defers the heavy load to _materialize_model,
+    # calling it only when there's at least one cache miss -- patch that out
+    # (not _ensure_model_loaded, which predict_all_batch no longer calls).
+    monkeypatch.setattr(ks, "_materialize_model", lambda *a, **kw: None)
 
     def fake_to_kronos_frame(df, lookback, amount="auto"):
         x_df = df.tail(lookback)[["open", "high", "low", "close", "volume"]].copy()

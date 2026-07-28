@@ -46,12 +46,18 @@ def content_hash_for_closes(closes) -> str:
 
 
 def make_key(symbol, interval, bar_timestamp, lookback_len, pred_samples,
-             model_id, content_hash) -> str:
-    """Build a canonical, filename-safe cache key string."""
+             model_id, content_hash, pred_len) -> str:
+    """Build a canonical, filename-safe cache key string.
+
+    pred_len is included so a longer-horizon prediction can never collide
+    with a cached prediction computed for a different pred_len under an
+    otherwise-identical key (symbol/interval/bar/lookback/samples/model/
+    content hash).
+    """
     bar_ts_iso = pd.Timestamp(bar_timestamp).isoformat()
     parts = [
         str(symbol), str(interval), bar_ts_iso, str(lookback_len),
-        str(pred_samples), str(model_id or "default"), str(content_hash),
+        str(pred_len), str(pred_samples), str(model_id or "default"), str(content_hash),
     ]
     return "|".join(parts)
 
