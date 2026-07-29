@@ -65,6 +65,11 @@ _dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
 # switches to a different (tokenizer_src, model_src) pair, both caches MUST
 # be cleared or a two-pass (base -> finetuned) flow would silently reuse
 # base-model predictions for the finetuned pass.
+_no_data_fallback_warned: set = set()  # symbols we've already printed the
+# "price_cache returned None; using direct local SQLite fallback" line for.
+# fetch_data_raw is called once per (symbol, date) pair, and callers like
+# prewarm_prediction_cache call it for every date in a backtest window, so
+# without this the same line prints hundreds of times per symbol per run.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,7 +159,9 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None, as_of=None) -> D
         # already succeeded via this exact fallback. Try it before giving up.
         raw = fetch_price_data_local_fallback(symbol, start_dt, end_dt, interval, price_cache.DB_PATH)
         if raw is not None and not raw.empty:
-            print(f"  [{symbol}] price_cache returned None; using direct local SQLite fallback")
+            if symbol not in _no_data_fallback_warned:
+                print(f"  [{symbol}] price_cache returned None; using direct local SQLite fallback")
+            _no_data_fallback_warned.add(symbol)
     if raw is None or raw.empty:
         raise RuntimeError(f"No price data returned for {symbol}")
 
@@ -297,6 +304,50 @@ def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
     )
 
 
+def _model_checkpoint_fingerprint(model_path) -> str:
+    """Cheap identity fingerprint for a model checkpoint, for cache-key use.
+
+    Local finetuned checkpoints (model_path is a directory) can be retrained
+    in place at the same path -- fingerprint off model.safetensors' size +
+    mtime so a retrain busts stale cache entries instead of silently serving
+    them. HF repo ids (e.g. the base model) aren't local paths and don't get
+    retrained in place, so there's nothing to stat -- the id string alone is
+    already a stable identity.
+    """
+    if not model_path:
+        return ""
+    try:
+        if not os.path.isdir(model_path):
+            return ""
+    except (TypeError, ValueError):
+        return ""
+
+    weights_path = os.path.join(model_path, "model.safetensors")
+    try:
+        st = os.stat(weights_path)
+        return f"{st.st_size}-{st.st_mtime_ns}"
+    except OSError:
+        pass
+
+    # Defensive fallback (not expected in practice): newest mtime across
+    # all files directly in the directory. Empty/unreadable directory -> "".
+    try:
+        newest = None
+        with os.scandir(model_path) as it:
+            for entry in it:
+                try:
+                    if not entry.is_file():
+                        continue
+                    mtime_ns = entry.stat().st_mtime_ns
+                except OSError:
+                    continue
+                if newest is None or mtime_ns > newest:
+                    newest = mtime_ns
+        return str(newest) if newest is not None else ""
+    except OSError:
+        return ""
+
+
 def _shared_cache_key(symbol, df, mdl_src, pred_len):
     """Build the shared-disk `kairos_predcache` key for one (symbol, df,
     model, pred_len) combination.
@@ -311,6 +362,7 @@ def _shared_cache_key(symbol, df, mdl_src, pred_len):
     content_hash = kairos_predcache.content_hash_for_closes(
         df["close"].iloc[-lookback_for_hash:]
     )
+    fingerprint = _model_checkpoint_fingerprint(mdl_src)
     return kairos_predcache.make_key(
         symbol=symbol,
         interval=KairosSettings.interval,
@@ -320,6 +372,7 @@ def _shared_cache_key(symbol, df, mdl_src, pred_len):
         model_id=mdl_src,
         content_hash=content_hash,
         pred_len=pred_len,
+        checkpoint_fingerprint=fingerprint,
     )
 
 

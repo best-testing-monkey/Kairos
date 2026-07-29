@@ -21,6 +21,9 @@ from kairos_papertrade import (
     _format_start_message,
     _format_finish_message,
     _format_crash_message,
+    _ensure_pred_cache_dir_env,
+    _log_watchdog_snapshot,
+    DEFAULT_PRED_CACHE_DIR,
 )
 import kairos_papertrade as kp
 from kairos.ops import OpsError
@@ -531,6 +534,73 @@ class TestPrewarmPredictionCache:
         assert len(predict_positions) == 3  # 3 dates, base_only
         assert notify_positions[0] < min(predict_positions)
 
+    def test_tqdm_wrapping_does_not_change_calls_or_failures(self, monkeypatch):
+        """Regression guard for the tqdm progress bars wrapping both passes
+        (fetch+check, real predict) of both sweep units (base, finetuned
+        group): predict_all_batch/_notify must still be invoked with the
+        exact same arguments, and `failures` must still contain the exact
+        same entries, as before the tqdm wrapping was added. tqdm's own
+        console rendering is not asserted on -- only that it's a pure
+        side-effect (progress reporting) with no bearing on the function's
+        real behavior."""
+        import kairos_strategies
+
+        predict_calls = []
+        notify_calls = []
+        fetch_attempts = {"n": 0}
+
+        def flaky_fetch_data_raw(sym, lookback, as_of=None):
+            fetch_attempts["n"] += 1
+            if fetch_attempts["n"] == 2:
+                raise RuntimeError("simulated fetch failure")
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+            predict_calls.append((model_path, tuple(sorted(data.keys()))))
+            return {}
+
+        def fake_is_batch_cached(data, model_path=None, pred_len=1):
+            return False  # always a genuine miss -> notify fires for both units
+
+        def fake_notify(text, enabled=True):
+            notify_calls.append((text, enabled))
+
+        groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
+        accepted_finetuned = {("AAA,BBB", "1d"): "repo/finetuned-ab"}
+        self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned)
+
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", flaky_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch", fake_predict_all_batch)
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached", fake_is_batch_cached)
+        monkeypatch.setattr(kp, "_notify", fake_notify)
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        # 3 dates; the group's 2nd fetch_data_raw call overall (2nd symbol
+        # of the base sweep's 1st date) fails, aborting just that one date's
+        # fetch dict comprehension -- the base sweep ends up with 1 failure
+        # and 2 successfully-fetched dates; the finetuned sweep's own 3
+        # fetches never land on the flaky counter's failing index again.
+        assert len(failures) == 1
+        assert "simulated fetch failure" in failures[0]
+
+        # 2 successful base dates + 3 finetuned dates = 5 predict_all_batch calls.
+        assert len(predict_calls) == 5
+        base_predict = [c for c in predict_calls if c[0] is None]
+        finetuned_predict = [c for c in predict_calls if c[0] == "repo/finetuned-ab"]
+        assert len(base_predict) == 2
+        assert len(finetuned_predict) == 3
+        assert all(c[1] == ("AAA", "BBB") for c in predict_calls)
+
+        # Both units had a genuine cache miss -> exactly one _notify per unit.
+        assert len(notify_calls) == 2
+        assert notify_calls[0][1] is True
+        assert notify_calls[1][1] is True
+        assert "Base" in notify_calls[0][0]
+        assert "Finetuned(AAA,BBB)" in notify_calls[1][0]
+
 
 # ============================================================================
 # map_instrument_type
@@ -857,3 +927,127 @@ class TestFormatCrashMessage:
         assert "interval=1h" in msg
         assert "boom" in msg
         assert "```" in msg
+
+
+# ============================================================================
+# _ensure_pred_cache_dir_env -- persistent cache-dir selection (extracted
+# from main() so it's directly unit-testable without importing `phantom`)
+# ============================================================================
+
+class TestEnsurePredCacheDirEnv:
+    def test_defaults_to_default_pred_cache_dir_when_unset(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+        # Point DEFAULT_PRED_CACHE_DIR at a tmp_path-backed location so the
+        # test never touches the real repo's data/ directory.
+        fake_default = str(tmp_path / "predcache")
+        monkeypatch.setattr(kp, "DEFAULT_PRED_CACHE_DIR", fake_default)
+
+        result = _ensure_pred_cache_dir_env()
+
+        assert result == fake_default
+        assert os.environ["KAIROS_PRED_CACHE_DIR"] == fake_default
+        assert os.path.isdir(fake_default)
+        monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+
+    def test_does_not_delete_default_dir_or_its_contents(self, monkeypatch, tmp_path):
+        # The whole point of persistence: unlike the old ephemeral tempdir
+        # behavior, calling this (and by extension, a papertrade run) must
+        # never remove the cache directory or what's in it.
+        monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+        fake_default = str(tmp_path / "predcache")
+        monkeypatch.setattr(kp, "DEFAULT_PRED_CACHE_DIR", fake_default)
+
+        _ensure_pred_cache_dir_env()
+        marker = os.path.join(fake_default, "existing_entry.npz")
+        with open(marker, "wb") as f:
+            f.write(b"fake cached prediction data")
+
+        # Call again (simulating a second invocation reusing the same dir).
+        _ensure_pred_cache_dir_env()
+
+        assert os.path.exists(marker), "persistent cache dir/contents must survive"
+        monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+
+    def test_respects_preset_env_var_without_overwriting(self, monkeypatch, tmp_path):
+        preset_dir = str(tmp_path / "caller_chosen_dir")
+        os.makedirs(preset_dir, exist_ok=True)
+        monkeypatch.setenv("KAIROS_PRED_CACHE_DIR", preset_dir)
+        fake_default = str(tmp_path / "predcache")
+        monkeypatch.setattr(kp, "DEFAULT_PRED_CACHE_DIR", fake_default)
+
+        result = _ensure_pred_cache_dir_env()
+
+        assert result == preset_dir
+        assert os.environ["KAIROS_PRED_CACHE_DIR"] == preset_dir
+        # Must not have created/touched the default dir at all.
+        assert not os.path.exists(fake_default)
+        monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+
+
+# ============================================================================
+# _log_watchdog_snapshot -- best-effort forensic logging for the
+# slow-iteration watchdog (freeze investigation; logging only, not a fix)
+# ============================================================================
+
+class TestLogWatchdogSnapshot:
+    def test_appends_timestamped_entry_with_command_output(self, monkeypatch, tmp_path):
+        log_path = str(tmp_path / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+
+        def fake_run(cmd, capture_output, text, timeout):
+            if cmd[0] == "free":
+                return MagicMock(stdout="              total        used\nMem:           13Gi        8Gi\n")
+            return MagicMock(stdout="memory.used,memory.total,utilization.gpu\n1000 MiB, 8000 MiB, 20 %\n")
+
+        monkeypatch.setattr(kp.subprocess, "run", fake_run)
+
+        _log_watchdog_snapshot("backtest 2026-07-28", 612.3)
+
+        assert os.path.exists(log_path)
+        with open(log_path) as f:
+            content = f.read()
+        assert "slow iteration" in content
+        assert "backtest 2026-07-28" in content
+        assert "elapsed=612.3s" in content
+        assert "13Gi" in content
+        assert "1000 MiB" in content
+
+    def test_appends_without_clobbering_prior_entries(self, monkeypatch, tmp_path):
+        log_path = str(tmp_path / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+        monkeypatch.setattr(kp.subprocess, "run", lambda *a, **kw: MagicMock(stdout=""))
+
+        _log_watchdog_snapshot("first", 400.0)
+        _log_watchdog_snapshot("second", 500.0)
+
+        with open(log_path) as f:
+            content = f.read()
+        assert "first" in content
+        assert "second" in content
+
+    def test_never_raises_when_subprocess_run_fails(self, monkeypatch, tmp_path):
+        log_path = str(tmp_path / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+
+        def boom(*a, **kw):
+            raise FileNotFoundError("no such binary")
+
+        monkeypatch.setattr(kp.subprocess, "run", boom)
+
+        # Must not raise -- best-effort forensics, never blocks the backtest.
+        _log_watchdog_snapshot("context", 301.0)
+
+        assert os.path.exists(log_path)
+        with open(log_path) as f:
+            content = f.read()
+        assert "free -h failed" in content
+        assert "nvidia-smi failed" in content
+
+    def test_creates_parent_directory_if_missing(self, monkeypatch, tmp_path):
+        log_path = str(tmp_path / "nested" / "dir" / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+        monkeypatch.setattr(kp.subprocess, "run", lambda *a, **kw: MagicMock(stdout=""))
+
+        _log_watchdog_snapshot("context", 301.0)
+
+        assert os.path.exists(log_path)

@@ -613,3 +613,88 @@ class TestSharedCacheKeyRefactor:
         monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
         kairos_predcache._singleton = None
         kairos_predcache._singleton_dir = None
+
+    def test_shared_cache_key_differs_after_simulated_in_place_retrain(self, tmp_path):
+        """A local finetuned checkpoint directory retrained in place (same
+        model_path, weights file's mtime bumped) must produce a different
+        _shared_cache_key so a stale prediction is never served -- this is
+        the exact staleness gap that used to justify making the shared
+        cache ephemeral (see CLAUDE.md's "Model-major prediction prewarm
+        (papertrade)" section)."""
+        model_dir = tmp_path / "finetuned_model"
+        model_dir.mkdir()
+        weights = model_dir / "model.safetensors"
+        weights.write_bytes(b"x" * 100)
+
+        df = self._make_asset_df()
+        key_before = kairos_strategies._shared_cache_key("BTC-USD", df, str(model_dir), 1)
+
+        # Simulate an in-place retrain: same path, weights file rewritten
+        # with a later mtime (and, in this case, a different size too).
+        os.utime(weights, (0, 0))
+        key_before_low_mtime = kairos_strategies._shared_cache_key("BTC-USD", df, str(model_dir), 1)
+        weights.write_bytes(b"y" * 250)
+        os.utime(weights, (1_700_000_000, 1_700_000_000))
+        key_after = kairos_strategies._shared_cache_key("BTC-USD", df, str(model_dir), 1)
+
+        assert key_before != key_before_low_mtime
+        assert key_before_low_mtime != key_after
+        assert key_before != key_after
+
+
+# ============================================================================
+# _model_checkpoint_fingerprint
+# ============================================================================
+
+class TestModelCheckpointFingerprint:
+    def test_returns_empty_string_for_bare_repo_id(self):
+        assert kairos_strategies._model_checkpoint_fingerprint("NeoQuasar/Kronos-base") == ""
+
+    def test_returns_empty_string_for_none(self):
+        assert kairos_strategies._model_checkpoint_fingerprint(None) == ""
+
+    def test_returns_empty_string_for_empty_string(self):
+        assert kairos_strategies._model_checkpoint_fingerprint("") == ""
+
+    def test_local_dir_with_weights_file_returns_nonempty_fingerprint(self, tmp_path):
+        weights = tmp_path / "model.safetensors"
+        weights.write_bytes(b"x" * 128)
+        fp = kairos_strategies._model_checkpoint_fingerprint(str(tmp_path))
+        assert fp != ""
+        assert "128" in fp
+
+    def test_fingerprint_changes_after_mtime_bump(self, tmp_path):
+        weights = tmp_path / "model.safetensors"
+        weights.write_bytes(b"x" * 128)
+        fp1 = kairos_strategies._model_checkpoint_fingerprint(str(tmp_path))
+
+        os.utime(weights, (1_700_000_000, 1_700_000_000))
+        fp2 = kairos_strategies._model_checkpoint_fingerprint(str(tmp_path))
+
+        assert fp1 != fp2
+
+    def test_fingerprint_changes_after_size_change(self, tmp_path):
+        weights = tmp_path / "model.safetensors"
+        weights.write_bytes(b"x" * 128)
+        fp1 = kairos_strategies._model_checkpoint_fingerprint(str(tmp_path))
+
+        weights.write_bytes(b"x" * 256)
+        fp2 = kairos_strategies._model_checkpoint_fingerprint(str(tmp_path))
+
+        assert fp1 != fp2
+
+    def test_empty_directory_returns_empty_string(self, tmp_path):
+        assert kairos_strategies._model_checkpoint_fingerprint(str(tmp_path)) == ""
+
+    def test_falls_back_to_newest_mtime_when_weights_file_missing(self, tmp_path):
+        # Defensive fallback path: no model.safetensors, but other files
+        # exist directly in the directory.
+        (tmp_path / "config.json").write_text("{}")
+        fp1 = kairos_strategies._model_checkpoint_fingerprint(str(tmp_path))
+        assert fp1 != ""
+
+        import time
+        time.sleep(0.01)
+        (tmp_path / "other.bin").write_bytes(b"z")
+        fp2 = kairos_strategies._model_checkpoint_fingerprint(str(tmp_path))
+        assert fp2 != ""

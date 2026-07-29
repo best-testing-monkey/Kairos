@@ -181,6 +181,33 @@ class TestFetchDataRawLocalSqliteFallback:
         assert "close" in raw.columns
         assert "using direct local SQLite fallback" in capsys.readouterr().out
 
+    def test_fallback_warning_prints_only_once_per_symbol(self, tmp_path, monkeypatch, capsys):
+        """fetch_data_raw is called once per (symbol, date) pair by callers like
+        prewarm_prediction_cache, which sweeps every date in a backtest window.
+        The fallback line must only print the first time a given symbol hits
+        this path in the process, not on every call."""
+        import kairos_strategies
+
+        as_of = datetime(2026, 1, 5, 12, 0)
+        db_path = str(tmp_path / "prices.db")
+        _seed_local_prices_db(db_path, ticker="CRV-USD", start="2025-12-10", n_bars=20)
+
+        monkeypatch.setattr(kairos_strategies.price_cache, "get_price_data", lambda *a, **k: None)
+        monkeypatch.setattr(kairos_strategies.price_cache, "DB_PATH", db_path)
+        monkeypatch.setattr(KairosSettings, "interval", "1d")
+        kairos_strategies._no_data_fallback_warned.clear()
+
+        raw1 = fetch_data_raw("CRV-USD", lookback=3, as_of=as_of)
+        assert "using direct local SQLite fallback" in capsys.readouterr().out
+
+        raw2 = fetch_data_raw("CRV-USD", lookback=3, as_of=as_of)
+        assert "using direct local SQLite fallback" not in capsys.readouterr().out
+
+        assert len(raw1) == 20
+        assert len(raw2) == 20
+
+        kairos_strategies._no_data_fallback_warned.clear()
+
     def test_raises_when_local_sqlite_also_has_no_data(self, tmp_path, monkeypatch):
         import kairos_strategies
 

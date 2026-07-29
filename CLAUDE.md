@@ -147,28 +147,48 @@ The key optimization in `auto_regressive_inference`: run `tokenizer.encode` and
 unloads+reloads (`_materialize_model`). `kairos_signals.run()`'s per-date
 loop visits base → finetuned-group-1 → ... → finetuned-group-G → (next date)
 → base again, so naively that's `G+1` reloads *per backtest date*.
-`kairos_papertrade.py`'s `main()` avoids this by wrapping the whole
-`generate_and_dedupe_reports()` loop in an ephemeral `KAIROS_PRED_CACHE_DIR`
-(a fresh `tempfile.mkdtemp`, torn down in `finally` — same one-run-only
-pattern `kairos_pipeline.py`'s `run_stage_auto` already uses for
-`--stage auto`) and running `prewarm_prediction_cache()` first: it sweeps
-**model-major** — every date for the base model, then every date for each
-finetuned group's model, in `strategy/kairos_predcache.py`'s shared disk
-cache — so each model loads exactly once for the whole run. The date-major
-`run()` loop that follows then finds every `(symbol, bar, model)` prediction
-already cached and never reloads at all
+`kairos_papertrade.py`'s `main()` avoids this by running
+`prewarm_prediction_cache()` before the whole `generate_and_dedupe_reports()`
+loop: it sweeps **model-major** — every date for the base model, then every
+date for each finetuned group's model, in `strategy/kairos_predcache.py`'s
+shared disk cache — so each model loads exactly once for the whole run. The
+date-major `run()` loop that follows then finds every `(symbol, bar, model)`
+prediction already cached and never reloads at all
 (`kairos_strategies.predict_all_batch` defers `_materialize_model` until
 *after* the shared-cache lookup, and skips it entirely on a full hit).
-Do NOT make this cache persist across separate `kairos_papertrade.py`
-invocations — the cache key has no checksum/mtime of the checkpoint file, so
-a finetuned model retrained in place at the same `model_path` between two
-runs would silently serve stale predictions under a persistent cache. Use
-`--no-pred-cache` to disable prewarm/reuse for a run if you need to debug
-around it. `kairos_predcache.make_key()`'s key includes `pred_len` — always
-`1` today (papertrade only predicts one bar ahead), but if that horizon
-becomes configurable, thread the real value through `predict_all_batch`
-rather than hardcoding it, or longer-horizon runs will silently collide
-with cached 1-bar predictions.
+
+The cache is a **persistent disk cache** at `data/predcache/`
+(`DEFAULT_PRED_CACHE_DIR` in `kairos_papertrade.py`) — deliberately NOT
+under `/tmp` or tmpfs, so it survives across separate `kairos_papertrade.py`
+invocations and reboots. `main()`'s `_ensure_pred_cache_dir_env()` points
+`KAIROS_PRED_CACHE_DIR` at it unless the caller already set that env var
+(an explicit choice that's left untouched). This used to be an ephemeral
+`tempfile.mkdtemp`, torn down in `finally` every run, specifically because
+the cache key had no way to detect a checkpoint retrained in place at the
+same `model_path`; that gap is now closed by
+`kairos_strategies._model_checkpoint_fingerprint()` (size + mtime of
+`model.safetensors` for local finetuned checkpoint directories; returns `""`
+for HF repo ids like the base model, which aren't retrained in place),
+folded into the shared cache key via `kairos_predcache.make_key()`'s
+`checkpoint_fingerprint` parameter. A checkpoint retrained in place therefore
+produces a different key and is treated as a fresh miss rather than served
+stale, so persistence across invocations is now safe. Disk usage is bounded
+by `PredictionCache.max_disk_bytes` (default 2GiB, oldest-`st_mtime`
+eviction on every write that pushes the cache over budget), configurable via
+the `KAIROS_PRED_CACHE_MAX_BYTES` env var. Use `--no-pred-cache` to disable
+prewarm/reuse for a run if you need to debug around it (unrelated to this
+persistence change — same escape hatch as before).
+`kairos_predcache.make_key()`'s key also includes `pred_len` — always `1`
+today (papertrade only predicts one bar ahead), but if that horizon becomes
+configurable, thread the real value through `predict_all_batch` rather than
+hardcoding it, or longer-horizon runs will silently collide with cached
+1-bar predictions.
+
+`kairos_pipeline.py --stage auto`'s own use of `kairos_predcache` is a
+*different* ephemeral tempdir, for a *different* reason (reusing predictions
+across overlapping correlation groups within one subprocess-spawning run,
+torn down at the end of that same run) — it has no retrain-in-place
+exposure and is unaffected by any of the above.
 
 ## Test suite
 

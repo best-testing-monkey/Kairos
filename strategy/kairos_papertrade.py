@@ -34,9 +34,8 @@ import argparse
 import json
 import os
 import re
-import shutil
+import subprocess
 import sys
-import tempfile
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -46,6 +45,7 @@ import sqlite3
 
 import pandas as pd
 import price_cache
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,6 +55,8 @@ from kairos.ops import GpuLock, OpsError, send_telegram
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PHANTOM_DATA_DIR = os.path.join(REPO_ROOT, "data", "phantom_ledger")
+DEFAULT_PRED_CACHE_DIR = os.path.join(REPO_ROOT, "data", "predcache")
+WATCHDOG_LOG_PATH = os.path.join(REPO_ROOT, "data", "papertrade_watchdog.log")
 
 # Finest-to-coarsest intraday intervals to try, in order, before falling
 # back to phantom's own daily ("1d") behavior. 3h/12h were requested but
@@ -106,6 +108,56 @@ def _notify(text: str, enabled: bool = True) -> None:
         send_telegram(text, parse_mode=None)
     except OpsError as exc:
         print(f"[kairos_papertrade] WARNING: Telegram notification failed: {exc}", file=sys.stderr)
+
+
+def _log_watchdog_snapshot(context: str, elapsed: float) -> None:
+    """Append a timestamped forensic snapshot to WATCHDOG_LOG_PATH when the
+    slow-iteration watchdog fires (see _SLOW_ITERATION_THRESHOLD_SECONDS's
+    two call sites).
+
+    This is deliberately logging-only, NOT a fix: an overnight papertrade
+    run froze the machine (2026-07-28/29) and the leading hypothesis at the
+    time this was written was a RAM/swap brownout, but the math doesn't
+    support the prediction cache as the culprit and this machine has a
+    separate, already-documented history of GPU/display driver hangs that
+    matches the symptom (full freeze, no clean shutdown) at least as well.
+    Rather than guess-fixing an unconfirmed cause, this captures `free -h`
+    and `nvidia-smi` output at the moment a slow iteration is detected, so a
+    future freeze has forensic evidence instead of nothing. Never touches
+    kairos_predcache's mem_fraction/LRU sizing -- out of scope, see above.
+
+    Best-effort only: every subprocess call and the log write itself are
+    wrapped in try/except so a missing binary (e.g. no nvidia-smi on a
+    CPU-only box), a subprocess timeout, or a log-write failure can never
+    crash or block the actual backtest loop.
+    """
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    lines = [f"=== {timestamp} slow iteration: {context} (elapsed={elapsed:.1f}s) ==="]
+
+    try:
+        free_result = subprocess.run(
+            ["free", "-h"], capture_output=True, text=True, timeout=10,
+        )
+        lines.append(free_result.stdout)
+    except Exception as exc:
+        lines.append(f"[free -h failed: {exc}]")
+
+    try:
+        gpu_result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
+             "--format=csv"],
+            capture_output=True, text=True, timeout=10,
+        )
+        lines.append(gpu_result.stdout)
+    except Exception as exc:
+        lines.append(f"[nvidia-smi failed: {exc}]")
+
+    try:
+        os.makedirs(os.path.dirname(WATCHDOG_LOG_PATH), exist_ok=True)
+        with open(WATCHDOG_LOG_PATH, "a") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as exc:
+        print(f"[kairos_papertrade] WARNING: watchdog log write failed: {exc}", file=sys.stderr)
 
 
 class _IntradayFallbackProvider:
@@ -235,6 +287,9 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, not
                 f"still running",
                 enabled=notify,
             )
+            _log_watchdog_snapshot(
+                f"report {i + 1}/{n_iterations} (date {iter_now:%Y-%m-%d})", elapsed,
+            )
         effective_dt = parse_report_effective_dt(out_path)
         if effective_dt not in seen:
             seen[effective_dt] = (effective_dt, stats_rows, advice_rows)
@@ -259,6 +314,36 @@ def _format_prewarm_load_message(model_label: str, dates: list) -> str:
     )
 
 
+def _ensure_pred_cache_dir_env() -> str:
+    """Point KAIROS_PRED_CACHE_DIR at a persistent, project-local cache dir
+    for this run, unless the caller already set it.
+
+    Persistent, project-local shared prediction cache dir (data/predcache/
+    -- NOT /tmp/tmpfs, survives across invocations and reboots; see
+    DEFAULT_PRED_CACHE_DIR and CLAUDE.md's "Model-major prediction prewarm"
+    section). If the caller already set KAIROS_PRED_CACHE_DIR, that's an
+    explicit choice -- this function leaves it alone entirely (no override,
+    no restore-on-exit anywhere in this module). Otherwise it points the env
+    var at DEFAULT_PRED_CACHE_DIR for this run; unlike the old ephemeral
+    tempdir behavior, the directory is NOT torn down afterward -- that's the
+    whole point of making this persistent.
+
+    Safety against a checkpoint retrained in place between two runs at the
+    same model_path comes from kairos_strategies._model_checkpoint_fingerprint()
+    being folded into the shared cache key (see kairos_strategies._shared_cache_key),
+    not from tearing the directory down every run.
+
+    Returns the resolved KAIROS_PRED_CACHE_DIR value (whichever of the two
+    cases applied).
+    """
+    existing = os.environ.get("KAIROS_PRED_CACHE_DIR")
+    if existing:
+        return existing
+    os.makedirs(DEFAULT_PRED_CACHE_DIR, exist_ok=True)
+    os.environ["KAIROS_PRED_CACHE_DIR"] = DEFAULT_PRED_CACHE_DIR
+    return DEFAULT_PRED_CACHE_DIR
+
+
 def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify: bool = True):
     """Populate kairos_predcache's shared disk/memory cache MODEL-MAJOR
     (all dates for the base model, then all dates for each finetuned group's
@@ -277,7 +362,8 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
 
     Discards predict_all_batch's return value -- the only purpose of this
     sweep is the kairos_predcache disk-cache side effect (requires
-    KAIROS_PRED_CACHE_DIR to already be set in the environment; see main()).
+    KAIROS_PRED_CACHE_DIR to already be set in the environment; see main(),
+    which points it at the persistent DEFAULT_PRED_CACHE_DIR by default).
 
     Each sweep unit -- the base sweep (one unit covering every group) and
     each finetuned group's sweep (its own unit, since each has a distinct
@@ -327,9 +413,13 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
     # ── Base sweep: one unit covering every group, every date. ─────────────
     base_entries = []  # (assets_str, grp_interval, date, data)
     base_needs_load = False
+    base_check_pbar = tqdm(
+        total=len(groups) * len(dates), desc="Prewarm check: Base", unit="req",
+    )
     for (assets_str, grp_interval), _group_rows in groups.items():
         assets = assets_str.split(",")
         for date in dates:
+            base_check_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
             try:
                 data = {
                     sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
@@ -340,15 +430,20 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
                     f"prewarm base group assets={assets_str} interval={grp_interval} "
                     f"date={date}: {e}"
                 )
+                base_check_pbar.update(1)
                 continue
             base_entries.append((assets_str, grp_interval, date, data))
             if not kairos_strategies.is_batch_cached(data, model_path=None):
                 base_needs_load = True
+            base_check_pbar.update(1)
+    base_check_pbar.close()
 
     if base_needs_load and dates:
         _notify(_format_prewarm_load_message("Base", dates), enabled=notify)
 
-    for assets_str, grp_interval, date, data in base_entries:
+    base_load_pbar = tqdm(base_entries, desc="Prewarm load: Base", unit="req", total=len(base_entries))
+    for assets_str, grp_interval, date, data in base_load_pbar:
+        base_load_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
         try:
             kairos_strategies.predict_all_batch(data, model_path=None)
         except Exception as e:
@@ -369,9 +464,14 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
                 continue
 
             assets = assets_str.split(",")
+            model_label = f"Finetuned({assets_str})"
             group_entries = []  # (date, data)
             group_needs_load = False
-            for date in dates:
+            group_check_pbar = tqdm(
+                dates, desc=f"Prewarm check: {model_label}", unit="req", total=len(dates),
+            )
+            for date in group_check_pbar:
+                group_check_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
                 try:
                     data = {
                         sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
@@ -388,10 +488,13 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
                     group_needs_load = True
 
             if group_needs_load and dates:
-                model_label = f"Finetuned({assets_str})"
                 _notify(_format_prewarm_load_message(model_label, dates), enabled=notify)
 
-            for date, data in group_entries:
+            group_load_pbar = tqdm(
+                group_entries, desc=f"Prewarm load: {model_label}", unit="req", total=len(group_entries),
+            )
+            for date, data in group_load_pbar:
+                group_load_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
                 try:
                     kairos_strategies.predict_all_batch(data, model_path=model_path)
                 except Exception as e:
@@ -971,10 +1074,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-pred-cache", dest="pred_cache", action="store_false",
                          default=True,
                          help="Disable the shared kairos_predcache prewarm/reuse pass for this "
-                              "run (default: enabled -- an ephemeral KAIROS_PRED_CACHE_DIR is "
-                              "created, model-major prewarm_prediction_cache() populates it, and "
+                              "run (default: enabled -- a persistent KAIROS_PRED_CACHE_DIR under "
+                              "data/predcache/ is used (unless already set in the environment), "
+                              "model-major prewarm_prediction_cache() populates it, and "
                               "generate_and_dedupe_reports() reuses it so kairos_strategies' "
-                              "single-slot model loader isn't reloaded once per (date, group))")
+                              "single-slot model loader isn't reloaded once per (date, group); "
+                              "the cache survives across invocations and is safe against "
+                              "in-place model retraining -- see DEFAULT_PRED_CACHE_DIR)")
     return parser
 
 
@@ -1021,28 +1127,19 @@ def main(argv=None):
         # accepted tradeoff over the alternative of colliding outright.
         with GpuLock():
             if args.pred_cache:
-                # Ephemeral, this-run-only shared prediction cache dir (same
-                # pattern as kairos_pipeline.py's run_stage_auto): populate it
-                # model-major via prewarm_prediction_cache() BEFORE the
-                # date-major generate_and_dedupe_reports() loop runs, so every
-                # (symbol, bar, model) prediction it needs is already cached
-                # and kairos_strategies never reloads the model mid-loop.
-                cache_dir = tempfile.mkdtemp(prefix="kairos_predcache_papertrade_")
-                prev_cache_dir = os.environ.get("KAIROS_PRED_CACHE_DIR")
-                os.environ["KAIROS_PRED_CACHE_DIR"] = cache_dir
-                try:
-                    prewarm_prediction_cache(
-                        base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
-                    )
-                    dated_rows = generate_and_dedupe_reports(
-                        base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
-                    )
-                finally:
-                    shutil.rmtree(cache_dir, ignore_errors=True)
-                    if prev_cache_dir is None:
-                        os.environ.pop("KAIROS_PRED_CACHE_DIR", None)
-                    else:
-                        os.environ["KAIROS_PRED_CACHE_DIR"] = prev_cache_dir
+                # Populate the persistent shared prediction cache model-major
+                # via prewarm_prediction_cache() BEFORE the date-major
+                # generate_and_dedupe_reports() loop runs, so every (symbol,
+                # bar, model) prediction it needs is already cached and
+                # kairos_strategies never reloads the model mid-loop. See
+                # _ensure_pred_cache_dir_env() for the persistent-dir choice.
+                _ensure_pred_cache_dir_env()
+                prewarm_prediction_cache(
+                    base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
+                )
+                dated_rows = generate_and_dedupe_reports(
+                    base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
+                )
             else:
                 dated_rows = generate_and_dedupe_reports(
                     base_now, args.interval, args.months_back, run_kwargs, notify=args.notify,
@@ -1122,6 +1219,9 @@ def main(argv=None):
                             f"⏱️ Kairos papertrade: backtest for {effective_dt:%Y-%m-%d} "
                             f"took {backtest_elapsed / 60:.1f}min (>5min) — still running",
                             enabled=args.notify,
+                        )
+                        _log_watchdog_snapshot(
+                            f"backtest {effective_dt:%Y-%m-%d}", backtest_elapsed,
                         )
 
             prev_candidates = fetch_signals(stats_rows, advice_rows)

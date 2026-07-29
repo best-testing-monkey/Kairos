@@ -51,6 +51,21 @@ def test_make_key_differs_by_pred_len_alone():
     assert k1 != k2
 
 
+def test_make_key_differs_by_checkpoint_fingerprint_alone():
+    k1 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123", 1,
+                      checkpoint_fingerprint="1024-1000")
+    k2 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123", 1,
+                      checkpoint_fingerprint="2048-2000")
+    assert k1 != k2
+
+
+def test_make_key_checkpoint_fingerprint_defaults_to_empty_and_is_stable():
+    k1 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123", 1)
+    k2 = pc.make_key("BTC-USD", "1d", pd.Timestamp("2024-01-01"), 300, 100, "base", "abc123", 1,
+                      checkpoint_fingerprint="")
+    assert k1 == k2
+
+
 # ── PredictionCache: disk + memory roundtrip ────────────────────────────────
 
 def test_put_then_get_roundtrip_reconstructs_equal_dataframes(tmp_path):
@@ -148,3 +163,82 @@ def test_get_cache_returns_instance_when_env_set(monkeypatch, tmp_path):
     monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
     pc._singleton = None
     pc._singleton_dir = None
+
+
+def test_get_cache_honors_max_bytes_env_var(monkeypatch, tmp_path):
+    monkeypatch.setenv("KAIROS_PRED_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("KAIROS_PRED_CACHE_MAX_BYTES", "12345")
+    pc._singleton = None
+    pc._singleton_dir = None
+    cache = pc.get_cache()
+    assert cache is not None
+    assert cache.max_disk_bytes == 12345
+    monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+    monkeypatch.delenv("KAIROS_PRED_CACHE_MAX_BYTES", raising=False)
+    pc._singleton = None
+    pc._singleton_dir = None
+
+
+def test_get_cache_defaults_max_bytes_when_env_var_unset(monkeypatch, tmp_path):
+    monkeypatch.setenv("KAIROS_PRED_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("KAIROS_PRED_CACHE_MAX_BYTES", raising=False)
+    pc._singleton = None
+    pc._singleton_dir = None
+    cache = pc.get_cache()
+    assert cache.max_disk_bytes == pc._DEFAULT_MAX_DISK_BYTES
+    monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+    pc._singleton = None
+    pc._singleton_dir = None
+
+
+# ── disk size cap + eviction ─────────────────────────────────────────────────
+
+class TestDiskEviction:
+    def _dir_size(self, cache_dir) -> int:
+        total = 0
+        for name in os.listdir(cache_dir):
+            total += os.path.getsize(os.path.join(cache_dir, name))
+        return total
+
+    def test_writing_past_budget_evicts_oldest_mtime_first(self, tmp_path):
+        # Each entry is a few KB on disk; use a tiny budget so a handful of
+        # writes forces eviction without needing thousands of entries.
+        cache = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024,
+                                    max_disk_bytes=6 * 1024)
+
+        keys = [f"k{i}" for i in range(6)]
+        paths = {}
+        for i, key in enumerate(keys):
+            cache.put(key, _make_samples(3, base_price=100.0 + i))
+            paths[key] = cache._disk_path(key)
+            # Ensure distinct, increasing mtimes so "oldest" is unambiguous
+            # even on filesystems with coarse mtime resolution.
+            os.utime(paths[key], (i * 10, i * 10))
+
+        # Total on-disk size must stay under budget after every write.
+        assert self._dir_size(str(tmp_path)) <= cache.max_disk_bytes
+
+        # The earliest-written keys should have been evicted first; the
+        # most recently written key must still be present.
+        assert not os.path.exists(paths[keys[0]])
+        assert os.path.exists(paths[keys[-1]])
+        assert cache.get(keys[-1]) is not None
+
+    def test_disk_bytes_tracks_actual_directory_size(self, tmp_path):
+        cache = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024,
+                                    max_disk_bytes=10 * 1024 * 1024)
+        cache.put("a", _make_samples(2))
+        cache.put("b", _make_samples(2))
+        assert cache._disk_bytes == self._dir_size(str(tmp_path))
+
+    def test_seeds_disk_bytes_from_existing_directory_on_init(self, tmp_path):
+        cache1 = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024,
+                                     max_disk_bytes=10 * 1024 * 1024)
+        cache1.put("seed-key", _make_samples(2))
+        on_disk_size = self._dir_size(str(tmp_path))
+
+        # A fresh instance over the same (already populated) cache_dir must
+        # seed its byte counter from what's actually on disk, not start at 0.
+        cache2 = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024,
+                                     max_disk_bytes=10 * 1024 * 1024)
+        assert cache2._disk_bytes == on_disk_size

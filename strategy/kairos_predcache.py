@@ -46,18 +46,29 @@ def content_hash_for_closes(closes) -> str:
 
 
 def make_key(symbol, interval, bar_timestamp, lookback_len, pred_samples,
-             model_id, content_hash, pred_len) -> str:
+             model_id, content_hash, pred_len, checkpoint_fingerprint: str = "") -> str:
     """Build a canonical, filename-safe cache key string.
 
     pred_len is included so a longer-horizon prediction can never collide
     with a cached prediction computed for a different pred_len under an
     otherwise-identical key (symbol/interval/bar/lookback/samples/model/
     content hash).
+
+    checkpoint_fingerprint is included so a local finetuned checkpoint
+    retrained in place at the same model_path (same model_id string, but
+    different actual weights on disk) never collides with a cached
+    prediction computed under the old weights. Callers own how to compute
+    their fingerprint (e.g. kairos_strategies._model_checkpoint_fingerprint)
+    -- this module stays agnostic about what a "model" is. Defaults to ""
+    (no fingerprint contribution) so callers that don't have a meaningful
+    fingerprint (e.g. an HF repo id, which isn't retrained in place) or
+    that predate this parameter behave identically to before.
     """
     bar_ts_iso = pd.Timestamp(bar_timestamp).isoformat()
     parts = [
         str(symbol), str(interval), bar_ts_iso, str(lookback_len),
         str(pred_len), str(pred_samples), str(model_id or "default"), str(content_hash),
+        str(checkpoint_fingerprint or ""),
     ]
     return "|".join(parts)
 
@@ -88,6 +99,9 @@ def _dfs_nbytes(sample_dfs: List[pd.DataFrame]) -> int:
     return total
 
 
+_DEFAULT_MAX_DISK_BYTES = 2 * 1024**3  # 2GiB
+
+
 class PredictionCache:
     """Disk-backed prediction cache with an in-memory LRU on top.
 
@@ -95,16 +109,33 @@ class PredictionCache:
     put(key, sample_dfs)
     """
 
-    def __init__(self, cache_dir, mem_fraction: float = 0.25, mem_budget_bytes: Optional[int] = None):
+    def __init__(self, cache_dir, mem_fraction: float = 0.25, mem_budget_bytes: Optional[int] = None,
+                 max_disk_bytes: int = _DEFAULT_MAX_DISK_BYTES):
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
         if mem_budget_bytes is not None:
             self.mem_budget_bytes = int(mem_budget_bytes)
         else:
             self.mem_budget_bytes = int(_read_mem_available_bytes() * mem_fraction)
+        self.max_disk_bytes = int(max_disk_bytes)
         self._lock = threading.Lock()
         self._mem: "OrderedDict[str, tuple]" = OrderedDict()  # key -> (list[DataFrame], nbytes)
         self._mem_bytes = 0
+        self._disk_bytes = self._scan_disk_bytes()
+
+    def _scan_disk_bytes(self) -> int:
+        total = 0
+        try:
+            with os.scandir(self.cache_dir) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file():
+                            total += entry.stat().st_size
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        return total
 
     # ── in-memory LRU ────────────────────────────────────────────────────
     def _mem_get(self, key: str):
@@ -160,7 +191,10 @@ class PredictionCache:
         except Exception:
             # Corrupt/unreadable file: treat as a miss and clean it up.
             try:
+                size = os.path.getsize(path)
                 os.remove(path)
+                with self._lock:
+                    self._disk_bytes -= size
             except OSError:
                 pass
             return None
@@ -180,9 +214,56 @@ class PredictionCache:
         ])
         path = self._disk_path(key)
         tmp_path = path + f".tmp{os.getpid()}"
+        old_size = 0
+        try:
+            old_size = os.path.getsize(path)
+        except OSError:
+            pass
         with open(tmp_path, "wb") as f:
             np.savez(f, values=values, columns=np.array(columns), index=index_iso)
         os.replace(tmp_path, path)
+        new_size = os.path.getsize(path)
+        with self._lock:
+            self._disk_bytes += new_size - old_size
+        self._evict_disk_if_over_budget(skip_path=path)
+
+    def _evict_disk_if_over_budget(self, skip_path: Optional[str] = None):
+        """Evict oldest-st_mtime files under cache_dir until _disk_bytes is
+        back under max_disk_bytes. Mirrors _mem_put's LRU-eviction pattern,
+        file-based instead of dict-based -- mtime stands in for "oldest"
+        since files on disk have no separate access-order structure.
+        `skip_path` (the entry we just wrote) is never evicted, matching
+        _mem_put's guard against evicting the entry just inserted.
+        """
+        with self._lock:
+            if self._disk_bytes <= self.max_disk_bytes:
+                return
+            try:
+                entries = []
+                with os.scandir(self.cache_dir) as it:
+                    for entry in it:
+                        if not entry.name.endswith(".npz"):
+                            continue
+                        try:
+                            if not entry.is_file():
+                                continue
+                            st = entry.stat()
+                        except OSError:
+                            continue
+                        entries.append((st.st_mtime, entry.path, st.st_size))
+            except OSError:
+                return
+            entries.sort(key=lambda t: t[0])  # oldest mtime first
+            for _mtime, path, size in entries:
+                if self._disk_bytes <= self.max_disk_bytes:
+                    break
+                if skip_path is not None and os.path.abspath(path) == os.path.abspath(skip_path):
+                    continue
+                try:
+                    os.remove(path)
+                except OSError:
+                    continue
+                self._disk_bytes -= size
 
     # ── public API ───────────────────────────────────────────────────────
     def get(self, key: str) -> Optional[List[pd.DataFrame]]:
@@ -212,6 +293,13 @@ def get_cache() -> Optional[PredictionCache]:
         return None
     if _singleton is not None and _singleton_dir == cache_dir:
         return _singleton
-    _singleton = PredictionCache(cache_dir)
+    max_disk_bytes = _DEFAULT_MAX_DISK_BYTES
+    env_max_bytes = os.environ.get("KAIROS_PRED_CACHE_MAX_BYTES")
+    if env_max_bytes:
+        try:
+            max_disk_bytes = int(env_max_bytes)
+        except ValueError:
+            pass
+    _singleton = PredictionCache(cache_dir, max_disk_bytes=max_disk_bytes)
     _singleton_dir = cache_dir
     return _singleton
