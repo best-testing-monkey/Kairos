@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -771,7 +772,8 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
 def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None,
         min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False,
-        cluster_map_path=None, base_only=False, return_rows=False):
+        cluster_map_path=None, base_only=False, return_rows=False,
+        on_group_timing=None):
     """Run the full signals-report flow. Returns the path to the written report.
 
     now: the moment treated as "now" — stamps output filenames/report
@@ -795,10 +797,22 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     return_rows: if True, return (out_path, stats_rows, advice_rows) instead
         of just out_path. Default False preserves the exact old return value
         for every existing caller.
+    on_group_timing: optional callback `(assets_str, interval, model_label,
+        elapsed_seconds, cache_hit) -> None`, invoked once per (group, pass)
+        after each _run_group() call in both the base pass and the
+        finetuned-overlay pass. Default None is a true no-op (skips even the
+        is_batch_cached() precheck) so existing callers (daily_signals.py,
+        weekly_discovery.py, finetune_next) are unaffected. Exists because a
+        single date can fan out into many groups x up to 2 passes each, and
+        callers timing the whole run() call (e.g. kairos_papertrade.py's
+        per-date slow-iteration watchdog) can't tell which group/model
+        actually consumed the time, or whether it was a genuine shared-cache
+        miss (unexpected once prewarm has run) vs. just many groups adding
+        up -- see kairos_papertrade._log_group_timing.
     """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
-    from kairos_strategies import fetch_data_raw, resolve_disabled_strategies, LOOKBACK
+    from kairos_strategies import fetch_data_raw, resolve_disabled_strategies, LOOKBACK, is_batch_cached
 
     if predict_fn is None:
         predict_fn = _real_predict_fn
@@ -834,11 +848,17 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
             }
             fetched_data_cache[(assets_str, interval)] = data
 
+            if on_group_timing is not None:
+                cache_hit = is_batch_cached(data, model_path=None)
+                _group_t0 = time.monotonic()
             group_stats, group_advice, group_skipped = _run_group(
                 assets, interval, group_rows, predict_fn,
                 model_path=None, model_label="Base",
                 data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
             )
+            if on_group_timing is not None:
+                on_group_timing(assets_str, interval, "Base",
+                                 time.monotonic() - _group_t0, cache_hit)
             group_results[(assets_str, interval)] = {
                 "stats": group_stats, "advice": group_advice,
             }
@@ -867,11 +887,17 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
             try:
                 data = fetched_data_cache[key]
                 model_label = f"Finetuned({assets_str})"
+                if on_group_timing is not None:
+                    cache_hit = is_batch_cached(data, model_path=model_path)
+                    _group_t0 = time.monotonic()
                 group_stats, group_advice, group_skipped = _run_group(
                     assets, interval, group_rows, predict_fn,
                     model_path=model_path, model_label=model_label,
                     data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
                 )
+                if on_group_timing is not None:
+                    on_group_timing(assets_str, interval, model_label,
+                                     time.monotonic() - _group_t0, cache_hit)
                 # Displace pass 1's base rows for this group into the
                 # comparison buckets, then swap in the finetuned rerun.
                 replaced_stats_rows.extend(group_results[key]["stats"])

@@ -40,6 +40,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 import sqlite3
 
@@ -70,6 +71,13 @@ _INTRADAY_FALLBACK_LADDER = ["1m", "15m", "30m", "1h"]
 # iteration/day taking this long is treated as an outlier worth a heads-up,
 # not a full every-iteration spam).
 _SLOW_ITERATION_THRESHOLD_SECONDS = 300.0
+
+# Per-(group, pass) threshold for the cheaper, subprocess-free companion log
+# (_log_group_timing). Deliberately much smaller than the per-date threshold
+# above: a single date's run() call can fan out into dozens of groups x up
+# to 2 passes each sharing that 300s budget, so an individual group taking
+# even 30s is worth a line -- see _log_group_timing's docstring.
+_SLOW_GROUP_THRESHOLD_SECONDS = 30.0
 
 # Mirrors the private `_configured`/`_ensure_configured` pattern in
 # phantom/data/yahoo.py (not importable -- it's private) so we only call
@@ -110,6 +118,24 @@ def _notify(text: str, enabled: bool = True) -> None:
         print(f"[kairos_papertrade] WARNING: Telegram notification failed: {exc}", file=sys.stderr)
 
 
+def _read_self_rss_kb() -> Optional[int]:
+    """Current resident set size of THIS process, in KiB, via /proc/self/status.
+
+    Deliberately reads /proc directly instead of shelling out (unlike the
+    free/nvidia-smi snapshots below) -- it's a per-process, per-call figure we
+    want cheaply and reliably on every watchdog fire, not just best-effort.
+    Returns None off-Linux or if /proc is unavailable.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])  # kB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _log_watchdog_snapshot(context: str, elapsed: float) -> None:
     """Append a timestamped forensic snapshot to WATCHDOG_LOG_PATH when the
     slow-iteration watchdog fires (see _SLOW_ITERATION_THRESHOLD_SECONDS's
@@ -126,13 +152,29 @@ def _log_watchdog_snapshot(context: str, elapsed: float) -> None:
     future freeze has forensic evidence instead of nothing. Never touches
     kairos_predcache's mem_fraction/LRU sizing -- out of scope, see above.
 
+    A second freeze (2026-07-29) recurred with the machine-wide RAM climbing
+    steadily over ~90 minutes (per `sar -r`) while this log's own entries
+    showed only date context, no PID -- indistinguishable from either an
+    in-process leak or two overlapping `kairos_papertrade.py` invocations
+    sharing this same log file (bash history that night showed the exact
+    same command launched twice). PID + this process's own VmRSS are logged
+    now so the next occurrence settles which it is: multiple distinct PIDs
+    in the log around the same time means overlapping runs; a single PID
+    whose own RSS climbs in step with system-wide usage means a real
+    in-process leak.
+
     Best-effort only: every subprocess call and the log write itself are
     wrapped in try/except so a missing binary (e.g. no nvidia-smi on a
     CPU-only box), a subprocess timeout, or a log-write failure can never
     crash or block the actual backtest loop.
     """
     timestamp = datetime.now().isoformat(timespec="seconds")
-    lines = [f"=== {timestamp} slow iteration: {context} (elapsed={elapsed:.1f}s) ==="]
+    rss_kb = _read_self_rss_kb()
+    rss_str = f"{rss_kb / (1024 * 1024):.2f}GiB" if rss_kb is not None else "unknown"
+    lines = [
+        f"=== {timestamp} slow iteration: {context} (elapsed={elapsed:.1f}s) "
+        f"pid={os.getpid()} self_rss={rss_str} ==="
+    ]
 
     try:
         free_result = subprocess.run(
@@ -158,6 +200,53 @@ def _log_watchdog_snapshot(context: str, elapsed: float) -> None:
             f.write("\n".join(lines) + "\n")
     except Exception as exc:
         print(f"[kairos_papertrade] WARNING: watchdog log write failed: {exc}", file=sys.stderr)
+
+
+def _log_group_timing(iter_now, assets_str: str, interval: str, model_label: str,
+                       elapsed: float, cache_hit: bool) -> None:
+    """Cheap, subprocess-free companion to _log_watchdog_snapshot.
+
+    generate_and_dedupe_reports's per-date watchdog only measures the whole
+    kairos_signals.run() call for that date -- a date can fan out into dozens
+    of (assets, interval) groups x up to 2 passes (base + finetuned overlay)
+    each, so a >5min date-level entry can't say which group/model actually
+    consumed the time, or whether prewarm's shared-cache coverage held up
+    during report generation. Wired in as run()'s on_group_timing callback
+    (see kairos_signals.run's docstring) so every individual group/pass that
+    was either slow (> _SLOW_GROUP_THRESHOLD_SECONDS) or a shared-cache MISS
+    (unexpected once prewarm has already run for this model/date) gets one
+    line here -- with no subprocess calls, so unlike _log_watchdog_snapshot
+    it's cheap enough to call once per group without adding real overhead to
+    the report-generation loop itself.
+
+    Best-effort: a log-write failure is swallowed (never blocks report
+    generation), matching _log_watchdog_snapshot's contract.
+    """
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    status = "HIT" if cache_hit else "MISS"
+    line = (
+        f"{timestamp} group_timing date={iter_now:%Y-%m-%d} pid={os.getpid()} "
+        f"model={model_label} interval={interval} assets={assets_str} "
+        f"elapsed={elapsed:.1f}s cache={status}\n"
+    )
+    try:
+        os.makedirs(os.path.dirname(WATCHDOG_LOG_PATH), exist_ok=True)
+        with open(WATCHDOG_LOG_PATH, "a") as f:
+            f.write(line)
+    except Exception as exc:
+        print(f"[kairos_papertrade] WARNING: group-timing log write failed: {exc}", file=sys.stderr)
+
+
+def _make_group_timing_cb(iter_now):
+    """Build the on_group_timing callback passed to kairos_signals.run() for
+    a given date, closing over `iter_now` so _log_group_timing's entries
+    carry the right date without threading it through run()'s callback
+    signature. Only logs groups that are slow or a cache miss -- a fully
+    warm, fast group is exactly the expected case and not worth a line."""
+    def _cb(assets_str, interval, model_label, elapsed, cache_hit):
+        if not cache_hit or elapsed > _SLOW_GROUP_THRESHOLD_SECONDS:
+            _log_group_timing(iter_now, assets_str, interval, model_label, elapsed, cache_hit)
+    return _cb
 
 
 class _IntradayFallbackProvider:
@@ -263,7 +352,11 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, not
     longer than `_SLOW_ITERATION_THRESHOLD_SECONDS` (5 minutes), sends a
     Telegram heads-up via `_notify` (enabled=`notify`) so a run that's stuck
     or unusually slow (e.g. a finetuned-overlay pass) is visible without
-    spamming a message per iteration -- only outliers notify.
+    spamming a message per iteration -- only outliers notify. Each `run()`
+    call also gets a per-date on_group_timing callback (see
+    _make_group_timing_cb/_log_group_timing) so a slow date's *groups* are
+    individually visible in data/papertrade_watchdog.log, not just the
+    date-level aggregate.
 
     Returns a list of (effective_dt, stats_rows, advice_rows) tuples, sorted
     oldest-first.
@@ -277,7 +370,8 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, not
         iter_now = base_now - i * step
         start_t = time.monotonic()
         out_path, stats_rows, advice_rows = _kairos_signals_mod.run(
-            now=iter_now, intervals=[interval], return_rows=True, **run_kwargs
+            now=iter_now, intervals=[interval], return_rows=True,
+            on_group_timing=_make_group_timing_cb(iter_now), **run_kwargs
         )
         elapsed = time.monotonic() - start_t
         if elapsed > _SLOW_ITERATION_THRESHOLD_SECONDS:

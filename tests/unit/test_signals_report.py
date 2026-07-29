@@ -1827,6 +1827,49 @@ class TestFinetunedOverlay:
         assert "Finetuned(" not in report
         assert "## Replaced base signals (comparison)" not in report
 
+    def test_on_group_timing_invoked_per_group_and_pass(self, tmp_path, monkeypatch):
+        db_path = self._seed_two_groups(tmp_path)
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD,ETH-USD", "BTC-USD,ETH-USD", "1d", "accepted", "models/ft-btc-eth"),
+        ])
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+        timing_calls = []
+
+        def on_group_timing(assets_str, interval, model_label, elapsed, cache_hit):
+            timing_calls.append((assets_str, interval, model_label, cache_hit))
+            assert elapsed >= 0.0
+
+        self._run(tmp_path, monkeypatch, db_path, strategy, calls,
+                   on_group_timing=on_group_timing)
+
+        # Base pass for both groups, plus the finetuned overlay pass for the
+        # one accepted group -- same fan-out as `calls` in the sibling test.
+        assert len(timing_calls) == 3
+        labels = {(a, m) for a, _, m, _ in timing_calls}
+        assert ("BTC-USD,ETH-USD", "Base") in labels
+        assert ("AAPL", "Base") in labels
+        assert ("BTC-USD,ETH-USD", "Finetuned(BTC-USD,ETH-USD)") in labels
+        # KAIROS_PRED_CACHE_DIR isn't set in this test env, so the shared
+        # cache is inactive and is_batch_cached() always reports a miss --
+        # still exercises the on_group_timing wiring end-to-end.
+        assert all(cache_hit is False for *_, cache_hit in timing_calls)
+
+    def test_on_group_timing_default_none_skips_cache_precheck(self, tmp_path, monkeypatch):
+        # Default (no on_group_timing) must never call is_batch_cached --
+        # regression guard for the "existing callers unaffected" contract.
+        import kairos_strategies
+        monkeypatch.setattr(
+            kairos_strategies, "is_batch_cached",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not be called")),
+        )
+        db_path = self._seed_two_groups(tmp_path)
+        calls = []
+        strategy = _CapturingLongSignalStrategy()
+
+        out_path = self._run(tmp_path, monkeypatch, db_path, strategy, calls)
+        assert os.path.exists(out_path)
+
     def test_base_only_flag_skips_overlay_even_if_accepted(self, tmp_path, monkeypatch):
         db_path = self._seed_two_groups(tmp_path)
         _seed_finetuned_models(db_path, [

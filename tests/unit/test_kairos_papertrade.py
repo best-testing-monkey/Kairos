@@ -23,6 +23,7 @@ from kairos_papertrade import (
     _format_crash_message,
     _ensure_pred_cache_dir_env,
     _log_watchdog_snapshot,
+    _read_self_rss_kb,
     DEFAULT_PRED_CACHE_DIR,
 )
 import kairos_papertrade as kp
@@ -201,6 +202,105 @@ class TestGenerateAndDedupeReports:
         )
 
         mock_send.assert_not_called()
+
+    def test_passes_on_group_timing_callback_per_iteration(self, tmp_path, monkeypatch):
+        import kairos_papertrade as kp
+
+        received_cbs = []
+
+        def fake_run(now, intervals, return_rows, on_group_timing=None, **kwargs):
+            received_cbs.append(on_group_timing)
+            report_path = tmp_path / f"report_{len(received_cbs)}.md"
+            report_path.write_text(f"# Kairos Signals Report {now:%Y-%m-%d} 0000h\n")
+            return str(report_path), [], []
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "run", fake_run)
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        generate_and_dedupe_reports(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert len(received_cbs) == 3
+        assert all(callable(cb) for cb in received_cbs)
+
+
+# ============================================================================
+# _log_group_timing / _make_group_timing_cb
+# ============================================================================
+
+class TestLogGroupTiming:
+    def test_appends_expected_fields(self, monkeypatch, tmp_path):
+        import kairos_papertrade as kp
+
+        log_path = str(tmp_path / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+
+        kp._log_group_timing(
+            datetime(2026, 7, 19), "BTC-USD,ETH-USD", "1d", "Finetuned(BTC-USD,ETH-USD)",
+            42.5, False,
+        )
+
+        with open(log_path) as f:
+            content = f.read()
+        assert "date=2026-07-19" in content
+        assert f"pid={os.getpid()}" in content
+        assert "model=Finetuned(BTC-USD,ETH-USD)" in content
+        assert "interval=1d" in content
+        assert "assets=BTC-USD,ETH-USD" in content
+        assert "elapsed=42.5s" in content
+        assert "cache=MISS" in content
+
+    def test_cache_hit_logged_as_hit(self, monkeypatch, tmp_path):
+        import kairos_papertrade as kp
+
+        log_path = str(tmp_path / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+
+        kp._log_group_timing(datetime(2026, 7, 19), "AAPL", "1d", "Base", 1.0, True)
+
+        with open(log_path) as f:
+            content = f.read()
+        assert "cache=HIT" in content
+
+    def test_never_raises_on_write_failure(self, monkeypatch):
+        import kairos_papertrade as kp
+
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", "/nonexistent/\0bad/path.log")
+        kp._log_group_timing(datetime(2026, 7, 19), "AAPL", "1d", "Base", 1.0, True)
+
+
+class TestMakeGroupTimingCb:
+    def test_logs_on_cache_miss_even_if_fast(self, monkeypatch, tmp_path):
+        import kairos_papertrade as kp
+
+        log_path = str(tmp_path / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+
+        cb = kp._make_group_timing_cb(datetime(2026, 7, 19))
+        cb("AAPL", "1d", "Base", 0.1, False)
+
+        assert os.path.exists(log_path)
+
+    def test_logs_on_slow_elapsed_even_if_cache_hit(self, monkeypatch, tmp_path):
+        import kairos_papertrade as kp
+
+        log_path = str(tmp_path / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+
+        cb = kp._make_group_timing_cb(datetime(2026, 7, 19))
+        cb("AAPL", "1d", "Base", kp._SLOW_GROUP_THRESHOLD_SECONDS + 1, True)
+
+        assert os.path.exists(log_path)
+
+    def test_silent_when_fast_and_cache_hit(self, monkeypatch, tmp_path):
+        import kairos_papertrade as kp
+
+        log_path = str(tmp_path / "papertrade_watchdog.log")
+        monkeypatch.setattr(kp, "WATCHDOG_LOG_PATH", log_path)
+
+        cb = kp._make_group_timing_cb(datetime(2026, 7, 19))
+        cb("AAPL", "1d", "Base", 0.1, True)
+
+        assert not os.path.exists(log_path)
 
 
 # ============================================================================
@@ -989,6 +1089,23 @@ class TestEnsurePredCacheDirEnv:
 # slow-iteration watchdog (freeze investigation; logging only, not a fix)
 # ============================================================================
 
+class TestReadSelfRssKb:
+    def test_returns_positive_int_on_linux(self):
+        rss = _read_self_rss_kb()
+        assert rss is None or rss > 0
+
+    def test_returns_none_when_proc_unreadable(self, monkeypatch):
+        real_open = open
+
+        def fake_open(path, *a, **kw):
+            if path == "/proc/self/status":
+                raise OSError("no /proc here")
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        assert _read_self_rss_kb() is None
+
+
 class TestLogWatchdogSnapshot:
     def test_appends_timestamped_entry_with_command_output(self, monkeypatch, tmp_path):
         log_path = str(tmp_path / "papertrade_watchdog.log")
@@ -1011,6 +1128,8 @@ class TestLogWatchdogSnapshot:
         assert "elapsed=612.3s" in content
         assert "13Gi" in content
         assert "1000 MiB" in content
+        assert f"pid={os.getpid()}" in content
+        assert "self_rss=" in content
 
     def test_appends_without_clobbering_prior_entries(self, monkeypatch, tmp_path):
         log_path = str(tmp_path / "papertrade_watchdog.log")
