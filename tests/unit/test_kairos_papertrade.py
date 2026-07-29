@@ -363,6 +363,50 @@ class TestPrewarmPredictionCache:
         # The finetuned group's 3 calls are contiguous (not interleaved).
         assert finetuned_positions == list(range(min(finetuned_positions), min(finetuned_positions) + 3))
 
+    def test_data_refetched_not_retained_between_check_and_load_passes(self, monkeypatch):
+        """Regression guard for the 2026-07-29 prewarm memory leak: a live
+        run held every fetched (group, date) DataFrame in a list across the
+        whole base sweep, growing RSS from ~2.4GB to 10.1GB in 18 minutes
+        before a single new predict_all_batch call. The fix re-fetches data
+        fresh in the load pass instead of reusing what the check pass
+        fetched, so fetch_data_raw is called exactly twice per successfully
+        checked entry (once to check, once to load) -- this test fails if
+        someone reverts to holding the data across passes (which would drop
+        the fetch count back to once per entry)."""
+        import kairos_strategies
+
+        fetch_calls = []
+
+        def counting_fetch_data_raw(sym, lookback, as_of=None):
+            fetch_calls.append((sym, as_of))
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
+                             lambda data, model_path=None, tokenizer_path=None: {})
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", counting_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+
+        groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda conn: {})
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        # 0.1 months -> 3 dates; 1 group of 2 symbols -> 2 fetches/date/pass.
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert failures == []
+        # 3 dates x 2 symbols x 2 passes (check + load) = 12 fetch calls.
+        assert len(fetch_calls) == 12
+
     def test_base_only_skips_finetuned_sweep(self, monkeypatch):
         import kairos_strategies
 

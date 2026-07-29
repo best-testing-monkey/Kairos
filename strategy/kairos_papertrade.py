@@ -480,6 +480,22 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
 
     Returns the list of (context, error) failure strings collected along
     the way (empty list if nothing failed).
+
+    MEMORY NOTE (2026-07-29): earlier versions of this function fetched each
+    (group, date)'s data ONCE in the check pass and kept every fetched
+    DataFrame alive in a list (base_entries / group_entries) for the load
+    pass to consume afterward. For a 6-month/1d run that's ~150 groups x
+    ~183 dates of lookback-window DataFrames held simultaneously -- a live
+    run was caught by a kill-at-10GB monitor: RSS climbed linearly from
+    ~2.4GB to 10.1GB in 18 minutes while still inside the BASE sweep's check
+    pass (data/predcache hadn't gained a single new file), matching this
+    exact accumulation. Fixed by keeping only the lightweight identifying
+    tuple (assets_str, interval, date) across passes and re-fetching the
+    actual DataFrame inside the load pass right before it's used, so at most
+    one entry's data is resident at a time. fetch_data_raw reads from the
+    local price_cache (SQLite, remote=False) -- re-fetching doubles that
+    local I/O but is far cheaper than holding tens of thousands of
+    DataFrames in RAM for the whole sweep.
     """
     import kairos_strategies
 
@@ -505,7 +521,11 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
     failures = []
 
     # ── Base sweep: one unit covering every group, every date. ─────────────
-    base_entries = []  # (assets_str, grp_interval, date, data)
+    # Only (assets_str, grp_interval, date) identifiers are kept between the
+    # check and load passes -- NOT the fetched data -- so peak memory stays
+    # O(1) DataFrames instead of O(groups x dates). See this function's
+    # MEMORY NOTE above.
+    base_entries = []  # (assets_str, grp_interval, date)
     base_needs_load = False
     base_check_pbar = tqdm(
         total=len(groups) * len(dates), desc="Prewarm check: Base", unit="req",
@@ -526,7 +546,7 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
                 )
                 base_check_pbar.update(1)
                 continue
-            base_entries.append((assets_str, grp_interval, date, data))
+            base_entries.append((assets_str, grp_interval, date))
             if not kairos_strategies.is_batch_cached(data, model_path=None):
                 base_needs_load = True
             base_check_pbar.update(1)
@@ -536,9 +556,14 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
         _notify(_format_prewarm_load_message("Base", dates), enabled=notify)
 
     base_load_pbar = tqdm(base_entries, desc="Prewarm load: Base", unit="req", total=len(base_entries))
-    for assets_str, grp_interval, date, data in base_load_pbar:
+    for assets_str, grp_interval, date in base_load_pbar:
         base_load_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
+        assets = assets_str.split(",")
         try:
+            data = {
+                sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
+                for sym in assets
+            }
             kairos_strategies.predict_all_batch(data, model_path=None)
         except Exception as e:
             failures.append(
@@ -559,7 +584,9 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
 
             assets = assets_str.split(",")
             model_label = f"Finetuned({assets_str})"
-            group_entries = []  # (date, data)
+            # Only `date` is kept between passes -- not the fetched data --
+            # matching the base sweep's fix; see this function's MEMORY NOTE.
+            group_entries = []  # date
             group_needs_load = False
             group_check_pbar = tqdm(
                 dates, desc=f"Prewarm check: {model_label}", unit="req", total=len(dates),
@@ -577,7 +604,7 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
                         f"date={date} (model_path={model_path}): {e}"
                     )
                     continue
-                group_entries.append((date, data))
+                group_entries.append(date)
                 if not kairos_strategies.is_batch_cached(data, model_path=model_path):
                     group_needs_load = True
 
@@ -587,9 +614,13 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
             group_load_pbar = tqdm(
                 group_entries, desc=f"Prewarm load: {model_label}", unit="req", total=len(group_entries),
             )
-            for date, data in group_load_pbar:
+            for date in group_load_pbar:
                 group_load_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
                 try:
+                    data = {
+                        sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
+                        for sym in assets
+                    }
                     kairos_strategies.predict_all_batch(data, model_path=model_path)
                 except Exception as e:
                     failures.append(
