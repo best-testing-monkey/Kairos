@@ -65,6 +65,26 @@ _dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
 # switches to a different (tokenizer_src, model_src) pair, both caches MUST
 # be cleared or a two-pass (base -> finetuned) flow would silently reuse
 # base-model predictions for the finetuned pass.
+
+_PREDICTION_CACHE_MAX_ENTRIES = 5000  # see _prediction_cache_put's docstring
+
+
+def _prediction_cache_put(key, value) -> None:
+    """Write to _prediction_cache with a hard size cap.
+
+    _prediction_cache is only cleared on a model switch (_prepare_model_switch)
+    -- correct for the base -> finetuned two-pass flow, but
+    prewarm_prediction_cache's model-major base sweep processes ~150 groups x
+    ~183 dates against the SAME model without ever switching, so it never
+    clears there. A live 6-month papertrade run's RSS grew unbounded with
+    this cache as a contributing factor (2026-07-29 leak investigation).
+    Entries here are just a convenience mirror of kairos_predcache's real,
+    bounded, persistent shared cache, so clearing early costs an extra disk
+    lookup on the next miss, not correctness.
+    """
+    _prediction_cache[key] = value
+    if len(_prediction_cache) > _PREDICTION_CACHE_MAX_ENTRIES:
+        _prediction_cache.clear()
 _no_data_fallback_warned: set = set()  # symbols we've already printed the
 # "price_cache returned None; using direct local SQLite fallback" line for.
 # fetch_data_raw is called once per (symbol, date) pair, and callers like
@@ -386,6 +406,12 @@ def is_batch_cached(assets: dict, model_path=None, pred_len=1) -> bool:
     returns None -- KAIROS_PRED_CACHE_DIR unset) or if any symbol is a
     miss. Never loads a model, never touches _prediction_cache, never
     writes to the shared cache -- purely a lookup.
+
+    Uses PredictionCache.has(), NOT .get(): .get() always deserializes a
+    disk hit and promotes it into the in-memory LRU as a side effect, which
+    for a pure existence check was quietly filling that LRU on every
+    prewarm check-pass call (see PredictionCache.has's docstring for the
+    2026-07-29 leak this caused).
     """
     import kairos_predcache
 
@@ -396,7 +422,7 @@ def is_batch_cached(assets: dict, model_path=None, pred_len=1) -> bool:
     mdl_src = model_path or "NeoQuasar/Kronos-base"
     for symbol, df in assets.items():
         key = _shared_cache_key(symbol, df, mdl_src, pred_len)
-        if shared_cache.get(key) is None:
+        if not shared_cache.has(key):
             return False
     return True
 
@@ -437,7 +463,7 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
             shared_keys[symbol] = shared_key
             shared_hit = shared_cache.get(shared_key)
             if shared_hit is not None:
-                _prediction_cache[cache_key] = shared_hit
+                _prediction_cache_put(cache_key, shared_hit)
                 cached_results[symbol] = shared_hit
                 continue
 
@@ -467,7 +493,7 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
         for symbol, preds in zip(uncached_symbols, pred_lists):
             if not isinstance(preds, list):
                 preds = [preds]
-            _prediction_cache[(symbol, assets[symbol].index[-1])] = preds
+            _prediction_cache_put((symbol, assets[symbol].index[-1]), preds)
             cached_results[symbol] = preds
             if shared_cache is not None and symbol in shared_keys:
                 shared_cache.put(shared_keys[symbol], preds)
@@ -694,7 +720,7 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataF
         result_list = [result_list]
 
     if signal is not None:
-        _prediction_cache[cache_key] = result_list
+        _prediction_cache_put(cache_key, result_list)
     return result_list
 
 

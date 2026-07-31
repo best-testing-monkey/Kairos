@@ -275,6 +275,30 @@ class PredictionCache:
             self._mem_put(key, from_disk)
         return from_disk
 
+    def has(self, key: str) -> bool:
+        """Existence check that never deserializes the entry or promotes it
+        into the in-memory LRU -- unlike get(), which always calls
+        _mem_put() on a disk hit as a read-side-effect.
+
+        Added 2026-07-29: kairos_strategies.is_batch_cached() was calling
+        get() purely to check existence (discarding the returned data), so
+        every check-pass call during prewarm_prediction_cache's cache-check
+        loop was silently materializing real DataFrame data into _mem. Worse,
+        _dfs_nbytes only counts raw numpy array bytes -- it doesn't account
+        for pandas Index/DataFrame/block-manager object overhead, which for
+        these small (few-row) sample DataFrames dominates the real memory
+        footprint -- so mem_budget_bytes-based eviction was tracking a total
+        far below actual RSS, letting real memory grow well past budget
+        before eviction ever kicked in. A live 6-month papertrade run's RSS
+        climbed to ~9GB during the check pass alone, before a single new
+        prediction had been written to disk. Existence-only callers should
+        use this method instead of get() to avoid the same trap.
+        """
+        with self._lock:
+            if key in self._mem:
+                return True
+        return os.path.exists(self._disk_path(key))
+
     def put(self, key: str, sample_dfs: List[pd.DataFrame]):
         self._mem_put(key, sample_dfs)
         self._disk_write(key, sample_dfs)

@@ -22,6 +22,7 @@ from kairos_papertrade import (
     _format_finish_message,
     _format_crash_message,
     _ensure_pred_cache_dir_env,
+    _raise_fd_limit,
     _log_watchdog_snapshot,
     _read_self_rss_kb,
     DEFAULT_PRED_CACHE_DIR,
@@ -329,7 +330,7 @@ class TestPrewarmPredictionCache:
             def close(self):
                 pass
 
-        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
 
         # 2 groups; only "AAA,BBB" has an accepted finetuned model.
         groups = {
@@ -369,10 +370,13 @@ class TestPrewarmPredictionCache:
         whole base sweep, growing RSS from ~2.4GB to 10.1GB in 18 minutes
         before a single new predict_all_batch call. The fix re-fetches data
         fresh in the load pass instead of reusing what the check pass
-        fetched, so fetch_data_raw is called exactly twice per successfully
-        checked entry (once to check, once to load) -- this test fails if
-        someone reverts to holding the data across passes (which would drop
-        the fetch count back to once per entry)."""
+        fetched, so the load pass's fetches are always independent re-reads
+        -- this test fails if someone reverts to threading fetched data from
+        check straight into load. With no shared cache active, is_batch_cached
+        is a miss on the very first checked entry, so the check pass stops
+        after just that one date (2026-07-29 speed fix -- see
+        prewarm_prediction_cache's docstring) and the load pass then covers
+        the full 3-date x 2-symbol cross product on its own."""
         import kairos_strategies
 
         fetch_calls = []
@@ -391,7 +395,7 @@ class TestPrewarmPredictionCache:
             def close(self):
                 pass
 
-        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
 
         groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
         monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
@@ -404,8 +408,185 @@ class TestPrewarmPredictionCache:
         failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
 
         assert failures == []
-        # 3 dates x 2 symbols x 2 passes (check + load) = 12 fetch calls.
-        assert len(fetch_calls) == 12
+        # Check pass: 1 date x 2 symbols (stops after the first miss) = 2.
+        # Load pass: full cross product, 3 dates x 2 symbols = 6.
+        assert len(fetch_calls) == 8
+
+    def test_gc_collect_called_periodically_during_long_check_pass(self, monkeypatch):
+        """Regression guard for the 2026-07-29 leak: gc.collect() is
+        otherwise only called on a model switch (_materialize_model), and
+        the base sweep never switches models, so a long, fully-cached check
+        pass (no misses -> runs to completion, see the early-exit speedup)
+        would previously never trigger a single collection. With
+        _PREWARM_GC_INTERVAL patched down to 3 and every entry a cache hit,
+        2 groups x 3 dates = 6 check iterations must cross it at least once."""
+        import kairos_strategies
+
+        monkeypatch.setattr(kp, "_PREWARM_GC_INTERVAL", 3)
+        gc_calls = {"n": 0}
+        monkeypatch.setattr(kp.gc, "collect", lambda: gc_calls.__setitem__("n", gc_calls["n"] + 1))
+
+        def fake_fetch_data_raw(sym, lookback, as_of=None):
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
+                             lambda data, model_path=None, tokenizer_path=None: {})
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached", lambda data, model_path=None, pred_len=1: True)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
+
+        groups = {
+            ("AAA", "1d"): [{"assets": "AAA", "interval": "1d"}],
+            ("BBB", "1d"): [{"assets": "BBB", "interval": "1d"}],
+        }
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda conn: {})
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        # 0.1 months -> 3 dates; 2 groups x 3 dates = 6 check iterations,
+        # no misses -> runs to completion, load pass skipped entirely.
+        kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert gc_calls["n"] >= 1
+
+    def test_gc_collect_called_periodically_during_load_pass(self, monkeypatch):
+        """Companion to the check-pass test above: once a miss triggers the
+        load pass, that loop must also periodically collect -- it iterates
+        the full cross product regardless of how much the check pass
+        covered before stopping early."""
+        import kairos_strategies
+
+        monkeypatch.setattr(kp, "_PREWARM_GC_INTERVAL", 3)
+        gc_calls = {"n": 0}
+        monkeypatch.setattr(kp.gc, "collect", lambda: gc_calls.__setitem__("n", gc_calls["n"] + 1))
+
+        def fake_fetch_data_raw(sym, lookback, as_of=None):
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
+                             lambda data, model_path=None, tokenizer_path=None: {})
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
+        # Every entry a miss -> check pass stops after 1, load pass covers
+        # the full 2 groups x 3 dates = 6 iterations.
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached", lambda data, model_path=None, pred_len=1: False)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
+
+        groups = {
+            ("AAA", "1d"): [{"assets": "AAA", "interval": "1d"}],
+            ("BBB", "1d"): [{"assets": "BBB", "interval": "1d"}],
+        }
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda conn: {})
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert gc_calls["n"] >= 1
+
+    def test_check_pass_stops_checking_at_first_miss(self, monkeypatch):
+        """2026-07-29 speed request: the check pass has all the information
+        it needs (needs_load=True) the moment ONE entry is a miss -- it must
+        not keep calling is_batch_cached (or fetching) for every remaining
+        entry in the unit. 5 groups x 3 dates = 15 possible check iterations;
+        the very first is a miss, so at most 1 should ever be checked."""
+        import kairos_strategies
+
+        is_batch_cached_calls = []
+
+        def fake_fetch_data_raw(sym, lookback, as_of=None):
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        def fake_is_batch_cached(data, model_path=None, pred_len=1):
+            is_batch_cached_calls.append(model_path)
+            return False  # every entry is a miss
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
+                             lambda data, model_path=None, tokenizer_path=None: {})
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached", fake_is_batch_cached)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
+
+        groups = {(f"SYM{i}", "1d"): [{"assets": f"SYM{i}", "interval": "1d"}] for i in range(5)}
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda conn: {})
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert failures == []
+        assert len(is_batch_cached_calls) == 1  # stopped after the very first check
+
+    def test_load_pass_skipped_and_logged_when_fully_cached(self, monkeypatch, capsys):
+        """2026-07-29 speed request: if the check pass finds zero misses,
+        the load pass must not run at all (no predict_all_batch calls), and
+        the skip must be visible on the console."""
+        import kairos_strategies
+
+        predict_calls = []
+
+        def fake_fetch_data_raw(sym, lookback, as_of=None):
+            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
+            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
+
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+            predict_calls.append(model_path)
+            return {}
+
+        monkeypatch.setattr(kairos_strategies, "predict_all_batch", fake_predict_all_batch)
+        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
+        monkeypatch.setattr(kairos_strategies, "is_batch_cached", lambda data, model_path=None, pred_len=1: True)
+        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
+
+        class _FakeConn:
+            def close(self):
+                pass
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
+
+        groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
+        accepted_finetuned = {("AAA,BBB", "1d"): "repo/finetuned-ab"}
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
+                             lambda conn, intervals=None, include_all=False: [])
+        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned",
+                             lambda conn: accepted_finetuned)
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
+
+        assert failures == []
+        assert predict_calls == []  # load pass never ran for either unit
+
+        out = capsys.readouterr().out
+        assert "Prewarm load: Base skipped" in out
+        assert "Prewarm load: Finetuned(AAA,BBB) skipped" in out
 
     def test_base_only_skips_finetuned_sweep(self, monkeypatch):
         import kairos_strategies
@@ -428,7 +609,7 @@ class TestPrewarmPredictionCache:
             def close(self):
                 pass
 
-        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
 
         groups = {("AAA,BBB", "1d"): [{"assets": "AAA,BBB", "interval": "1d"}]}
 
@@ -474,7 +655,7 @@ class TestPrewarmPredictionCache:
             def close(self):
                 pass
 
-        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
 
         groups = {("AAA", "1d"): [{"assets": "AAA", "interval": "1d"}]}
         monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
@@ -508,7 +689,7 @@ class TestPrewarmPredictionCache:
             def close(self):
                 pass
 
-        monkeypatch.setattr(kp.sqlite3, "connect", lambda db_path: _FakeConn())
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
         monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
                              lambda conn, intervals=None, include_all=False: [])
         monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
@@ -724,17 +905,22 @@ class TestPrewarmPredictionCache:
 
         # 3 dates; the group's 2nd fetch_data_raw call overall (2nd symbol
         # of the base sweep's 1st date) fails, aborting just that one date's
-        # fetch dict comprehension -- the base sweep ends up with 1 failure
-        # and 2 successfully-fetched dates; the finetuned sweep's own 3
-        # fetches never land on the flaky counter's failing index again.
+        # fetch dict comprehension during the CHECK pass -- recorded as 1
+        # failure. Every entry is a miss, so the check pass stops after its
+        # 2nd date (the 1st failed, the 2nd found the miss); the load pass
+        # then covers the FULL 3-date cross product on its own (it doesn't
+        # depend on what the check pass fetched), re-attempting date0's
+        # fetch too -- which succeeds this time, since the flaky counter
+        # only ever fails once. So all 3 base dates end up predicted despite
+        # date0's transient check-pass failure.
         assert len(failures) == 1
         assert "simulated fetch failure" in failures[0]
 
-        # 2 successful base dates + 3 finetuned dates = 5 predict_all_batch calls.
-        assert len(predict_calls) == 5
+        # 3 base dates + 3 finetuned dates = 6 predict_all_batch calls.
+        assert len(predict_calls) == 6
         base_predict = [c for c in predict_calls if c[0] is None]
         finetuned_predict = [c for c in predict_calls if c[0] == "repo/finetuned-ab"]
-        assert len(base_predict) == 2
+        assert len(base_predict) == 3
         assert len(finetuned_predict) == 3
         assert all(c[1] == ("AAA", "BBB") for c in predict_calls)
 
@@ -1071,6 +1257,53 @@ class TestFormatCrashMessage:
         assert "interval=1h" in msg
         assert "boom" in msg
         assert "```" in msg
+
+
+# ============================================================================
+# _raise_fd_limit -- regression guard for the 2026-07-29 "Too many open
+# files" crash (OSError, Errno 24) hours into a 6-month run
+# ============================================================================
+
+class TestRaiseFdLimit:
+    def test_raises_soft_to_hard_when_below(self, monkeypatch, capsys):
+        monkeypatch.setattr(kp.resource, "getrlimit", lambda which: (1024, 1048576))
+        calls = []
+        monkeypatch.setattr(kp.resource, "setrlimit", lambda which, limits: calls.append(limits))
+
+        _raise_fd_limit()
+
+        assert calls == [(1048576, 1048576)]
+        assert "1024 -> 1048576" in capsys.readouterr().err
+
+    def test_noop_when_already_at_hard_limit(self, monkeypatch):
+        monkeypatch.setattr(kp.resource, "getrlimit", lambda which: (1048576, 1048576))
+        calls = []
+        monkeypatch.setattr(kp.resource, "setrlimit", lambda which, limits: calls.append(limits))
+
+        _raise_fd_limit()
+
+        assert calls == []
+
+    def test_noop_when_hard_limit_is_infinity(self, monkeypatch):
+        monkeypatch.setattr(kp.resource, "getrlimit", lambda which: (1024, kp.resource.RLIM_INFINITY))
+        calls = []
+        monkeypatch.setattr(kp.resource, "setrlimit", lambda which, limits: calls.append(limits))
+
+        _raise_fd_limit()
+
+        assert calls == []
+
+    def test_never_raises_when_setrlimit_fails(self, monkeypatch, capsys):
+        monkeypatch.setattr(kp.resource, "getrlimit", lambda which: (1024, 1048576))
+
+        def boom(which, limits):
+            raise OSError("not permitted in this sandbox")
+
+        monkeypatch.setattr(kp.resource, "setrlimit", boom)
+
+        _raise_fd_limit()  # must not raise
+
+        assert "could not raise open-file limit" in capsys.readouterr().err
 
 
 # ============================================================================

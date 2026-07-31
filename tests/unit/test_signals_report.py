@@ -28,9 +28,70 @@ from kairos_signals import (
     SIGNALS_ALIGN,
     _interval_to_timedelta,
     run_bars_backtest,
+    _connect_with_retry,
 )
 from datetime import timedelta
 import pandas as pd
+
+
+# ============================================================================
+# _connect_with_retry
+# ============================================================================
+
+class TestConnectWithRetry:
+    def test_succeeds_immediately_on_valid_path(self, tmp_path):
+        db_path = str(tmp_path / "ok.db")
+        conn = _connect_with_retry(db_path)
+        try:
+            conn.execute("SELECT 1")
+        finally:
+            conn.close()
+
+    def test_retries_then_succeeds(self, monkeypatch):
+        import kairos_signals
+
+        attempts = {"n": 0}
+        real_connect = sqlite3.connect
+
+        def flaky_connect(db_path):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise sqlite3.OperationalError("unable to open database file")
+            return real_connect(":memory:")
+
+        monkeypatch.setattr(kairos_signals.sqlite3, "connect", flaky_connect)
+        monkeypatch.setattr(kairos_signals.time, "sleep", lambda s: None)
+
+        conn = _connect_with_retry("irrelevant.db")
+        conn.close()
+        assert attempts["n"] == 3
+
+    def test_raises_after_exhausting_all_attempts(self, monkeypatch):
+        import kairos_signals
+
+        def always_fails(db_path):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(kairos_signals.sqlite3, "connect", always_fails)
+        monkeypatch.setattr(kairos_signals.time, "sleep", lambda s: None)
+
+        with pytest.raises(sqlite3.OperationalError):
+            _connect_with_retry("irrelevant.db", attempts=3)
+
+    def test_non_operational_error_propagates_immediately(self, monkeypatch):
+        import kairos_signals
+
+        calls = {"n": 0}
+
+        def boom(db_path):
+            calls["n"] += 1
+            raise ValueError("not a sqlite error")
+
+        monkeypatch.setattr(kairos_signals.sqlite3, "connect", boom)
+
+        with pytest.raises(ValueError):
+            _connect_with_retry("irrelevant.db", attempts=3)
+        assert calls["n"] == 1
 
 
 # ============================================================================

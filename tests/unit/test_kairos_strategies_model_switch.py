@@ -15,6 +15,32 @@ import pytest
 import kairos_strategies
 
 
+class TestPredictionCachePut:
+    """Regression guard for the 2026-07-29 leak: _prediction_cache is only
+    cleared on a model switch, but prewarm_prediction_cache's base sweep
+    processes many groups x dates against ONE model with no switch at all,
+    so without a size cap it grows unbounded for the whole sweep."""
+
+    def test_normal_writes_are_retained_under_the_cap(self):
+        kairos_strategies._prediction_cache.clear()
+        kairos_strategies._prediction_cache_put(("BTC-USD", "t0"), ["pred"])
+        assert kairos_strategies._prediction_cache == {("BTC-USD", "t0"): ["pred"]}
+        kairos_strategies._prediction_cache.clear()
+
+    def test_exceeding_max_entries_clears_the_cache(self, monkeypatch):
+        kairos_strategies._prediction_cache.clear()
+        monkeypatch.setattr(kairos_strategies, "_PREDICTION_CACHE_MAX_ENTRIES", 3)
+
+        for i in range(3):
+            kairos_strategies._prediction_cache_put((f"SYM{i}", "t0"), ["pred"])
+        assert len(kairos_strategies._prediction_cache) == 3
+
+        kairos_strategies._prediction_cache_put(("SYM_OVER", "t0"), ["pred"])
+        # Cap crossed -> cleared entirely, including the entry that pushed it over.
+        assert kairos_strategies._prediction_cache == {}
+        kairos_strategies._prediction_cache.clear()
+
+
 class _FakeTokenizer:
     def __init__(self, src):
         self.src = src
@@ -555,6 +581,50 @@ class TestIsBatchCached:
         assert kairos_strategies._prediction_cache == {}
         files_written = list(tmp_path.iterdir())
         assert files_written == []
+
+        monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+        kairos_predcache._singleton = None
+        kairos_predcache._singleton_dir = None
+
+    def test_hit_does_not_populate_in_memory_lru(self, monkeypatch, tmp_path):
+        """Regression guard for the 2026-07-29 prewarm memory leak:
+        is_batch_cached() used to call PredictionCache.get() purely to check
+        existence, and get() always promotes a disk hit into the in-memory
+        LRU as a side effect -- so every check-pass call during a 6-month
+        papertrade run's prewarm silently filled the LRU with real
+        DataFrame data, and _dfs_nbytes' undercount of real pandas/DataFrame
+        overhead meant mem_budget_bytes-based eviction never kicked in
+        before RSS grew several GB past budget. is_batch_cached now uses
+        PredictionCache.has(), which must leave the LRU untouched on a hit."""
+        import kairos_predcache
+
+        monkeypatch.setenv("KAIROS_PRED_CACHE_DIR", str(tmp_path))
+        kairos_predcache._singleton = None
+        kairos_predcache._singleton_dir = None
+
+        from kairos_backtest import KairosSettings
+        monkeypatch.setattr(KairosSettings, "lookback", 300)
+        monkeypatch.setattr(KairosSettings, "pred_samples", 5)
+        monkeypatch.setattr(KairosSettings, "interval", "1d")
+
+        df = self._make_asset_df()
+        cache = kairos_predcache.get_cache()
+        key = kairos_strategies._shared_cache_key("BTC-USD", df, "NeoQuasar/Kronos-base", 1)
+        sample = pd.DataFrame({
+            "open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+            "volume": [1.0], "amount": [1.0],
+        }, index=[df.index[-1] + pd.Timedelta(days=1)])
+        cache.put(key, [sample])
+        # put() itself populates _mem (expected -- the writer wants its own
+        # write available for reuse); clear it so the assertion below is
+        # specifically about is_batch_cached's own read, not the put above.
+        cache._mem.clear()
+        cache._mem_bytes = 0
+
+        result = kairos_strategies.is_batch_cached({"BTC-USD": df})
+
+        assert result is True
+        assert cache._mem == {}
 
         monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
         kairos_predcache._singleton = None

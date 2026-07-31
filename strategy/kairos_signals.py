@@ -27,6 +27,38 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
+_DB_CONNECT_RETRY_ATTEMPTS = 3
+_DB_CONNECT_RETRY_BACKOFF_SECONDS = 1.0
+
+
+def _connect_with_retry(db_path, attempts=_DB_CONNECT_RETRY_ATTEMPTS,
+                         backoff_seconds=_DB_CONNECT_RETRY_BACKOFF_SECONDS):
+    """sqlite3.connect() with a short retry-with-backoff on OperationalError.
+
+    A live 6-month papertrade run (2026-07-29) crashed on the very first
+    per-date sqlite3.connect(db_path) in run()'s date-major loop with
+    "unable to open database file" (SQLITE_CANTOPEN). It did not reproduce
+    under a short smoketest, no scheduled kairos systemd timer was active in
+    that window, and data/'s directory/file permissions were fine -- so the
+    most likely explanation is a transient blip (another concurrent process
+    briefly touching pipeline_results.db, or a momentary disk hiccup) rather
+    than a deterministic path/permission bug. run()'s date-major loop calls
+    connect() once PER DATE (183 times for a 6-month/1d sweep), so a single
+    transient failure anywhere in that loop previously killed the entire
+    multi-hour run. A short retry is cheap insurance against exactly that,
+    without masking a genuinely broken setup -- that still fails on every
+    attempt and raises the last exception.
+    """
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return sqlite3.connect(db_path)
+        except sqlite3.OperationalError as e:
+            last_exc = e
+            if attempt < attempts - 1:
+                time.sleep(backoff_seconds * (attempt + 1))
+    raise last_exc
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -821,7 +853,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     if now is None:
         now = datetime.now()
 
-    conn = sqlite3.connect(db_path)
+    conn = _connect_with_retry(db_path)
     try:
         rows = load_work_items(conn, intervals=intervals, include_all=include_all)
         accepted_finetuned = {} if base_only else load_accepted_finetuned(conn)
