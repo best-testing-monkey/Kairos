@@ -190,6 +190,72 @@ across overlapping correlation groups within one subprocess-spawning run,
 torn down at the end of that same run) — it has no retrain-in-place
 exposure and is unaffected by any of the above.
 
+### Prewarm leak sources and crash fixes (2026-07-29/30)
+A `--months-back 6` overnight run repeatedly froze the machine or crashed
+before completing; root-causing it took several rounds. In addition to the
+`base_entries`/`group_entries` DataFrame-retention leak (fixed earlier, see
+commit `e2cf607`), three more accumulation sources and two crash classes had
+to be fixed before a full 6-month run finished cleanly (RSS stable ~5.28GB):
+
+- **`is_batch_cached()` was mutating the shared LRU.** It called
+  `PredictionCache.get()` purely for a boolean check, but `get()` always
+  promotes a disk hit into `_mem` as a side effect — so every prewarm
+  check-pass lookup was silently growing the in-memory cache the same as a
+  real prediction would. Fixed with `PredictionCache.has()`, an
+  existence-only check that never touches `_mem`. If you ever need a
+  read-only cache-hit check elsewhere, use `.has()`, not `.get()`.
+- **`_prediction_cache` (the per-process dict in `kairos_strategies.py`,
+  distinct from `kairos_predcache`'s disk-backed `PredictionCache`) is only
+  cleared on a model switch** (`_prepare_model_switch`). The base sweep
+  processes one model for its entire ~20k-entry pass with no switch, so
+  this dict grew unbounded for the whole sweep. Fixed with a hard 5000-entry
+  cap (`_PREDICTION_CACHE_MAX_ENTRIES`) in `_prediction_cache_put()` —
+  clears the whole dict on overflow rather than evicting individually.
+- **GC starvation during long same-model sweeps.** `gc.collect()` previously
+  only fired inside `_materialize_model()` on a model switch. CPython's
+  generational GC thresholds are allocation-*count* based, not memory-size
+  based, so large-but-few pandas DataFrames can sit as uncollected garbage
+  for a long time with nothing triggering a collection. Fixed with a
+  periodic `gc.collect()` every `_PREWARM_GC_INTERVAL` (500) iterations in
+  all four prewarm check/load loops (base and finetuned).
+- **`sqlite3.OperationalError: unable to open database file`** and
+  **`OSError: [Errno 24] Too many open files`** both crashed live runs.
+  Mitigated (not root-caused with full certainty — never deterministically
+  reproduced outside the long run) with `kairos_signals._connect_with_retry()`
+  (3 attempts, 1s/2s backoff, used by both `kairos_signals.run()` and
+  `prewarm_prediction_cache()`) and `kairos_papertrade._raise_fd_limit()`
+  (raises the process's soft `RLIMIT_NOFILE` to its hard cap, called as the
+  first line of `main()`, best-effort/non-fatal on failure).
+- **Prewarm speed**: the check pass now stops at the first cache miss per
+  unit (base, or a finetuned group) instead of exhaustively checking every
+  remaining entry — one miss is already enough to know a load is needed.
+  When a unit's check pass finds zero misses, the load pass is skipped
+  entirely (logged to console: `"Prewarm load: <unit> skipped -- check pass
+  found no cache misses"`). When a load pass does run, it always covers the
+  *full* cross product for that unit, not just what the check pass happened
+  to see before stopping early.
+
+### Configurable signal selection (`--signal-selection`)
+Both `kairos_signals.py` and `kairos_papertrade.py` accept `--signal-selection
+"<rule>"` (see `strategy/signal_selection.py` for the grammar/column registry,
+e.g. `"'n' > 60, 'Win raw' > 0.6, ORDER 'EV raw %' DESC, TOP 3"`) to override
+`strategy/allocation.py`'s hardcoded selection logic (RFC
+`docs/rfc_allocation_sheet.md` §4.4). **The rule fully REPLACES the default
+`min_n`/`ev_net>0` gate — it is not AND'd with it.** A rule that never checks
+EV can admit a negative-EV signal; this is intentional (the rule is meant to
+be the whole gate), but it means a rule missing an EV/quality condition is a
+foot-gun, not a safety net. `ORDER`/`TOP` in the rule likewise override the
+default `score` sort and `top_k`/`--top-n`; `--top-n` remains the fallback
+top-K only when the rule has no `TOP` clause. `AllocationConfig.n0`/`min_n`
+still drive the `shrink`/`ev_net` *math* even when a rule is active (only the
+*gating* on them is bypassed) — the `Config:` line in the generated report
+echoes the active rule string (`selection="..."`) so this isn't silently
+invisible. Columns are limited to what's known pre-sizing (Ticker, Cluster,
+Strategy, Dir, Entry, Stop, Target, Risk %, Reward %, b, n, Win raw, Win
+shrunk, EV raw %, EV net %, Kelly raw, Score, Sharpe) — `Alloc %`/`Alloc
+EUR`/`Flags`/`Advised liq %` aren't available to filter/sort on since they're
+only computed after top-K selection.
+
 ## Test suite
 
 Tests live in `tests/unit/` and require no GPU or model download.

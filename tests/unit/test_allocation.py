@@ -17,6 +17,7 @@ from allocation import (
     compute_ev_ratio, select_candidates, size_selected, allocate, load_cluster_map,
     AllocationResult
 )
+from signal_selection import parse_signal_selection, SelectionCondition, SignalSelectionRule
 
 
 class TestCandidateDataclass:
@@ -2536,6 +2537,137 @@ class TestSelectCandidates:
         # A duplicate should be DUP_ASSET
         assert result[2]["ticker"] == "A"
         assert result[2]["status"] == "DUP_ASSET"
+
+
+class TestSelectCandidatesWithSelectionRule:
+    """select_candidates() behavior when config.selection_rule is set.
+
+    Per the --signal-selection design: a rule's conditions fully REPLACE the
+    hardcoded LOW_N/NEG_EV_NET gate (not AND'd with it), its ORDER clause
+    replaces the score-based rank key (used for both the DUP_ASSET tie-break
+    and final sort), and its TOP clause overrides config.top_k.
+    """
+
+    def test_rule_admits_low_n_candidate_that_default_gate_would_reject(self):
+        """A candidate with n < min_n survives when the rule doesn't check n."""
+        c = Candidate(
+            strategy="s1", ticker="TEST", direction="long",
+            entry=100.0, stop=95.0, target=110.0,
+            ev_pct=5.0, base_win_rate=0.55, n=10,  # n < default min_n=50
+            backtest_period="p", sharpe=1.0, advised_liquidity_pct=5.0,
+        )
+        rule = parse_signal_selection("'Win raw' > 0.5")
+        config = AllocationConfig(min_n=50, selection_rule=rule)
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] is None  # not LOW_N, not RULE_FILTERED
+
+    def test_rule_rejects_candidate_default_gate_would_admit(self):
+        """A high-n, positive-EV candidate is RULE_FILTERED if it fails a rule condition."""
+        c = Candidate(
+            strategy="s1", ticker="TEST", direction="long",
+            entry=100.0, stop=95.0, target=110.0,
+            ev_pct=5.0, base_win_rate=0.55, n=100,  # would pass default LOW_N/NEG_EV_NET
+            backtest_period="p", sharpe=1.0, advised_liquidity_pct=5.0,
+        )
+        rule = parse_signal_selection("'n' > 1000")  # fails
+        config = AllocationConfig(min_n=50, selection_rule=rule)
+        result = select_candidates([c], config, {})
+
+        assert len(result) == 1
+        assert result[0]["status"] == "RULE_FILTERED"
+        assert any("failed:" in flag and "'n'" in flag for flag in result[0]["flags"])
+
+    def test_rule_filtered_notes_first_failing_condition(self):
+        """The rejected row's flags note which condition failed (audit trail)."""
+        c = Candidate(
+            strategy="s1", ticker="TEST", direction="long",
+            entry=100.0, stop=95.0, target=110.0,
+            ev_pct=5.0, base_win_rate=0.2, n=100,
+            backtest_period="p", sharpe=1.0, advised_liquidity_pct=5.0,
+        )
+        rule = parse_signal_selection("'n' > 1, 'Win raw' > 0.9")
+        config = AllocationConfig(selection_rule=rule)
+        result = select_candidates([c], config, {})
+
+        assert result[0]["status"] == "RULE_FILTERED"
+        # First condition ('n' > 1) passes; second ('Win raw' > 0.9) fails first.
+        assert any("Win raw" in flag for flag in result[0]["flags"])
+        assert not any("'n' >" in flag for flag in result[0]["flags"])
+
+    def test_rule_order_changes_dup_asset_winner(self):
+        """ORDER by a non-score column changes which duplicate ticker wins collapse."""
+        # c1 has the higher default 'score' but lower 'EV raw %'.
+        # c2 has the lower default 'score' but higher 'EV raw %'.
+        c1 = Candidate(
+            strategy="s1", ticker="TEST", direction="long",
+            entry=100.0, stop=95.0, target=110.0,
+            ev_pct=3.0, base_win_rate=0.55, n=100000,  # huge n -> shrink~1 -> higher score
+            backtest_period="p", sharpe=1.0, advised_liquidity_pct=5.0,
+        )
+        c2 = Candidate(
+            strategy="s1", ticker="TEST", direction="long",
+            entry=100.0, stop=95.0, target=110.0,
+            ev_pct=8.0, base_win_rate=0.55, n=25,  # small n -> low shrink -> lower score despite higher raw EV
+            backtest_period="p", sharpe=1.0, advised_liquidity_pct=5.0,
+        )
+        baseline_config = AllocationConfig()
+        d1 = compute_derived(c1, baseline_config)
+        d2 = compute_derived(c2, baseline_config)
+        assert d1["score"] > d2["score"]
+        assert c2.ev_pct > c1.ev_pct
+
+        rule = parse_signal_selection("ORDER 'EV raw %' DESC")
+        config = AllocationConfig(selection_rule=rule)
+        result = select_candidates([c1, c2], config, {})
+
+        assert len(result) == 2
+        # c2 (higher EV raw %) should survive; c1 should be DUP_ASSET.
+        assert result[0]["status"] == "DUP_ASSET"
+        assert result[1]["status"] is None
+
+    def test_rule_top_overrides_config_top_k(self):
+        """rule.top_n overrides config.top_k as the selection-size cutoff."""
+        candidates = []
+        for i in range(5):
+            c = Candidate(
+                strategy="s1", ticker=f"T{i}", direction="long",
+                entry=100.0, stop=95.0, target=110.0,
+                ev_pct=5.0 - i * 0.1, base_win_rate=0.55, n=100,
+                backtest_period="p", sharpe=1.0, advised_liquidity_pct=5.0,
+            )
+            candidates.append(c)
+
+        rule = parse_signal_selection("'n' > 1, ORDER 'EV raw %' DESC, TOP 2")
+        config = AllocationConfig(top_k=12, selection_rule=rule)  # top_k=12 would admit all 5
+        result = select_candidates(candidates, config, {})
+
+        selected = [r for r in result if r["status"] is None]
+        below = [r for r in result if r["status"] == "BELOW_TOPK"]
+        assert len(selected) == 2
+        assert len(below) == 3
+
+    def test_no_selection_rule_reproduces_default_behavior(self):
+        """selection_rule=None (the default) reproduces the old LOW_N/NEG_EV_NET/score/top_k behavior."""
+        low_n = Candidate(
+            strategy="s1", ticker="LOWN", direction="long",
+            entry=100.0, stop=95.0, target=110.0,
+            ev_pct=5.0, base_win_rate=0.55, n=10,
+            backtest_period="p", sharpe=1.0, advised_liquidity_pct=5.0,
+        )
+        good = Candidate(
+            strategy="s1", ticker="GOOD", direction="long",
+            entry=100.0, stop=95.0, target=110.0,
+            ev_pct=5.0, base_win_rate=0.55, n=100,
+            backtest_period="p", sharpe=1.0, advised_liquidity_pct=5.0,
+        )
+        config = AllocationConfig(min_n=50)  # selection_rule defaults to None
+        assert config.selection_rule is None
+        result = select_candidates([low_n, good], config, {})
+
+        assert result[0]["status"] == "LOW_N"
+        assert result[1]["status"] is None
 
 
 class TestSizeSelected:

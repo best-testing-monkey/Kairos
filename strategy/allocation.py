@@ -14,6 +14,7 @@ from typing import Optional
 from openpyxl.styles import Protection
 
 from kairos_signals import _ev_pct_value, format_table
+from signal_selection import SignalSelectionRule, evaluate_condition, resolve_column
 
 
 @dataclass
@@ -59,6 +60,7 @@ class AllocationConfig:
     dust_min_pct: float = 1.0  # Zero out final allocations below this, % of equity
     equity: Optional[float] = None  # Optional account equity for currency-amount column
     cluster_map: dict = field(default_factory=dict)  # ticker -> cluster name, static mapping
+    selection_rule: Optional[SignalSelectionRule] = None  # optional --signal-selection override
 
 
 @dataclass
@@ -300,6 +302,22 @@ def fetch_signals(stats_rows, advice_rows):
     return candidates
 
 
+def _rank_key(row: dict, candidate: Candidate, config: AllocationConfig) -> float:
+    """Return the value used to rank a survivor row, "larger is always better".
+
+    Defaults to derived["score"] when no selection_rule (or no ORDER clause
+    within it) is active. Otherwise resolves the rule's order_by column and
+    negates it when ascending, so callers can keep using max()/sort(reverse=True)
+    semantics unchanged regardless of ASC/DESC.
+    """
+    rule = config.selection_rule
+    if rule is None or rule.order_by is None:
+        return row["derived"]["score"]
+    column, descending = rule.order_by
+    value = resolve_column(column, candidate, row["derived"], config.cluster_map)
+    return value if descending else -value
+
+
 def select_candidates(candidates: list[Candidate], config: AllocationConfig, enabled_mask: dict) -> list[dict]:
     """Select and reject candidates through gating, collapse, and top-K ranking.
 
@@ -308,10 +326,13 @@ def select_candidates(candidates: list[Candidate], config: AllocationConfig, ena
     Rejection reasons (per RFC §4.5):
     - SCHEMA_ERROR: required field missing or direction/stop/target inconsistent
     - DISABLED: enabled_mask[ticker] is False
-    - LOW_N: n < config.min_n
-    - NEG_EV_NET: ev_net <= 0
+    - LOW_N: n < config.min_n (only when config.selection_rule is None)
+    - NEG_EV_NET: ev_net <= 0 (only when config.selection_rule is None)
+    - RULE_FILTERED: failed a condition in config.selection_rule (only when set;
+      fully replaces the LOW_N/NEG_EV_NET checks above rather than adding to them)
     - DIRECTION_CONFLICT: both long and short survive gating for same ticker
-    - DUP_ASSET: duplicate ticker/direction, not the max-score row
+    - DUP_ASSET: duplicate ticker/direction, not the max-rank_key row (score by
+      default, or config.selection_rule.order_by when set)
     - BELOW_TOPK: survivor after collapse, but outside top config.top_k
 
     Args:
@@ -363,6 +384,25 @@ def select_candidates(candidates: list[Candidate], config: AllocationConfig, ena
             row["status"] = "DISABLED"
             continue
 
+        if config.selection_rule is not None:
+            # A --signal-selection rule fully REPLACES the LOW_N/NEG_EV_NET
+            # gate below (not additive) — evaluate the rule's conditions in
+            # order, rejecting on the first one that fails.
+            rejected = False
+            for cond in config.selection_rule.conditions:
+                if not evaluate_condition(cond, c, derived, config.cluster_map):
+                    row["status"] = "RULE_FILTERED"
+                    row["flags"].append(
+                        f"failed: '{cond.column}' {cond.op} {cond.value}"
+                    )
+                    rejected = True
+                    break
+            if rejected:
+                continue
+            # Survived gating
+            row["status"] = None
+            continue
+
         # Check LOW_N (third in gate order)
         if c.n < config.min_n:
             row["status"] = "LOW_N"
@@ -398,12 +438,13 @@ def select_candidates(candidates: list[Candidate], config: AllocationConfig, ena
             for _, _, row in group:
                 row["status"] = "DIRECTION_CONFLICT"
         else:
-            # Only one direction; keep max-score row, reject rest as DUP_ASSET
+            # Only one direction; keep max-rank_key row, reject rest as DUP_ASSET
             if len(group) > 1:
-                # Find index of max-score row
+                # Find index of max-rank_key row (score by default, or the
+                # active selection_rule's ORDER column)
                 max_idx = max(
                     range(len(group)),
-                    key=lambda j: group[j][2]["derived"]["score"]
+                    key=lambda j: _rank_key(group[j][2], group[j][1], config)
                 )
                 for j, (_, _, row) in enumerate(group):
                     if j != max_idx:
@@ -419,13 +460,20 @@ def select_candidates(candidates: list[Candidate], config: AllocationConfig, ena
         if row["status"] is None:
             survivors.append((i, row, c))
 
-    # Sort by score descending (stable sort preserves insertion order on ties)
-    # per RFC §4.4's deterministic tie-break note
-    survivors.sort(key=lambda x: x[1]["derived"]["score"], reverse=True)
+    # Sort by rank key descending (stable sort preserves insertion order on
+    # ties) per RFC §4.4's deterministic tie-break note. rank key is
+    # derived["score"] by default, or the active selection_rule's ORDER
+    # column (negated when ascending, so "larger is always better" holds).
+    survivors.sort(key=lambda x: _rank_key(x[1], x[2], config), reverse=True)
 
     # Mark top-K as selected (status remains None), rest as BELOW_TOPK
+    top_k = (
+        config.selection_rule.top_n
+        if (config.selection_rule and config.selection_rule.top_n is not None)
+        else config.top_k
+    )
     for rank, (_, row, _) in enumerate(survivors):
-        if rank >= config.top_k:
+        if rank >= top_k:
             row["status"] = "BELOW_TOPK"
 
     # Return all rows in original input order (not sorted)
@@ -1652,12 +1700,15 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
     lines = ["## Portfolio Allocation", ""]
 
     # Config summary line (RFC §6 example format)
-    lines.append(
+    config_line = (
         f"Config: n0={config.n0:g} min_n={config.min_n:g} "
         f"cost={config.round_trip_cost_pct:g}% kelly_mult={config.kelly_mult:g} "
         f"top_k={config.top_k:g} max_pos={config.max_pos_pct:g}% "
         f"max_cluster={config.max_cluster_pct:g}% gross_cap={config.gross_cap_pct:g}%"
     )
+    if config.selection_rule is not None:
+        config_line += f" selection=\"{config.selection_rule.raw}\""
+    lines.append(config_line)
     lines.append("")
 
     # Selection summary

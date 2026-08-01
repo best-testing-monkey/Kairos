@@ -5,6 +5,7 @@ all required lines in the correct order, using a hand-built AllocationResult.
 """
 
 from allocation import AllocationResult, AllocationConfig, write_md_section
+from signal_selection import parse_signal_selection
 
 
 class TestWriteMdSection:
@@ -123,6 +124,28 @@ class TestWriteMdSection:
         assert output.startswith("## Portfolio Allocation")
         assert "Config: n0=100 min_n=50 cost=0.15% kelly_mult=0.35 top_k=12 " in output
         assert "max_pos=15% max_cluster=25% gross_cap=100%" in output
+
+    def test_config_summary_omits_selection_when_no_rule(self):
+        """No selection= suffix appears when config.selection_rule is unset (default)."""
+        config = self._make_config()
+        assert config.selection_rule is None
+        result = self._make_result()
+        output = write_md_section(result, config)
+
+        assert 'selection=' not in output
+
+    def test_config_summary_includes_selection_raw_string_when_rule_set(self):
+        """The rule's raw spec string is echoed in the Config: line when selection_rule is set."""
+        spec = "'n' > 60, 'Win raw' > 0.6, ORDER 'EV raw %' DESC, TOP 3"
+        config = self._make_config()
+        config.selection_rule = parse_signal_selection(spec)
+        result = self._make_result()
+        output = write_md_section(result, config)
+
+        # Existing n0=/min_n=/etc fields are still printed as before.
+        assert "Config: n0=100 min_n=50 cost=0.15% kelly_mult=0.35 top_k=12 " in output
+        assert "max_pos=15% max_cluster=25% gross_cap=100%" in output
+        assert f'selection="{spec}"' in output
 
     def test_selection_summary_line(self):
         """Selection summary reports selected count and gross exposure."""

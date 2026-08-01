@@ -1219,6 +1219,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--months-back", dest="months_back", type=float, default=6.0)
     parser.add_argument("--interval", default="1d")
     parser.add_argument("--top-n", dest="top_n", type=int, default=3)
+    parser.add_argument("--signal-selection", dest="signal_selection", default=None,
+                        help="Optional rule string that fully replaces the default "
+                             "Portfolio Allocation gating (min_n/positive-EV-net) and "
+                             "ranking (score sort, top_k) used both for the generated "
+                             "reports and for the actual orders Phantom Ledger places. "
+                             "Grammar: comma-separated clauses, each either a condition "
+                             "\"'col' OP value\" (OP one of > >= < <= == !=), an "
+                             "\"ORDER 'col' [ASC|DESC]\" clause (default DESC, at most one), "
+                             "or a \"TOP <int>\" clause (at most one). Column names match "
+                             "the Allocation sheet headers (Ticker, Cluster, Strategy, Dir, "
+                             "Entry, Stop, Target, Risk %%, Reward %%, b, n, Win raw, Win "
+                             "shrunk, EV raw %%, EV net %%, Kelly raw, Score, Sharpe), "
+                             "case-insensitive. Example: \"'n' > 60, 'Win raw' > 0.6, "
+                             "ORDER 'EV raw %%' DESC, TOP 3\". NOTE: when set, this REPLACES "
+                             "(not adds to) the default min_n/EV-positivity gate -- a rule "
+                             "that doesn't check EV can admit a negative-EV signal. "
+                             "--top-n remains the fallback selection size when the rule "
+                             "has no TOP clause of its own.")
     parser.add_argument("--capital", type=float, default=200.0)
     parser.add_argument("--broker", default="IBKR")
     parser.add_argument("--base-only", dest="base_only", action="store_true", default=False,
@@ -1280,7 +1298,16 @@ def _raise_fd_limit() -> None:
 
 def main(argv=None):
     _raise_fd_limit()
-    args = _build_arg_parser().parse_args(argv)
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    parsed_signal_selection = None
+    if args.signal_selection:
+        from signal_selection import parse_signal_selection, SignalSelectionError
+        try:
+            parsed_signal_selection = parse_signal_selection(args.signal_selection)
+        except SignalSelectionError as e:
+            parser.error(str(e))
 
     now = None
     if args.effective_per is not None:
@@ -1305,6 +1332,7 @@ def main(argv=None):
             min_ev_pct=args.min_ev_pct,
             cluster_map_path=args.cluster_map,
             base_only=args.base_only,
+            signal_selection=parsed_signal_selection,
         )
 
         # Hold the SHARED kairos.ops.GpuLock (the same one daily_signals,
@@ -1376,6 +1404,7 @@ def main(argv=None):
                 cash = client.accounts.get(account_id).cash
                 alloc_config = AllocationConfig(
                     top_k=args.top_n, gross_cap_pct=100, equity=cash, cluster_map=cluster_map,
+                    selection_rule=parsed_signal_selection,
                 )
                 enabled_mask = {c.ticker: (c.ticker not in open_tickers) for c in prev_candidates}
                 alloc_result = allocate(prev_candidates, alloc_config, enabled_mask=enabled_mask)

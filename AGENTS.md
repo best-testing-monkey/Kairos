@@ -158,6 +158,7 @@ See `strategy/PIPELINE.md` for the complete stage reference.
 uv run ./strategy/kairos_signals.py
 uv run ./strategy/kairos_signals.py --gsheets   # uploads to Google Sheets
 uv run ./strategy/kairos_signals.py --xlsx --ods
+uv run ./strategy/kairos_signals.py --signal-selection "'n' > 60, 'Win raw' > 0.6, ORDER 'EV raw %' DESC, TOP 3"
 ```
 
 ### Start the web UI
@@ -297,6 +298,10 @@ All `generate_signal()` implementations must return either a `Signal` dataclass 
 ### Prediction samples and lookback
 
 `PRED_SAMPLES = 100` and `DEMO_LOOKBACK = 300` in `strategy/kairos_strategies.py` are hard constraints. Do not reduce them as a performance shortcut.
+
+### Configurable signal selection
+
+`kairos_signals.py`/`kairos_papertrade.py`'s `--signal-selection "<rule>"` flag (grammar in `strategy/signal_selection.py`) lets you replace `strategy/allocation.py`'s hardcoded `min_n`/positive-EV gate and `score`-based ranking/top-K with your own filter+sort rule. When set, the rule **fully replaces** the default gate rather than adding to it — a rule that doesn't check EV can admit a negative-EV signal, so include an EV/quality condition if you want that safety back.
 
 ### Pipeline storage
 

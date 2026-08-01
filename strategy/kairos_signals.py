@@ -805,7 +805,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None,
         min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False,
         cluster_map_path=None, base_only=False, return_rows=False,
-        on_group_timing=None):
+        on_group_timing=None, signal_selection=None):
     """Run the full signals-report flow. Returns the path to the written report.
 
     now: the moment treated as "now" — stamps output filenames/report
@@ -841,6 +841,11 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         actually consumed the time, or whether it was a genuine shared-cache
         miss (unexpected once prewarm has run) vs. just many groups adding
         up -- see kairos_papertrade._log_group_timing.
+    signal_selection: optional, already-parsed SignalSelectionRule (see
+        signal_selection.parse_signal_selection) to pass into AllocationConfig
+        as selection_rule, overriding the default min_n/ev_net gate and
+        score-sort/top_k ranking in allocation.select_candidates(). Default
+        None preserves the exact old default behavior.
     """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
@@ -959,7 +964,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     candidates = fetch_signals(stats_rows, advice_rows)
     if candidates:
         cluster_map = load_cluster_map(cluster_map_path) if cluster_map_path else {}
-        allocation_config = AllocationConfig(cluster_map=cluster_map)
+        allocation_config = AllocationConfig(cluster_map=cluster_map, selection_rule=signal_selection)
         allocation_result = allocate(candidates, allocation_config)
         allocation_section = write_md_section(allocation_result, allocation_config)
 
@@ -1078,10 +1083,34 @@ def main(argv=None):
                              'backward from --effective_per (or now) as the '
                              'most recent report. E.g. "--bars_backtest 28" '
                              '-> 28 reports for the past 28 bars.')
+    parser.add_argument("--signal-selection", dest="signal_selection", default=None,
+                        help="Optional rule string that fully replaces the default "
+                             "Portfolio Allocation gating (min_n/positive-EV-net) and "
+                             "ranking (score sort, top_k) in allocation.select_candidates(). "
+                             "Grammar: comma-separated clauses, each either a condition "
+                             "\"'col' OP value\" (OP one of > >= < <= == !=), an "
+                             "\"ORDER 'col' [ASC|DESC]\" clause (default DESC, at most one), "
+                             "or a \"TOP <int>\" clause (at most one, overrides --top_k-style "
+                             "sizing). Column names match the Allocation sheet headers "
+                             "(Ticker, Cluster, Strategy, Dir, Entry, Stop, Target, Risk %%, "
+                             "Reward %%, b, n, Win raw, Win shrunk, EV raw %%, EV net %%, "
+                             "Kelly raw, Score, Sharpe), case-insensitive. Example: "
+                             "\"'n' > 60, 'Win raw' > 0.6, ORDER 'EV raw %%' DESC, TOP 3\". "
+                             "NOTE: when set, this REPLACES (not adds to) the default "
+                             "min_n/EV-positivity gate -- a rule that doesn't check EV "
+                             "can admit a negative-EV signal.")
     args = parser.parse_args(argv)
 
     if args.bars_backtest is not None and (not args.intervals or len(args.intervals) != 1):
         parser.error("--bars_backtest requires --intervals to name exactly one interval")
+
+    parsed_signal_selection = None
+    if args.signal_selection:
+        from signal_selection import parse_signal_selection, SignalSelectionError
+        try:
+            parsed_signal_selection = parse_signal_selection(args.signal_selection)
+        except SignalSelectionError as e:
+            parser.error(str(e))
 
     now = None
     if args.effective_per is not None:
@@ -1098,6 +1127,7 @@ def main(argv=None):
             xlsx=args.xlsx, ods=args.ods,
             cluster_map_path=args.cluster_map,
             base_only=args.base_only,
+            signal_selection=parsed_signal_selection,
         )
         for p in out_paths:
             print(p)
@@ -1110,6 +1140,7 @@ def main(argv=None):
         xlsx=args.xlsx, ods=args.ods, now=now,
         cluster_map_path=args.cluster_map,
         base_only=args.base_only,
+        signal_selection=parsed_signal_selection,
     )
     print(out_path)
     return out_path
