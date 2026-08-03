@@ -293,19 +293,17 @@ Two slow-run observability/de-dup mechanisms in `kairos_papertrade.py`:
   run drags, that log is the first place to look — it exists because the
   6-month leak hunt needed per-iteration RSS evidence, not anecdotes.
 - **Persistent report de-dup.** `generate_and_dedupe_reports()` keeps its
-  `seen` map in a `SqliteDict` (`report_seen.db`, table `seen_<sha256>` —
-  `_make_report_hash()` covers `base_now`, interval, and the work-item
-  groups), so an interrupted multi-month run resumes without regenerating
-  reports it already produced. Gotchas: the filename is **CWD-relative** —
-  run from the repo root or you silently get a fresh empty DB and
-  regenerate everything; and accepted-finetuned model paths are **not**
-  hashed, so a newly accepted finetuned model for an existing group does
-  NOT bust already-seen dates (delete the table or the DB to force a
-  regen). `base_now` is floored to the interval (`floor_dt`) before
-  hashing/iterating so sub-day jitter doesn't fragment the key space. The
-  returned list is still de-duped by each report's parsed effective_dt
-  (first-seen/newest wins) — weekend/holiday reports at distinct `iter_now`
-  values can share one last-closed-bar date and must not execute twice.
+  `seen` map in a `SqliteDict` (`report_seen.db`, table `seen_v2_<sha256>` for
+  new runs). `_make_report_hash()` returns a v2 hash that covers `base_now`,
+  interval, work-item groups, **and accepted-finetuned model paths**, plus a
+  legacy hash for backward compatibility. A newly accepted finetuned model
+  for an existing group now busts already-seen dates. Existing
+  `seen_<legacy_hash>` tables are read as a fallback so an in-flight run
+  doesn't suddenly regenerate everything; once a window starts writing to a
+  v2 table it stays on v2. Gotchas: the filename is **CWD-relative** — run
+  from the repo root or you silently get a fresh empty DB and regenerate
+  everything. `base_now` is floored to the interval (`floor_dt`) before
+  hashing/iterating so sub-day jitter doesn't fragment the key space.
 
 ### Configurable signal selection (`--signal-selection`)
 Both `kairos_signals.py` and `kairos_papertrade.py` accept `--signal-selection

@@ -735,6 +735,16 @@ class KairosOrchestrator:
 
         # Sub-components
         self.predictor = KairosPredictor(predict_fn)
+        if batch_predict_fn is not None:
+            # kwargs["model"]/["tokenizer"] (e.g. a finetuned checkpoint path)
+            # must reach batch_predict_fn explicitly -- unlike predict_fn,
+            # it's called as batch_predict_fn(assets) with no per-call kwargs,
+            # so without this binding it silently defaults to the base model.
+            batch_predict_fn = functools.partial(
+                batch_predict_fn,
+                model_path=kwargs.get("model"),
+                tokenizer_path=kwargs.get("tokenizer"),
+            )
         self.multi_predictor = MultiAssetKairosPredictor(predict_fn, batch_predict_fn=batch_predict_fn)
         self.tracker = StrategyPerformanceTracker(
             lookback_window=self.config.performance_lookback

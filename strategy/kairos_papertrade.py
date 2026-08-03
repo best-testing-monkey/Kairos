@@ -385,16 +385,16 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, not
     n_iterations = round(months_back * 30.44 / days_per_step)
     base_now = floor_dt(base_now,interval=step);
 
-    hash = _make_report_hash(base_now, interval, run_kwargs)
+    hash_v2, hash_legacy = _make_report_hash(base_now, interval, run_kwargs)
     # todo: install SqliteDict un uv (and lockfile or something.. don't know how that works with u)
-    # todo: use SqliteDict for seen with hash in the filename or something to select tables.
     #   d = SqliteDict('mydata.sqlite', autocommit=True)
     #   d['key'] = {'some': 'value'}
     #   d.close()
 
-    seen = SqliteDict(filename ="report_seen.db", tablename="seen_"+ hash, autocommit=True)
+    seen_table = _pick_seen_table("report_seen.db", hash_v2, hash_legacy)
+    seen = SqliteDict(filename="report_seen.db", tablename=seen_table, autocommit=True)
     for i in tqdm(iterable=range(n_iterations), desc="Interval report", unit="bar"):
-        generate_and_dedupe_report_single(seen, base_now,i,step,interval, run_kwargs, n_iterations, notify)
+        generate_and_dedupe_report_single(seen, base_now, i, step, interval, run_kwargs, n_iterations, notify)
 
     return [seen[key] for key in sorted(seen.keys())]
 
@@ -406,15 +406,21 @@ def json_default(obj):
 
 
 def _make_report_hash(base_now, interval, run_kwargs):
+    """Return (v2_hash, legacy_hash) for the report de-dup DB table name.
+
+    v2 includes accepted-finetuned model paths in the key, so a newly
+    accepted finetuned model for an existing group busts report resume.
+    legacy is the pre-2026-08-03 hash that only covered base_now/interval/
+    work-item groups; it is kept as a read fallback so in-flight runs do
+    not suddenly see empty tables and regenerate everything.
+    """
     db_path = run_kwargs.get("db_path", DB_PATH)
     base_only = run_kwargs.get("base_only", False)
-    lookback = kairos_strategies.LOOKBACK
 
     # See kairos_signals._connect_with_retry's docstring for why this isn't
     # a plain sqlite3.connect() -- a live run crashed here (and in run()'s
     # date-major loop) with a transient "unable to open database file".
     conn = _kairos_signals_mod._connect_with_retry(db_path)
-    groups = None
     try:
         rows = _kairos_signals_mod.load_work_items(conn, intervals=[interval])
         groups = _kairos_signals_mod.group_items(rows)
@@ -424,19 +430,66 @@ def _make_report_hash(base_now, interval, run_kwargs):
     finally:
         conn.close()
 
+    # Legacy hash: identical to the pre-fix computation so existing
+    # seen_<hash> tables continue to be found.
+    legacy_key = [base_now, interval, "base"]
+    legacy_key += groups
+    legacy_hash = hashlib.sha256(
+        json.dumps(legacy_key, sort_keys=True, default=json_default).encode()
+    ).hexdigest()
 
-    key_base = [base_now, interval, "base"]
-    key_base += groups 
-    accepted_finetuned = ( {} if base_only else _kairos_signals_mod.load_accepted_finetuned(conn) )   
+    # v2 hash: additionally folds in accepted-finetuned model paths.
+    v2_key = [base_now, interval, "base", "v2"]
+    v2_key += sorted(groups)
     if not base_only and accepted_finetuned:
         finetuned = []
         for (assets_str, grp_interval), _group_rows in groups.items():
             sorted_key = ",".join(sorted(assets_str.split(",")))
             model_path = accepted_finetuned.get((sorted_key, grp_interval))
             if model_path is not None:
-                finetuned += [model_path]
-    hash = hashlib.sha256(json.dumps(key_base, sort_keys=True, default=json_default).encode()).hexdigest()
-    return hash
+                finetuned.append(model_path)
+        v2_key.append(sorted(finetuned))
+    v2_hash = hashlib.sha256(
+        json.dumps(v2_key, sort_keys=True, default=json_default).encode()
+    ).hexdigest()
+
+    return v2_hash, legacy_hash
+
+
+def _table_has_rows(db_path: str, table_name: str) -> bool:
+    """Best-effort row count check for _pick_seen_table. Treats any sqlite
+    error as "no rows" so a missing/corrupt DB never blocks the run."""
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            )
+            if cur.fetchone()[0] == 0:
+                return False
+            cur = conn.execute(f'SELECT count(*) FROM "{table_name}"')
+            return cur.fetchone()[0] > 0
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+def _pick_seen_table(seen_db_path: str, hash_v2: str, hash_legacy: str) -> str:
+    """Choose which seen table to open.
+
+    Prefer a populated v2 table; fall back to a populated legacy table so
+    existing in-flight runs resume without a full regen. If neither exists,
+    start fresh with v2.
+    """
+    v2_table = f"seen_v2_{hash_v2}"
+    legacy_table = f"seen_{hash_legacy}"
+    if _table_has_rows(seen_db_path, v2_table):
+        return v2_table
+    if _table_has_rows(seen_db_path, legacy_table):
+        return legacy_table
+    return v2_table
 
 
 def generate_and_dedupe_report_single(seen, base_now: datetime, i:int, step: timedelta, interval, run_kwargs, n_iterations, notify):

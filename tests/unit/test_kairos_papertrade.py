@@ -2,6 +2,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -83,7 +84,10 @@ class TestGenerateAndDedupeReports:
         # stub it out so these unit tests stay hermetic. Also replace the
         # persistent SqliteDict with an in-memory dict so tests do not
         # collide with a real run's report_seen.db in the repo root.
-        monkeypatch.setattr(kp, "_make_report_hash", lambda *a, **k: "testhash")
+        monkeypatch.setattr(
+            kp, "_make_report_hash", lambda *a, **k: ("testhash", "legacy_testhash")
+        )
+        monkeypatch.setattr(kp, "_pick_seen_table", lambda *a, **k: "seen_v2_testhash")
         monkeypatch.setattr(
             kp, "SqliteDict", lambda filename, tablename, autocommit=True: {}
         )
@@ -244,6 +248,88 @@ class TestGenerateAndDedupeReports:
         # 0.2 months ~= 6 iterations, 3 of which were already seen.
         assert len(calls) == 6
         assert len(second) == 6
+
+
+# ============================================================================
+# Report hash / table selection
+# ============================================================================
+
+class TestReportHashAndTableSelection:
+    def test_make_report_hash_v2_includes_finetuned_paths(self, monkeypatch):
+        import kairos_papertrade as kp
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: MagicMock())
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items", lambda conn, intervals: [])
+        monkeypatch.setattr(
+            kp._kairos_signals_mod, "group_items", lambda rows: {("A,B", "1d"): []}
+        )
+        monkeypatch.setattr(
+            kp._kairos_signals_mod, "load_accepted_finetuned",
+            lambda conn: {("A,B", "1d"): "/models/v1"},
+        )
+
+        v2_a, legacy_a = kp._make_report_hash(datetime(2026, 7, 19), "1d", {})
+
+        monkeypatch.setattr(
+            kp._kairos_signals_mod, "load_accepted_finetuned",
+            lambda conn: {("A,B", "1d"): "/models/v2"},
+        )
+        v2_b, legacy_b = kp._make_report_hash(datetime(2026, 7, 19), "1d", {})
+
+        # v2 changes when the accepted finetuned model changes; legacy stays
+        # identical so existing seen_<legacy> tables are still found.
+        assert v2_a != v2_b
+        assert legacy_a == legacy_b
+
+    def test_make_report_hash_base_only_ignores_finetuned(self, monkeypatch):
+        import kairos_papertrade as kp
+
+        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: MagicMock())
+        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items", lambda conn, intervals: [])
+        monkeypatch.setattr(
+            kp._kairos_signals_mod, "group_items", lambda rows: {("A,B", "1d"): []}
+        )
+        monkeypatch.setattr(
+            kp._kairos_signals_mod, "load_accepted_finetuned",
+            lambda conn: {("A,B", "1d"): "/models/v1"},
+        )
+
+        v2_with, legacy_with = kp._make_report_hash(datetime(2026, 7, 19), "1d", {})
+        v2_without, legacy_without = kp._make_report_hash(
+            datetime(2026, 7, 19), "1d", {"base_only": True}
+        )
+
+        # base_only=True strips finetuned paths from v2.
+        assert v2_with != v2_without
+        assert legacy_with == legacy_without
+
+    def test_pick_seen_table_prefers_populated_v2(self, tmp_path):
+        import kairos_papertrade as kp
+        db_path = str(tmp_path / "report_seen.db")
+        # Both tables exist; v2 has rows, legacy is empty.
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE seen_v2_hash (key TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO seen_v2_hash VALUES ('x')")
+        conn.execute("CREATE TABLE seen_hash (key TEXT PRIMARY KEY)")
+        conn.commit()
+        conn.close()
+        assert kp._pick_seen_table(db_path, "hash", "hash") == "seen_v2_hash"
+
+    def test_pick_seen_table_falls_back_to_legacy(self, tmp_path):
+        import kairos_papertrade as kp
+        db_path = str(tmp_path / "report_seen.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE seen_v2_hash (key TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE seen_hash (key TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO seen_hash VALUES ('x')")
+        conn.commit()
+        conn.close()
+        assert kp._pick_seen_table(db_path, "hash", "hash") == "seen_hash"
+
+    def test_pick_seen_table_defaults_to_v2_when_empty(self, tmp_path):
+        import kairos_papertrade as kp
+        db_path = str(tmp_path / "report_seen.db")
+        assert kp._pick_seen_table(db_path, "hash", "hash") == "seen_v2_hash"
 
 
 # ============================================================================
