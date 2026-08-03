@@ -32,6 +32,7 @@ needed.
 """
 import argparse
 import gc
+import hashlib
 import json
 import os
 import re
@@ -40,7 +41,7 @@ import subprocess
 import sys
 import time
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from typing import Optional
 
@@ -49,12 +50,14 @@ import sqlite3
 import pandas as pd
 import price_cache
 from tqdm import tqdm
+from sqlitedict import SqliteDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kairos_signals import DB_PATH, RESULTS_DIR, _interval_to_timedelta
 import kairos_signals as _kairos_signals_mod
 from kairos.ops import GpuLock, OpsError, send_telegram
+import kairos_strategies
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_PHANTOM_DATA_DIR = os.path.join(REPO_ROOT, "data", "phantom_ledger")
@@ -72,7 +75,7 @@ _INTRADAY_FALLBACK_LADDER = ["1m", "15m", "30m", "1h"]
 # long-running report-generation and day-by-day backtest loops (a single
 # iteration/day taking this long is treated as an outlier worth a heads-up,
 # not a full every-iteration spam).
-_SLOW_ITERATION_THRESHOLD_SECONDS = 300.0
+_SLOW_ITERATION_THRESHOLD_SECONDS = 60.0
 
 # Per-(group, pass) threshold for the cheaper, subprocess-free companion log
 # (_log_group_timing). Deliberately much smaller than the per-date threshold
@@ -123,6 +126,9 @@ def _notify(text: str, enabled: bool = True) -> None:
     entities" error (see CLAUDE.md's "Telegram notifications" section).
     Plain text can never fail to parse.
     """
+
+    print(text)
+
     if not enabled:
         return
     try:
@@ -377,32 +383,86 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, not
     step = _interval_to_timedelta(interval)
     days_per_step = step.total_seconds() / 86400.0
     n_iterations = round(months_back * 30.44 / days_per_step)
+    base_now = floor_dt(base_now,interval=step);
 
-    seen = {}
-    for i in range(n_iterations):
-        iter_now = base_now - i * step
-        start_t = time.monotonic()
-        out_path, stats_rows, advice_rows = _kairos_signals_mod.run(
-            now=iter_now, intervals=[interval], return_rows=True,
-            on_group_timing=_make_group_timing_cb(iter_now), **run_kwargs
-        )
-        elapsed = time.monotonic() - start_t
-        if elapsed > _SLOW_ITERATION_THRESHOLD_SECONDS:
-            _notify(
-                f"⏱️ Kairos papertrade: report {i + 1}/{n_iterations} "
-                f"(date {iter_now:%Y-%m-%d}) took {elapsed / 60:.1f}min (>5min) — "
-                f"still running",
-                enabled=notify,
-            )
-            _log_watchdog_snapshot(
-                f"report {i + 1}/{n_iterations} (date {iter_now:%Y-%m-%d})", elapsed,
-            )
-        effective_dt = parse_report_effective_dt(out_path)
-        if effective_dt not in seen:
-            seen[effective_dt] = (effective_dt, stats_rows, advice_rows)
+    hash = _make_report_hash(base_now, interval, run_kwargs)
+    # todo: install SqliteDict un uv (and lockfile or something.. don't know how that works with u)
+    # todo: use SqliteDict for seen with hash in the filename or something to select tables.
+    #   d = SqliteDict('mydata.sqlite', autocommit=True)
+    #   d['key'] = {'some': 'value'}
+    #   d.close()
+
+    seen = SqliteDict(filename ="report_seen.db", tablename="seen_"+ hash, autocommit=True)
+    for i in tqdm(iterable=range(n_iterations), desc="Interval report", unit="bar"):
+        generate_and_dedupe_report_single(seen, base_now,i,step,interval, run_kwargs, n_iterations, notify)
 
     return [seen[key] for key in sorted(seen.keys())]
 
+
+def json_default(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _make_report_hash(base_now, interval, run_kwargs):
+    db_path = run_kwargs.get("db_path", DB_PATH)
+    base_only = run_kwargs.get("base_only", False)
+    lookback = kairos_strategies.LOOKBACK
+
+    # See kairos_signals._connect_with_retry's docstring for why this isn't
+    # a plain sqlite3.connect() -- a live run crashed here (and in run()'s
+    # date-major loop) with a transient "unable to open database file".
+    conn = _kairos_signals_mod._connect_with_retry(db_path)
+    groups = None
+    try:
+        rows = _kairos_signals_mod.load_work_items(conn, intervals=[interval])
+        groups = _kairos_signals_mod.group_items(rows)
+        accepted_finetuned = (
+            {} if base_only else _kairos_signals_mod.load_accepted_finetuned(conn)
+        )
+    finally:
+        conn.close()
+
+
+    key_base = [base_now, interval, "base"]
+    key_base += groups 
+    accepted_finetuned = ( {} if base_only else _kairos_signals_mod.load_accepted_finetuned(conn) )   
+    if not base_only and accepted_finetuned:
+        finetuned = []
+        for (assets_str, grp_interval), _group_rows in groups.items():
+            sorted_key = ",".join(sorted(assets_str.split(",")))
+            model_path = accepted_finetuned.get((sorted_key, grp_interval))
+            if model_path is not None:
+                finetuned += [model_path]
+    hash = hashlib.sha256(json.dumps(key_base, sort_keys=True, default=json_default).encode()).hexdigest()
+    return hash
+
+
+def generate_and_dedupe_report_single(seen, base_now: datetime, i:int, step: timedelta, interval, run_kwargs, n_iterations, notify):
+    iter_now = base_now - i * step
+
+    if iter_now in seen:
+        return seen[iter_now]
+
+    start_t = time.monotonic()
+    out_path, stats_rows, advice_rows = _kairos_signals_mod.run(
+        now=iter_now, intervals=[interval], return_rows=True,
+        on_group_timing=_make_group_timing_cb(iter_now), **run_kwargs
+    )
+    elapsed = time.monotonic() - start_t
+    if elapsed > _SLOW_ITERATION_THRESHOLD_SECONDS:
+        _notify(
+            f"⏱️ Kairos papertrade: report {i + 1}/{n_iterations} "
+            f"(date {iter_now:%Y-%m-%d}) took {elapsed / 60:.1f}min (>5min) — "
+            f"still running",
+            enabled=notify,
+        )
+        _log_watchdog_snapshot(
+            f"report {i + 1}/{n_iterations} (date {iter_now:%Y-%m-%d})", elapsed,
+        )
+    if iter_now not in seen:
+        seen[iter_now] = (iter_now, stats_rows, advice_rows)
 
 def _format_prewarm_load_message(model_label: str, dates: list) -> str:
     """🧠 pre-load heads-up notification text, sent right before
@@ -516,7 +576,6 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
     local I/O but is far cheaper than holding tens of thousands of
     DataFrames in RAM for the whole sweep.
     """
-    import kairos_strategies
 
     step = _interval_to_timedelta(interval)
     days_per_step = step.total_seconds() / 86400.0
@@ -796,6 +855,11 @@ def _parse_iso(value):
 # =============================================================================
 # Phantom Ledger orchestration (requires a live `phantom` install)
 # =============================================================================
+
+def floor_dt(dt: datetime, interval: timedelta) -> datetime:
+    ref = datetime.min
+    delta = dt - ref
+    return ref + (delta // interval) * interval
 
 def selected_rows(allocation_result):
     """Rows from an AllocationResult with status == 'SELECTED' (alloc > 0)."""
@@ -1187,6 +1251,12 @@ def _format_start_message(base_now, args) -> str:
         f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}"
     )
 
+def _format_start_sim_message(base_now, args) -> str:
+    return (
+        f"🟢 Kairos papertrade simulating: window ending {base_now.strftime('%Y-%m-%d %H:%M')}, "
+        f"interval={args.interval}, months_back={args.months_back}, top_n={args.top_n}, "
+        f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}"
+    )
 
 def _format_finish_message(metrics: dict, report_filename: str) -> str:
     """✅ success notification text, summarizing the final metrics dict
@@ -1295,7 +1365,6 @@ def _raise_fd_limit() -> None:
     except (ValueError, OSError) as exc:
         print(f"[kairos_papertrade] WARNING: could not raise open-file limit: {exc}", file=sys.stderr)
 
-
 def main(argv=None):
     _raise_fd_limit()
     parser = _build_arg_parser()
@@ -1382,6 +1451,8 @@ def main(argv=None):
         if not dated_rows:
             raise RuntimeError("No kairos_signals reports were generated in the requested window.")
 
+        _notify(_format_start_sim_message(base_now, args), enabled=args.notify)
+        
         cluster_map = load_cluster_map(args.cluster_map) if args.cluster_map else {}
 
         client = ph.Phantom(data_dir=args.phantom_data_dir)

@@ -39,7 +39,12 @@ License: MIT (inherited from upstream Kronos).
 - **Test runner**: pytest
 - **Lint / type check**: flake8, mypy
 
-Key external Python dependency: `price_cache` installed directly from Git (`git+https://github.com/best-testing-monkey/price_cache.git`).
+Key external Python dependencies installed directly from Git:
+
+- `price_cache` (`git+https://github.com/best-testing-monkey/price_cache.git`)
+- `phantom-ledger` (`git+https://github.com/best-testing-monkey/phantom_ledger.git`, imported as `phantom`) — sibling paper-trading engine used by `strategy/kairos_papertrade.py`
+
+Also: `sqlitedict` (persistent dict-on-SQLite, used for papertrade report de-dup).
 
 ---
 
@@ -72,6 +77,10 @@ Key external Python dependency: `price_cache` installed directly from Git (`git+
 │   ├── kairos_horizon.py
 │   ├── kairos_pipeline.py  # 5-stage asset-discovery pipeline
 │   ├── kairos_signals.py   # Current-signals report generator
+│   ├── kairos_papertrade.py # Paper-trade executor (Phantom Ledger, roadmap Phase 4)
+│   ├── kairos_predcache.py # Disk-backed prediction cache + in-memory LRU
+│   ├── signal_selection.py # --signal-selection DSL grammar + column registry
+│   ├── allocation.py       # Signal gating/ranking (default min_n + EV gate, top-K)
 │   ├── kairos_gpu.py       # CUDA recovery helpers
 │   ├── PIPELINE.md         # Pipeline usage docs
 │   └── README.md           # Strategy framework docs
@@ -97,10 +106,10 @@ Key external Python dependency: `price_cache` installed directly from Git (`git+
 ├── kairos/                 # Main installable Python package
 │   ├── ops.py              # GPU lock, GPU health/utilization, Telegram notifications
 │   └── ...
-├── data/                   # SQLite databases (ignored by git)
+├── data/                   # SQLite DBs, predcache/, phantom_ledger/ (ignored by git)
 ├── results/                # Pipeline CSV reports (ignored by git)
 ├── output/                 # Example / report outputs (ignored by git)
-├── docs/                   # RFCs, tickets, todo
+├── docs/                   # RFCs, tickets, todo, papertrade_tickets/, playbooks/
 └── roadmap/                # Phase documents
 ```
 
@@ -160,6 +169,15 @@ uv run ./strategy/kairos_signals.py --gsheets   # uploads to Google Sheets
 uv run ./strategy/kairos_signals.py --xlsx --ods
 uv run ./strategy/kairos_signals.py --signal-selection "'n' > 60, 'Win raw' > 0.6, ORDER 'EV raw %' DESC, TOP 3"
 ```
+
+### Run the paper-trade executor (Phantom Ledger)
+
+```bash
+uv run ./strategy/kairos_papertrade.py --months-back 6 --interval 1d
+uv run ./strategy/kairos_papertrade.py --no-pred-cache   # bypass the prediction prewarm cache
+```
+
+Replays `kairos_signals.py` reports through Phantom Ledger with a one-report lag (report `i`'s candidates execute at report `i+1`'s next-bar open). Sends Telegram lifecycle/slow-iteration alerts (`--no-telegram` to mute); see the papertrade gotchas in §7.
 
 ### Start the web UI
 
@@ -303,6 +321,19 @@ All `generate_signal()` implementations must return either a `Signal` dataclass 
 
 `kairos_signals.py`/`kairos_papertrade.py`'s `--signal-selection "<rule>"` flag (grammar in `strategy/signal_selection.py`) lets you replace `strategy/allocation.py`'s hardcoded `min_n`/positive-EV gate and `score`-based ranking/top-K with your own filter+sort rule. When set, the rule **fully replaces** the default gate rather than adding to it — a rule that doesn't check EV can admit a negative-EV signal, so include an EV/quality condition if you want that safety back.
 
+### Paper trading & prediction caches
+
+`strategy/kairos_papertrade.py` replays `kairos_signals.py` reports through Phantom Ledger (roadmap Phase 4). It grew several caches and ops safeguards that are easy to trip over:
+
+- **Persistent prediction cache** (`strategy/kairos_predcache.py`): disk-backed `.npz` store at `data/predcache/` (env `KAIROS_PRED_CACHE_DIR`) plus a byte-bounded in-memory LRU on top. Keys include symbol/interval/bar/lookback/`pred_len`/`pred_samples`/model/content-hash/`checkpoint_fingerprint` — the fingerprint (size+mtime of `model.safetensors`) busts the cache when a finetuned checkpoint is retrained in place. Disk is bounded (default 2 GiB, oldest-mtime eviction; `KAIROS_PRED_CACHE_MAX_BYTES` to tune). `kairos_papertrade.py --no-pred-cache` disables prewarm/reuse for a run. `kairos_pipeline.py --stage auto` uses the same module with a *separate ephemeral* tempdir — don't conflate the two.
+- **Use `.has()`, not `.get()`, for existence checks.** `PredictionCache.get()` promotes a disk hit into the in-memory LRU as a side effect; calling it as a boolean probe (as `is_batch_cached()` once did) silently grows RAM until the machine freezes. `.has()` never touches `_mem`.
+- **Model-major prewarm**: `kairos_papertrade.main()` runs `prewarm_prediction_cache()` before the date-major report loop so each model (base + each finetuned group) loads exactly once per run. `kairos_strategies.predict_all_batch` defers `_materialize_model` until *after* the shared-cache lookup and skips it on a full hit.
+- **Long-run leak guards**: `_prediction_cache` (the per-process dict in `kairos_strategies.py`, distinct from `kairos_predcache`) is capped at 5000 entries (`_PREDICTION_CACHE_MAX_ENTRIES`) and cleared on overflow; the prewarm loops in `kairos_papertrade.py` call `gc.collect()` every 500 iterations (`_PREWARM_GC_INTERVAL`) because CPython's GC is allocation-count-based and won't collect few-but-large DataFrames on its own.
+- **Crash mitigations**: `kairos_signals._connect_with_retry()` (3 attempts, backoff) for transient `sqlite3.OperationalError: unable to open database file`; `kairos_papertrade._raise_fd_limit()` (soft `RLIMIT_NOFILE` → hard cap, first line of `main()`) for `Errno 24 Too many open files`.
+- **Report de-dup is persistent**: `generate_and_dedupe_reports()` keeps its `seen` map in a `SqliteDict` (`report_seen.db`, table `seen_<hash>` where the hash covers base_now/interval/work-item groups) so interrupted runs resume without regenerating reports. Two caveats: the filename is **CWD-relative** — run from the repo root or you get a fresh, empty DB — and accepted-finetuned model paths are **not** hashed, so a newly accepted finetuned model does not bust already-seen dates.
+- **Per-strategy signals cache**: `kairos_signals.run()` caches each strategy's rows in the `signals_cache` table in `pipeline_results.db`, keyed by `(strategy, assets, interval, as_of_date, lookback, pred_samples, min_ev_pct, model_path, checkpoint_fingerprint)`. `as_of` is a *date*, not a timestamp, so overlapping backtest windows hit. Disabled strategies are never served stale (live registry check happens before any cache lookup). `--no-signal-cache` disables it (`use_signal_cache=True` is the default); writes are `INSERT OR REPLACE`, so growth is bounded by unique-key space.
+- **Ops during report generation**: the shared `kairos.ops.GpuLock` is held for the whole `generate_and_dedupe_reports()` loop (other Kairos GPU jobs block meanwhile). Slow iterations (> `_SLOW_ITERATION_THRESHOLD_SECONDS`, 60s) trigger a Telegram heads-up plus a forensic snapshot (own PID/VmRSS, `free -h`, `nvidia-smi`) appended to `data/papertrade_watchdog.log`; per-group timing lines for slow or shared-cache-MISS groups go there too via `_log_group_timing`.
+
 ### Pipeline storage
 
 The discovery pipeline persists results to:
@@ -310,7 +341,7 @@ The discovery pipeline persists results to:
 - `data/pipeline_results.db` (SQLite, source of truth)
 - `results/<stage>_<table>_<timestamp>.csv` (point-in-time mirrors)
 
-Tables include `runs`, `universe_screen`, `correlation_pairs`, `suggested_groups`, `oracle_results`, `model_results`, and `viability_report`.
+Tables include `runs`, `universe_screen`, `correlation_pairs`, `suggested_groups`, `oracle_results`, `model_results`, `viability_report`, and `signals_cache` (per-strategy signals cache, see above).
 
 ---
 
@@ -332,6 +363,7 @@ Tables include `runs`, `universe_screen`, `correlation_pairs`, `suggested_groups
 | `CLAUDE.md` | Project layout, run commands, hard-won gotchas |
 | `strategy/README.md` | Strategy framework architecture, 42-strategy catalog, config reference |
 | `strategy/PIPELINE.md` | Asset-discovery pipeline stages, DB schema, CLI reference |
+| `docs/papertrade_tickets/` | Known papertrade gap-analysis tickets (exposure cap, costs, execution, sizing, model fitness, ...) |
 | `docs/todo.md` | Epic/ticket tracker for active feature work |
 | `ROADMAP.md` and `roadmap/*.md` | Long-term phase planning |
 | `finetune_csv/README.md` | Custom CSV fine-tuning instructions |

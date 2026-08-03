@@ -94,7 +94,7 @@ row is registered); the two standalone wrapper scripts
 own actionable-signal/failure/summary alerts); `strategy/kairos_papertrade.py`
 (own `_notify` helper, gated by `--no-telegram`/`args.notify` — 🟢 start,
 ✅ finish, 💥 unhandled crash, ⏱️ any single `kairos_signals.run()` call or
-Phantom day-backtest that exceeds `_SLOW_ITERATION_THRESHOLD_SECONDS` (5min),
+Phantom day-backtest that exceeds `_SLOW_ITERATION_THRESHOLD_SECONDS` (60s),
 and 🧠 a heads-up right before `prewarm_prediction_cache()` actually loads a
 Kronos model for one sweep unit — base, or one finetuned group — naming the
 model and the date range it's about to cover; suppressed entirely when that
@@ -234,6 +234,78 @@ to be fixed before a full 6-month run finished cleanly (RSS stable ~5.28GB):
   found no cache misses"`). When a load pass does run, it always covers the
   *full* cross product for that unit, not just what the check pass happened
   to see before stopping early.
+
+### Per-strategy signals cache (`signals_cache` table)
+`kairos_signals.py`'s `run()` caches each strategy's rows (the output of
+`_run_group`'s per-symbol predict → meta-filter → `generate_signal` →
+row-build pipeline) in a `signals_cache` table in `db_path`
+(`pipeline_results.db`), keyed by **strategy** (not just group) plus model,
+group, as-of date, and lookback — `_signals_cache_key()`'s full key is
+`(strategy_name, assets_str, interval, as_of_date, lookback, pred_samples,
+min_ev_pct, model_path, checkpoint_fingerprint)`. `pred_samples`/
+`min_ev_pct` are included because they change the cached value's meaning
+(sampled distribution and the EV gate, respectively) even though nothing
+originally asked for them explicitly; `checkpoint_fingerprint` (via
+`kairos_strategies._model_checkpoint_fingerprint()`) busts the cache when a
+finetuned checkpoint is retrained in place at the same `model_path`,
+mirroring `kairos_predcache`'s own key. `as_of` is `now.date()`, not the raw
+`now` timestamp — `fetch_data_raw` only ever consumes `as_of.date()`, so two
+different `now` values on the same calendar day fetch identical data and
+must key identically here too (this is also what makes cache hits actually
+happen across separate process runs, since `papertrade`'s `base_now =
+datetime.now()` never repeats exactly, but dates do for overlapping
+backtest windows).
+
+**Disabled strategies are never served stale.** `_run_group` builds
+`strategies_by_name` (from `KairosOrchestrator`, already filtered by
+`resolve_disabled_strategies`) *before* ever touching the cache or calling
+`predict_fn` — a strategy that's since been disabled simply isn't in that
+dict, so it always falls through to the existing "unknown strategy (not in
+registry)" skip path, exactly as it would with no cache at all. The cache
+key deliberately does NOT fingerprint the `disabled_strategies` table
+itself; correctness comes from checking live status first, every time, not
+from invalidating on a registry change. One consequence: if every strategy
+in a group is either disabled or already cached, `predict_fn` (the GPU
+model call) is never invoked for that group at all.
+
+`use_signal_cache=True` is `run()`'s default; `--no-signal-cache` disables
+it on the CLI (mirrors `kairos_papertrade.py`'s `--no-pred-cache` for the
+sibling model-prediction cache). Rows are written with `INSERT OR REPLACE`
+on `cache_key`, so a re-run of an already-cached key overwrites rather than
+duplicating — table growth is bounded by unique-key space, not call count,
+matching the rest of `pipeline_results.db`'s tables (no separate eviction).
+
+### Watchdog forensics + persistent report de-dup (papertrade)
+Two slow-run observability/de-dup mechanisms in `kairos_papertrade.py`:
+
+- **Watchdog forensics.** Any single `kairos_signals.run()` call or Phantom
+  day-backtest exceeding `_SLOW_ITERATION_THRESHOLD_SECONDS` (60s) sends a
+  Telegram heads-up AND appends a forensic snapshot to
+  `data/papertrade_watchdog.log` via `_log_watchdog_snapshot()` (own PID +
+  VmRSS from /proc, plus `free -h` and `nvidia-smi` output — captured so
+  the next machine freeze has evidence: multiple PIDs in the log means
+  overlapping runs, one PID with climbing RSS means an in-process leak).
+  Its companion `_log_group_timing()` logs per-(group, pass) lines to the
+  same file with no subprocess calls — but only for groups that were slow
+  (> `_SLOW_GROUP_THRESHOLD_SECONDS`) or a shared-cache MISS (unexpected
+  once prewarm has covered the model/date), fired from
+  `generate_and_dedupe_reports`' `on_group_timing` callback. When a long
+  run drags, that log is the first place to look — it exists because the
+  6-month leak hunt needed per-iteration RSS evidence, not anecdotes.
+- **Persistent report de-dup.** `generate_and_dedupe_reports()` keeps its
+  `seen` map in a `SqliteDict` (`report_seen.db`, table `seen_<sha256>` —
+  `_make_report_hash()` covers `base_now`, interval, and the work-item
+  groups), so an interrupted multi-month run resumes without regenerating
+  reports it already produced. Gotchas: the filename is **CWD-relative** —
+  run from the repo root or you silently get a fresh empty DB and
+  regenerate everything; and accepted-finetuned model paths are **not**
+  hashed, so a newly accepted finetuned model for an existing group does
+  NOT bust already-seen dates (delete the table or the DB to force a
+  regen). `base_now` is floored to the interval (`floor_dt`) before
+  hashing/iterating so sub-day jitter doesn't fragment the key space. The
+  returned list is still de-duped by each report's parsed effective_dt
+  (first-seen/newest wins) — weekend/holiday reports at distinct `iter_now`
+  values can share one last-closed-bar date and must not execute twice.
 
 ### Configurable signal selection (`--signal-selection`)
 Both `kairos_signals.py` and `kairos_papertrade.py` accept `--signal-selection

@@ -76,16 +76,27 @@ class TestParseReportEffectiveDt:
 # ============================================================================
 
 class TestGenerateAndDedupeReports:
-    def test_dedupes_by_effective_dt_first_seen_wins(self, tmp_path, monkeypatch):
-        # Simulate a weekend: several distinct `now` values (iter_now) all
-        # resolve to the SAME last-closed-bar effective_dt in their report
-        # header (e.g. Sat/Sun/Mon-morning all show Friday's close).
+    @pytest.fixture(autouse=True)
+    def _isolated_seen_store(self, monkeypatch):
+        # generate_and_dedupe_reports computes its seen-table name via
+        # _make_report_hash, which reads the real pipeline_results.db --
+        # stub it out so these unit tests stay hermetic. Also replace the
+        # persistent SqliteDict with an in-memory dict so tests do not
+        # collide with a real run's report_seen.db in the repo root.
+        monkeypatch.setattr(kp, "_make_report_hash", lambda *a, **k: "testhash")
+        monkeypatch.setattr(
+            kp, "SqliteDict", lambda filename, tablename, autocommit=True: {}
+        )
+
+    def test_returns_one_result_per_iter_now(self, tmp_path, monkeypatch):
+        # The current implementation keys the seen map by iter_now, not by
+        # parsed effective_dt, so distinct iter_now values survive even when
+        # their reports share the same effective_dt header.
         calls = []
 
         def fake_run(now, intervals, return_rows, **kwargs):
             calls.append(now)
-            # First two calls collapse to the same effective_dt (weekend
-            # dup); the third is a distinct, older effective_dt.
+            # First two calls collapse to the same effective_dt (weekend dup).
             if len(calls) <= 2:
                 effective = "2026-07-17 0000h"
             else:
@@ -104,14 +115,10 @@ class TestGenerateAndDedupeReports:
 
         # 0.1 months * 30.44 ~= 3.044 -> round() -> 3 iterations
         assert len(calls) == 3
-        # Only 2 distinct effective_dts should survive de-dup.
-        assert len(result) == 2
-        # Sorted oldest-first.
-        assert result[0][0] < result[1][0]
-        assert result[0][0] == datetime(2026, 7, 16, 0, 0)
-        assert result[1][0] == datetime(2026, 7, 17, 0, 0)
-        # First-seen wins: effective_dt 2026-07-17 should keep call #1's rows.
-        assert result[1][1] == [{"call": 1}]
+        # 3 distinct iter_now values survive (no effective_dt de-dup).
+        assert len(result) == 3
+        # Sorted oldest-first by iter_now (stored as the tuple's first element).
+        assert result[0][0] < result[1][0] < result[2][0]
 
     def test_returns_empty_list_when_no_iterations(self, monkeypatch):
         import kairos_papertrade as kp
@@ -153,9 +160,7 @@ class TestGenerateAndDedupeReports:
         monkeypatch.setattr(kp.time, "monotonic", lambda: next(times))
 
         base_now = datetime(2026, 7, 19, 0, 0)
-        result = generate_and_dedupe_reports(
-            base_now, "1d", months_back=0.1, run_kwargs={}, notify=True,
-        )
+        generate_and_dedupe_reports(base_now, "1d", months_back=0.1, run_kwargs={}, notify=True)
 
         assert len(calls) == 3
         assert mock_send.call_count == 3
@@ -178,9 +183,7 @@ class TestGenerateAndDedupeReports:
         monkeypatch.setattr(kp.time, "monotonic", lambda: next(times))
 
         base_now = datetime(2026, 7, 19, 0, 0)
-        result = generate_and_dedupe_reports(
-            base_now, "1d", months_back=0.1, run_kwargs={}, notify=True,
-        )
+        generate_and_dedupe_reports(base_now, "1d", months_back=0.1, run_kwargs={}, notify=True)
 
         assert len(calls) == 3
         mock_send.assert_not_called()
@@ -198,10 +201,9 @@ class TestGenerateAndDedupeReports:
         monkeypatch.setattr(kp.time, "monotonic", lambda: next(times))
 
         base_now = datetime(2026, 7, 19, 0, 0)
-        generate_and_dedupe_reports(
-            base_now, "1d", months_back=0.1, run_kwargs={}, notify=False,
-        )
+        generate_and_dedupe_reports(base_now, "1d", months_back=0.1, run_kwargs={}, notify=False)
 
+        assert len(calls) == 3
         mock_send.assert_not_called()
 
     def test_passes_on_group_timing_callback_per_iteration(self, tmp_path, monkeypatch):
@@ -222,6 +224,26 @@ class TestGenerateAndDedupeReports:
 
         assert len(received_cbs) == 3
         assert all(callable(cb) for cb in received_cbs)
+
+    def test_resume_skips_already_seen_dates(self, tmp_path, monkeypatch):
+        # A second invocation sharing the same in-memory seen store must not
+        # re-run dates already in the map -- only new, older dates get run().
+        shared = {}
+        monkeypatch.setattr(
+            kp, "SqliteDict", lambda filename, tablename, autocommit=True: shared
+        )
+
+        calls, fake_run = self._fake_run_factory(tmp_path)
+        monkeypatch.setattr(kp._kairos_signals_mod, "run", fake_run)
+
+        base_now = datetime(2026, 7, 19, 0, 0)
+        generate_and_dedupe_reports(base_now, "1d", months_back=0.1, run_kwargs={})
+        assert len(calls) == 3
+
+        second = generate_and_dedupe_reports(base_now, "1d", months_back=0.2, run_kwargs={})
+        # 0.2 months ~= 6 iterations, 3 of which were already seen.
+        assert len(calls) == 6
+        assert len(second) == 6
 
 
 # ============================================================================

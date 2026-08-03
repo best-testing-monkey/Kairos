@@ -17,6 +17,7 @@ Structured so the heavy lifting is testable without GPU/network:
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -64,6 +65,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(REPO_ROOT, "data", "pipeline_results.db")
 RESULTS_DIR = os.path.join(REPO_ROOT, "results")
+
+# See _run_group's per-strategy cache precheck for why the key is this fine
+# grained (strategy_name, not just group) -- a strategy disabled after a row
+# was cached must never be served stale from here; see CLAUDE.md's
+# "Signals cache" section.
+SIGNALS_CACHE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS signals_cache (
+    cache_key TEXT PRIMARY KEY,
+    strategy_name TEXT NOT NULL,
+    assets TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    lookback INTEGER NOT NULL,
+    pred_samples INTEGER NOT NULL,
+    min_ev_pct REAL NOT NULL,
+    model_label TEXT NOT NULL,
+    model_path TEXT,
+    checkpoint_fingerprint TEXT NOT NULL DEFAULT '',
+    stats_json TEXT NOT NULL,
+    advice_json TEXT NOT NULL,
+    skipped_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
 
 
 # =============================================================================
@@ -127,6 +152,66 @@ def load_accepted_finetuned(conn):
     except sqlite3.Error:
         return {}
     return {(row[0], row[1]): row[2] for row in rows}
+
+
+# =============================================================================
+# Per-strategy signals cache (signals_cache table in db_path)
+# =============================================================================
+
+def _signals_cache_key(strategy_name, assets_str, interval, as_of_date, lookback,
+                        pred_samples, min_ev_pct, model_path, checkpoint_fingerprint) -> str:
+    """Canonical cache key for one strategy's rows within one group/pass.
+
+    as_of_date is a date (not a datetime) -- fetch_data_raw only ever
+    consumes as_of.date() (kairos_strategies.py), so two `now` timestamps on
+    the same calendar day fetch identical data and must key identically
+    here too. checkpoint_fingerprint (see
+    kairos_strategies._model_checkpoint_fingerprint) busts the cache when a
+    finetuned checkpoint is retrained in place at the same model_path,
+    mirroring kairos_predcache.make_key's own key design.
+    """
+    parts = [
+        str(strategy_name), str(assets_str), str(interval), as_of_date.isoformat(),
+        str(lookback), str(pred_samples), str(min_ev_pct),
+        str(model_path or "base"), str(checkpoint_fingerprint or ""),
+    ]
+    return "|".join(parts)
+
+
+def _ensure_signals_cache_table(conn):
+    conn.executescript(SIGNALS_CACHE_SCHEMA)
+
+
+def _load_cached_group_result(conn, cache_key):
+    """Return (stats_rows, advice_rows, skipped) for cache_key, or None on a miss."""
+    row = conn.execute(
+        "SELECT stats_json, advice_json, skipped_json FROM signals_cache WHERE cache_key = ?",
+        (cache_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    stats_json, advice_json, skipped_json = row
+    return json.loads(stats_json), json.loads(advice_json), json.loads(skipped_json)
+
+
+def _store_cached_group_result(conn, cache_key, strategy_name, assets_str, interval,
+                                as_of_date, lookback, pred_samples, min_ev_pct,
+                                model_label, model_path, checkpoint_fingerprint,
+                                stats_rows, advice_rows, skipped):
+    """INSERT OR REPLACE so a re-run of the same key overwrites rather than
+    duplicating -- row count stays bounded by unique-key space, not call count."""
+    conn.execute(
+        """INSERT OR REPLACE INTO signals_cache
+           (cache_key, strategy_name, assets, interval, as_of, lookback, pred_samples,
+            min_ev_pct, model_label, model_path, checkpoint_fingerprint,
+            stats_json, advice_json, skipped_json, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (cache_key, strategy_name, assets_str, interval, as_of_date.isoformat(),
+         lookback, pred_samples, min_ev_pct, model_label, model_path,
+         checkpoint_fingerprint, json.dumps(stats_rows), json.dumps(advice_rows),
+         json.dumps(skipped), datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
 
 
 # =============================================================================
@@ -669,7 +754,9 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
 
 
 def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label,
-               data, pred_samples, min_ev_pct):
+               data, pred_samples, min_ev_pct, conn=None, use_signal_cache=True,
+               assets_str=None, as_of_date=None, lookback=None,
+               checkpoint_fingerprint=""):
     """Generate stats/advice rows for one (assets, interval) group against
     already-fetched `data`.
 
@@ -682,6 +769,21 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
         base model.
     model_label: stamped into every stats_row/advice_row's "model" key
         ("Base" or "Finetuned(<assets>)").
+
+    Per-strategy signals cache (signals_cache table, see
+    _signals_cache_key): `strategies_by_name` only needs `assets`/`config`
+    (built against a dummy predict_fn below), never predict_fn/data -- so
+    every strategy's disabled/registry status is resolved *before*
+    predict_fn is ever called. A strategy that's since been disabled is
+    therefore never a cache read/write candidate; it always falls through
+    to the same live "unknown strategy" skip it would hit with no cache at
+    all, so a disabled_strategies change always takes effect immediately
+    with no stale-cache risk. If every strategy in the group is either
+    disabled or already cached, predict_fn is never called at all.
+    conn/use_signal_cache/assets_str/as_of_date/lookback/checkpoint_fingerprint
+    are only used for cache lookups/writes; conn=None (the default) makes
+    caching fully inert regardless of use_signal_cache.
+
     Returns (stats_rows, advice_rows, skipped) for this group. Raises on
     unexpected errors -- the caller wraps each pass in try/except and
     records group-level failures.
@@ -697,8 +799,6 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
     advice_rows = []
     skipped = []
 
-    multi_preds = predict_fn(data, model_path=model_path)
-
     disabled = resolve_disabled_strategies(interval, assets)
     config = OrchestratorConfig(disabled_strategies=disabled)
 
@@ -710,6 +810,8 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
     )
     strategies_by_name = build_strategy_index(orchestrator.strategies)
 
+    cache_active = use_signal_cache and conn is not None
+    pending = []  # (row, strat, cache_key)
     for row in group_rows:
         strategy_name = row["strategy_name"]
         # Each viable row targets the group's assets collectively but a
@@ -720,6 +822,33 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
             skipped.append(f"{strategy_name}: unknown strategy (not in registry)")
             continue
 
+        cache_key = None
+        if cache_active:
+            cache_key = _signals_cache_key(
+                strategy_name, assets_str, interval, as_of_date, lookback,
+                pred_samples, min_ev_pct, model_path, checkpoint_fingerprint,
+            )
+            cached = _load_cached_group_result(conn, cache_key)
+            if cached is not None:
+                c_stats, c_advice, c_skipped = cached
+                stats_rows.extend(c_stats)
+                advice_rows.extend(c_advice)
+                skipped.extend(c_skipped)
+                continue
+
+        pending.append((row, strat, cache_key))
+
+    if not pending:
+        return stats_rows, advice_rows, skipped
+
+    multi_preds = predict_fn(data, model_path=model_path)
+
+    for row, strat, cache_key in pending:
+        strategy_name = row["strategy_name"]
+        strat_stats = []
+        strat_advice = []
+        strat_skipped = []
+
         for sym in assets:
             pred = multi_preds.get(sym)
             if pred is None:
@@ -729,7 +858,7 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
             history = pred.history
 
             if orchestrator._apply_meta_filters(dist, current_price):
-                skipped.append(
+                strat_skipped.append(
                     f"{strategy_name}/{sym}: blocked by meta-filters"
                 )
                 continue
@@ -739,7 +868,7 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
             try:
                 sig = strat.generate_signal(dist, current_price, history, context)
             except Exception as e:
-                skipped.append(f"{strategy_name}/{sym}: signal generation error ({e})")
+                strat_skipped.append(f"{strategy_name}/{sym}: signal generation error ({e})")
                 continue
 
             if sig is None:
@@ -751,7 +880,7 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
             # traded, so they must not appear as advice. FLAT signals
             # are exit advice and naturally size 0 — keep them.
             if sig.direction != Direction.FLAT and sig.size <= 0:
-                skipped.append(
+                strat_skipped.append(
                     f"{strategy_name}/{sym}: zero-size signal dropped (no Kelly edge)"
                 )
                 continue
@@ -764,13 +893,13 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
                 if ev_pct_val is None or ev_pct_val < min_ev_pct:
                     ev_str = (f"{ev_pct_val:.2f}%" if ev_pct_val is not None
                               else "n/a")
-                    skipped.append(
+                    strat_skipped.append(
                         f"{strategy_name}/{sym}: ev_pct below threshold "
                         f"({ev_str} < {min_ev_pct:.2f}%)"
                     )
                     continue
 
-            stats_rows.append({
+            strat_stats.append({
                 "strategy": strategy_name,
                 "symbol": sym,
                 "interval": interval,
@@ -788,7 +917,7 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
                 "signals_per_week": row.get("signals_per_week"),
                 "model": model_label,
             })
-            advice_rows.append({
+            strat_advice.append({
                 "expected_value": sig.expected_value,
                 "entry": sig.entry,
                 "base_win_rate": row.get("base_win_rate"),
@@ -798,14 +927,24 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
                 "model": model_label,
             })
 
-    return stats_rows, advice_rows, skipped
+        stats_rows.extend(strat_stats)
+        advice_rows.extend(strat_advice)
+        skipped.extend(strat_skipped)
 
+        if cache_key is not None:
+            _store_cached_group_result(
+                conn, cache_key, strategy_name, assets_str, interval, as_of_date,
+                lookback, pred_samples, min_ev_pct, model_label, model_path,
+                checkpoint_fingerprint, strat_stats, strat_advice, strat_skipped,
+            )
+
+    return stats_rows, advice_rows, skipped
 
 def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None,
         min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False,
         cluster_map_path=None, base_only=False, return_rows=False,
-        on_group_timing=None, signal_selection=None):
+        on_group_timing=None, signal_selection=None, use_signal_cache=True):
     """Run the full signals-report flow. Returns the path to the written report.
 
     now: the moment treated as "now" — stamps output filenames/report
@@ -846,10 +985,21 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         as selection_rule, overriding the default min_n/ev_net gate and
         score-sort/top_k ranking in allocation.select_candidates(). Default
         None preserves the exact old default behavior.
+    use_signal_cache: if True (default), cache/reuse each strategy's rows in
+        the signals_cache table of db_path, keyed by (strategy, group,
+        model+checkpoint, as_of date, lookback, pred_samples, min_ev_pct) --
+        see _run_group's docstring and _signals_cache_key. A strategy
+        disabled since it was cached is never served stale (checked live,
+        before any cache lookup). Set False to always recompute, matching
+        pre-cache behavior exactly (also available as --no-signal-cache on
+        the CLI).
     """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
-    from kairos_strategies import fetch_data_raw, resolve_disabled_strategies, LOOKBACK, is_batch_cached
+    from kairos_strategies import (
+        fetch_data_raw, resolve_disabled_strategies, LOOKBACK, is_batch_cached,
+        _model_checkpoint_fingerprint,
+    )
 
     if predict_fn is None:
         predict_fn = _real_predict_fn
@@ -857,95 +1007,105 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         lookback = LOOKBACK
     if now is None:
         now = datetime.now()
+    as_of_date = now.date()
 
     conn = _connect_with_retry(db_path)
     try:
         rows = load_work_items(conn, intervals=intervals, include_all=include_all)
         accepted_finetuned = {} if base_only else load_accepted_finetuned(conn)
-    finally:
-        conn.close()
+        if use_signal_cache:
+            _ensure_signals_cache_table(conn)
 
-    groups = group_items(rows)
+        groups = group_items(rows)
 
-    group_results = {}  # (assets_str, interval) -> {"stats": [...], "advice": [...]}
-    fetched_data_cache = {}  # (assets_str, interval) -> {symbol: DataFrame}
-    failures = []
-    skipped = []
+        group_results = {}  # (assets_str, interval) -> {"stats": [...], "advice": [...]}
+        fetched_data_cache = {}  # (assets_str, interval) -> {symbol: DataFrame}
+        failures = []
+        skipped = []
 
-    # Pass 1: base model, every group.
-    for (assets_str, interval), group_rows in groups.items():
-        assets = assets_str.split(",")
-        try:
-            KairosSettings.interval = interval
-            KairosSettings.pred_samples = pred_samples
-
-            data = {
-                sym: fetch_data_raw(sym, lookback, as_of=now).tail(lookback)
-                for sym in assets
-            }
-            fetched_data_cache[(assets_str, interval)] = data
-
-            if on_group_timing is not None:
-                cache_hit = is_batch_cached(data, model_path=None)
-                _group_t0 = time.monotonic()
-            group_stats, group_advice, group_skipped = _run_group(
-                assets, interval, group_rows, predict_fn,
-                model_path=None, model_label="Base",
-                data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
-            )
-            if on_group_timing is not None:
-                on_group_timing(assets_str, interval, "Base",
-                                 time.monotonic() - _group_t0, cache_hit)
-            group_results[(assets_str, interval)] = {
-                "stats": group_stats, "advice": group_advice,
-            }
-            skipped.extend(group_skipped)
-        except Exception as e:
-            failures.append(f"group assets={assets_str} interval={interval}: {e}")
-            continue
-
-    # Pass 2: overlay accepted-finetuned groups (skipped entirely under
-    # --base_only, or when nothing in the registry matches). Reuses pass 1's
-    # fetched data (no refetch); displaced base rows move to the
-    # replaced_*_rows comparison buckets.
-    replaced_stats_rows = []
-    replaced_advice_rows = []
-    if not base_only and accepted_finetuned:
+        # Pass 1: base model, every group.
         for (assets_str, interval), group_rows in groups.items():
-            key = (assets_str, interval)
-            if key not in group_results:
-                continue  # pass 1 failed this group entirely; nothing to overlay
-            sorted_key = ",".join(sorted(assets_str.split(",")))
-            model_path = accepted_finetuned.get((sorted_key, interval))
-            if model_path is None:
-                continue
-
             assets = assets_str.split(",")
             try:
-                data = fetched_data_cache[key]
-                model_label = f"Finetuned({assets_str})"
+                KairosSettings.interval = interval
+                KairosSettings.pred_samples = pred_samples
+
+                data = {
+                    sym: fetch_data_raw(sym, lookback, as_of=now).tail(lookback)
+                    for sym in assets
+                }
+                fetched_data_cache[(assets_str, interval)] = data
+
                 if on_group_timing is not None:
-                    cache_hit = is_batch_cached(data, model_path=model_path)
+                    cache_hit = is_batch_cached(data, model_path=None)
                     _group_t0 = time.monotonic()
                 group_stats, group_advice, group_skipped = _run_group(
                     assets, interval, group_rows, predict_fn,
-                    model_path=model_path, model_label=model_label,
+                    model_path=None, model_label="Base",
                     data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
+                    conn=conn, use_signal_cache=use_signal_cache,
+                    assets_str=assets_str, as_of_date=as_of_date, lookback=lookback,
+                    checkpoint_fingerprint="",
                 )
                 if on_group_timing is not None:
-                    on_group_timing(assets_str, interval, model_label,
+                    on_group_timing(assets_str, interval, "Base",
                                      time.monotonic() - _group_t0, cache_hit)
-                # Displace pass 1's base rows for this group into the
-                # comparison buckets, then swap in the finetuned rerun.
-                replaced_stats_rows.extend(group_results[key]["stats"])
-                replaced_advice_rows.extend(group_results[key]["advice"])
-                group_results[key] = {"stats": group_stats, "advice": group_advice}
+                group_results[(assets_str, interval)] = {
+                    "stats": group_stats, "advice": group_advice,
+                }
                 skipped.extend(group_skipped)
             except Exception as e:
-                failures.append(
-                    f"group assets={assets_str} interval={interval} (finetuned overlay): {e}"
-                )
+                failures.append(f"group assets={assets_str} interval={interval}: {e}")
                 continue
+
+        # Pass 2: overlay accepted-finetuned groups (skipped entirely under
+        # --base_only, or when nothing in the registry matches). Reuses pass 1's
+        # fetched data (no refetch); displaced base rows move to the
+        # replaced_*_rows comparison buckets.
+        replaced_stats_rows = []
+        replaced_advice_rows = []
+        if not base_only and accepted_finetuned:
+            for (assets_str, interval), group_rows in groups.items():
+                key = (assets_str, interval)
+                if key not in group_results:
+                    continue  # pass 1 failed this group entirely; nothing to overlay
+                sorted_key = ",".join(sorted(assets_str.split(",")))
+                model_path = accepted_finetuned.get((sorted_key, interval))
+                if model_path is None:
+                    continue
+
+                assets = assets_str.split(",")
+                try:
+                    data = fetched_data_cache[key]
+                    model_label = f"Finetuned({assets_str})"
+                    if on_group_timing is not None:
+                        cache_hit = is_batch_cached(data, model_path=model_path)
+                        _group_t0 = time.monotonic()
+                    checkpoint_fingerprint = _model_checkpoint_fingerprint(model_path)
+                    group_stats, group_advice, group_skipped = _run_group(
+                        assets, interval, group_rows, predict_fn,
+                        model_path=model_path, model_label=model_label,
+                        data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
+                        conn=conn, use_signal_cache=use_signal_cache,
+                        assets_str=assets_str, as_of_date=as_of_date, lookback=lookback,
+                        checkpoint_fingerprint=checkpoint_fingerprint,
+                    )
+                    if on_group_timing is not None:
+                        on_group_timing(assets_str, interval, model_label,
+                                         time.monotonic() - _group_t0, cache_hit)
+                    # Displace pass 1's base rows for this group into the
+                    # comparison buckets, then swap in the finetuned rerun.
+                    replaced_stats_rows.extend(group_results[key]["stats"])
+                    replaced_advice_rows.extend(group_results[key]["advice"])
+                    group_results[key] = {"stats": group_stats, "advice": group_advice}
+                    skipped.extend(group_skipped)
+                except Exception as e:
+                    failures.append(
+                        f"group assets={assets_str} interval={interval} (finetuned overlay): {e}"
+                    )
+                    continue
+    finally:
+        conn.close()
 
     stats_rows = []
     advice_rows = []
@@ -1029,8 +1189,10 @@ def run_bars_backtest(base_now, interval, bars_backtest, **run_kwargs) -> list:
 
     `run_kwargs` is forwarded to each `run()` call unchanged (db_path,
     out_dir, pred_samples, include_all, predict_fn, lookback, min_ev_pct,
-    gsheets, xlsx, ods, cluster_map_path, base_only); `now` and `intervals`
-    are set per iteration.
+    gsheets, xlsx, ods, cluster_map_path, base_only, use_signal_cache); `now`
+    and `intervals` are set per iteration. use_signal_cache defaulting True
+    is exactly what makes repeat --bars_backtest runs over the same window
+    fast: each bar's per-strategy rows are cached on first computation.
     """
     step = _interval_to_timedelta(interval)
     out_paths = []
@@ -1099,6 +1261,17 @@ def main(argv=None):
                              "NOTE: when set, this REPLACES (not adds to) the default "
                              "min_n/EV-positivity gate -- a rule that doesn't check EV "
                              "can admit a negative-EV signal.")
+    parser.add_argument("--no-signal-cache", dest="use_signal_cache",
+                        action="store_false", default=True,
+                        help="Disable the per-strategy signals_cache table in "
+                             "db_path (default: enabled). Each strategy's rows "
+                             "are normally cached per (strategy, model, group, "
+                             "as_of date, lookback, pred_samples, min_ev_pct) so "
+                             "a repeat run for an already-computed historical "
+                             "bar skips prediction/signal-generation entirely; "
+                             "a disabled strategy is never served stale from it. "
+                             "Use this flag to always recompute, e.g. while "
+                             "debugging.")
     args = parser.parse_args(argv)
 
     if args.bars_backtest is not None and (not args.intervals or len(args.intervals) != 1):
@@ -1128,6 +1301,7 @@ def main(argv=None):
             cluster_map_path=args.cluster_map,
             base_only=args.base_only,
             signal_selection=parsed_signal_selection,
+            use_signal_cache=args.use_signal_cache,
         )
         for p in out_paths:
             print(p)
@@ -1141,6 +1315,7 @@ def main(argv=None):
         cluster_map_path=args.cluster_map,
         base_only=args.base_only,
         signal_selection=parsed_signal_selection,
+        use_signal_cache=args.use_signal_cache,
     )
     print(out_path)
     return out_path

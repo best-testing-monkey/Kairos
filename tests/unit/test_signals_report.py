@@ -29,6 +29,10 @@ from kairos_signals import (
     _interval_to_timedelta,
     run_bars_backtest,
     _connect_with_retry,
+    _signals_cache_key,
+    _ensure_signals_cache_table,
+    _load_cached_group_result,
+    _store_cached_group_result,
 )
 from datetime import timedelta
 import pandas as pd
@@ -2038,3 +2042,328 @@ class TestFinetunedOverlay:
         monkeypatch.setattr(kairos_signals, "run", fake_run)
         kairos_signals.main(["--db", "unused.db", "--out", "/tmp"])
         assert captured["base_only"] is False
+
+    def test_cli_parser_no_signal_cache_flag(self, monkeypatch):
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main(["--db", "unused.db", "--out", "/tmp", "--no-signal-cache"])
+        assert captured["use_signal_cache"] is False
+
+    def test_cli_parser_signal_cache_defaults_true(self, monkeypatch):
+        import kairos_signals
+
+        captured = {}
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+            return "/dev/null"
+
+        monkeypatch.setattr(kairos_signals, "run", fake_run)
+        kairos_signals.main(["--db", "unused.db", "--out", "/tmp"])
+        assert captured["use_signal_cache"] is True
+
+
+# ============================================================================
+# Per-strategy signals cache (signals_cache table)
+# ============================================================================
+
+class _CallLoggingStrategy:
+    """Fake strategy that always returns a valid LONG signal and records
+    every generate_signal() call by name -- lets a test tell whether a
+    given strategy's signal-generation logic actually ran, independent of
+    whether predict_fn was called for the group as a whole."""
+
+    def __init__(self, name, calls_log, expected_value=0.5):
+        self.name = name
+        self.expected_value = expected_value
+        self._calls_log = calls_log
+
+    def generate_signal(self, dist, current_price, history, context):
+        self._calls_log.append(self.name)
+        return Signal(
+            direction=Direction.LONG, size=0.10, entry=current_price,
+            stop=current_price * 0.97, target=current_price * 1.05,
+            strategy_name=self.name, confidence=0.7,
+            expected_value=self.expected_value,
+        )
+
+
+class TestSignalsCache:
+    """run()'s per-strategy signals_cache: a repeat call for an identical
+    (strategy, model, group, as_of date, lookback, pred_samples, min_ev_pct)
+    skips predict_fn + signal-generation entirely for that strategy, and a
+    strategy disabled since it was cached is never served stale.
+    """
+
+    def _seed_group(self, tmp_path, strategy_names, assets="BTC-USD", interval="1d"):
+        db_path = os.path.join(tmp_path, "pipeline_results.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(VIABILITY_SCHEMA)
+        rows = [
+            (30, name, assets, "crypto", interval, "1m",
+             20.0, 5, 0.8, 0.02, 300, 20.0, 5, 0.8, 0.02, 301, None, 0.5, 1)
+            for name in strategy_names
+        ]
+        conn.executemany(
+            "INSERT INTO viability_report VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _run(self, tmp_path, monkeypatch, db_path, strategies, predict_calls,
+             now=None, **run_kwargs):
+        import numpy as np
+        idx = pd.date_range("2024-01-01", periods=310, freq="D")
+        fake_history = pd.DataFrame({
+            "open": np.full(310, 100.0), "high": np.full(310, 101.0),
+            "low": np.full(310, 99.0), "close": np.full(310, 100.0),
+            "volume": np.full(310, 1e6),
+        }, index=idx)
+
+        import kairos_strategies
+        monkeypatch.setattr(
+            kairos_strategies, "fetch_data_raw",
+            lambda symbol, lookback, pred_len=0, min_bars=None, as_of=None: fake_history,
+        )
+
+        import kairos_orchestrator
+        monkeypatch.setattr(
+            kairos_orchestrator.StrategyRegistry, "build_all",
+            classmethod(lambda cls, config: [
+                s for s in strategies if s.name not in config.disabled_strategies
+            ]),
+        )
+        monkeypatch.setattr(
+            kairos_orchestrator.KairosOrchestrator, "_apply_meta_filters",
+            lambda self, dist, current_price: False,
+        )
+
+        from kairos_meta import AssetPrediction, KairosDistribution
+
+        def fake_predict_fn(assets_dict, model_path=None):
+            predict_calls.append((frozenset(assets_dict.keys()), model_path))
+            frames = [fake_history.iloc[[i]] for i in range(len(fake_history) - 20, len(fake_history))]
+            dist = KairosDistribution(frames)
+            return {
+                sym: AssetPrediction(symbol=sym, dist=dist, current_price=100.0, history=fake_history)
+                for sym in assets_dict
+            }
+
+        eff_now = now or datetime(2026, 7, 10, 8, 0)
+        run_kwargs.setdefault("base_only", True)
+        return run(
+            db_path=db_path, out_dir=str(tmp_path), intervals=None,
+            pred_samples=5, include_all=False, predict_fn=fake_predict_fn,
+            lookback=300, now=eff_now, return_rows=True, **run_kwargs,
+        )
+
+    def test_second_call_same_params_skips_predict_fn_entirely(self, tmp_path, monkeypatch):
+        db_path = self._seed_group(tmp_path, ["strat_a", "strat_b"])
+        calls_log = []
+        predict_calls = []
+        strategies = [
+            _CallLoggingStrategy("strat_a", calls_log),
+            _CallLoggingStrategy("strat_b", calls_log),
+        ]
+
+        out1, stats1, advice1 = self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls)
+        assert len(predict_calls) == 1
+        assert set(calls_log) == {"strat_a", "strat_b"}
+
+        calls_log.clear()
+        predict_calls.clear()
+        out2, stats2, advice2 = self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls)
+
+        assert predict_calls == []
+        assert calls_log == []
+        assert stats2 == stats1
+        assert advice2 == advice1
+
+    def test_different_date_is_a_fresh_miss(self, tmp_path, monkeypatch):
+        db_path = self._seed_group(tmp_path, ["strat_a"])
+        calls_log = []
+        predict_calls = []
+        strategies = [_CallLoggingStrategy("strat_a", calls_log)]
+
+        self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls)
+        assert len(predict_calls) == 1
+
+        predict_calls.clear()
+        self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls,
+                   now=datetime(2026, 7, 11, 8, 0))
+        assert len(predict_calls) == 1  # different as_of date -> real miss
+
+    def test_use_signal_cache_false_disables_caching(self, tmp_path, monkeypatch):
+        db_path = self._seed_group(tmp_path, ["strat_a"])
+        calls_log = []
+        predict_calls = []
+        strategies = [_CallLoggingStrategy("strat_a", calls_log)]
+
+        self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls,
+                   use_signal_cache=False)
+        assert len(predict_calls) == 1
+
+        predict_calls.clear()
+        self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls,
+                   use_signal_cache=False)
+        assert len(predict_calls) == 1  # cache disabled -> always recomputes
+
+    def test_disabled_strategy_never_served_from_stale_cache(self, tmp_path, monkeypatch):
+        db_path = self._seed_group(tmp_path, ["strat_a", "strat_b"])
+        calls_log = []
+        predict_calls = []
+        strategies = [
+            _CallLoggingStrategy("strat_a", calls_log),
+            _CallLoggingStrategy("strat_b", calls_log),
+        ]
+
+        out1, stats1, advice1 = self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls)
+        assert {row["strategy"] for row in stats1} == {"strat_a", "strat_b"}
+
+        calls_log.clear()
+        predict_calls.clear()
+        import kairos_strategies
+        monkeypatch.setattr(
+            kairos_strategies, "resolve_disabled_strategies",
+            lambda interval, assets: {"strat_a"},
+        )
+        out2, stats2, advice2 = self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls)
+
+        # strat_a is now disabled -> must not appear, even though its
+        # cache row from the first run is still sitting in signals_cache.
+        assert {row["strategy"] for row in stats2} == {"strat_b"}
+        # strat_b is still enabled and still cached -> predict_fn is never
+        # called at all for this group (strat_a is skipped live, not via
+        # cache; strat_b is a cache hit).
+        assert predict_calls == []
+        assert calls_log == []
+
+    def test_checkpoint_fingerprint_change_busts_finetuned_cache(self, tmp_path, monkeypatch):
+        db_path = self._seed_group(tmp_path, ["strat_a"])
+        model_dir = tmp_path / "ft_model"
+        model_dir.mkdir()
+        weights = model_dir / "model.safetensors"
+        weights.write_bytes(b"v1")
+        _seed_finetuned_models(db_path, [
+            ("BTC-USD", "BTC-USD", "1d", "accepted", str(model_dir)),
+        ])
+        calls_log = []
+        predict_calls = []
+        strategies = [_CallLoggingStrategy("strat_a", calls_log)]
+
+        self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls,
+                   base_only=False)
+        # Base pass + finetuned overlay pass, both real misses on a cold cache.
+        assert len(predict_calls) == 2
+
+        predict_calls.clear()
+        calls_log.clear()
+        self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls,
+                   base_only=False)
+        # Nothing changed -> both passes now fully cached.
+        assert predict_calls == []
+
+        # Simulate an in-place retrain: same path, new weights/mtime.
+        predict_calls.clear()
+        calls_log.clear()
+        os.utime(weights, None)
+        weights.write_bytes(b"v2-different-size")
+        self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls,
+                   base_only=False)
+        # Base pass is still a cache hit (fingerprint-independent); the
+        # finetuned pass must be a fresh miss despite everything else
+        # matching, because its checkpoint_fingerprint changed.
+        assert len(predict_calls) == 1
+        assert predict_calls[0][1] == str(model_dir)
+
+    def test_partial_cache_only_recomputes_the_miss(self, tmp_path, monkeypatch):
+        db_path = self._seed_group(tmp_path, ["strat_a", "strat_b"])
+        calls_log = []
+        predict_calls = []
+        strategies = [
+            _CallLoggingStrategy("strat_a", calls_log),
+            _CallLoggingStrategy("strat_b", calls_log),
+        ]
+
+        # First run caches both strategies.
+        self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls)
+
+        # Second run: same params, but a fresh strategy object list where
+        # strat_a's expected_value differs -- if it were recomputed, its
+        # cached rows would change. It should NOT be recomputed.
+        calls_log.clear()
+        predict_calls.clear()
+        strategies_v2 = [
+            _CallLoggingStrategy("strat_a", calls_log, expected_value=0.99),
+            _CallLoggingStrategy("strat_b_v2", calls_log),  # different registry name -> "unknown strategy"
+        ]
+        out2, stats2, advice2 = self._run(
+            tmp_path, monkeypatch, db_path, strategies_v2, predict_calls,
+        )
+
+        # strat_a untouched (served from cache, still expected_value=0.5);
+        # strat_b_v2 isn't a registered strategy name (viability_report
+        # still says "strat_b") so it's skipped as "unknown strategy",
+        # never reaching cache lookup or predict_fn.
+        assert calls_log == []
+        assert predict_calls == []
+        strat_a_rows = [r for r in stats2 if r["strategy"] == "strat_a"]
+        assert len(strat_a_rows) == 1
+        assert strat_a_rows[0]["expected_value"] == 0.5
+
+    def test_signals_cache_key_changes_with_each_component(self):
+        base = dict(
+            strategy_name="s1", assets_str="BTC-USD", interval="1d",
+            as_of_date=datetime(2026, 7, 10).date(), lookback=300,
+            pred_samples=100, min_ev_pct=0.1, model_path=None,
+            checkpoint_fingerprint="",
+        )
+        key0 = _signals_cache_key(**base)
+        assert key0 == _signals_cache_key(**base)  # deterministic
+
+        for field, other_value in [
+            ("strategy_name", "s2"),
+            ("pred_samples", 200),
+            ("min_ev_pct", 0.2),
+            ("model_path", "models/ft"),
+            ("checkpoint_fingerprint", "abc123"),
+            ("as_of_date", datetime(2026, 7, 11).date()),
+            ("lookback", 301),
+        ]:
+            variant = dict(base)
+            variant[field] = other_value
+            assert _signals_cache_key(**variant) != key0, f"{field} did not change the key"
+
+    def test_load_store_round_trip(self, tmp_path):
+        db_path = os.path.join(tmp_path, "roundtrip.db")
+        conn = sqlite3.connect(db_path)
+        _ensure_signals_cache_table(conn)
+
+        key = _signals_cache_key(
+            "s1", "BTC-USD", "1d", datetime(2026, 7, 10).date(), 300, 100, 0.1,
+            None, "",
+        )
+        assert _load_cached_group_result(conn, key) is None
+
+        stats = [{"strategy": "s1", "symbol": "BTC-USD"}]
+        advice = [{"signal": "buy"}]
+        skipped = ["s1/ETH-USD: blocked"]
+        _store_cached_group_result(
+            conn, key, "s1", "BTC-USD", "1d", datetime(2026, 7, 10).date(), 300,
+            100, 0.1, "Base", None, "", stats, advice, skipped,
+        )
+        conn.close()
+
+        conn2 = sqlite3.connect(db_path)
+        loaded = _load_cached_group_result(conn2, key)
+        conn2.close()
+        assert loaded == (stats, advice, skipped)
