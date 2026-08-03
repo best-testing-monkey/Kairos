@@ -84,6 +84,16 @@ _SLOW_ITERATION_THRESHOLD_SECONDS = 60.0
 # even 30s is worth a line -- see _log_group_timing's docstring.
 _SLOW_GROUP_THRESHOLD_SECONDS = 30.0
 
+
+def _format_slow_threshold(seconds: float = _SLOW_ITERATION_THRESHOLD_SECONDS) -> str:
+    """Human-readable threshold for watchdog messages, e.g. '60s' or '5min'."""
+    if seconds >= 60:
+        minutes = seconds / 60.0
+        # Avoid '5.0min'; show integer minutes when exact.
+        label = f"{minutes:.0f}min" if minutes == int(minutes) else f"{minutes:.1f}min"
+        return label
+    return f"{seconds:.0f}s"
+
 # prewarm_prediction_cache's check/load loops call gc.collect() every this
 # many iterations. _materialize_model() is the only other gc.collect() call
 # site in this codebase, and it only fires on a model switch -- the base
@@ -228,8 +238,8 @@ def _log_group_timing(iter_now, assets_str: str, interval: str, model_label: str
     generate_and_dedupe_reports's per-date watchdog only measures the whole
     kairos_signals.run() call for that date -- a date can fan out into dozens
     of (assets, interval) groups x up to 2 passes (base + finetuned overlay)
-    each, so a >5min date-level entry can't say which group/model actually
-    consumed the time, or whether prewarm's shared-cache coverage held up
+    each, so a slow (threshold-dependent) date-level entry can't say which
+    group/model actually consumed the time, or whether prewarm's shared-cache coverage held up
     during report generation. Wired in as run()'s on_group_timing callback
     (see kairos_signals.run's docstring) so every individual group/pass that
     was either slow (> _SLOW_GROUP_THRESHOLD_SECONDS) or a shared-cache MISS
@@ -368,14 +378,13 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, not
     same last-closed-bar date).
 
     Watchdog: times each `kairos_signals.run()` call. If a single call takes
-    longer than `_SLOW_ITERATION_THRESHOLD_SECONDS` (5 minutes), sends a
-    Telegram heads-up via `_notify` (enabled=`notify`) so a run that's stuck
-    or unusually slow (e.g. a finetuned-overlay pass) is visible without
-    spamming a message per iteration -- only outliers notify. Each `run()`
-    call also gets a per-date on_group_timing callback (see
-    _make_group_timing_cb/_log_group_timing) so a slow date's *groups* are
-    individually visible in data/papertrade_watchdog.log, not just the
-    date-level aggregate.
+    longer than `_SLOW_ITERATION_THRESHOLD_SECONDS`, sends a Telegram heads-up
+    via `_notify` (enabled=`notify`) so a run that's stuck or unusually slow
+    (e.g. a finetuned-overlay pass) is visible without spamming a message per
+    iteration -- only outliers notify. Each `run()` call also gets a per-date
+    on_group_timing callback (see _make_group_timing_cb/_log_group_timing) so
+    a slow date's *groups* are individually visible in
+    data/papertrade_watchdog.log, not just the date-level aggregate.
 
     Returns a list of (effective_dt, stats_rows, advice_rows) tuples, sorted
     oldest-first.
@@ -507,8 +516,8 @@ def generate_and_dedupe_report_single(seen, base_now: datetime, i:int, step: tim
     if elapsed > _SLOW_ITERATION_THRESHOLD_SECONDS:
         _notify(
             f"⏱️ Kairos papertrade: report {i + 1}/{n_iterations} "
-            f"(date {iter_now:%Y-%m-%d}) took {elapsed / 60:.1f}min (>5min) — "
-            f"still running",
+            f"(date {iter_now:%Y-%m-%d}) took {elapsed / 60:.1f}min "
+            f"(>{_format_slow_threshold()}) — still running",
             enabled=notify,
         )
         _log_watchdog_snapshot(
@@ -1577,7 +1586,7 @@ def main(argv=None):
                     if backtest_elapsed > _SLOW_ITERATION_THRESHOLD_SECONDS:
                         _notify(
                             f"⏱️ Kairos papertrade: backtest for {effective_dt:%Y-%m-%d} "
-                            f"took {backtest_elapsed / 60:.1f}min (>5min) — still running",
+                            f"took {backtest_elapsed / 60:.1f}min (>{_format_slow_threshold()}) — still running",
                             enabled=args.notify,
                         )
                         _log_watchdog_snapshot(

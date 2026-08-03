@@ -47,6 +47,7 @@ from typing import List, Optional, Dict, Callable, Tuple, Any, Set
 from collections import defaultdict, deque
 import warnings
 import json
+import functools
 from datetime import datetime
 
 from tqdm import tqdm
