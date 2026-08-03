@@ -1713,7 +1713,7 @@ def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
                 _notify(
                     f"❌ Kairos finetune_next FAILED (training subprocess exit "
                     f"{proc.returncode}): assets={assets_raw} id={row_id}\n"
-                    f"```\n{stderr_tail}\n```",
+                    f"```\n{stderr_tail.strip('\n')}\n```",
                     enabled=notify,
                 )
                 print(f"\n[finetune_next] VERDICT: FAILED (training subprocess exit "
@@ -1721,6 +1721,12 @@ def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
                 return row_id
 
             update_finetune_registry_row(conn, row_id, model_path=best_model_path)
+
+            _notify(
+                f"〰️ backtesting finetuned model: assets={assets_list} interval={interval} "
+                f"backtest_period={backtest_period}",
+                enabled=True
+            )
 
             ft_run_id = run_stage_model(
                 conn, stage="finetuned", assets=assets_list, interval=interval,
