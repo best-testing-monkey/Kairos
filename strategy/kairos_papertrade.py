@@ -59,7 +59,7 @@ from kairos_signals import DB_PATH, RESULTS_DIR, _interval_to_timedelta
 import kairos_signals as _kairos_signals_mod
 from kairos.ops import GpuLock, OpsError, send_telegram
 from kairos_margin import classify_symbol
-from kairos_mtm import admission_check
+from kairos_mtm import admission_check, OpenPositionView, unrealized_pnl
 import kairos_strategies
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -947,6 +947,60 @@ def _use_full_notional(ticker, margin_config, max_leverage):
     return classify_symbol(ticker, margin_config).initial_margin_pct >= 100.0
 
 
+def _liquidate_position(conn, pos, close_price, exit_dt, margin_config, max_leverage):
+    """Force-close one phantom Position for a margin-call liquidation via
+    direct SQL (same `_conn` pattern as `remove_all_open_positions`) and
+    return the corrected-cash delta to apply.
+
+    Nulls `orders.position_id` first (RESTRICT FK, same reasoning as
+    `remove_all_open_positions`), then UPDATEs the position row IN PLACE --
+    unlike `remove_all_open_positions` this does not delete the row, it
+    writes `status='liquidated'`/`close_reason='margin_call'` so the trade
+    still shows up in reporting. Never calls phantom's `PositionAPI.close()`
+    (its cash/short-PnL handling is wrong for shorts -- see
+    `compute_corrected_realized_pnl`).
+
+    `realized_pnl_to_store` is `gross_pnl` minus the three non-fx entry-side
+    cost fields (NOT `gross_pnl` directly) so that
+    `compute_corrected_realized_pnl` + `_close_cash_delta` reproduce the true
+    round-trip economic effect `gross_pnl - entry_costs`, matching how
+    phantom's own stored `realized_pnl` omits fx (see `_close_cash_delta`'s
+    docstring for the full identity).
+
+    # ponytail: liquidation assumes zero exit cost/fx -- no forced-close
+    # cost model exists yet (no commission/spread/slippage/fx is simulated
+    # for a broker-forced close). Add one if a real cost model is needed.
+    """
+    view = OpenPositionView(
+        ticker=pos.ticker, direction=pos.direction, entry_price=pos.entry_price,
+        quantity=pos.quantity,
+        entry_costs=(
+            pos.commission_entry + pos.spread_cost + pos.slippage_cost + pos.fx_conversion_cost
+        ),
+    )
+    gross_pnl = unrealized_pnl(view, close_price)
+    realized_pnl_to_store = gross_pnl - pos.commission_entry - pos.spread_cost - pos.slippage_cost
+
+    cur = conn.cursor()
+    cur.execute("UPDATE orders SET position_id = NULL WHERE position_id = ?", (pos.id,))
+    cur.execute(
+        "UPDATE positions SET status = 'liquidated', exit_price = ?, exit_datetime = ?, "
+        "realized_pnl = ?, close_reason = 'margin_call' WHERE id = ?",
+        (close_price, exit_dt.isoformat(), realized_pnl_to_store, pos.id),
+    )
+    conn.commit()
+
+    updated = {
+        "entry_price": pos.entry_price, "quantity": pos.quantity,
+        "realized_pnl": realized_pnl_to_store, "fx_conversion_cost": pos.fx_conversion_cost,
+        "commission_entry": pos.commission_entry, "spread_cost": pos.spread_cost,
+        "slippage_cost": pos.slippage_cost,
+    }
+    return _close_cash_delta(
+        updated, include_notional=_use_full_notional(pos.ticker, margin_config, max_leverage),
+    )
+
+
 def _place_order_if_admitted(
     client, account_id, order, ticker, order_notional, effective_dt,
     snapshot, margin_config, alloc_config,
@@ -1701,7 +1755,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     from kairos_margin import load_margin_config
-    from kairos_mtm import OpenPositionView, DailySnapshot, compute_daily_snapshot, compute_daily_financing_total
+    from kairos_mtm import (
+        OpenPositionView, DailySnapshot, compute_daily_snapshot, compute_daily_financing_total,
+        liquidation_check,
+    )
     margin_config = load_margin_config(args.margin_config)
 
     parsed_signal_selection = None
@@ -1807,10 +1864,12 @@ def main(argv=None):
         corrected_cash = args.capital
         financing_accrued_total = 0.0
         margin_rejected_count = 0
+        liquidation_events_count = 0
+        ruined = False
         last_snapshot = None  # set at end of each iteration; consumed at admission-check time next iteration
         known_open_ids = set()
         for effective_dt, stats_rows, advice_rows in dated_rows:
-            if prev_candidates:
+            if prev_candidates and not ruined:
                 open_positions = client.positions.list(account_name=account_name, status="open")
                 open_tickers = {p.ticker for p in open_positions}
                 cash = client.accounts.get(account_id).cash
@@ -1928,6 +1987,50 @@ def main(argv=None):
                                 margin_utilization=0.0, financing_accrued_day=financing_day,
                                 liquidations=0,
                             )
+
+                        # E4-S11: evaluate the ESMA close-out rule against THIS
+                        # day's snapshot, before it is persisted -- a liquidation
+                        # must be reflected in the row actually written for today.
+                        tickers_liquidated, _post_equity, ruined_today = liquidation_check(
+                            snapshot, mtm_positions, margin_config,
+                        )
+                        if tickers_liquidated:
+                            pos_by_ticker = {p.ticker: p for p in current_open}
+                            for ticker in tickers_liquidated:
+                                liq_pos = pos_by_ticker.get(ticker)
+                                if liq_pos is None:
+                                    continue
+                                close_price = day_bars[ticker]["close"]
+                                corrected_cash += _liquidate_position(
+                                    client._conn, liq_pos, close_price, day_start,
+                                    margin_config, args.max_leverage,
+                                )
+                                _notify(
+                                    f"⚠️ Kairos papertrade: liquidated {ticker} @ "
+                                    f"{close_price:.4f} on {day_start:%Y-%m-%d} (margin call)",
+                                    enabled=args.notify,
+                                )
+                                known_open_ids.discard(liq_pos.id)
+                            liquidation_events_count += len(tickers_liquidated)
+
+                            # Recompute the snapshot that actually gets persisted
+                            # from POST-liquidation cash and the remaining
+                            # (non-liquidated) positions -- the pre-liquidation
+                            # `snapshot` above must not be what's written/returned.
+                            remaining_positions = [
+                                p for p in mtm_positions if p.ticker not in tickers_liquidated
+                            ]
+                            snapshot = replace(
+                                compute_daily_snapshot(
+                                    remaining_positions, day_bars, corrected_cash, margin_config,
+                                ),
+                                financing_accrued_day=financing_day,
+                                liquidations=len(tickers_liquidated),
+                            )
+
+                        if ruined_today or snapshot.equity <= 0.0:
+                            ruined = True
+
                         _insert_mtm_daily_row(client._conn, account_name, snapshot, financing_accrued_total)
                         last_snapshot = snapshot
                     except Exception as e:
@@ -1999,6 +2102,8 @@ def main(argv=None):
             "base_only": args.base_only, "top_n": args.top_n,
             "num_days": len(dated_rows),
             "margin_rejected_count": margin_rejected_count,
+            "mtm_liquidation_events": liquidation_events_count,
+            "mtm_ruined": ruined,
         }
 
         os.makedirs(args.out, exist_ok=True)

@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy
 import json
 import sqlite3
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -34,12 +35,13 @@ from kairos_papertrade import (
     _use_full_notional,
     _place_order_if_admitted,
     _place_batch_orders,
+    _liquidate_position,
     compute_corrected_realized_pnl,
     DEFAULT_PRED_CACHE_DIR,
 )
 from allocation import AllocationConfig
 from kairos_margin import load_margin_config
-from kairos_mtm import DailySnapshot
+from kairos_mtm import DailySnapshot, OpenPositionView, compute_daily_snapshot, liquidation_check
 import kairos_papertrade as kp
 from kairos.ops import OpsError
 
@@ -1384,6 +1386,193 @@ class TestMtmDailyTable:
             assert rows == [(200.0,)]
         finally:
             conn.close()
+
+
+# ============================================================================
+# E4-S11 -- liquidation execution
+# ============================================================================
+
+class TestLiquidatePosition:
+    # entry_price=100, qty=10, long -> entry_notional=1000, EC=2+1.5+1+0.5=5.
+    # close_price=80 -> gross_pnl=(80-100)*10=-200 (a losing position, the
+    # realistic liquidation case). realized_pnl_to_store = gross_pnl - the
+    # three non-fx entry costs = -200 -2 -1.5 -1 = -204.5 (NOT gross_pnl
+    # itself -- see _liquidate_position's docstring). corrected_realized_pnl
+    # = -204.5 - fx(0.5) = -205 = gross_pnl - EC. close_delta (include_notional
+    # True) = notional(1000) + EC(5) + corrected_pnl(-205) = 800. Round trip:
+    # fill(-1005) + close(800) = -205 = gross_pnl - EC - EXC(0), matching the
+    # zero-exit-cost liquidation simplification.
+    def _pos(self, **overrides):
+        base = dict(
+            id="pos1", ticker="AAPL", direction="long",
+            entry_price=100.0, quantity=10.0,
+            commission_entry=2.0, spread_cost=1.5,
+            slippage_cost=1.0, fx_conversion_cost=0.5,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def test_cash_delta_matches_worked_example(self, margin_cfg):
+        conn = MagicMock()
+        pos = self._pos()
+
+        delta = _liquidate_position(
+            conn, pos, close_price=80.0, exit_dt=datetime(2026, 8, 7),
+            margin_config=margin_cfg, max_leverage=1.0,
+        )
+
+        assert delta == pytest.approx(800.0)
+
+    def test_short_position_cash_delta(self, margin_cfg):
+        # short: gross_pnl = (entry-close)*qty = (100-120)*10 = -200 (loss on
+        # a short that rallied against it) -- same magnitude as the long case
+        # above but via the direction-aware formula, not a coincidence.
+        conn = MagicMock()
+        pos = self._pos(direction="short")
+
+        delta = _liquidate_position(
+            conn, pos, close_price=120.0, exit_dt=datetime(2026, 8, 7),
+            margin_config=margin_cfg, max_leverage=1.0,
+        )
+
+        assert delta == pytest.approx(800.0)
+
+    def test_writes_status_liquidated_and_margin_call_reason(self, margin_cfg):
+        conn = MagicMock()
+        cur = conn.cursor.return_value
+        pos = self._pos()
+        exit_dt = datetime(2026, 8, 7, 4, 0, 0)
+
+        _liquidate_position(
+            conn, pos, close_price=80.0, exit_dt=exit_dt,
+            margin_config=margin_cfg, max_leverage=1.0,
+        )
+
+        order_null_call, position_update_call = cur.execute.call_args_list
+        assert "orders" in order_null_call.args[0]
+        assert order_null_call.args[1] == ("pos1",)
+
+        sql, params = position_update_call.args
+        assert "status = 'liquidated'" in sql
+        assert "close_reason = 'margin_call'" in sql
+        close_price, exit_datetime, realized_pnl, position_id = params
+        assert close_price == 80.0
+        assert exit_datetime == exit_dt.isoformat()
+        assert realized_pnl == pytest.approx(-204.5)
+        assert position_id == "pos1"
+        conn.commit.assert_called_once()
+
+    def test_margin_locked_class_excludes_notional(self, margin_cfg):
+        # AAPL under leverage -> equity_cfd class, im_pct=20 < 100 -> margin
+        # bookkeeping excludes notional on both sides, matching _use_full_notional.
+        conn = MagicMock()
+        pos = self._pos()
+
+        delta = _liquidate_position(
+            conn, pos, close_price=80.0, exit_dt=datetime(2026, 8, 7),
+            margin_config=margin_cfg, max_leverage=2.0,
+        )
+
+        # 0 (no notional) + EC(5) + corrected_pnl(-205) = -200
+        assert delta == pytest.approx(-200.0)
+
+    def test_real_db_writes_and_nulls_order_fk(self, tmp_path):
+        # Small fixture schema mirroring the phantom columns this function
+        # touches -- proves the SQL actually runs against sqlite, not just
+        # that the right strings were passed to a mock.
+        conn = sqlite3.connect(str(tmp_path / "phantom.db"))
+        try:
+            conn.execute(
+                "CREATE TABLE positions (id TEXT PRIMARY KEY, status TEXT, "
+                "exit_price REAL, exit_datetime TEXT, realized_pnl REAL, close_reason TEXT)"
+            )
+            conn.execute("CREATE TABLE orders (id TEXT PRIMARY KEY, position_id TEXT)")
+            conn.execute("INSERT INTO positions (id, status) VALUES ('pos1', 'open')")
+            conn.execute("INSERT INTO orders (id, position_id) VALUES ('order1', 'pos1')")
+            conn.commit()
+
+            margin_cfg_local = load_margin_config(
+                os.path.join(os.path.dirname(__file__), "..", "..", "config", "margin_ibkr.yaml")
+            )
+            pos = self._pos()
+            exit_dt = datetime(2026, 8, 7)
+
+            delta = _liquidate_position(
+                conn, pos, close_price=80.0, exit_dt=exit_dt,
+                margin_config=margin_cfg_local, max_leverage=1.0,
+            )
+
+            assert delta == pytest.approx(800.0)
+            row = conn.execute(
+                "SELECT status, exit_price, exit_datetime, realized_pnl, close_reason "
+                "FROM positions WHERE id = 'pos1'"
+            ).fetchone()
+            assert row == ("liquidated", 80.0, exit_dt.isoformat(), pytest.approx(-204.5), "margin_call")
+
+            order_row = conn.execute("SELECT position_id FROM orders WHERE id = 'order1'").fetchone()
+            assert order_row == (None,)
+        finally:
+            conn.close()
+
+
+class TestLiquidationPipeline:
+    """End-to-end (no phantom/main() involved) exercise of the same sequence
+    main()'s day loop performs: compute a snapshot, run liquidation_check,
+    liquidate via _liquidate_position, recompute the snapshot from
+    post-liquidation cash and the surviving positions -- proving the pieces
+    compose the way E4-S11 wires them together."""
+
+    def test_trigger_liquidates_and_recomputed_snapshot_excludes_ticker(self, margin_cfg):
+        # A single AAPL long, deep underwater, with equity far below the
+        # closeout_fraction * initial_margin_used trigger.
+        pos_view = OpenPositionView(
+            ticker="AAPL", direction="long", entry_price=100.0, quantity=100.0,
+            entry_costs=5.0,
+        )
+        day_bars = {"AAPL": {"date": datetime(2026, 8, 7).date(), "close": 50.0}}
+        # cash deliberately small so equity (cash + unrealized_pnl) is deeply negative.
+        cash = 100.0
+        snapshot = compute_daily_snapshot([pos_view], day_bars, cash, margin_cfg)
+        assert snapshot.equity < 0  # sanity: unrealized_pnl = (50-100)*100 = -5000
+
+        tickers_liquidated, _post_equity, ruined = liquidation_check(snapshot, [pos_view], margin_cfg)
+        assert tickers_liquidated == ["AAPL"]
+        assert ruined is True  # only position liquidated, equity still <= 0
+
+        conn = MagicMock()
+        phantom_pos = SimpleNamespace(
+            id="pos1", ticker="AAPL", direction="long", entry_price=100.0, quantity=100.0,
+            commission_entry=2.0, spread_cost=1.5, slippage_cost=1.0, fx_conversion_cost=0.5,
+        )
+        corrected_cash = cash + _liquidate_position(
+            conn, phantom_pos, close_price=50.0, exit_dt=datetime(2026, 8, 7),
+            margin_config=margin_cfg, max_leverage=1.0,
+        )
+
+        remaining = [p for p in [pos_view] if p.ticker not in tickers_liquidated]
+        recomputed = compute_daily_snapshot(remaining, day_bars, corrected_cash, margin_cfg)
+        recomputed = kp.replace(recomputed, liquidations=len(tickers_liquidated))
+
+        assert remaining == []
+        assert recomputed.liquidations == 1
+        # No positions left -> unrealized_pnl is 0, equity == corrected cash.
+        assert recomputed.unrealized_pnl == 0.0
+        assert recomputed.equity == pytest.approx(corrected_cash)
+
+    def test_below_trigger_no_liquidation(self, margin_cfg):
+        # Healthy position: equity comfortably above closeout_fraction * IM.
+        pos_view = OpenPositionView(
+            ticker="AAPL", direction="long", entry_price=100.0, quantity=10.0,
+            entry_costs=5.0,
+        )
+        day_bars = {"AAPL": {"date": datetime(2026, 8, 7).date(), "close": 101.0}}
+        snapshot = compute_daily_snapshot([pos_view], day_bars, cash=10000.0, cfg=margin_cfg)
+
+        tickers_liquidated, post_equity, ruined = liquidation_check(snapshot, [pos_view], margin_cfg)
+
+        assert tickers_liquidated == []
+        assert ruined is False
+        assert post_equity == snapshot.equity
 
 
 # ============================================================================
