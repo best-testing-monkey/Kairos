@@ -59,6 +59,8 @@ class AllocationConfig:
     gross_cap_pct: float = 100  # Total gross exposure cap
     dust_min_pct: float = 1.0  # Zero out final allocations below this, % of equity
     equity: Optional[float] = None  # Optional account equity for currency-amount column
+    max_leverage: float = 1.0  # >1 enables margin mode; 1.0 preserves legacy cash path
+    margin_utilization_cap: float = 0.8  # Fraction of equity usable as initial margin
     cluster_map: dict = field(default_factory=dict)  # ticker -> cluster name, static mapping
     selection_rule: Optional[SignalSelectionRule] = None  # optional --signal-selection override
 

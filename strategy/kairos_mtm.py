@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kairos.errors import KairosError
+from allocation import AllocationConfig
 from kairos_margin import classify_symbol, MarginConfig
 
 
@@ -199,4 +200,43 @@ def compute_daily_snapshot(
         margin_utilization=margin_utilization,
         financing_accrued_day=0.0,
         liquidations=0,
+    )
+
+
+def admission_check(
+    order_notional: float,
+    ticker: str,
+    account: DailySnapshot,
+    cfg: MarginConfig,
+    alloc_config: AllocationConfig,
+) -> bool:
+    """Return True if a new order may be admitted without breaching margin limits.
+
+    When ``alloc_config.max_leverage <= 1.0`` the check is a no-op and returns
+    ``True`` to preserve legacy cash-only behavior.
+
+    Args:
+        order_notional: Notional value of the new order in account currency.
+        ticker: Symbol or contract identifier (used for margin class lookup).
+        account: Current daily MTM snapshot.
+        cfg: Loaded margin configuration.
+        alloc_config: Allocation configuration with leverage/cap settings.
+
+    Returns:
+        ``True`` if the order passes the post-trade margin admission test,
+        otherwise ``False``.
+    """
+    if alloc_config.max_leverage <= 1.0:
+        return True
+
+    margin_class = classify_symbol(ticker, cfg)
+    new_gross_notional = account.gross_notional + order_notional  # noqa: F841
+    new_initial_margin_used = (
+        account.initial_margin_used + order_notional * margin_class.initial_margin_pct / 100.0
+    )
+    new_equity = account.equity
+
+    return (
+        new_initial_margin_used <= new_equity * alloc_config.margin_utilization_cap
+        and new_equity > 0.0
     )
