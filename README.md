@@ -406,6 +406,22 @@ uv run --with pytest python -m pytest tests/unit/ -q
 | `test_strategy_signals.py` | Individual strategy signal generation logic |
 | `test_filters.py` | Kurtosis filter and meta-filter behaviour |
 
+### Paper trading
+
+`strategy/kairos_papertrade.py` replays Kairos signals through a local Phantom
+Ledger paper-trading account. It supports an optional margin/leverage model
+via three flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--margin-config` | `config/margin_ibkr.yaml` | Path to YAML margin configuration |
+| `--max-leverage` | `1.0` | Maximum leverage for margin mode (default: 1.0, cash-only mode) |
+| `--margin-utilization` | `0.8` | Fraction of equity usable as initial margin |
+
+```bash
+uv run ./strategy/kairos_papertrade.py --max-leverage 2.0 --margin-utilization 0.5 --months-back 1
+```
+
 ---
 
 ## Upstream: Kronos

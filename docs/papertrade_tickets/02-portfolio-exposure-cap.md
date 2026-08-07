@@ -1,3 +1,5 @@
+> Subsumed by the margin model in docs/tickets/DESIGN_DOC_mtm_margin_leverage.md — admission check + utilization cap provides the exposure cap.
+
 # Factor 2: Portfolio-level risk aggregation / concurrent exposure
 
 Source: `docs/papertrade_loss_analysis.md` §4, Factor 2
