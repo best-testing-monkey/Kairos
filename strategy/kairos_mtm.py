@@ -240,3 +240,85 @@ def admission_check(
         new_initial_margin_used <= new_equity * alloc_config.margin_utilization_cap
         and new_equity > 0.0
     )
+
+
+def liquidation_check(
+    snapshot: DailySnapshot,
+    positions: list[OpenPositionView],
+    cfg: MarginConfig,
+) -> tuple[list[str], float, bool]:
+    """Determine which positions to liquidate under the ESMA 50% close-out rule.
+
+    Evaluates the liquidation trigger condition: when account equity falls below
+    ``closeout_fraction * initial_margin_used``, positions are liquidated in
+    greedy order (largest maintenance-margin release first) until the condition
+    is satisfied or no positions remain.
+
+    Args:
+        snapshot: Current daily MTM snapshot with equity and margin state.
+        positions: List of open positions available for liquidation.
+        cfg: Loaded margin configuration with ``closeout_fraction``.
+
+    Returns:
+        A tuple ``(tickers_liquidated, post_equity, ruined)`` where:
+        - ``tickers_liquidated``: List of tickers that were force-closed.
+        - ``post_equity``: Equity after liquidation (clamped to 0.0 if negative).
+        - ``ruined``: ``True`` if all positions were liquidated and equity
+          remains non-positive; ``False`` otherwise.
+
+    Raises:
+        KairosError: If a position's direction is invalid.
+    """
+    # Check trigger condition: equity < closeout_fraction * initial_margin_used
+    if snapshot.equity >= cfg.closeout_fraction * snapshot.initial_margin_used:
+        # Not triggered; return current state
+        return ([], snapshot.equity, False)
+
+    # Trigger condition met; liquidate positions greedily
+    tickers_liquidated: list[str] = []
+    remaining_positions = list(positions)  # work with a copy
+
+    # Precompute maintenance margin release for each position for sorting
+    maintenance_releases: list[tuple[int, str, float]] = []
+    for idx, pos in enumerate(remaining_positions):
+        notional = pos.entry_price * pos.quantity
+        margin_class = classify_symbol(pos.ticker, cfg)
+        mm_release = notional * margin_class.maintenance_margin_pct / 100.0
+        maintenance_releases.append((idx, pos.ticker, mm_release))
+
+    # Sort by maintenance margin release, descending (largest first)
+    maintenance_releases.sort(key=lambda x: x[2], reverse=True)
+
+    # Current state tracking for recomputation
+    current_equity = snapshot.equity
+    current_initial_margin_used = snapshot.initial_margin_used
+
+    # Liquidate positions in order of largest MM release
+    for idx, ticker, _mm_release in maintenance_releases:
+        pos = remaining_positions[idx]
+        notional = pos.entry_price * pos.quantity
+        margin_class = classify_symbol(pos.ticker, cfg)
+
+        # Remove this position's margin requirement
+        current_initial_margin_used -= (
+            notional * margin_class.initial_margin_pct / 100.0
+        )
+
+        # Record liquidation
+        tickers_liquidated.append(ticker)
+
+        # Check if we've restored safety (equity >= closeout_fraction * im_used)
+        if current_equity >= cfg.closeout_fraction * current_initial_margin_used:
+            break
+
+    # Determine ruined status and clamp equity if needed
+    post_equity = current_equity
+    ruined = False
+
+    if len(tickers_liquidated) == len(positions):
+        # All positions were liquidated
+        if post_equity <= 0.0:
+            post_equity = 0.0
+            ruined = True
+
+    return (tickers_liquidated, post_equity, ruined)
