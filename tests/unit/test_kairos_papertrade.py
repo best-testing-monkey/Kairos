@@ -27,8 +27,11 @@ from kairos_papertrade import (
     _raise_fd_limit,
     _log_watchdog_snapshot,
     _read_self_rss_kb,
+    _ensure_mtm_daily_table,
+    _insert_mtm_daily_row,
     DEFAULT_PRED_CACHE_DIR,
 )
+from kairos_mtm import DailySnapshot
 import kairos_papertrade as kp
 from kairos.ops import OpsError
 
@@ -1039,6 +1042,82 @@ class TestPrewarmPredictionCache:
         assert notify_calls[1][1] is True
         assert "Base" in notify_calls[0][0]
         assert "Finetuned(AAA,BBB)" in notify_calls[1][0]
+
+
+# ============================================================================
+# kairos_mtm_daily table (schema + insert/read-back round trip)
+# ============================================================================
+
+class TestMtmDailyTable:
+    def test_ensure_creates_table_idempotently(self, tmp_path):
+        conn = sqlite3.connect(str(tmp_path / "phantom.db"))
+        try:
+            _ensure_mtm_daily_table(conn)
+            _ensure_mtm_daily_table(conn)  # must not raise on a second call
+
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(kairos_mtm_daily)")}
+            assert cols == {
+                "account_name", "date", "cash", "unrealized_pnl", "equity",
+                "gross_notional", "initial_margin_used", "maintenance_margin_used",
+                "free_margin", "margin_utilization", "financing_accrued_day",
+                "financing_accrued_total", "liquidations",
+            }
+        finally:
+            conn.close()
+
+    def test_insert_and_read_back_row(self, tmp_path):
+        conn = sqlite3.connect(str(tmp_path / "phantom.db"))
+        try:
+            _ensure_mtm_daily_table(conn)
+            snapshot = DailySnapshot(
+                date=datetime(2026, 7, 1).date(), cash=150.0, unrealized_pnl=5.0,
+                equity=155.0, gross_notional=1000.0, initial_margin_used=100.0,
+                maintenance_margin_used=50.0, free_margin=55.0, margin_utilization=0.645,
+                financing_accrued_day=-1.5, liquidations=0,
+            )
+            _insert_mtm_daily_row(conn, "acct1", snapshot, financing_accrued_total=-3.0)
+
+            row = conn.execute(
+                "SELECT account_name, date, cash, unrealized_pnl, equity, gross_notional, "
+                "initial_margin_used, maintenance_margin_used, free_margin, margin_utilization, "
+                "financing_accrued_day, financing_accrued_total, liquidations "
+                "FROM kairos_mtm_daily WHERE account_name = ? AND date = ?",
+                ("acct1", "2026-07-01"),
+            ).fetchone()
+
+            assert row == (
+                "acct1", "2026-07-01", 150.0, 5.0, 155.0, 1000.0, 100.0, 50.0, 55.0,
+                0.645, -1.5, -3.0, 0,
+            )
+        finally:
+            conn.close()
+
+    def test_insert_or_replace_on_rerun(self, tmp_path):
+        conn = sqlite3.connect(str(tmp_path / "phantom.db"))
+        try:
+            _ensure_mtm_daily_table(conn)
+            snap1 = DailySnapshot(
+                date=datetime(2026, 7, 1).date(), cash=150.0, unrealized_pnl=0.0,
+                equity=150.0, gross_notional=0.0, initial_margin_used=0.0,
+                maintenance_margin_used=0.0, free_margin=150.0, margin_utilization=0.0,
+                financing_accrued_day=0.0, liquidations=0,
+            )
+            snap2 = DailySnapshot(
+                date=datetime(2026, 7, 1).date(), cash=200.0, unrealized_pnl=0.0,
+                equity=200.0, gross_notional=0.0, initial_margin_used=0.0,
+                maintenance_margin_used=0.0, free_margin=200.0, margin_utilization=0.0,
+                financing_accrued_day=0.0, liquidations=0,
+            )
+            _insert_mtm_daily_row(conn, "acct1", snap1, financing_accrued_total=0.0)
+            _insert_mtm_daily_row(conn, "acct1", snap2, financing_accrued_total=0.0)  # re-run, same key
+
+            rows = conn.execute(
+                "SELECT cash FROM kairos_mtm_daily WHERE account_name = ? AND date = ?",
+                ("acct1", "2026-07-01"),
+            ).fetchall()
+            assert rows == [(200.0,)]
+        finally:
+            conn.close()
 
 
 # ============================================================================

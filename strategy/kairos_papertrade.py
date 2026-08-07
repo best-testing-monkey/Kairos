@@ -41,6 +41,7 @@ import subprocess
 import sys
 import time
 import traceback
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from typing import Optional
@@ -1030,6 +1031,82 @@ def remove_all_open_positions(ph_instance, account_id, account_name):
     conn.commit()
 
 
+def _ensure_mtm_daily_table(conn) -> None:
+    """Create the `kairos_mtm_daily` sidecar table (Kairos-owned, no phantom
+    schema change) in whatever DB `conn` points at, if it doesn't already
+    exist. Schema per DESIGN_DOC_mtm_margin_leverage.md Section 4.2. Uses the
+    same direct-`_conn`-access pattern as remove_all_open_positions, since
+    phantom's public API has no method for creating or writing sidecar
+    tables."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kairos_mtm_daily (
+            account_name TEXT NOT NULL,
+            date TEXT NOT NULL,
+            cash REAL, unrealized_pnl REAL, equity REAL,
+            gross_notional REAL,
+            initial_margin_used REAL, maintenance_margin_used REAL,
+            free_margin REAL, margin_utilization REAL,
+            financing_accrued_day REAL, financing_accrued_total REAL,
+            liquidations INTEGER,
+            PRIMARY KEY (account_name, date)
+        )
+        """
+    )
+    conn.commit()
+
+
+def _insert_mtm_daily_row(conn, account_name, snapshot, financing_accrued_total) -> None:
+    """INSERT OR REPLACE one `kairos_mtm_daily` row for `snapshot.date` so a
+    re-run over an already-processed window doesn't crash on the
+    (account_name, date) PRIMARY KEY."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO kairos_mtm_daily (
+            account_name, date, cash, unrealized_pnl, equity, gross_notional,
+            initial_margin_used, maintenance_margin_used, free_margin,
+            margin_utilization, financing_accrued_day, financing_accrued_total,
+            liquidations
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            account_name, snapshot.date.isoformat(), snapshot.cash,
+            snapshot.unrealized_pnl, snapshot.equity, snapshot.gross_notional,
+            snapshot.initial_margin_used, snapshot.maintenance_margin_used,
+            snapshot.free_margin, snapshot.margin_utilization,
+            snapshot.financing_accrued_day, financing_accrued_total,
+            snapshot.liquidations,
+        ),
+    )
+    conn.commit()
+
+
+def _fetch_day_close_bars(intraday_provider, tickers, day_start, day_end):
+    """Fetch each ticker's closing price for [day_start, day_end) from the
+    same `_IntradayFallbackProvider` ladder used for order fill/SL/TP
+    evaluation, for the daily MTM snapshot. Returns a kairos_mtm.Bar dict
+    keyed by ticker; a ticker whose bars can't be fetched is omitted (logged
+    as a warning, not fatal) rather than aborting the whole snapshot."""
+    bars = {}
+    for ticker in tickers:
+        try:
+            df = intraday_provider.get_bars(ticker, day_start, day_end)
+        except Exception as e:
+            print(
+                f"WARNING: MTM close-price fetch failed for {ticker} on "
+                f"{day_start:%Y-%m-%d}: {e}", file=sys.stderr,
+            )
+            continue
+        if df is None or df.empty:
+            print(
+                f"WARNING: MTM close-price fetch returned no bars for {ticker} "
+                f"on {day_start:%Y-%m-%d}", file=sys.stderr,
+            )
+            continue
+        bars[ticker] = {"date": day_start.date(), "close": float(df["Close"].iloc[-1])}
+    return bars
+
+
 def build_closed_trade_equity_curve(closed_positions, capital, start_dt=None):
     """Build a step-function equity curve from CLOSED positions only, using
     compute_corrected_realized_pnl (direction + fx corrected), sorted by
@@ -1111,7 +1188,10 @@ def build_closed_trade_equity_curve(closed_positions, capital, start_dt=None):
     return curve
 
 
-def _reconcile_cash_and_log(ph_instance, account_id, capital, closed_positions, total_profit_eur):
+def _reconcile_cash_and_log(
+    ph_instance, account_id, capital, closed_positions, total_profit_eur,
+    corrected_cash=None, open_unrealized_pnl=0.0,
+):
     """Compare Kairos's own corrected total P&L against phantom's raw
     `account.cash` and log a warning (does not raise) if they diverge
     beyond a small tolerance.
@@ -1123,6 +1203,16 @@ def _reconcile_cash_and_log(ph_instance, account_id, capital, closed_positions, 
     a long-only run where it should NOT fire, or an eventual upstream
     phantom fix) instead of requiring manual SQL forensics again, the way
     this exact gap was originally found.
+
+    When `corrected_cash` is supplied (the running, Kairos-side cash ledger
+    maintained in main()'s day loop -- see kairos_mtm.compute_daily_snapshot),
+    also runs a SECOND, independent check: `corrected_cash +
+    open_unrealized_pnl` against phantom's raw `account.cash` (phantom's own
+    per-bar cash is the only trustworthy "phantom equity" proxy available --
+    see APPENDIX-A: phantom cash/equity is not source of truth for MTM math,
+    it is only used for fill/SL/TP mechanics). This check is independent of
+    the one above: it comes from an incrementally-tracked running total, not
+    the closed-trade equity curve. Also warning-only.
     """
     try:
         raw_cash = ph_instance.accounts.get(account_id).cash
@@ -1145,10 +1235,26 @@ def _reconcile_cash_and_log(ph_instance, account_id, capital, closed_positions, 
             f"uninvestigated divergence.",
             file=sys.stderr,
         )
+
+    if corrected_cash is not None:
+        corrected_equity = corrected_cash + open_unrealized_pnl
+        gap2 = raw_cash - corrected_equity
+        if abs(gap2) > 0.01:
+            print(
+                f"WARNING: cash reconciliation gap of {gap2:.4f} EUR between phantom's raw "
+                f"account.cash ({raw_cash:.4f}) and Kairos's day-loop corrected_cash + open "
+                f"unrealized P&L ({corrected_equity:.4f}). See "
+                f"docs/tickets/DESIGN_DOC_mtm_margin_leverage.md Section 4.2.",
+                file=sys.stderr,
+            )
+
     return gap
 
 
-def compute_final_metrics(ph_instance, account_id, account_name, capital, start_dt=None) -> dict:
+def compute_final_metrics(
+    ph_instance, account_id, account_name, capital, start_dt=None,
+    corrected_cash=None, open_unrealized_pnl=0.0,
+) -> dict:
     """Compute the 6 required summary metrics for the finished papertrade run.
 
     Uses a Kairos-reconstructed "closed-trade" equity curve
@@ -1157,6 +1263,10 @@ def compute_final_metrics(ph_instance, account_id, account_name, capital, start_
     the confirmed phantom_ledger direction-blind cash bug that makes
     phantom's own per-bar curve untrustworthy whenever short positions are
     involved.
+
+    `corrected_cash`/`open_unrealized_pnl` are optional and, when supplied,
+    are forwarded to `_reconcile_cash_and_log` for its second, independent
+    cross-check against the day-loop's running cash ledger.
     """
     from phantom.reports.metrics import calculate_metrics
     from phantom.errors import ValidationError as PhValidationError
@@ -1187,7 +1297,10 @@ def compute_final_metrics(ph_instance, account_id, account_name, capital, start_
         "num_trades": len(closed_positions),
     }
 
-    _reconcile_cash_and_log(ph_instance, account_id, capital, closed_positions, total_profit_eur)
+    _reconcile_cash_and_log(
+        ph_instance, account_id, capital, closed_positions, total_profit_eur,
+        corrected_cash=corrected_cash, open_unrealized_pnl=open_unrealized_pnl,
+    )
 
     return metrics
 
@@ -1441,7 +1554,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     from kairos_margin import load_margin_config
-    margin_config = load_margin_config(args.margin_config)  # noqa: F841
+    from kairos_mtm import OpenPositionView, DailySnapshot, compute_daily_snapshot, compute_daily_financing_total
+    margin_config = load_margin_config(args.margin_config)
 
     parsed_signal_selection = None
     if args.signal_selection:
@@ -1539,8 +1653,13 @@ def main(argv=None):
         )
         account_id = account.id
 
+        _ensure_mtm_daily_table(client._conn)
+
         equity_curve = []
         prev_candidates = None
+        corrected_cash = args.capital
+        financing_accrued_total = 0.0
+        known_open_ids = set()
         for effective_dt, stats_rows, advice_rows in dated_rows:
             if prev_candidates:
                 open_positions = client.positions.list(account_name=account_name, status="open")
@@ -1593,6 +1712,79 @@ def main(argv=None):
                         f"WARNING: runner.backtest failed for {effective_dt} "
                         f"(tickers={tickers}): {e}", file=sys.stderr,
                     )
+                else:
+                    try:
+                        # Maintain corrected_cash (same direction-aware, fx-corrected
+                        # philosophy as compute_corrected_realized_pnl) by diffing which
+                        # positions are newly open/closed this iteration -- order fills
+                        # happen INSIDE runner.backtest() above, so fill price/cost is
+                        # only knowable now, not at orders.place() time.
+                        current_open = client.positions.list(account_name=account_name, status="open")
+                        current_open_ids = {p.id for p in current_open}
+                        for pos in current_open:
+                            if pos.id not in known_open_ids:
+                                # New fill: full-notional debit + entry costs, matching
+                                # phantom's own OrderManager.handle_fill exactly -- byte
+                                # identical to the legacy cash path when max_leverage ==
+                                # 1.0 (no margin lock here; that split is E4-S10's job).
+                                corrected_cash -= (
+                                    pos.entry_price * pos.quantity
+                                    + pos.commission_entry + pos.spread_cost
+                                    + pos.slippage_cost + pos.fx_conversion_cost
+                                )
+                        for closed_id in known_open_ids - current_open_ids:
+                            closed_pos = client.positions.get(closed_id)
+                            # Reverse the entry debit and add back the corrected
+                            # (direction-aware, fx-corrected) realized P&L.
+                            corrected_cash += (
+                                closed_pos.entry_price * closed_pos.quantity
+                                + (compute_corrected_realized_pnl(closed_pos) or 0.0)
+                            )
+                        known_open_ids = current_open_ids
+
+                        # Daily MTM snapshot + financing accrual (DESIGN_DOC_
+                        # mtm_margin_leverage.md Section 4.2/4.5): mark every still-open
+                        # position to today's close, persist one kairos_mtm_daily row.
+                        day_bars = _fetch_day_close_bars(
+                            intraday_provider, [p.ticker for p in current_open], day_start, day_end,
+                        )
+                        mtm_positions = [
+                            OpenPositionView(
+                                ticker=p.ticker, direction=p.direction, entry_price=p.entry_price,
+                                quantity=p.quantity,
+                                entry_costs=(
+                                    p.commission_entry + p.spread_cost
+                                    + p.slippage_cost + p.fx_conversion_cost
+                                ),
+                            )
+                            for p in current_open if p.ticker in day_bars
+                        ]
+                        financing_day = (
+                            compute_daily_financing_total(mtm_positions, day_bars, margin_config)
+                            if mtm_positions else 0.0
+                        )
+                        corrected_cash -= financing_day
+                        financing_accrued_total += financing_day
+
+                        if mtm_positions:
+                            snapshot = replace(
+                                compute_daily_snapshot(mtm_positions, day_bars, corrected_cash, margin_config),
+                                financing_accrued_day=financing_day,
+                            )
+                        else:
+                            snapshot = DailySnapshot(
+                                date=day_start.date(), cash=corrected_cash, unrealized_pnl=0.0,
+                                equity=corrected_cash, gross_notional=0.0, initial_margin_used=0.0,
+                                maintenance_margin_used=0.0, free_margin=corrected_cash,
+                                margin_utilization=0.0, financing_accrued_day=financing_day,
+                                liquidations=0,
+                            )
+                        _insert_mtm_daily_row(client._conn, account_name, snapshot, financing_accrued_total)
+                    except Exception as e:
+                        print(
+                            f"WARNING: MTM snapshot / corrected-cash update failed for "
+                            f"{effective_dt} (tickers={tickers}): {e}", file=sys.stderr,
+                        )
                 finally:
                     backtest_elapsed = time.monotonic() - backtest_start_t
                     if backtest_elapsed > _SLOW_ITERATION_THRESHOLD_SECONDS:
@@ -1609,6 +1801,17 @@ def main(argv=None):
 
         last_effective_dt = dated_rows[-1][0]
         start_dt, end_dt = dated_rows[0][0], last_effective_dt
+
+        # remove_all_open_positions refunds entry_price*quantity + entry-side
+        # costs for every still-open position (see its docstring) -- apply the
+        # SAME refund to corrected_cash here so the running ledger stays in
+        # sync with phantom's raw cash across the window-end removal too.
+        final_open_positions = client.positions.list(account_name=account_name, status="open")
+        corrected_cash += sum(
+            p.entry_price * p.quantity + p.commission_entry + p.spread_cost
+            + p.slippage_cost + p.fx_conversion_cost
+            for p in final_open_positions
+        )
         remove_all_open_positions(client, account_id, account_name)
 
         # Reflect the window-end removal in our in-memory equity_curve for the
@@ -1633,6 +1836,7 @@ def main(argv=None):
 
         metrics = compute_final_metrics(
             client, account_id, account_name, args.capital, start_dt=start_dt,
+            corrected_cash=corrected_cash,
         )
         closed_positions = client.positions.list(account_name=account_name, status="closed")
 
