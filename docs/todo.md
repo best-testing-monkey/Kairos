@@ -5,7 +5,7 @@ Ordered by dependency. Check off an item only in the same commit that completes 
 ## Epic 1 — Margin config & asset classification
 
 - [x] E1-S01 Create default IBKR retail margin config file (docs/tickets/E1-S01-margin-config-yaml.md)
-- [ ] E1-S02 Build margin config loader and symbol classifier (docs/tickets/E1-S02-kairos-margin-module.md)
+- [x] E1-S02 Build margin config loader and symbol classifier (docs/tickets/E1-S02-kairos-margin-module.md)
 
 ## Epic 2 — Pure MTM math
 
