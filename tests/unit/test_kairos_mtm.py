@@ -177,30 +177,30 @@ def test_liquidation_check_greedy_ordering(cfg) -> None:
     # AAPL has MM release of 5000 * 0.10 = 500
     # BTC has MM release of 40000 * 0.0 = 0 (crypto spot, no margin)
     # So AAPL should be liquidated first (largest release)
-    assert tickers[0] == "AAPL" if tickers else None
+    assert tickers[0] == "AAPL"
 
 
 def test_liquidation_check_post_invariant_holds(cfg) -> None:
     """Post-liquidation, equity >= closeout_fraction * initial_margin_used_post."""
-    # Setup: trigger liquidation by being unsafe
-    # Equity = 3000, IM_used = 10000 => ratio = 0.30 < 0.5 => liquidate
-    # One position: AAPL with IM = 2000
-    # After liquidation: IM_used = 8000, equity = 3000
-    # ratio = 3000/8000 = 0.375 < 0.5 => continue
-    # After all liquidation: IM_used = 0, ratio = undefined (safe by default)
+    # AAPL: notional 5000, IM 20% = 1000, MM 10% = 500.
+    # MSFT: notional 10000, IM 20% = 2000, MM 10% = 1000.
+    # Total IM = 3000, equity = 1000 => ratio = 0.333 < 0.5 => liquidate.
+    # Greedy order liquidates MSFT first (largest MM release: 1000 > 500).
+    # After removing MSFT: IM = 3000 - 2000 = 1000; equity(1000) >= 0.5*1000 => safe, stop.
     positions = [
         OpenPositionView(
             ticker="AAPL", direction="long", entry_price=100.0, quantity=50.0, entry_costs=0.0
         ),
+        OpenPositionView(
+            ticker="MSFT", direction="long", entry_price=200.0, quantity=50.0, entry_costs=0.0
+        ),
     ]
-    snapshot = _make_snapshot(equity=3000.0, initial_margin_used=2000.0)
+    snapshot = _make_snapshot(equity=1000.0, initial_margin_used=3000.0)
     tickers, post_eq, ruined = liquidation_check(snapshot, positions, cfg)
 
-    # After removing AAPL: IM = 2000 - 1000 = 1000
-    # Equity / IM = 3000 / 1000 = 3.0 >= 0.5 => safe!
-    if tickers:
-        # Verify that post-liquidation state is safe
-        assert post_eq >= 0.5 * (snapshot.initial_margin_used - 1000)
+    assert tickers == ["MSFT"]
+    assert post_eq >= 0.5 * (snapshot.initial_margin_used - 2000.0)
+    assert ruined is False
 
 
 def test_liquidation_check_clamp_and_ruined(cfg) -> None:
