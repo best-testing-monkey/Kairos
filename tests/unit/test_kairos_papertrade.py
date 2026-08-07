@@ -33,6 +33,7 @@ from kairos_papertrade import (
     _close_cash_delta,
     _use_full_notional,
     _place_order_if_admitted,
+    _place_batch_orders,
     compute_corrected_realized_pnl,
     DEFAULT_PRED_CACHE_DIR,
 )
@@ -1233,6 +1234,80 @@ class TestPlaceOrderIfAdmitted:
 
         assert placed is True
         client.orders.place.assert_called_once_with("acct1", order)
+
+
+class TestPlaceBatchOrders:
+    """Regression coverage for the same-day batch-admission gap: top_k
+    defaults to 12, so several orders can be admitted in one iteration
+    before `last_snapshot` next refreshes (once per day, at iteration end).
+    Checking every order in the batch against that one static snapshot lets
+    each pass individually while the batch together breaches
+    margin_utilization_cap -- _place_batch_orders must thread a running
+    initial_margin_used through the batch instead.
+    """
+
+    def _snapshot(self, equity, initial_margin_used):
+        return DailySnapshot(
+            date=datetime(2026, 8, 7).date(), cash=equity, unrealized_pnl=0.0,
+            equity=equity, gross_notional=0.0,
+            initial_margin_used=initial_margin_used, maintenance_margin_used=0.0,
+            free_margin=equity - initial_margin_used,
+            margin_utilization=(initial_margin_used / equity if equity > 0 else 0.0),
+            financing_accrued_day=0.0, liquidations=0,
+        )
+
+    def test_second_order_in_batch_rejected_once_first_consumes_headroom(self, margin_cfg):
+        # AAPL -> default equity_cfd class, initial_margin_pct=20.
+        # equity=1000, cap=0.8 -> initial_margin_used may not exceed 800.
+        # Each order alone locks 3000*0.20=600, which is <=800 in isolation
+        # (i.e. checked against the static start-of-day snapshot ALONE, both
+        # would incorrectly pass) -- but the two together lock 1200 > 800.
+        client = MagicMock()
+        alloc_config = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
+        snapshot = self._snapshot(equity=1000.0, initial_margin_used=0.0)
+        order1, order2 = MagicMock(), MagicMock()
+        order_requests = [(order1, "AAPL", 3000.0), (order2, "AAPL", 3000.0)]
+
+        rejected = _place_batch_orders(
+            client, "acct1", order_requests, datetime(2026, 8, 7),
+            snapshot, margin_cfg, alloc_config,
+        )
+
+        assert rejected == 1
+        client.orders.place.assert_called_once_with("acct1", order1)
+
+    def test_batch_admits_up_to_the_running_cap_then_rejects_rest(self, margin_cfg):
+        client = MagicMock()
+        alloc_config = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
+        snapshot = self._snapshot(equity=1000.0, initial_margin_used=0.0)
+        orders = [MagicMock() for _ in range(4)]
+        # Each locks 300*0.20=60 margin; cap allows floor(800/60)=13, so all
+        # 4 should be admitted here -- sanity check the running total doesn't
+        # over-reject when there IS enough headroom for the whole batch.
+        order_requests = [(o, "AAPL", 300.0) for o in orders]
+
+        rejected = _place_batch_orders(
+            client, "acct1", order_requests, datetime(2026, 8, 7),
+            snapshot, margin_cfg, alloc_config,
+        )
+
+        assert rejected == 0
+        assert client.orders.place.call_count == 4
+
+    def test_no_snapshot_admits_whole_batch(self, margin_cfg):
+        # First iteration of a run: no snapshot yet, nothing to check against.
+        client = MagicMock()
+        alloc_config = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
+        orders = [MagicMock(), MagicMock()]
+        order_requests = [(o, "AAPL", 1_000_000.0) for o in orders]
+
+        rejected = _place_batch_orders(
+            client, "acct1", order_requests, datetime(2026, 8, 7),
+            None, margin_cfg, alloc_config,
+        )
+
+        assert rejected == 0
+        assert client.orders.place.call_count == 2
 
 
 # ============================================================================

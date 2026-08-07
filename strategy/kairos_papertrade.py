@@ -971,6 +971,46 @@ def _place_order_if_admitted(
     return True
 
 
+def _place_batch_orders(client, account_id, order_requests, effective_dt, snapshot, margin_config, alloc_config):
+    """Admission-gate and place a whole day's worth of orders in one batch.
+
+    `order_requests` is an iterable of `(order, ticker, order_notional)` tuples
+    (already built by the caller -- this function doesn't need `Order` or
+    `map_instrument_type`, keeping it phantom-import-free and testable).
+
+    `top_k` defaults to 12, so a single day routinely places several orders
+    before `snapshot` (computed once per day, at the END of the PRIOR
+    iteration -- see `main`'s day loop) next refreshes. Checking every order
+    in the batch against that one static snapshot would let each pass
+    individually while the batch together breaches
+    `alloc_config.margin_utilization_cap` -- admission_check has no
+    visibility into orders already admitted earlier in the same batch unless
+    told. So a running `initial_margin_used` is threaded through the batch,
+    bumped after each ACCEPTED order, and fed into the next order's check via
+    `dataclasses.replace(snapshot, initial_margin_used=...)`. `equity` is left
+    untouched -- admitting an order doesn't move cash/equity, only locks
+    margin, until the fill actually happens later in `main`'s loop.
+
+    Returns the number of MARGIN_REJECTED orders in this batch.
+    """
+    running_margin_used = snapshot.initial_margin_used if snapshot is not None else 0.0
+    rejected = 0
+    for order, ticker, order_notional in order_requests:
+        check_snapshot = (
+            replace(snapshot, initial_margin_used=running_margin_used) if snapshot is not None else None
+        )
+        if _place_order_if_admitted(
+            client, account_id, order, ticker, order_notional, effective_dt,
+            check_snapshot, margin_config, alloc_config,
+        ):
+            running_margin_used += (
+                order_notional * classify_symbol(ticker, margin_config).initial_margin_pct / 100.0
+            )
+        else:
+            rejected += 1
+    return rejected
+
+
 def compute_pct_profit_per_trade(closed_positions):
     """Mean of corrected_realized_pnl / (entry_price * quantity) across
     closed positions, as a percentage (see compute_corrected_realized_pnl
@@ -1782,6 +1822,7 @@ def main(argv=None):
                 enabled_mask = {c.ticker: (c.ticker not in open_tickers) for c in prev_candidates}
                 alloc_result = allocate(prev_candidates, alloc_config, enabled_mask=enabled_mask)
 
+                order_requests = []
                 for row in selected_rows(alloc_result):
                     entry = row.get("entry")
                     if not entry:
@@ -1797,11 +1838,11 @@ def main(argv=None):
                         quantity=quantity, take_profit=row.get("target"),
                         stop_loss=row.get("stop"), created_at=effective_dt,
                     )
-                    if not _place_order_if_admitted(
-                        client, account_id, order, row["ticker"], alloc_eur, effective_dt,
-                        last_snapshot, margin_config, alloc_config,
-                    ):
-                        margin_rejected_count += 1
+                    order_requests.append((order, row["ticker"], alloc_eur))
+                margin_rejected_count += _place_batch_orders(
+                    client, account_id, order_requests, effective_dt,
+                    last_snapshot, margin_config, alloc_config,
+                )
 
             all_open_tickers = {p.ticker for p in client.positions.list(account_name=account_name, status="open")}
             new_tickers = {c.ticker for c in (prev_candidates or [])}
