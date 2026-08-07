@@ -827,6 +827,44 @@ def map_instrument_type(candidate_or_row):
     return "stock"
 
 
+def _bracket_is_stale(direction: str, stop, target, fresh_price: float) -> bool:
+    """True if `stop`/`target` (as computed by signal generation, possibly a
+    full day or more before the order actually admits) no longer bracket
+    `fresh_price` -- the fill-day's real Open, fetched fresh from
+    `_IntradayFallbackProvider` right before order placement.
+
+    See docs/tickets/RESEARCH-01-sl-close-reason-positive-pnl.md: a live run
+    hit a case where `kairos_signals`' price_cache mirror (data/yfd_prices.db)
+    silently stopped advancing for a ticker (a stale `no_data_tickers`
+    marker) while `_IntradayFallbackProvider`'s OWN, separate mirror
+    (phantom-data-dir-local) kept getting fresh bars. The strategy's
+    stop/target were computed correctly relative to the STALE current_price
+    at signal time (e.g. stop below, target above) -- but by the time the
+    resulting order actually admitted, days later, the real market had moved
+    far enough that the fixed absolute stop_loss level ended up ABOVE the
+    real fill price for a long (or the take_profit level ended up BELOW it).
+    phantom's `PositionManager.determine_close` triggers `sl`/`tp` purely
+    from `bar.Low <= stop_loss` / `bar.High >= take_profit` and reports
+    `exit_price = stop_loss`/`take_profit` verbatim -- so a long whose
+    stop_loss sits above its actual entry closes "sl" on the very same day
+    with a POSITIVE realized_pnl (exit > entry), which is exactly the
+    confusing pattern that ticket documents. This check catches that BEFORE
+    the order is ever placed, using the same fresh price phantom itself is
+    about to fill against, regardless of why the bracket went stale.
+    """
+    if direction == "long":
+        if stop is not None and stop >= fresh_price:
+            return True
+        if target is not None and target <= fresh_price:
+            return True
+    elif direction == "short":
+        if stop is not None and stop <= fresh_price:
+            return True
+        if target is not None and target >= fresh_price:
+            return True
+    return False
+
+
 def _get_field(obj, key):
     """Duck-typed field access: works for dicts and attribute-bearing
     objects (e.g. phantom.models.position.Position) alike."""
@@ -2016,6 +2054,15 @@ def main(argv=None):
         last_snapshot = None  # set at end of each iteration; consumed at admission-check time next iteration
         known_open_ids = set()
         for effective_dt, stats_rows, advice_rows in dated_rows:
+            # end must be the START OF THE NEXT DAY, not the same midnight,
+            # or the daily bar (timestamped ~04-05h UTC) gets filtered out
+            # by HistoricalProvider's `df.index <= end_ts` check and
+            # nothing fills/evaluates. Computed once per iteration -- used
+            # both for the stale-bracket sanity check below and for
+            # runner.backtest() further down.
+            day_start = datetime(effective_dt.year, effective_dt.month, effective_dt.day)
+            day_end = day_start + timedelta(days=1)
+
             if prev_candidates and not ruined:
                 open_positions = client.positions.list(account_name=account_name, status="open")
                 open_tickers = {p.ticker for p in open_positions}
@@ -2029,9 +2076,33 @@ def main(argv=None):
                 alloc_result = allocate(prev_candidates, alloc_config, enabled_mask=enabled_mask)
 
                 order_requests = []
+                fresh_open_by_ticker: dict[str, Optional[float]] = {}
                 for row in selected_rows(alloc_result):
                     entry = row.get("entry")
                     if not entry:
+                        continue
+                    ticker = row["ticker"]
+                    if ticker not in fresh_open_by_ticker:
+                        try:
+                            fresh_df = intraday_provider.get_bars(ticker, day_start, day_end)
+                            fresh_open_by_ticker[ticker] = (
+                                float(fresh_df["Open"].iloc[0])
+                                if fresh_df is not None and not fresh_df.empty else None
+                            )
+                        except Exception:
+                            fresh_open_by_ticker[ticker] = None
+                    fresh_price = fresh_open_by_ticker[ticker]
+                    if fresh_price is not None and _bracket_is_stale(
+                        row["direction"], row.get("stop"), row.get("target"), fresh_price,
+                    ):
+                        print(
+                            f"WARNING: skipping stale-bracket order for {ticker} "
+                            f"({row['direction']}) on {effective_dt:%Y-%m-%d}: "
+                            f"stop={row.get('stop')} target={row.get('target')} no longer "
+                            f"bracket today's fill price ({fresh_price:.6g}) -- see "
+                            f"docs/tickets/RESEARCH-01-sl-close-reason-positive-pnl.md",
+                            file=sys.stderr,
+                        )
                         continue
                     alloc_eur = row["alloc"] / 100.0 * cash
                     quantity = alloc_eur / entry
@@ -2054,12 +2125,6 @@ def main(argv=None):
             new_tickers = {c.ticker for c in (prev_candidates or [])}
             tickers = sorted(all_open_tickers | new_tickers)
             if tickers:
-                # end must be the START OF THE NEXT DAY, not the same midnight,
-                # or the daily bar (timestamped ~04-05h UTC) gets filtered out
-                # by HistoricalProvider's `df.index <= end_ts` check and
-                # nothing fills/evaluates.
-                day_start = datetime(effective_dt.year, effective_dt.month, effective_dt.day)
-                day_end = day_start + timedelta(days=1)
                 backtest_start_t = time.monotonic()
                 try:
                     result = client.runner.backtest(

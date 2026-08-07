@@ -620,3 +620,123 @@ def test_same_day_round_trip_mixed_with_multiday_position(monkeypatch, tmp_path)
         assert rows["2024-01-04"][2] == pytest.approx(10400.87, rel=1e-9)
     finally:
         client._conn.close()
+
+
+# =============================================================================
+# Test 5: RESEARCH-01 -- stale stop/target bracket rejected before order placement
+# =============================================================================
+
+CAPITAL_5 = 10000.0
+
+
+def test_stale_bracket_order_is_skipped_not_placed(monkeypatch, tmp_path):
+    """RESEARCH-01 regression: a candidate whose `stop`/`target` were computed
+    correctly relative to a NOW-STALE reference price must never reach
+    phantom as an `Order(...)` once the fill day's real price has moved past
+    those levels.
+
+    Root cause (docs/tickets/RESEARCH-01-sl-close-reason-positive-pnl.md): a
+    live run showed 3 WLD-USD long positions closed `close_reason='sl'` with
+    POSITIVE `realized_pnl` and an `exit_price` above `entry_price` -- the
+    exact opposite of what a stop-loss should do. Root-caused via the run's
+    own `data/pipeline_results.db` (`signals_cache` table) and two SEPARATE
+    local `price_cache` SQLite mirrors: `data/yfd_prices.db` (used by
+    `kairos_signals`/`fetch_data_raw` for SIGNAL generation) had silently
+    stopped advancing for WLD-USD after 2026-07-25 (a stale `no_data_tickers`
+    marker), so `HighLowStrategy.generate_signal` kept computing
+    stop=l*0.99/target=h from the SAME frozen current_price for FOUR straight
+    as_of dates (confirmed via `signals_cache.stats_json`, byte-identical
+    across 07-25..07-28). Meanwhile `_IntradayFallbackProvider`'s OWN,
+    separate mirror (`data/phantom_ledger/yfd_prices.db`) kept getting fresh
+    bars, so the real fill price kept dropping while the order's fixed
+    absolute `stop_loss` stayed pinned above it. phantom's
+    `PositionManager.determine_close` (see `.venv/.../phantom/engine/
+    position_manager.py`) triggers purely off `bar.Low <= stop_loss` and
+    reports `exit_price = stop_loss` verbatim -- so the long closed "sl" on
+    the very same day (also BUG-01's same-day pattern) with exit > entry.
+
+    Fix: `kairos_papertrade.py`'s day loop now fetches each candidate
+    ticker's OWN fill-day Open via `intraday_provider.get_bars()` (the exact
+    same call phantom's `runner.backtest()` is about to make) BEFORE
+    constructing the `Order`, and skips (does not place) any candidate whose
+    stop/target no longer bracket that fresh price on the correct side (see
+    `_bracket_is_stale`). This scenario reproduces the mechanism directly:
+    TICKA's candidate (entry=100, stop=90, target=140) was sane relative to
+    its OWN signal-time reference (100), but the fill day's real Open has
+    already crashed to 70 -- below stop=90 -- exactly like WLD-USD's real
+    price outrunning its stale stop. Before the fix this would fill at 70
+    and instantly "stop out" at exit_price=90 for a nonsensical +20 gain
+    tagged 'sl'; after the fix, no order/position for TICKA should exist at
+    all. TICKB is an ordinary, non-stale candidate in the SAME run, proving
+    the guard doesn't reject healthy signals too -- it reuses
+    test_leverage_off_matches_pinned_baseline's exact TICKB path (fills
+    day1, stop-losses day2) so it actually CLOSES before window end, rather
+    than being silently refunded/dropped by `remove_all_open_positions`
+    (main()'s normal end-of-window handling for any still-OPEN position,
+    which would otherwise make an "open forever" TICKB indistinguishable
+    from a wrongly-skipped one in this test).
+    """
+    day0 = datetime(2024, 1, 1)
+    day1 = datetime(2024, 1, 2)
+    day2 = datetime(2024, 1, 3)
+
+    dated_rows = _dated_rows([
+        (day0, [
+            _candidate("TICKA", 100.0, 90.0, 140.0),  # sane vs its OWN signal-time reference (100)
+            _candidate("TICKB", 50.0, 45.0, 65.0),    # ordinary, stays sane at fill time too
+        ]),
+        (day1, []),
+        (day2, []),
+    ])
+
+    bars_by_ticker = {
+        "TICKA": {
+            # Real price has crashed to 70 by fill day -- stop=90 sits ABOVE
+            # this Open, so the bracket is stale (would trigger an instant,
+            # mislabeled "sl" win if placed). No entry for day2: TICKA must
+            # never fill, so no later bar is needed.
+            day1.date(): (70.0, 72.0, 68.0, 69.0, 1000.0),
+        },
+        "TICKB": {
+            day1.date(): (50.0, 50.5, 49.5, 50.2, 1000.0),   # fills at Open=50, no touch
+            day2.date(): (48.0, 49.0, 44.0, 44.5, 1000.0),   # Low<=45 -> sl @ 45 exactly
+        },
+    }
+
+    metrics, meta, client = _run_main(
+        monkeypatch, tmp_path, dated_rows, bars_by_ticker,
+        argv_extra=[
+            "--capital", str(CAPITAL_5), "--top-n", "3",
+            "--max-leverage", "1.0", "--margin-utilization", "0.8",
+        ],
+        account_name="stale_bracket_test",
+    )
+    try:
+        # TICKA: the stale-bracket candidate must never become an order or a
+        # position -- this is the actual fix under test.
+        ticka_orders = [
+            o for o in client.orders.list(account_name="stale_bracket_test", status=None)
+            if o.ticker == "TICKA"
+        ]
+        ticka_positions = [
+            p for p in client.positions.list(account_name="stale_bracket_test", status=None)
+            if p.ticker == "TICKA"
+        ]
+        assert ticka_orders == []
+        assert ticka_positions == []
+
+        # TICKB: an ordinary, non-stale candidate in the same batch must
+        # still fill and close normally -- proves the guard is targeted,
+        # not a blanket order-placement regression.
+        tickb_positions = [
+            p for p in client.positions.list(account_name="stale_bracket_test", status=None)
+            if p.ticker == "TICKB"
+        ]
+        assert len(tickb_positions) == 1
+        assert tickb_positions[0].entry_price == pytest.approx(50.0)
+        assert tickb_positions[0].close_reason == "sl"
+
+        assert meta["margin_rejected_count"] == 0
+        assert metrics["num_trades"] == 1
+    finally:
+        client._conn.close()
