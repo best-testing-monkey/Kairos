@@ -1943,7 +1943,7 @@ def main(argv=None):
     from kairos_margin import load_margin_config
     from kairos_mtm import (
         OpenPositionView, DailySnapshot, compute_daily_snapshot, compute_daily_financing_total,
-        liquidation_check,
+        liquidation_check, position_margin_contribution,
     )
     margin_config = load_margin_config(args.margin_config)
 
@@ -2175,6 +2175,13 @@ def main(argv=None):
                         # returns every closed position ever, not just today's
                         # (without it, a normal multi-day close from an
                         # earlier iteration would be re-processed forever).
+                        # BUG-02: also remember these same-day round trips so their
+                        # entry-side margin usage can be folded into today's snapshot
+                        # below -- otherwise `last_snapshot.initial_margin_used` (what
+                        # tomorrow's admission_check() sees) never reflects capital an
+                        # account dominated by same-day round trips actually used, and
+                        # the margin_utilization_cap admission gate is defeated.
+                        same_day_round_trip_positions = []
                         for pos in client.positions.list(account_name=account_name, status="closed"):
                             if pos.id in known_open_ids or pos.id in current_open_ids:
                                 continue  # already handled above
@@ -2183,6 +2190,7 @@ def main(argv=None):
                             include_notional = _use_full_notional(pos.ticker, margin_config, args.max_leverage)
                             corrected_cash += _fill_cash_delta(pos, include_notional=include_notional)
                             corrected_cash += _close_cash_delta(pos, include_notional=include_notional)
+                            same_day_round_trip_positions.append(pos)
 
                         known_open_ids = current_open_ids
 
@@ -2260,6 +2268,44 @@ def main(argv=None):
                                 ),
                                 financing_accrued_day=financing_day,
                                 liquidations=len(tickers_liquidated),
+                            )
+
+                        # BUG-02: fold same-day round trips' entry-side margin usage
+                        # into the snapshot that gets persisted/becomes `last_snapshot`
+                        # -- admission_check() for tomorrow's orders must see capital
+                        # today's (already-closed) round trips actually used. Cash/
+                        # equity are untouched here: cash already reflects their real
+                        # P&L via corrected_cash above, and marking them to today's
+                        # close (like an open position) would double-count that P&L.
+                        if same_day_round_trip_positions:
+                            extra_notional = extra_initial_margin = extra_maintenance_margin = 0.0
+                            for pos in same_day_round_trip_positions:
+                                view = OpenPositionView(
+                                    ticker=pos.ticker, direction=pos.direction,
+                                    entry_price=pos.entry_price, quantity=pos.quantity,
+                                    entry_costs=(
+                                        pos.commission_entry + pos.spread_cost
+                                        + pos.slippage_cost + pos.fx_conversion_cost
+                                    ),
+                                )
+                                notional, initial_margin, maintenance_margin = position_margin_contribution(
+                                    view, margin_config,
+                                )
+                                extra_notional += notional
+                                extra_initial_margin += initial_margin
+                                extra_maintenance_margin += maintenance_margin
+                            new_initial_margin_used = snapshot.initial_margin_used + extra_initial_margin
+                            snapshot = replace(
+                                snapshot,
+                                gross_notional=snapshot.gross_notional + extra_notional,
+                                initial_margin_used=new_initial_margin_used,
+                                maintenance_margin_used=(
+                                    snapshot.maintenance_margin_used + extra_maintenance_margin
+                                ),
+                                free_margin=snapshot.equity - new_initial_margin_used,
+                                margin_utilization=(
+                                    new_initial_margin_used / snapshot.equity if snapshot.equity > 0 else 0.0
+                                ),
                             )
 
                         if ruined_today or snapshot.equity <= 0.0:

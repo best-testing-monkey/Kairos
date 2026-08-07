@@ -740,3 +740,114 @@ def test_stale_bracket_order_is_skipped_not_placed(monkeypatch, tmp_path):
         assert metrics["num_trades"] == 1
     finally:
         client._conn.close()
+
+
+# =============================================================================
+# Test 6: BUG-02 -- admission check must see same-day round trips' margin usage
+# =============================================================================
+
+CAPITAL_6 = 10000.0
+
+
+def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path):
+    """BUG-02 regression: `admission_check`'s gate for a NEW batch of orders
+    must be based on margin usage that reflects prior same-day round-trip
+    trades, not just positions still `status='open'` when a `DailySnapshot`
+    is taken.
+
+    Root cause: `last_snapshot` (what `admission_check` sees) is built from
+    `mtm_positions`, which is sourced from `current_open` positions only
+    (kairos_papertrade.py's day loop, ~line 2203). BUG-01's fix applies
+    same-day round trips' P&L to `corrected_cash` but never added them to
+    `mtm_positions` -- confirmed empirically (see this ticket) by probing
+    `kairos_mtm_daily.initial_margin_used`/`gross_notional` after BUG-01's
+    fix alone: they stayed at 0.0 for a day containing only same-day round
+    trips. So `admission_check`'s `new_initial_margin_used` was computed
+    against a permanently-zero baseline for accounts dominated by such
+    trades, defeating `margin_utilization_cap` -- exactly the scenario in
+    BUG-01's confirmed live repro (3/3 real trades were same-day round
+    trips).
+
+    Scenario (ticket's suggested structure): wave 1 (TICK1, TICK2) is
+    offered on day0 -- admitted unchecked (first-ever batch, `last_snapshot`
+    is None) -- and same-day round-trips (fills + take-profits) on day1,
+    each consuming ~300 EUR of initial margin (15%-of-cash Kelly-capped
+    alloc * 20% equity_cfd initial_margin_pct, see `_candidate`'s
+    docstring). Wave 2 (TICK3..TICK6) is then offered on day1 too, so it is
+    admission-checked against `last_snapshot` from day1 -- the same
+    snapshot day1's round trips should have fed into. `margin_utilization`
+    is set tight enough (0.13) that wave 2's aggregate notional fits
+    entirely if day1's (already-closed) usage is ignored (0 rejected -- the
+    pre-fix/BUG-02 symptom, confirmed empirically) but must partially
+    breach the cap once day1's real usage is correctly counted (2 of 4
+    rejected, confirmed empirically on the fixed code).
+    """
+    day0 = datetime(2024, 1, 1)
+    day1 = datetime(2024, 1, 2)
+    day2 = datetime(2024, 1, 3)
+
+    wave1 = ["TICK1", "TICK2"]
+    wave2 = ["TICK3", "TICK4", "TICK5", "TICK6"]
+    all_tickers = wave1 + wave2
+
+    dated_rows = _dated_rows([
+        (day0, [_candidate(t, 100.0, 90.0, 140.0) for t in wave1]),
+        (day1, [_candidate(t, 100.0, 90.0, 140.0) for t in wave2]),
+        (day2, []),
+    ])
+
+    bars_by_ticker = {
+        t: {
+            # wave1 tickers same-day round trip on day1: fill at Open=100,
+            # High=145 crosses target=140 on the SAME bar (BUG-01's exact
+            # repro shape). wave2 tickers get a flat, no-touch bar on day1
+            # (their fill day) so they stay open into day2.
+            day1.date(): (
+                (100.0, 145.0, 95.0, 130.0, 1000.0) if t in wave1
+                else (100.0, 101.0, 99.0, 100.0, 1000.0)
+            ),
+            day2.date(): (100.0, 101.0, 99.0, 100.0, 1000.0),
+        }
+        for t in all_tickers
+    }
+
+    metrics, meta, client = _run_main(
+        monkeypatch, tmp_path, dated_rows, bars_by_ticker,
+        argv_extra=[
+            "--capital", str(CAPITAL_6), "--top-n", "6",
+            "--max-leverage", "2.0", "--margin-utilization", "0.13",
+        ],
+        account_name="bug02_admission_test",
+    )
+    try:
+        closed = client.positions.list(account_name="bug02_admission_test", status="closed")
+        wave1_closed = [p for p in closed if p.ticker in wave1]
+        assert len(wave1_closed) == 2
+        for p in wave1_closed:
+            assert p.entry_datetime.date() == p.exit_datetime.date() == day1.date()
+
+        rows = {
+            r[0]: r for r in client._conn.execute(
+                "SELECT date, gross_notional, initial_margin_used FROM kairos_mtm_daily "
+                "WHERE account_name = ? ORDER BY date",
+                ("bug02_admission_test",),
+            ).fetchall()
+        }
+        assert set(rows) >= {"2024-01-02", "2024-01-03"}
+
+        # THE fix: day1's snapshot (== tomorrow's `last_snapshot` for
+        # admission_check) must reflect wave1's round-trip margin usage, not
+        # stay at 0.0 -- this is the exact BUG-02 symptom confirmed
+        # empirically against BUG-01-fixed-but-BUG-02-unfixed code.
+        day1_gross_notional, day1_initial_margin = rows["2024-01-02"][1], rows["2024-01-02"][2]
+        assert day1_gross_notional == pytest.approx(3000.0, rel=1e-9)
+        assert day1_initial_margin == pytest.approx(600.0, rel=1e-9)
+
+        # The cap must actually have been load-bearing for wave 2 (not
+        # vacuously satisfied): at least one, but not all, of wave 2's 4
+        # candidates rejected. Pre-fix this is 0 (all 4 admitted) because
+        # day1's round-trip usage was invisible to the gate.
+        assert meta["margin_rejected_count"] > 0
+        assert meta["margin_rejected_count"] < len(wave2)
+    finally:
+        client._conn.close()

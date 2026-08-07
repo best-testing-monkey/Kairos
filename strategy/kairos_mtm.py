@@ -116,6 +116,30 @@ def _bar_date(bar: Bar) -> datetime.date:
     return datetime.date.fromisoformat(value)
 
 
+def position_margin_contribution(pos: OpenPositionView, cfg: MarginConfig) -> tuple[float, float, float]:
+    """Return ``(notional, initial_margin, maintenance_margin)`` for one position.
+
+    Same per-position margin math used inside ``compute_daily_snapshot``,
+    exposed standalone so callers can fold a position's margin usage into a
+    snapshot without also needing a mark-to-market close price -- e.g. a
+    same-day round-trip position that already closed, where marking it to a
+    close price would double-count P&L already reflected in cash.
+
+    Args:
+        pos: Position view (entry price/quantity/ticker only; direction and
+            entry_costs are unused here).
+        cfg: Loaded margin configuration.
+
+    Returns:
+        Tuple of ``(notional, initial_margin, maintenance_margin)``.
+    """
+    margin_class = classify_symbol(pos.ticker, cfg)
+    notional = pos.entry_price * pos.quantity
+    initial_margin = notional * margin_class.initial_margin_pct / 100.0
+    maintenance_margin = notional * margin_class.maintenance_margin_pct / 100.0
+    return notional, initial_margin, maintenance_margin
+
+
 def compute_daily_snapshot(
     positions: list[OpenPositionView],
     bars_by_ticker: dict[str, Bar],
@@ -173,12 +197,10 @@ def compute_daily_snapshot(
             snap_date = _bar_date(bar)
 
         close_price = _bar_close(bar)
-        margin_class = classify_symbol(pos.ticker, cfg)
-
-        notional = pos.entry_price * pos.quantity
+        notional, initial_margin, maintenance_margin = position_margin_contribution(pos, cfg)
         gross_notional += notional
-        initial_margin_used += notional * margin_class.initial_margin_pct / 100.0
-        maintenance_margin_used += notional * margin_class.maintenance_margin_pct / 100.0
+        initial_margin_used += initial_margin
+        maintenance_margin_used += maintenance_margin
         total_unrealized += unrealized_pnl(pos, close_price)
 
     if snap_date is None:
