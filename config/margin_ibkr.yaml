@@ -1,0 +1,46 @@
+base_currency: EUR
+benchmark_annual_pct: 3.15          # configurable; verify current EUR benchmark
+negative_balance_protection: true
+closeout_fraction: 0.5              # ESMA: liquidate at 50% of initial margin
+classes:
+  fx_major:
+    symbols: ["EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X", "USDCAD=X", "NZDUSD=X", "USDCHF=X"]
+    initial_margin_pct: 3.33
+    maintenance_margin_pct: 1.67
+    financing_spread_pct: 1.5
+  fx_minor:
+    match: "=X$"                    # regex fallback for any other FX pair
+    initial_margin_pct: 5.0
+    maintenance_margin_pct: 2.5
+    financing_spread_pct: 1.5
+  index_gold_major:
+    symbols: ["GC=F", "^GSPC", "^IXIC", "^DJI", "SPY", "QQQ"]
+    initial_margin_pct: 5.0
+    maintenance_margin_pct: 2.5
+    financing_spread_pct: 1.5
+  commodity_other:
+    match: "=F$"                    # other futures proxies after index_gold_major
+    initial_margin_pct: 10.0
+    maintenance_margin_pct: 5.0
+    financing_spread_pct: 1.5
+  crypto_cfd:
+    enabled: false                  # IBKR EU retail availability uncertain; off by default
+    initial_margin_pct: 50.0
+    maintenance_margin_pct: 25.0
+    financing_spread_pct: 2.5
+  crypto_spot:
+    match: "-USD$"
+    initial_margin_pct: 100.0       # unleveraged: full notional locked
+    maintenance_margin_pct: 0.0
+    financing_spread_pct: 0.0
+  equity_cfd:
+    match: null                     # default for anything unmatched (plain tickers)
+    initial_margin_pct: 20.0
+    maintenance_margin_pct: 10.0
+    financing_spread_pct: 1.5
+# Per-symbol house-margin overrides example:
+# "LDO-USD": {initial_margin_pct: 100.0}
+overrides: {}
+short_borrow_annual_pct:
+  default: 1.0                      # placeholder; real borrow fees are per-name
+  overrides: {}
