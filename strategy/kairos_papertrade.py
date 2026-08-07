@@ -1389,6 +1389,65 @@ def build_closed_trade_equity_curve(closed_positions, capital, start_dt=None):
     return curve
 
 
+def _compute_mtm_metrics(ph_instance, account_name, capital, ruined: bool) -> dict:
+    """Compute the 7 `mtm_*` summary keys from `kairos_mtm_daily` rows for
+    `account_name`, ordered by date. Mirrors the closed-trade metrics block in
+    compute_final_metrics -- reuses `phantom.reports.metrics.calculate_metrics`
+    (via a synthetic EquityPoint curve, one point per day) for `mtm_sharpe`/
+    `mtm_max_drawdown_pct` rather than hand-rolling a second formula.
+
+    Graceful degradation: a legacy/no-MTM run (table missing, or zero rows for
+    this account) returns all 7 keys with sane defaults instead of raising.
+    """
+    conn = ph_instance._conn
+    try:
+        rows = conn.execute(
+            "SELECT date, equity, margin_utilization, financing_accrued_total, liquidations "
+            "FROM kairos_mtm_daily WHERE account_name = ? ORDER BY date",
+            (account_name,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+
+    if not rows:
+        return {
+            "mtm_total_return_pct": 0.0,
+            "mtm_max_drawdown_pct": 0.0,
+            "mtm_sharpe": 0.0,
+            "mtm_margin_utilization_peak": 0.0,
+            "mtm_financing_total_eur": 0.0,
+            "mtm_liquidation_events": 0,
+            "mtm_ruined": ruined,
+        }
+
+    from phantom.reports.metrics import EquityPoint as MetricsEquityPoint, calculate_metrics
+    from phantom.errors import ValidationError as PhValidationError
+
+    mtm_curve = [
+        MetricsEquityPoint(timestamp=datetime.fromisoformat(row[0]), equity=row[1])
+        for row in rows
+    ]
+    mtm_equity_metrics = None
+    if len(mtm_curve) >= 2:
+        try:
+            mtm_equity_metrics = calculate_metrics(mtm_curve)
+        except PhValidationError:
+            mtm_equity_metrics = None
+
+    final_equity = rows[-1][1]
+    mtm_total_return_pct = (final_equity - capital) / capital * 100.0 if capital else 0.0
+
+    return {
+        "mtm_total_return_pct": mtm_total_return_pct,
+        "mtm_max_drawdown_pct": mtm_equity_metrics.max_drawdown_pct if mtm_equity_metrics is not None else 0.0,
+        "mtm_sharpe": mtm_equity_metrics.sharpe_ratio if mtm_equity_metrics is not None else 0.0,
+        "mtm_margin_utilization_peak": max(row[2] for row in rows),
+        "mtm_financing_total_eur": rows[-1][3],
+        "mtm_liquidation_events": sum(row[4] for row in rows),
+        "mtm_ruined": ruined,
+    }
+
+
 def _reconcile_cash_and_log(
     ph_instance, account_id, capital, closed_positions, total_profit_eur,
     corrected_cash=None, open_unrealized_pnl=0.0,
@@ -1454,9 +1513,10 @@ def _reconcile_cash_and_log(
 
 def compute_final_metrics(
     ph_instance, account_id, account_name, capital, start_dt=None,
-    corrected_cash=None, open_unrealized_pnl=0.0,
+    corrected_cash=None, open_unrealized_pnl=0.0, ruined: bool = False,
 ) -> dict:
-    """Compute the 6 required summary metrics for the finished papertrade run.
+    """Compute the 6 closed-trade summary metrics plus 7 MTM-derived summary
+    metrics for the finished papertrade run.
 
     Uses a Kairos-reconstructed "closed-trade" equity curve
     (build_closed_trade_equity_curve) rather than phantom's own
@@ -1464,6 +1524,11 @@ def compute_final_metrics(
     the confirmed phantom_ledger direction-blind cash bug that makes
     phantom's own per-bar curve untrustworthy whenever short positions are
     involved.
+
+    The MTM metrics (`mtm_*`, see _compute_mtm_metrics) are a parallel
+    computation over the `kairos_mtm_daily` sidecar table -- see
+    DESIGN_DOC_mtm_margin_leverage.md Section 4.6. `ruined` is a run-level
+    flag tracked by main()'s day loop (not derivable from the table itself).
 
     `corrected_cash`/`open_unrealized_pnl` are optional and, when supplied,
     are forwarded to `_reconcile_cash_and_log` for its second, independent
@@ -1497,6 +1562,7 @@ def compute_final_metrics(
         "sharpe": equity_metrics.sharpe_ratio if equity_metrics is not None else 0.0,
         "num_trades": len(closed_positions),
     }
+    metrics.update(_compute_mtm_metrics(ph_instance, account_name, capital, ruined))
 
     _reconcile_cash_and_log(
         ph_instance, account_id, capital, closed_positions, total_profit_eur,
@@ -1864,7 +1930,6 @@ def main(argv=None):
         corrected_cash = args.capital
         financing_accrued_total = 0.0
         margin_rejected_count = 0
-        liquidation_events_count = 0
         ruined = False
         last_snapshot = None  # set at end of each iteration; consumed at admission-check time next iteration
         known_open_ids = set()
@@ -2011,8 +2076,6 @@ def main(argv=None):
                                     enabled=args.notify,
                                 )
                                 known_open_ids.discard(liq_pos.id)
-                            liquidation_events_count += len(tickers_liquidated)
-
                             # Recompute the snapshot that actually gets persisted
                             # from POST-liquidation cash and the remaining
                             # (non-liquidated) positions -- the pre-liquidation
@@ -2090,7 +2153,7 @@ def main(argv=None):
 
         metrics = compute_final_metrics(
             client, account_id, account_name, args.capital, start_dt=start_dt,
-            corrected_cash=corrected_cash,
+            corrected_cash=corrected_cash, ruined=ruined,
         )
         closed_positions = client.positions.list(account_name=account_name, status="closed")
 
@@ -2102,8 +2165,6 @@ def main(argv=None):
             "base_only": args.base_only, "top_n": args.top_n,
             "num_days": len(dated_rows),
             "margin_rejected_count": margin_rejected_count,
-            "mtm_liquidation_events": liquidation_events_count,
-            "mtm_ruined": ruined,
         }
 
         os.makedirs(args.out, exist_ok=True)

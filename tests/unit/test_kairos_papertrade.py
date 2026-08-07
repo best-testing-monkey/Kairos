@@ -30,6 +30,7 @@ from kairos_papertrade import (
     _read_self_rss_kb,
     _ensure_mtm_daily_table,
     _insert_mtm_daily_row,
+    compute_final_metrics,
     _fill_cash_delta,
     _close_cash_delta,
     _use_full_notional,
@@ -1384,6 +1385,108 @@ class TestMtmDailyTable:
                 ("acct1", "2026-07-01"),
             ).fetchall()
             assert rows == [(200.0,)]
+        finally:
+            conn.close()
+
+
+# ============================================================================
+# E4-S12 -- MTM metrics block
+# ============================================================================
+
+def _mtm_snapshot(day, cash, equity, margin_utilization, liquidations=0):
+    return DailySnapshot(
+        date=day, cash=cash, unrealized_pnl=equity - cash, equity=equity,
+        gross_notional=0.0, initial_margin_used=0.0, maintenance_margin_used=0.0,
+        free_margin=0.0, margin_utilization=margin_utilization,
+        financing_accrued_day=0.0, liquidations=liquidations,
+    )
+
+
+class TestComputeFinalMetricsMtm:
+    CAPITAL = 200.0
+
+    def _ph_instance(self, conn):
+        ph = MagicMock()
+        ph._conn = conn
+        ph.positions.list.return_value = []
+        ph.accounts.get.return_value.cash = self.CAPITAL
+        return ph
+
+    def test_seven_mtm_keys_present_with_plausible_values(self, tmp_path):
+        conn = sqlite3.connect(str(tmp_path / "phantom.db"))
+        try:
+            _ensure_mtm_daily_table(conn)
+            _insert_mtm_daily_row(
+                conn, "acct1",
+                _mtm_snapshot(datetime(2026, 7, 1).date(), 200.0, 200.0, 0.10, liquidations=0),
+                financing_accrued_total=-0.5,
+            )
+            _insert_mtm_daily_row(
+                conn, "acct1",
+                _mtm_snapshot(datetime(2026, 7, 2).date(), 190.0, 210.0, 0.55, liquidations=1),
+                financing_accrued_total=-1.2,
+            )
+            _insert_mtm_daily_row(
+                conn, "acct1",
+                _mtm_snapshot(datetime(2026, 7, 3).date(), 220.0, 220.0, 0.20, liquidations=0),
+                financing_accrued_total=-1.7,
+            )
+
+            ph = self._ph_instance(conn)
+            metrics = compute_final_metrics(ph, 1, "acct1", self.CAPITAL, ruined=True)
+
+            # final equity 220.0, capital 200.0 -> +10%
+            assert metrics["mtm_total_return_pct"] == pytest.approx(10.0)
+            # peak of 0.10 / 0.55 / 0.20 is 0.55, not the last row's value
+            assert metrics["mtm_margin_utilization_peak"] == pytest.approx(0.55)
+            # last row's cumulative total, NOT sum(-0.5, -1.2, -1.7)
+            assert metrics["mtm_financing_total_eur"] == pytest.approx(-1.7)
+            # 0 + 1 + 0
+            assert metrics["mtm_liquidation_events"] == 1
+            assert metrics["mtm_ruined"] is True
+            assert isinstance(metrics["mtm_sharpe"], float)
+            assert isinstance(metrics["mtm_max_drawdown_pct"], float)
+
+            # existing closed-trade keys still present and unaffected (no closed positions)
+            assert metrics["num_trades"] == 0
+            assert metrics["total_profit_eur"] == 0.0
+        finally:
+            conn.close()
+
+    def test_graceful_degradation_no_table(self, tmp_path):
+        """A legacy/no-MTM run (kairos_mtm_daily never created for this DB) must
+        still return all 7 mtm_* keys with sane defaults, not raise."""
+        conn = sqlite3.connect(str(tmp_path / "phantom.db"))
+        try:
+            ph = self._ph_instance(conn)
+            metrics = compute_final_metrics(ph, 1, "acct1", self.CAPITAL, ruined=False)
+
+            assert metrics["mtm_total_return_pct"] == 0.0
+            assert metrics["mtm_max_drawdown_pct"] == 0.0
+            assert metrics["mtm_sharpe"] == 0.0
+            assert metrics["mtm_margin_utilization_peak"] == 0.0
+            assert metrics["mtm_financing_total_eur"] == 0.0
+            assert metrics["mtm_liquidation_events"] == 0
+            assert metrics["mtm_ruined"] is False
+        finally:
+            conn.close()
+
+    def test_graceful_degradation_table_exists_no_rows_for_account(self, tmp_path):
+        """Table exists (created for a different account) but has zero rows for
+        THIS account -- same graceful-default contract as no table at all."""
+        conn = sqlite3.connect(str(tmp_path / "phantom.db"))
+        try:
+            _ensure_mtm_daily_table(conn)
+            _insert_mtm_daily_row(
+                conn, "other_acct",
+                _mtm_snapshot(datetime(2026, 7, 1).date(), 200.0, 200.0, 0.10),
+                financing_accrued_total=0.0,
+            )
+            ph = self._ph_instance(conn)
+            metrics = compute_final_metrics(ph, 1, "acct1", self.CAPITAL, ruined=False)
+
+            assert metrics["mtm_liquidation_events"] == 0
+            assert metrics["mtm_ruined"] is False
         finally:
             conn.close()
 
