@@ -20,7 +20,7 @@ Ordered by dependency. Check off an item only in the same commit that completes 
 
 ## Epic 4 — Papertrade engine wiring
 
-- [ ] E4-S08 Add CLI flags and load margin config in main (docs/tickets/E4-S08-cli-config-load.md)
+- [x] E4-S08 Add CLI flags and load margin config in main (docs/tickets/E4-S08-cli-config-load.md)
 - [ ] E4-S09 Maintain corrected cash and persist daily MTM snapshots (docs/tickets/E4-S09-corrected-cash-mtm-persist.md)
 - [ ] E4-S10 Wire admission check and locked-margin order semantics (docs/tickets/E4-S10-admission-orders.md)
 - [ ] E4-S11 Implement liquidation execution path (docs/tickets/E4-S11-liquidation-execution.md)

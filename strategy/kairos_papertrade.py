@@ -1310,14 +1310,16 @@ def _format_start_message(base_now, args) -> str:
     return (
         f"🟢 Kairos papertrade starting: window ending {base_now.strftime('%Y-%m-%d %H:%M')}, "
         f"interval={args.interval}, months_back={args.months_back}, top_n={args.top_n}, "
-        f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}"
+        f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}, "
+        f"max_leverage={args.max_leverage}, margin_utilization={args.margin_utilization}"
     )
 
 def _format_start_sim_message(base_now, args) -> str:
     return (
         f"🟢 Kairos papertrade simulating: window ending {base_now.strftime('%Y-%m-%d %H:%M')}, "
         f"interval={args.interval}, months_back={args.months_back}, top_n={args.top_n}, "
-        f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}"
+        f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}, "
+        f"max_leverage={args.max_leverage}, margin_utilization={args.margin_utilization}"
     )
 
 def _format_finish_message(metrics: dict, report_filename: str) -> str:
@@ -1400,6 +1402,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                               "single-slot model loader isn't reloaded once per (date, group); "
                               "the cache survives across invocations and is safe against "
                               "in-place model retraining -- see DEFAULT_PRED_CACHE_DIR)")
+    parser.add_argument("--margin-config", dest="margin_config", default="config/margin_ibkr.yaml",
+                        help="Path to YAML margin configuration (default: config/margin_ibkr.yaml)")
+    parser.add_argument("--max-leverage", dest="max_leverage", type=float, default=1.0,
+                        help="Maximum leverage for margin mode (default: 1.0, cash-only mode)")
+    parser.add_argument("--margin-utilization", dest="margin_utilization", type=float, default=0.8,
+                        help="Fraction of equity usable as initial margin (default: 0.8)")
     return parser
 
 
@@ -1431,6 +1439,9 @@ def main(argv=None):
     _raise_fd_limit()
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+
+    from kairos_margin import load_margin_config
+    margin_config = load_margin_config(args.margin_config)  # noqa: F841
 
     parsed_signal_selection = None
     if args.signal_selection:
@@ -1538,6 +1549,7 @@ def main(argv=None):
                 alloc_config = AllocationConfig(
                     top_k=args.top_n, gross_cap_pct=100, equity=cash, cluster_map=cluster_map,
                     selection_rule=parsed_signal_selection,
+                    max_leverage=args.max_leverage, margin_utilization_cap=args.margin_utilization,
                 )
                 enabled_mask = {c.ticker: (c.ticker not in open_tickers) for c in prev_candidates}
                 alloc_result = allocate(prev_candidates, alloc_config, enabled_mask=enabled_mask)

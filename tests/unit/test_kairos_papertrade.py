@@ -20,6 +20,7 @@ from kairos_papertrade import (
     _INTRADAY_FALLBACK_LADDER,
     _notify,
     _format_start_message,
+    _format_start_sim_message,
     _format_finish_message,
     _format_crash_message,
     _ensure_pred_cache_dir_env,
@@ -1164,6 +1165,30 @@ class TestBuildArgParser:
         args = _build_arg_parser().parse_args(["--no-pred-cache"])
         assert args.pred_cache is False
 
+    def test_margin_config_default_is_config_margin_ibkr_yaml(self):
+        args = _build_arg_parser().parse_args([])
+        assert args.margin_config == "config/margin_ibkr.yaml"
+
+    def test_margin_config_accepts_custom_path(self):
+        args = _build_arg_parser().parse_args(["--margin-config", "/path/to/custom.yaml"])
+        assert args.margin_config == "/path/to/custom.yaml"
+
+    def test_max_leverage_default_is_1_0(self):
+        args = _build_arg_parser().parse_args([])
+        assert args.max_leverage == 1.0
+
+    def test_max_leverage_accepts_float(self):
+        args = _build_arg_parser().parse_args(["--max-leverage", "2.5"])
+        assert args.max_leverage == 2.5
+
+    def test_margin_utilization_default_is_0_8(self):
+        args = _build_arg_parser().parse_args([])
+        assert args.margin_utilization == 0.8
+
+    def test_margin_utilization_accepts_float(self):
+        args = _build_arg_parser().parse_args(["--margin-utilization", "0.6"])
+        assert args.margin_utilization == 0.6
+
 
 # ============================================================================
 # _IntradayFallbackProvider
@@ -1327,6 +1352,42 @@ class TestFormatStartMessage:
         assert "top_n=5" in msg
         assert "capital=500.0" in msg
         assert "broker=IBKR" in msg
+
+    def test_contains_margin_leverage_params(self):
+        args = _build_arg_parser().parse_args(
+            ["--max-leverage", "2.0", "--margin-utilization", "0.7"]
+        )
+        base_now = datetime(2026, 7, 27, 12, 30)
+        msg = _format_start_message(base_now, args)
+        assert "max_leverage=2.0" in msg
+        assert "margin_utilization=0.7" in msg
+
+
+class TestFormatStartSimMessage:
+    def test_contains_emoji_and_key_params(self):
+        args = _build_arg_parser().parse_args(
+            ["--interval", "1d", "--months-back", "3", "--top-n", "5",
+             "--capital", "500", "--broker", "IBKR"]
+        )
+        base_now = datetime(2026, 7, 27, 12, 30)
+        msg = _format_start_sim_message(base_now, args)
+        assert msg.startswith("🟢")
+        assert "simulating" in msg
+        assert "2026-07-27 12:30" in msg
+        assert "interval=1d" in msg
+        assert "months_back=3.0" in msg
+        assert "top_n=5" in msg
+        assert "capital=500.0" in msg
+        assert "broker=IBKR" in msg
+
+    def test_contains_margin_leverage_params(self):
+        args = _build_arg_parser().parse_args(
+            ["--max-leverage", "2.0", "--margin-utilization", "0.7"]
+        )
+        base_now = datetime(2026, 7, 27, 12, 30)
+        msg = _format_start_sim_message(base_now, args)
+        assert "max_leverage=2.0" in msg
+        assert "margin_utilization=0.7" in msg
 
 
 class TestFormatFinishMessage:
