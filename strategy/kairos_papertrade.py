@@ -864,6 +864,56 @@ def compute_corrected_realized_pnl(position):
     return realized_pnl - fx_cost
 
 
+def _entry_costs(position):
+    """Sum of the four entry-side cost fields phantom's OrderManager.handle_fill
+    debits from cash at fill time (commission + spread + slippage + fx).
+    Duck-typed like compute_corrected_realized_pnl."""
+    return (
+        (_get_field(position, "commission_entry") or 0.0)
+        + (_get_field(position, "spread_cost") or 0.0)
+        + (_get_field(position, "slippage_cost") or 0.0)
+        + (_get_field(position, "fx_conversion_cost") or 0.0)
+    )
+
+
+def _fill_cash_delta(position):
+    """Cash effect to ADD to corrected_cash when `position` is newly filled:
+    a full-notional debit plus entry costs, matching phantom's own
+    OrderManager.handle_fill exactly (`total_deduction = fill_price*quantity
+    + costs.total`) -- byte-identical to the legacy cash path when
+    max_leverage == 1.0 (no margin lock here; that split is E4-S10's job).
+    Duck-typed like compute_corrected_realized_pnl."""
+    entry_price = _get_field(position, "entry_price")
+    quantity = _get_field(position, "quantity")
+    return -(entry_price * quantity + _entry_costs(position))
+
+
+def _close_cash_delta(position):
+    """Cash effect to ADD to corrected_cash when `position` closes: reverses
+    the entry debit (entry_notional + entry costs) and adds back the
+    corrected (direction-aware, fx-corrected) realized P&L.
+
+    `compute_corrected_realized_pnl` already nets OUT both entry- and
+    exit-side costs (phantom's stored `realized_pnl` = gross_pnl - all_costs,
+    where all_costs spans BOTH entry and exit commission/spread/slippage --
+    see phantom/engine/position_manager.py's `close()`, ~lines 319-327 --
+    plus this helper's own fx subtraction), i.e.
+    `corrected_realized_pnl = gross_pnl - entry_costs - exit_costs`. So
+    entry_costs must be added back explicitly here, or it's debited at fill
+    time and then silently never restored (a real ~EC-per-trade shortfall on
+    every closed position). Verify: `_fill_cash_delta(pos) +
+    _close_cash_delta(pos) == gross_pnl - entry_costs - exit_costs`, matching
+    the true round-trip cash effect phantom's own raw cash mechanics produce
+    (see build_closed_trade_equity_curve's docstring).
+
+    Duck-typed like compute_corrected_realized_pnl.
+    """
+    entry_price = _get_field(position, "entry_price")
+    quantity = _get_field(position, "quantity")
+    corrected_pnl = compute_corrected_realized_pnl(position) or 0.0
+    return entry_price * quantity + _entry_costs(position) + corrected_pnl
+
+
 def compute_pct_profit_per_trade(closed_positions):
     """Mean of corrected_realized_pnl / (entry_price * quantity) across
     closed positions, as a percentage (see compute_corrected_realized_pnl
@@ -1723,23 +1773,10 @@ def main(argv=None):
                         current_open_ids = {p.id for p in current_open}
                         for pos in current_open:
                             if pos.id not in known_open_ids:
-                                # New fill: full-notional debit + entry costs, matching
-                                # phantom's own OrderManager.handle_fill exactly -- byte
-                                # identical to the legacy cash path when max_leverage ==
-                                # 1.0 (no margin lock here; that split is E4-S10's job).
-                                corrected_cash -= (
-                                    pos.entry_price * pos.quantity
-                                    + pos.commission_entry + pos.spread_cost
-                                    + pos.slippage_cost + pos.fx_conversion_cost
-                                )
+                                corrected_cash += _fill_cash_delta(pos)
                         for closed_id in known_open_ids - current_open_ids:
                             closed_pos = client.positions.get(closed_id)
-                            # Reverse the entry debit and add back the corrected
-                            # (direction-aware, fx-corrected) realized P&L.
-                            corrected_cash += (
-                                closed_pos.entry_price * closed_pos.quantity
-                                + (compute_corrected_realized_pnl(closed_pos) or 0.0)
-                            )
+                            corrected_cash += _close_cash_delta(closed_pos)
                         known_open_ids = current_open_ids
 
                         # Daily MTM snapshot + financing accrual (DESIGN_DOC_
@@ -1807,11 +1844,7 @@ def main(argv=None):
         # SAME refund to corrected_cash here so the running ledger stays in
         # sync with phantom's raw cash across the window-end removal too.
         final_open_positions = client.positions.list(account_name=account_name, status="open")
-        corrected_cash += sum(
-            p.entry_price * p.quantity + p.commission_entry + p.spread_cost
-            + p.slippage_cost + p.fx_conversion_cost
-            for p in final_open_positions
-        )
+        corrected_cash += sum(-_fill_cash_delta(p) for p in final_open_positions)
         remove_all_open_positions(client, account_id, account_name)
 
         # Reflect the window-end removal in our in-memory equity_curve for the

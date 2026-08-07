@@ -29,6 +29,9 @@ from kairos_papertrade import (
     _read_self_rss_kb,
     _ensure_mtm_daily_table,
     _insert_mtm_daily_row,
+    _fill_cash_delta,
+    _close_cash_delta,
+    compute_corrected_realized_pnl,
     DEFAULT_PRED_CACHE_DIR,
 )
 from kairos_mtm import DailySnapshot
@@ -1042,6 +1045,49 @@ class TestPrewarmPredictionCache:
         assert notify_calls[1][1] is True
         assert "Base" in notify_calls[0][0]
         assert "Finetuned(AAA,BBB)" in notify_calls[1][0]
+
+
+# ============================================================================
+# _fill_cash_delta / _close_cash_delta -- corrected_cash round-trip arithmetic
+# (regression for the E4-S09 follow-up bug: entry costs were debited at fill
+# and never restored at close, short-changing corrected_cash by exactly EC
+# on every closed trade)
+# ============================================================================
+
+class TestCorrectedCashFillCloseDelta:
+    # entry_price=100, qty=10 -> entry_notional=1000, EC=2+1.5+1+0.5=5.
+    # exit_price=110 -> gross_pnl=(110-100)*10=100. EXC (exit-side
+    # commission+spread+slippage, never stored on the position row) = 3, so
+    # phantom's stored realized_pnl = gross_pnl - (EC_no_fx + EXC)
+    # = 100 - (4.5 + 3) = 92.5, and corrected_realized_pnl
+    # = realized_pnl - fx = 92.5 - 0.5 = 92 = gross_pnl - EC - EXC.
+    CLOSED_POSITION = {
+        "entry_price": 100.0, "quantity": 10.0,
+        "commission_entry": 2.0, "spread_cost": 1.5,
+        "slippage_cost": 1.0, "fx_conversion_cost": 0.5,
+        "realized_pnl": 92.5,
+    }
+
+    def test_fill_delta_is_full_notional_plus_entry_costs_debit(self):
+        # -(1000 + 5) = -1005
+        assert _fill_cash_delta(self.CLOSED_POSITION) == pytest.approx(-1005.0)
+
+    def test_corrected_realized_pnl_sanity(self):
+        assert compute_corrected_realized_pnl(self.CLOSED_POSITION) == pytest.approx(92.0)
+
+    def test_close_delta_restores_entry_costs_and_adds_corrected_pnl(self):
+        # 1000 + 5 (EC) + 92 (corrected_realized_pnl) = 1097
+        assert _close_cash_delta(self.CLOSED_POSITION) == pytest.approx(1097.0)
+
+    def test_fill_then_close_round_trip_matches_true_economic_pnl(self):
+        # Net effect of fill + close must equal gross_pnl - EC - EXC = 100 - 5 - 3 = 92,
+        # NOT gross_pnl - 2*EC - EXC = 87 (the bug: EC debited at fill, never restored).
+        capital = 10000.0
+        cash = capital
+        cash += _fill_cash_delta(self.CLOSED_POSITION)
+        cash += _close_cash_delta(self.CLOSED_POSITION)
+        assert cash == pytest.approx(10092.0)
+        assert cash - capital == pytest.approx(92.0)
 
 
 # ============================================================================
