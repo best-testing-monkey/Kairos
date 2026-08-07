@@ -1572,11 +1572,29 @@ def compute_final_metrics(
     return metrics
 
 
-def write_html_report(equity_curve, positions, metrics, meta, out_path) -> str:
+def write_html_report(equity_curve, positions, metrics, meta, out_path,
+                      mtm_curve=None, margin_utilization_cap=None) -> str:
     """Render the equity/cash curve + per-position markers + metrics table
     as an interactive Plotly HTML report, following the make_subplots /
     go.Table / fig.write_html(..., include_plotlyjs='cdn') idiom from
-    examples/run_backtest_kairos_html.py::plot_results_html."""
+    examples/run_backtest_kairos_html.py::plot_results_html.
+
+    mtm_curve: optional list of `kairos_mtm_daily` rows for one account, as
+    plain positional tuples/sequences `(date, equity, margin_utilization,
+    liquidations)` -- e.g. the result of `SELECT date, equity,
+    margin_utilization, liquidations FROM kairos_mtm_daily WHERE
+    account_name = ? ORDER BY date` (same row-shape convention as
+    `_compute_mtm_metrics`: plain tuples, not sqlite3.Row). `date` may be an
+    ISO date/datetime string or a `datetime`/`date` object (anything
+    `_parse_iso` accepts). When falsy (None, empty list -- legacy run or no
+    rows for this account), the report degrades to the original 2-row
+    layout (equity/cash chart + metrics table) with no MTM panel.
+
+    margin_utilization_cap: optional float (e.g. `AllocationConfig
+    .margin_utilization_cap`) drawn as a horizontal reference line on the
+    margin-utilization subplot; skipped when None. Ignored if `mtm_curve`
+    is falsy.
+    """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -1597,11 +1615,22 @@ def write_html_report(equity_curve, positions, metrics, meta, out_path) -> str:
             return best[1]
         return equity_vals[0] if equity_vals else 0.0
 
-    fig = make_subplots(
-        rows=2, cols=1, row_heights=[4.0, 1.4],
-        specs=[[{"type": "xy"}], [{"type": "table"}]],
-        vertical_spacing=0.08,
-    )
+    has_mtm = bool(mtm_curve)
+    margin_row = 2 if has_mtm else None
+    table_row = 3 if has_mtm else 2
+
+    if has_mtm:
+        fig = make_subplots(
+            rows=3, cols=1, row_heights=[3.2, 1.2, 1.4],
+            specs=[[{"type": "xy"}], [{"type": "xy"}], [{"type": "table"}]],
+            vertical_spacing=0.06,
+        )
+    else:
+        fig = make_subplots(
+            rows=2, cols=1, row_heights=[4.0, 1.4],
+            specs=[[{"type": "xy"}], [{"type": "table"}]],
+            vertical_spacing=0.08,
+        )
 
     fig.add_trace(go.Scatter(
         x=xs, y=equity_vals, name="Equity (total)",
@@ -1634,6 +1663,59 @@ def write_html_report(equity_curve, positions, metrics, meta, out_path) -> str:
             hovertemplate=hover,
         ), row=1, col=1)
 
+    if has_mtm:
+        mtm_xs = [_parse_iso(row[0]) for row in mtm_curve]
+        mtm_equity = [row[1] for row in mtm_curve]
+        mtm_util = [row[2] for row in mtm_curve]
+        mtm_liq = [row[3] for row in mtm_curve]
+
+        running_peak = []
+        peak = mtm_equity[0]
+        for e in mtm_equity:
+            peak = max(peak, e)
+            running_peak.append(peak)
+
+        # Drawdown shading: an invisible running-peak line, then the MTM
+        # equity line with fill='tonexty' fills the region back to it.
+        fig.add_trace(go.Scatter(
+            x=mtm_xs, y=running_peak, name="MTM peak", mode="lines",
+            line=dict(width=0), hoverinfo="skip", showlegend=False,
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=mtm_xs, y=mtm_equity, name="MTM equity", mode="lines",
+            line=dict(color="#f59e0b", width=2),
+            fill="tonexty", fillcolor="rgba(245, 158, 11, 0.15)",
+        ), row=1, col=1)
+
+        liq_xs = [x for x, liq in zip(mtm_xs, mtm_liq) if liq]
+        if liq_xs:
+            y_all = equity_vals + cash_vals + mtm_equity + running_peak
+            y_lo, y_hi = min(y_all), max(y_all)
+            pad = (y_hi - y_lo) * 0.05 or 1.0
+            y_lo, y_hi = y_lo - pad, y_hi + pad
+            line_x, line_y = [], []
+            for x in liq_xs:
+                line_x += [x, x, None]
+                line_y += [y_lo, y_hi, None]
+            fig.add_trace(go.Scatter(
+                x=line_x, y=line_y, name="Liquidation", mode="lines",
+                line=dict(color="#ef4444", dash="dash", width=1.5),
+                hoverinfo="skip",
+            ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=mtm_xs, y=mtm_util, name="Margin utilization", mode="lines",
+            line=dict(color="#a855f7", width=2),
+        ), row=margin_row, col=1)
+        if margin_utilization_cap is not None:
+            fig.add_hline(
+                y=margin_utilization_cap, row=margin_row, col=1,
+                line=dict(color="#94a3b8", dash="dash", width=1.5),
+                annotation_text=f"Cap {margin_utilization_cap:.0%}",
+                annotation_position="top left",
+            )
+        fig.update_yaxes(row=margin_row, col=1, title_text="Margin utilization")
+
     metric_labels = list(metrics.keys())
     metric_values = [
         f"{v:.4f}" if isinstance(v, float) else str(v) for v in metrics.values()
@@ -1643,13 +1725,13 @@ def write_html_report(equity_curve, positions, metrics, meta, out_path) -> str:
                     font=dict(color="white", size=12)),
         cells=dict(values=[metric_labels, metric_values], fill_color="#0f172a",
                    font=dict(color="#94a3b8", size=11, family="monospace")),
-    ), row=2, col=1)
+    ), row=table_row, col=1)
 
     title = out_path.name
     fig.update_layout(
         template="plotly_dark",
         title=dict(text=title, font=dict(size=14)),
-        height=900, showlegend=True,
+        height=1100 if has_mtm else 900, showlegend=True,
         legend=dict(orientation="h", y=1.02, x=0),
     )
     fig.update_yaxes(row=1, col=1, title_text="Equity")
@@ -2174,7 +2256,18 @@ def main(argv=None):
 
         if args.html:
             html_path = os.path.join(args.out, _report_filename(end_dt, start_dt, args.interval, args.months_back, "html"))
-            write_html_report(equity_curve, closed_positions, metrics, meta, html_path)
+            try:
+                mtm_curve = client._conn.execute(
+                    "SELECT date, equity, margin_utilization, liquidations "
+                    "FROM kairos_mtm_daily WHERE account_name = ? ORDER BY date",
+                    (account_name,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                mtm_curve = []
+            write_html_report(
+                equity_curve, closed_positions, metrics, meta, html_path,
+                mtm_curve=mtm_curve, margin_utilization_cap=args.margin_utilization,
+            )
             print(html_path)
 
         _notify(

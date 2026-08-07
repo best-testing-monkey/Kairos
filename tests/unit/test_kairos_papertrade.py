@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy
 import json
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -16,6 +17,7 @@ from kairos_papertrade import (
     map_instrument_type,
     compute_pct_profit_per_trade,
     write_json_report,
+    write_html_report,
     _build_arg_parser,
     _IntradayFallbackProvider,
     _INTRADAY_FALLBACK_LADDER,
@@ -1781,6 +1783,73 @@ class TestWriteJsonReport:
         out_path = tmp_path / "nested" / "dir" / "report.json"
         write_json_report({"num_trades": 0}, {}, out_path)
         assert out_path.exists()
+
+
+# ============================================================================
+# E4-S13 -- write_html_report MTM panel
+# ============================================================================
+
+class TestWriteHtmlReport:
+    def _equity_curve(self):
+        return [
+            SimpleNamespace(timestamp="2026-07-01T00:00:00", equity=200.0, cash=200.0),
+            SimpleNamespace(timestamp="2026-07-05T00:00:00", equity=210.0, cash=190.0),
+        ]
+
+    def _meta(self):
+        return {
+            "start": "2026-07-01T00:00:00", "end": "2026-07-05T00:00:00",
+            "interval": "1d", "months_back": 1.0, "capital": 200.0,
+            "currency": "EUR", "broker": "IBKR", "base_only": True,
+            "num_days": 5,
+        }
+
+    def test_legacy_no_mtm_curve_degrades_to_two_row_layout(self, tmp_path):
+        out_path = tmp_path / "report.html"
+        result = write_html_report(
+            self._equity_curve(), [], {"sharpe": 0.5}, self._meta(), out_path,
+        )
+        html = Path(result).read_text(encoding="utf-8")
+        assert os.path.exists(result)
+        assert "Equity (total)" in html
+        assert "MTM equity" not in html
+        assert "Margin utilization" not in html
+        assert "Liquidation" not in html
+
+    def test_empty_mtm_curve_degrades_to_two_row_layout(self, tmp_path):
+        out_path = tmp_path / "report.html"
+        result = write_html_report(
+            self._equity_curve(), [], {"sharpe": 0.5}, self._meta(), out_path,
+            mtm_curve=[], margin_utilization_cap=0.8,
+        )
+        html = Path(result).read_text(encoding="utf-8")
+        assert "MTM equity" not in html
+
+    def test_mtm_curve_adds_third_row_with_expected_traces(self, tmp_path):
+        out_path = tmp_path / "report.html"
+        mtm_curve = [
+            ("2026-07-01", 200.0, 0.30, 0),
+            ("2026-07-02", 195.0, 0.55, 1),
+            ("2026-07-03", 205.0, 0.40, 0),
+        ]
+        result = write_html_report(
+            self._equity_curve(), [], {"sharpe": 0.5}, self._meta(), out_path,
+            mtm_curve=mtm_curve, margin_utilization_cap=0.8,
+        )
+        html = Path(result).read_text(encoding="utf-8")
+        assert "MTM equity" in html
+        assert "Margin utilization" in html
+        assert "Liquidation" in html
+
+    def test_mtm_curve_no_cap_skips_reference_line(self, tmp_path):
+        out_path = tmp_path / "report.html"
+        mtm_curve = [("2026-07-01", 200.0, 0.30, 0), ("2026-07-02", 195.0, 0.55, 0)]
+        result = write_html_report(
+            self._equity_curve(), [], {"sharpe": 0.5}, self._meta(), out_path,
+            mtm_curve=mtm_curve, margin_utilization_cap=None,
+        )
+        html = Path(result).read_text(encoding="utf-8")
+        assert "MTM equity" in html
 
 
 # ============================================================================

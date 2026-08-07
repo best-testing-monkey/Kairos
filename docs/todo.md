@@ -25,7 +25,7 @@ Ordered by dependency. Check off an item only in the same commit that completes 
 - [x] E4-S10 Wire admission check and locked-margin order semantics (docs/tickets/E4-S10-admission-orders.md)
 - [x] E4-S11 Implement liquidation execution path (docs/tickets/E4-S11-liquidation-execution.md)
 - [x] E4-S12 Add MTM metrics block and extend reconciliation (docs/tickets/E4-S12-mtm-metrics.md)
-- [ ] E4-S13 Add MTM panel to HTML report (docs/tickets/E4-S13-html-mtm-panel.md)
+- [x] E4-S13 Add MTM panel to HTML report (docs/tickets/E4-S13-html-mtm-panel.md)
 
 ## Epic 5 — Validation & closeout
 
