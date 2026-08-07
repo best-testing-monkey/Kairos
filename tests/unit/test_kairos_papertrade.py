@@ -31,9 +31,13 @@ from kairos_papertrade import (
     _insert_mtm_daily_row,
     _fill_cash_delta,
     _close_cash_delta,
+    _use_full_notional,
+    _place_order_if_admitted,
     compute_corrected_realized_pnl,
     DEFAULT_PRED_CACHE_DIR,
 )
+from allocation import AllocationConfig
+from kairos_margin import load_margin_config
 from kairos_mtm import DailySnapshot
 import kairos_papertrade as kp
 from kairos.ops import OpsError
@@ -1088,6 +1092,147 @@ class TestCorrectedCashFillCloseDelta:
         cash += _close_cash_delta(self.CLOSED_POSITION)
         assert cash == pytest.approx(10092.0)
         assert cash - capital == pytest.approx(92.0)
+
+
+# ============================================================================
+# E4-S10 -- admission check gating + margin-aware cash debits
+# ============================================================================
+
+@pytest.fixture
+def margin_cfg():
+    """Default IBKR-style margin config fixture (same file production loads)."""
+    return load_margin_config(
+        os.path.join(os.path.dirname(__file__), "..", "..", "config", "margin_ibkr.yaml")
+    )
+
+
+class TestUseFullNotional:
+    def test_max_leverage_one_is_always_full_notional(self, margin_cfg):
+        # AAPL falls through to the default `equity_cfd` class (im_pct=20,
+        # NOT spot) -- with leverage off this must still be full-notional,
+        # or legacy (max_leverage=1.0) cash handling would silently change.
+        assert _use_full_notional("AAPL", margin_cfg, max_leverage=1.0) is True
+        assert _use_full_notional("BTC-USD", margin_cfg, max_leverage=1.0) is True
+
+    def test_leveraged_spot_class_is_full_notional(self, margin_cfg):
+        # crypto_spot (BTC-USD) has initial_margin_pct == 100 -> still full notional.
+        assert _use_full_notional("BTC-USD", margin_cfg, max_leverage=2.0) is True
+
+    def test_leveraged_marginable_class_excludes_notional(self, margin_cfg):
+        # AAPL -> default equity_cfd, im_pct=20 < 100 -> margin-locked, not spent.
+        assert _use_full_notional("AAPL", margin_cfg, max_leverage=2.0) is False
+
+
+class TestFillCloseDeltaMarginAware:
+    # Same fixture position as TestCorrectedCashFillCloseDelta, but exercised
+    # with include_notional=False (marginable class under leverage).
+    POSITION = {
+        "entry_price": 100.0, "quantity": 10.0,
+        "commission_entry": 2.0, "spread_cost": 1.5,
+        "slippage_cost": 1.0, "fx_conversion_cost": 0.5,
+        "realized_pnl": 92.5,
+    }
+
+    def test_fill_delta_excludes_notional_when_margin_locked(self):
+        # -(0 + 5) = -5, no notional debited.
+        assert _fill_cash_delta(self.POSITION, include_notional=False) == pytest.approx(-5.0)
+
+    def test_close_delta_excludes_notional_when_margin_locked(self):
+        # 0 + 5 (EC) + 92 (corrected_realized_pnl) = 97, no notional credited.
+        assert _close_cash_delta(self.POSITION, include_notional=False) == pytest.approx(97.0)
+
+    def test_fill_then_close_round_trip_still_equals_corrected_pnl(self):
+        # The notional term cancels out either way -- net effect is exactly
+        # corrected_realized_pnl (92), the true economic P&L when no cash
+        # notional ever actually moved.
+        capital = 10000.0
+        cash = capital
+        cash += _fill_cash_delta(self.POSITION, include_notional=False)
+        cash += _close_cash_delta(self.POSITION, include_notional=False)
+        assert cash - capital == pytest.approx(92.0)
+
+    def test_legacy_default_matches_pre_e4_s10_behavior(self):
+        # Pinned against the OLD (pre-E4-S10) formulas: fill = -(notional+EC),
+        # close = notional+EC+corrected_pnl. Calling with no include_notional
+        # kwarg (default True) must reproduce them byte-for-byte.
+        entry_notional = self.POSITION["entry_price"] * self.POSITION["quantity"]
+        ec = 2.0 + 1.5 + 1.0 + 0.5
+        old_fill = -(entry_notional + ec)
+        old_close = entry_notional + ec + 92.0
+        assert _fill_cash_delta(self.POSITION) == pytest.approx(old_fill)
+        assert _close_cash_delta(self.POSITION) == pytest.approx(old_close)
+
+
+class TestPlaceOrderIfAdmitted:
+    def _snapshot(self, equity, initial_margin_used, gross_notional=0.0):
+        return DailySnapshot(
+            date=datetime(2026, 8, 7).date(), cash=equity, unrealized_pnl=0.0,
+            equity=equity, gross_notional=gross_notional,
+            initial_margin_used=initial_margin_used, maintenance_margin_used=0.0,
+            free_margin=equity - initial_margin_used,
+            margin_utilization=(initial_margin_used / equity if equity > 0 else 0.0),
+            financing_accrued_day=0.0, liquidations=0,
+        )
+
+    def test_accepted_order_is_placed(self, margin_cfg):
+        client = MagicMock()
+        alloc_config = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
+        # equity=1000, no margin used yet; a small order stays under the cap.
+        snapshot = self._snapshot(equity=1000.0, initial_margin_used=0.0)
+        order = MagicMock()
+
+        placed = _place_order_if_admitted(
+            client, "acct1", order, "AAPL", 100.0, datetime(2026, 8, 7),
+            snapshot, margin_cfg, alloc_config,
+        )
+
+        assert placed is True
+        client.orders.place.assert_called_once_with("acct1", order)
+
+    def test_rejected_order_is_skipped_and_logged(self, margin_cfg, capsys):
+        client = MagicMock()
+        alloc_config = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
+        # equity=100, already fully margined out -- any new order breaches the cap.
+        snapshot = self._snapshot(equity=100.0, initial_margin_used=80.0)
+        order = MagicMock()
+
+        placed = _place_order_if_admitted(
+            client, "acct1", order, "AAPL", 500.0, datetime(2026, 8, 7),
+            snapshot, margin_cfg, alloc_config,
+        )
+
+        assert placed is False
+        client.orders.place.assert_not_called()
+        assert "MARGIN_REJECTED" in capsys.readouterr().err
+
+    def test_first_iteration_with_no_snapshot_skips_check(self, margin_cfg):
+        client = MagicMock()
+        alloc_config = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
+        order = MagicMock()
+
+        placed = _place_order_if_admitted(
+            client, "acct1", order, "AAPL", 1_000_000.0, datetime(2026, 8, 7),
+            None, margin_cfg, alloc_config,
+        )
+
+        assert placed is True
+        client.orders.place.assert_called_once_with("acct1", order)
+
+    def test_max_leverage_one_is_always_admitted(self, margin_cfg):
+        # admission_check itself no-ops for max_leverage<=1.0; confirm the
+        # wiring here doesn't reject even a snapshot that would otherwise breach.
+        client = MagicMock()
+        alloc_config = AllocationConfig(max_leverage=1.0, margin_utilization_cap=0.8)
+        snapshot = self._snapshot(equity=100.0, initial_margin_used=1000.0)
+        order = MagicMock()
+
+        placed = _place_order_if_admitted(
+            client, "acct1", order, "AAPL", 500.0, datetime(2026, 8, 7),
+            snapshot, margin_cfg, alloc_config,
+        )
+
+        assert placed is True
+        client.orders.place.assert_called_once_with("acct1", order)
 
 
 # ============================================================================

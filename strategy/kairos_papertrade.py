@@ -58,6 +58,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kairos_signals import DB_PATH, RESULTS_DIR, _interval_to_timedelta
 import kairos_signals as _kairos_signals_mod
 from kairos.ops import GpuLock, OpsError, send_telegram
+from kairos_margin import classify_symbol
+from kairos_mtm import admission_check
 import kairos_strategies
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -876,22 +878,29 @@ def _entry_costs(position):
     )
 
 
-def _fill_cash_delta(position):
+def _fill_cash_delta(position, include_notional=True):
     """Cash effect to ADD to corrected_cash when `position` is newly filled:
     a full-notional debit plus entry costs, matching phantom's own
     OrderManager.handle_fill exactly (`total_deduction = fill_price*quantity
     + costs.total`) -- byte-identical to the legacy cash path when
-    max_leverage == 1.0 (no margin lock here; that split is E4-S10's job).
+    `include_notional` is True (the default).
+
+    E4-S10: for marginable classes (`initial_margin_pct < 100`), the
+    notional is only *locked* as margin, never actually spent -- pass
+    `include_notional=False` so only entry costs are debited. See
+    `_use_full_notional` for how callers decide which mode applies.
     Duck-typed like compute_corrected_realized_pnl."""
     entry_price = _get_field(position, "entry_price")
     quantity = _get_field(position, "quantity")
-    return -(entry_price * quantity + _entry_costs(position))
+    notional = entry_price * quantity if include_notional else 0.0
+    return -(notional + _entry_costs(position))
 
 
-def _close_cash_delta(position):
+def _close_cash_delta(position, include_notional=True):
     """Cash effect to ADD to corrected_cash when `position` closes: reverses
-    the entry debit (entry_notional + entry costs) and adds back the
-    corrected (direction-aware, fx-corrected) realized P&L.
+    the entry debit (entry_notional + entry costs, when `include_notional`
+    is True) and adds back the corrected (direction-aware, fx-corrected)
+    realized P&L.
 
     `compute_corrected_realized_pnl` already nets OUT both entry- and
     exit-side costs (phantom's stored `realized_pnl` = gross_pnl - all_costs,
@@ -904,14 +913,62 @@ def _close_cash_delta(position):
     every closed position). Verify: `_fill_cash_delta(pos) +
     _close_cash_delta(pos) == gross_pnl - entry_costs - exit_costs`, matching
     the true round-trip cash effect phantom's own raw cash mechanics produce
-    (see build_closed_trade_equity_curve's docstring).
+    (see build_closed_trade_equity_curve's docstring). This identity holds
+    for EITHER `include_notional` value -- the notional term cancels between
+    fill and close either way, it's only present (True) or absent (False)
+    on both sides together.
+
+    E4-S10: for marginable classes, pass `include_notional=False` to match
+    the corresponding `_fill_cash_delta` call -- see `_use_full_notional`.
 
     Duck-typed like compute_corrected_realized_pnl.
     """
     entry_price = _get_field(position, "entry_price")
     quantity = _get_field(position, "quantity")
     corrected_pnl = compute_corrected_realized_pnl(position) or 0.0
-    return entry_price * quantity + _entry_costs(position) + corrected_pnl
+    notional = entry_price * quantity if include_notional else 0.0
+    return notional + _entry_costs(position) + corrected_pnl
+
+
+def _use_full_notional(ticker, margin_config, max_leverage):
+    """Whether corrected-cash bookkeeping should treat `ticker`'s fill/close
+    as a full-notional cash movement (spot/legacy) rather than margin-locked
+    (entry costs only, per DESIGN_DOC_mtm_margin_leverage.md Section 4.3).
+
+    Legacy/no-op whenever `max_leverage <= 1.0`, regardless of asset class --
+    this matters because a plain ticker falls through to config/margin_ibkr.
+    yaml's default `equity_cfd` class (initial_margin_pct=20, NOT spot) even
+    with leverage off, so gating on classification alone would silently
+    change legacy (max_leverage=1.0) cash handling. Only once leverage is
+    actually enabled does the spot/margin split apply.
+    """
+    if max_leverage <= 1.0:
+        return True
+    return classify_symbol(ticker, margin_config).initial_margin_pct >= 100.0
+
+
+def _place_order_if_admitted(
+    client, account_id, order, ticker, order_notional, effective_dt,
+    snapshot, margin_config, alloc_config,
+):
+    """Admission-gate `order` against `snapshot` before calling
+    `client.orders.place`. `snapshot` may be `None` (the very first day of
+    the run, before any positions/margin usage exist) -- nothing can be
+    over-levered yet, so the check is skipped rather than faked.
+
+    Returns True if the order was placed, False if MARGIN_REJECTED (a log
+    line is printed to stderr; the caller is responsible for counting it).
+    """
+    if snapshot is not None and not admission_check(
+        order_notional, ticker, snapshot, margin_config, alloc_config,
+    ):
+        print(
+            f"WARNING: MARGIN_REJECTED order for {ticker} notional={order_notional:.2f} "
+            f"at {effective_dt} (would breach margin_utilization_cap)", file=sys.stderr,
+        )
+        return False
+    client.orders.place(account_id, order)
+    return True
 
 
 def compute_pct_profit_per_trade(closed_positions):
@@ -1709,6 +1766,8 @@ def main(argv=None):
         prev_candidates = None
         corrected_cash = args.capital
         financing_accrued_total = 0.0
+        margin_rejected_count = 0
+        last_snapshot = None  # set at end of each iteration; consumed at admission-check time next iteration
         known_open_ids = set()
         for effective_dt, stats_rows, advice_rows in dated_rows:
             if prev_candidates:
@@ -1738,7 +1797,11 @@ def main(argv=None):
                         quantity=quantity, take_profit=row.get("target"),
                         stop_loss=row.get("stop"), created_at=effective_dt,
                     )
-                    client.orders.place(account_id, order)
+                    if not _place_order_if_admitted(
+                        client, account_id, order, row["ticker"], alloc_eur, effective_dt,
+                        last_snapshot, margin_config, alloc_config,
+                    ):
+                        margin_rejected_count += 1
 
             all_open_tickers = {p.ticker for p in client.positions.list(account_name=account_name, status="open")}
             new_tickers = {c.ticker for c in (prev_candidates or [])}
@@ -1773,10 +1836,18 @@ def main(argv=None):
                         current_open_ids = {p.id for p in current_open}
                         for pos in current_open:
                             if pos.id not in known_open_ids:
-                                corrected_cash += _fill_cash_delta(pos)
+                                corrected_cash += _fill_cash_delta(
+                                    pos, include_notional=_use_full_notional(
+                                        pos.ticker, margin_config, args.max_leverage,
+                                    ),
+                                )
                         for closed_id in known_open_ids - current_open_ids:
                             closed_pos = client.positions.get(closed_id)
-                            corrected_cash += _close_cash_delta(closed_pos)
+                            corrected_cash += _close_cash_delta(
+                                closed_pos, include_notional=_use_full_notional(
+                                    closed_pos.ticker, margin_config, args.max_leverage,
+                                ),
+                            )
                         known_open_ids = current_open_ids
 
                         # Daily MTM snapshot + financing accrual (DESIGN_DOC_
@@ -1817,6 +1888,7 @@ def main(argv=None):
                                 liquidations=0,
                             )
                         _insert_mtm_daily_row(client._conn, account_name, snapshot, financing_accrued_total)
+                        last_snapshot = snapshot
                     except Exception as e:
                         print(
                             f"WARNING: MTM snapshot / corrected-cash update failed for "
@@ -1844,7 +1916,12 @@ def main(argv=None):
         # SAME refund to corrected_cash here so the running ledger stays in
         # sync with phantom's raw cash across the window-end removal too.
         final_open_positions = client.positions.list(account_name=account_name, status="open")
-        corrected_cash += sum(-_fill_cash_delta(p) for p in final_open_positions)
+        corrected_cash += sum(
+            -_fill_cash_delta(
+                p, include_notional=_use_full_notional(p.ticker, margin_config, args.max_leverage),
+            )
+            for p in final_open_positions
+        )
         remove_all_open_positions(client, account_id, account_name)
 
         # Reflect the window-end removal in our in-memory equity_curve for the
@@ -1880,6 +1957,7 @@ def main(argv=None):
             "capital": args.capital, "currency": "EUR", "broker": args.broker,
             "base_only": args.base_only, "top_n": args.top_n,
             "num_days": len(dated_rows),
+            "margin_rejected_count": margin_rejected_count,
         }
 
         os.makedirs(args.out, exist_ok=True)
