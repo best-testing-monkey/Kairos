@@ -10,13 +10,13 @@ Ordered by dependency. Check off an item only in the same commit that completes 
 ## Epic 2 — Pure MTM math
 
 - [x] E2-S03 Build daily MTM snapshot dataclasses and pure math (docs/tickets/E2-S03-mtm-snapshot-core.md)
-- [ ] E2-S04 Add margin admission check (docs/tickets/E2-S04-admission-check.md)
+- [x] E2-S04 Add margin admission check (docs/tickets/E2-S04-admission-check.md)
 - [ ] E2-S05 Add liquidation check (docs/tickets/E2-S05-liquidation-check.md)
 - [ ] E2-S06 Add financing and borrow-cost accrual (docs/tickets/E2-S06-financing-accrual.md)
 
 ## Epic 3 — Allocation config extensions
 
-- [ ] E3-S07 Extend AllocationConfig with leverage fields (docs/tickets/E3-S07-allocation-config-leverage.md)
+- [x] E3-S07 Extend AllocationConfig with leverage fields (docs/tickets/E3-S07-allocation-config-leverage.md)
 
 ## Epic 4 — Papertrade engine wiring
 
