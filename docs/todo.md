@@ -31,7 +31,7 @@ Ordered by dependency. Check off an item only in the same commit that completes 
 
 - [x] E5-S14 Frozen-fixture MTM repro test (docs/tickets/E5-S14-frozen-fixture-mtm-repro.md)
 - [x] E5-S15 Leverage-off regression and exposure-cap verification (docs/tickets/E5-S15-leverage-off-regression.md)
-- [ ] E5-S16 Smoke test, docs update, and ticket closure (docs/tickets/E5-S16-smoke-docs-closeout.md)
+- [x] E5-S16 Smoke test, docs update, and ticket closure (docs/tickets/E5-S16-smoke-docs-closeout.md)
 
 ---
 
