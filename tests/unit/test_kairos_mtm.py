@@ -12,7 +12,9 @@ from allocation import AllocationConfig  # noqa: E402
 from kairos_margin import load_margin_config  # noqa: E402
 from kairos_mtm import (  # noqa: E402
     admission_check,
+    compute_daily_financing_total,
     compute_daily_snapshot,
+    daily_financing,
     DailySnapshot,
     liquidation_check,
     OpenPositionView,
@@ -221,3 +223,126 @@ def test_liquidation_check_clamp_and_ruined(cfg) -> None:
     assert post_eq == 0.0
     # Ruined flag should be set
     assert ruined is True
+
+
+def test_daily_financing_long_exact_value(cfg) -> None:
+    """Long position financing: notional * (benchmark + spread) / 360."""
+    # AAPL (equity CFD): entry_price=100, qty=10 => notional=1000
+    # Benchmark=3.15%, Spread=1.5% => (3.15+1.5) / 360 = 4.65 / 360 ≈ 0.01291667
+    # Expected: 1000 * 0.01291667 ≈ 12.91667
+    pos = OpenPositionView(
+        ticker="AAPL", direction="long", entry_price=100.0, quantity=10.0, entry_costs=0.0
+    )
+    close_price = 100.0
+    margin_class = cfg.classes["equity_cfd"]
+    result = daily_financing(pos, close_price, margin_class, cfg)
+
+    expected = 1000.0 * (3.15 + 1.5) / 360.0
+    assert abs(result - expected) < 1e-9
+
+
+def test_daily_financing_short_with_borrow_exact_value(cfg) -> None:
+    """Short position financing: borrow_cost - financing_credit_if_positive."""
+    # AAPL short: entry_price=100, qty=10 => notional=1000
+    # Borrow cost: 1000 * 1.0 / 360 ≈ 2.77778
+    # Financing credit: max(0, 1000 * (3.15 - 1.5) / 360) = 1000 * 1.65 / 360 ≈ 4.58333
+    # Net cost: 2.77778 - 4.58333 ≈ -1.80556 (credit to account)
+    pos = OpenPositionView(
+        ticker="AAPL", direction="short", entry_price=100.0, quantity=10.0, entry_costs=0.0
+    )
+    close_price = 100.0
+    margin_class = cfg.classes["equity_cfd"]
+    result = daily_financing(pos, close_price, margin_class, cfg)
+
+    borrow_cost = 1000.0 * 1.0 / 360.0
+    financing_credit = max(0.0, 1000.0 * (3.15 - 1.5) / 360.0)
+    expected = borrow_cost - financing_credit
+    assert abs(result - expected) < 1e-9
+
+
+def test_daily_financing_spot_returns_zero(cfg) -> None:
+    """Spot classes (initial_margin_pct == 100) return 0.0."""
+    # BTC-USD is crypto_spot: initial_margin_pct=100.0
+    pos = OpenPositionView(
+        ticker="BTC-USD", direction="long", entry_price=40000.0, quantity=0.1, entry_costs=0.0
+    )
+    close_price = 41000.0
+    margin_class = cfg.classes["crypto_spot"]
+    result = daily_financing(pos, close_price, margin_class, cfg)
+
+    assert result == 0.0
+
+
+def test_daily_financing_benchmark_and_spread_zero(cfg) -> None:
+    """Edge case: zero spread (credit rate approaches benchmark)."""
+    # Create a margin class with zero spread
+    # For long: should return benchmark (no spread added)
+    # For short: credit rate = benchmark - 0 = benchmark (if positive)
+    from kairos_margin import MarginClass  # noqa: E402
+
+    zero_spread_class = MarginClass(
+        name="test_zero",
+        initial_margin_pct=20.0,
+        maintenance_margin_pct=10.0,
+        financing_spread_pct=0.0,
+    )
+
+    # Long position: 1000 * (3.15 + 0) / 360 = 8.75
+    pos_long = OpenPositionView(
+        ticker="TEST", direction="long", entry_price=100.0, quantity=10.0, entry_costs=0.0
+    )
+    result_long = daily_financing(pos_long, 100.0, zero_spread_class, cfg)
+    expected_long = 1000.0 * (3.15 + 0.0) / 360.0
+    assert abs(result_long - expected_long) < 1e-9
+
+    # Short position: 1000 * 1.0 / 360 - max(0, 1000 * (3.15 - 0) / 360)
+    # = 2.77778 - 8.75 = -5.97222 (credit to account)
+    pos_short = OpenPositionView(
+        ticker="TEST", direction="short", entry_price=100.0, quantity=10.0, entry_costs=0.0
+    )
+    result_short = daily_financing(pos_short, 100.0, zero_spread_class, cfg)
+    borrow_cost = 1000.0 * 1.0 / 360.0
+    financing_credit = max(0.0, 1000.0 * (3.15 - 0.0) / 360.0)
+    expected_short = borrow_cost - financing_credit
+    assert abs(result_short - expected_short) < 1e-9
+
+
+def test_compute_daily_financing_total_multiple_positions(cfg) -> None:
+    """Sum financing across multiple mixed positions."""
+    positions = [
+        OpenPositionView(
+            ticker="AAPL", direction="long", entry_price=100.0, quantity=10.0, entry_costs=0.0
+        ),
+        OpenPositionView(
+            ticker="EURUSD=X", direction="short", entry_price=1.1, quantity=100000.0, entry_costs=0.0
+        ),
+        OpenPositionView(
+            ticker="BTC-USD", direction="long", entry_price=40000.0, quantity=0.1, entry_costs=0.0
+        ),
+    ]
+    bars_by_ticker = {
+        "AAPL": {"date": datetime.date(2026, 8, 7), "close": 100.0},
+        "EURUSD=X": {"date": datetime.date(2026, 8, 7), "close": 1.1},
+        "BTC-USD": {"date": datetime.date(2026, 8, 7), "close": 41000.0},
+    }
+
+    total = compute_daily_financing_total(positions, bars_by_ticker, cfg)
+
+    # Compute expected values:
+    # AAPL long: 1000 * (3.15 + 1.5) / 360 = 12.91667
+    aapl_fin = 1000.0 * (3.15 + 1.5) / 360.0
+
+    # EURUSD=X short: notional=110000
+    # Borrow: 110000 * 1.0 / 360 ≈ 305.55556
+    # Credit: max(0, 110000 * (3.15 - 1.5) / 360) = 110000 * 1.65 / 360 ≈ 505.20833
+    # Net: 305.55556 - 505.20833 ≈ -199.65278
+    eurusd_borrow = 110000.0 * 1.0 / 360.0
+    eurusd_credit = max(0.0, 110000.0 * (3.15 - 1.5) / 360.0)
+    eurusd_fin = eurusd_borrow - eurusd_credit
+
+    # BTC-USD spot: 0
+    btc_fin = 0.0
+
+    expected_total = aapl_fin + eurusd_fin + btc_fin
+
+    assert abs(total - expected_total) < 1e-6

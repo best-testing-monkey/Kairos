@@ -12,7 +12,7 @@ from typing import Any
 
 from kairos.errors import KairosError
 from allocation import AllocationConfig
-from kairos_margin import classify_symbol, MarginConfig
+from kairos_margin import classify_symbol, MarginClass, MarginConfig
 
 
 @dataclass(frozen=True)
@@ -240,6 +240,101 @@ def admission_check(
         new_initial_margin_used <= new_equity * alloc_config.margin_utilization_cap
         and new_equity > 0.0
     )
+
+
+def daily_financing(
+    pos: OpenPositionView,
+    close_price: float,
+    cls: MarginClass,
+    cfg: MarginConfig,
+) -> float:
+    """Return financing cost accrued on a single position for one day.
+
+    Spot classes (``initial_margin_pct == 100.0``) accrue zero financing.
+
+    Long CFD/margin: charged ``notional_close * (benchmark_annual_pct + financing_spread_pct) / 360``.
+
+    Short CFD/margin: debited ``notional_close * short_borrow_annual_pct / 360``,
+    minus a credit of ``(benchmark_annual_pct - financing_spread_pct) / 360``
+    (credit only if positive). The returned value represents the net financing
+    cost charged to the account (positive = cost owed, negative = benefit received).
+
+    By convention, financing is charged on positions open at bar close; the entry
+    day counts, the exit day does not. This function computes the daily accrual
+    only; the caller's day loop enforces the entry/exit day convention.
+
+    Args:
+        pos: Open position view.
+        close_price: Mark price for the position on the day.
+        cls: Margin class for the position's ticker.
+        cfg: Loaded margin configuration, including ``benchmark_annual_pct``
+            and ``short_borrow_annual_pct``.
+
+    Returns:
+        Daily financing cost in account currency (positive = cost, negative = credit).
+
+    Raises:
+        KairosError: If ``pos.direction`` is not ``"long"`` or ``"short"``.
+    """
+    # Spot classes (no margin) incur no financing.
+    if cls.initial_margin_pct >= 100.0:
+        return 0.0
+
+    notional_close = close_price * pos.quantity
+    direction = pos.direction.lower()
+
+    if direction == "long":
+        # Long: charged (benchmark + spread) daily
+        return notional_close * (cfg.benchmark_annual_pct + cls.financing_spread_pct) / 360.0
+
+    if direction == "short":
+        # Short: always debited borrow fee, credited financing if positive
+        short_borrow_pct = cfg.short_borrow_annual_pct.get("overrides", {}).get(
+            pos.ticker, cfg.short_borrow_annual_pct.get("default", 0.0)
+        )
+        borrow_cost = notional_close * short_borrow_pct / 360.0
+        financing_credit = max(
+            0.0,
+            notional_close * (cfg.benchmark_annual_pct - cls.financing_spread_pct) / 360.0,
+        )
+        return borrow_cost - financing_credit
+
+    raise KairosError(f"Unknown direction {pos.direction!r} for {pos.ticker!r}")
+
+
+def compute_daily_financing_total(
+    positions: list[OpenPositionView],
+    bars_by_ticker: dict[str, Bar],
+    cfg: MarginConfig,
+) -> float:
+    """Sum daily financing accrual across all open positions for a single day.
+
+    Each position's financing is computed via ``daily_financing``, using the
+    closing price from ``bars_by_ticker``.
+
+    Args:
+        positions: Open positions to accrue financing on.
+        bars_by_ticker: Mapping from ticker to bar with ``"close"`` key.
+        cfg: Loaded margin configuration.
+
+    Returns:
+        Total daily financing cost (positive = net cost to account).
+
+    Raises:
+        KairosError: If a required bar is missing, lacks price data, or
+            a position's direction is invalid.
+    """
+    total = 0.0
+    for pos in positions:
+        bar = bars_by_ticker.get(pos.ticker)
+        if bar is None:
+            raise KairosError(f"No bar available for {pos.ticker!r}")
+
+        close_price = _bar_close(bar)
+        margin_class = classify_symbol(pos.ticker, cfg)
+        total += daily_financing(pos, close_price, margin_class, cfg)
+
+    return total
 
 
 def liquidation_check(
