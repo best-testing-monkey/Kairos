@@ -409,3 +409,214 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
         assert meta["margin_rejected_count"] < len(wave2)  # not ALL rejected either
     finally:
         client._conn.close()
+
+
+# =============================================================================
+# Test 3: BUG-01 -- same-day fill+close round trip
+# =============================================================================
+
+CAPITAL_3 = 10000.0
+
+
+def test_same_day_round_trip_reflected_in_corrected_cash(monkeypatch, tmp_path):
+    """BUG-01 regression: a position whose fill-day bar's High already
+    crosses `target` on THAT SAME bar (a stop/target hit on the day it
+    fills -- routine for tight stops on volatile daily-bar assets) must
+    still have its P&L applied to `corrected_cash`/`kairos_mtm_daily`.
+
+    Before the fix, the day-loop's fill/close diffing only compared
+    `current_open` (queried AFTER runner.backtest() returns, by which point
+    this position is already `status='closed'`) against `known_open_ids`
+    (which never saw it, since it didn't exist before this same iteration)
+    -- so it was invisible to BOTH loops, and `corrected_cash`/
+    `kairos_mtm_daily` stayed flat at capital despite a real closed,
+    profitable trade. This is the exact confirmed-live scenario from
+    docs/tickets/BUG-01-same-day-fill-close-blind-spot.md.
+
+    Numbers reuse test_leverage_off_matches_pinned_baseline's TICKA
+    derivation verbatim (same entry/stop/target/qty/exit price) -- only the
+    SL/TP touch is moved onto the fill bar itself instead of the following
+    day: corrected_realized_pnl = 594.70.
+    """
+    day0 = datetime(2024, 1, 1)
+    day1 = datetime(2024, 1, 2)
+
+    dated_rows = _dated_rows([
+        (day0, [_candidate("TICKA", 100.0, 90.0, 140.0)]),
+        (day1, []),
+    ])
+
+    bars_by_ticker = {
+        "TICKA": {
+            # Open=100 fills the entry; High=145 >= target(140) triggers a
+            # take-profit close on THIS SAME bar/day -- the ticket's exact
+            # suggested repro shape.
+            day1.date(): (100.0, 145.0, 95.0, 130.0, 1000.0),
+        },
+    }
+
+    metrics, meta, client = _run_main(
+        monkeypatch, tmp_path, dated_rows, bars_by_ticker,
+        argv_extra=[
+            "--capital", str(CAPITAL_3), "--top-n", "3",
+            "--max-leverage", "1.0", "--margin-utilization", "0.8",
+        ],
+        account_name="same_day_round_trip",
+    )
+    try:
+        closed = client.positions.list(account_name="same_day_round_trip", status="closed")
+        assert len(closed) == 1
+        pos = closed[0]
+        assert pos.close_reason == "tp"
+        assert pos.entry_datetime.date() == pos.exit_datetime.date() == day1.date()
+
+        expected_profit = 594.70
+        assert metrics["total_profit_eur"] == pytest.approx(expected_profit, rel=1e-9)
+        assert metrics["num_trades"] == 1
+
+        rows = client._conn.execute(
+            "SELECT date, cash, equity, gross_notional FROM kairos_mtm_daily "
+            "WHERE account_name = ? ORDER BY date",
+            ("same_day_round_trip",),
+        ).fetchall()
+        assert rows, "expected at least one kairos_mtm_daily row"
+
+        # THE bug: pre-fix, every row stays flat at capital (the round trip
+        # is invisible to corrected_cash) -- these are the assertions that
+        # fail on unfixed code.
+        final_cash, final_equity = rows[-1][1], rows[-1][2]
+        assert final_cash != pytest.approx(CAPITAL_3)
+        assert final_equity == pytest.approx(CAPITAL_3 + expected_profit, rel=1e-9)
+
+        # Ticket DoD #3: kairos_mtm_daily's final equity must reconcile with
+        # the closed-trade equity curve -- same convergence invariant as
+        # test_kairos_papertrade_mtm_repro.py::
+        # test_final_mtm_equity_equals_final_closed_trade_equity.
+        assert metrics["mtm_total_return_pct"] == pytest.approx(metrics["pct_profit"], rel=1e-6)
+    finally:
+        client._conn.close()
+
+
+# =============================================================================
+# Test 4: BUG-01 -- same-day round trip mixed with an ordinary multi-day hold
+# =============================================================================
+
+CAPITAL_4 = 10000.0
+
+
+def test_same_day_round_trip_mixed_with_multiday_position(monkeypatch, tmp_path):
+    """Regression companion to the pure same-day-round-trip test above:
+    proves the BUG-01 fix's new "closed position never seen open" loop
+    does not double-count or otherwise disturb the EXISTING (already-
+    working) multi-day fill/close path when both kinds of trades appear in
+    the same run.
+
+    TICKA: same-day round trip on day1 (fills + take-profits on the same
+    bar, exactly as in test_same_day_round_trip_reflected_in_corrected_cash).
+    TICKB: ordinary multi-day hold -- fills day1, held flat through day2
+    (which forces the day-loop's diffing block to run AGAIN with TICKA
+    already closed -- the exact condition that would double-count TICKA
+    under a naive "status=closed, not in known_open_ids" check with no date
+    filter, since `positions.list(status="closed")` returns every closed
+    position ever, not just the current day's), stop-losses on day3.
+
+    Both positions individually reuse test_leverage_off_matches_pinned_
+    baseline's hand-derived P&L (TICKA's TP number now realized same-day
+    instead of next-day; TICKB's SL number unchanged), so the combined
+    total is the same pinned constant that test asserts
+    (EXPECTED_METRICS_LEVERAGE_OFF), even though the trade timing differs.
+
+    Note on `kairos_mtm_daily` cash/equity below: both tickers are plain
+    (non-"-USD") symbols, so they classify as `equity_cfd` in
+    config/margin_ibkr.yaml (initial_margin_pct=20, NOT spot -- true even
+    at --max-leverage 1.0, see CLAUDE.md's "Configurable signal selection"
+    / margin gotchas) and accrue overnight financing on TICKB while it's
+    held. That financing is debited from `corrected_cash` only (a
+    Kairos-side-only accrual; phantom's raw `account.cash` never sees it,
+    same as a real CFD financing charge), so it does NOT feed into
+    `total_profit_eur`/`pct_profit` (computed purely from closed positions'
+    `realized_pnl`) -- it's an intentional, pre-existing, orthogonal source
+    of cash/equity divergence, not a BUG-01 symptom. The cash/equity values
+    pinned below are hand-verified to include it (see inline derivation).
+    """
+    day0 = datetime(2024, 1, 1)
+    day1 = datetime(2024, 1, 2)
+    day2 = datetime(2024, 1, 3)
+    day3 = datetime(2024, 1, 4)
+
+    dated_rows = _dated_rows([
+        (day0, [_candidate("TICKA", 100.0, 90.0, 140.0), _candidate("TICKB", 50.0, 45.0, 65.0)]),
+        (day1, []),
+        (day2, []),
+        (day3, []),
+    ])
+
+    bars_by_ticker = {
+        "TICKA": {
+            # Same-day round trip: fills at Open=100, High=145 >= target(140)
+            # triggers TP on this same bar.
+            day1.date(): (100.0, 145.0, 95.0, 130.0, 1000.0),
+        },
+        "TICKB": {
+            day1.date(): (50.0, 50.5, 49.5, 50.2, 1000.0),  # fills at Open=50, no touch
+            day2.date(): (50.0, 50.5, 49.5, 50.2, 1000.0),  # still open, no touch -- forces the
+                                                              # day-loop to run its diffing block
+                                                              # again with TICKA already closed
+            day3.date(): (48.0, 49.0, 44.0, 44.5, 1000.0),  # Low<=45 -> sl @ 45 exactly
+        },
+    }
+
+    metrics, meta, client = _run_main(
+        monkeypatch, tmp_path, dated_rows, bars_by_ticker,
+        argv_extra=[
+            "--capital", str(CAPITAL_4), "--top-n", "3",
+            "--max-leverage", "1.0", "--margin-utilization", "0.8",
+        ],
+        account_name="same_day_plus_multiday",
+    )
+    try:
+        closed = {
+            p.ticker: p for p in client.positions.list(
+                account_name="same_day_plus_multiday", status="closed",
+            )
+        }
+        assert set(closed) == {"TICKA", "TICKB"}
+        assert closed["TICKA"].entry_datetime.date() == closed["TICKA"].exit_datetime.date()
+        assert closed["TICKB"].entry_datetime.date() != closed["TICKB"].exit_datetime.date()
+
+        for key, expected in EXPECTED_METRICS_LEVERAGE_OFF.items():
+            assert metrics[key] == pytest.approx(expected, rel=1e-9), key
+
+        rows = {
+            r[0]: r for r in client._conn.execute(
+                "SELECT date, cash, equity, financing_accrued_day FROM kairos_mtm_daily "
+                "WHERE account_name = ? ORDER BY date",
+                ("same_day_plus_multiday",),
+            ).fetchall()
+        }
+        assert set(rows) == {"2024-01-02", "2024-01-03", "2024-01-04"}
+
+        # day1 (TICKA's round-trip day): corrected_cash = capital + TICKA's
+        # fill+close net (594.70, the identity fill_delta+close_delta ==
+        # corrected_realized_pnl) - TICKB's fill debit (1500 notional + 3.25
+        # entry costs) - TICKB's day1 overnight financing (1506 notional_close
+        # * (3.15+1.5)/360 == 19.4525). This is the assertion that fails
+        # pre-fix: without the fix, TICKA's round trip contributes nothing,
+        # leaving cash at capital - 1503.25 - 19.4525 == 8477.2975 instead.
+        assert rows["2024-01-02"][1] == pytest.approx(9071.9975, rel=1e-9)
+        assert rows["2024-01-02"][3] == pytest.approx(19.4525, rel=1e-9)
+
+        # day2: TICKB held flat (no fill/close event) -- exercises the fix's
+        # date filter, since TICKA is STILL in positions.list(status="closed")
+        # here but must NOT be reprocessed. One more night of TICKB financing.
+        assert rows["2024-01-03"][1] == pytest.approx(9052.545, rel=1e-9)
+        assert rows["2024-01-03"][3] == pytest.approx(19.4525, rel=1e-9)
+
+        # day3: TICKB closes (sl). Final cash must equal capital + both
+        # trades' combined corrected P&L (439.775) minus the two nights of
+        # TICKB financing (38.905) -- i.e. exactly phantom's raw closed-trade
+        # equity (10439.775) minus financing, not flat and not double-counted.
+        assert rows["2024-01-04"][1] == pytest.approx(10400.87, rel=1e-9)
+        assert rows["2024-01-04"][2] == pytest.approx(10400.87, rel=1e-9)
+    finally:
+        client._conn.close()

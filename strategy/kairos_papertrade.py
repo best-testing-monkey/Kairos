@@ -2095,6 +2095,30 @@ def main(argv=None):
                                     closed_pos.ticker, margin_config, args.max_leverage,
                                 ),
                             )
+
+                        # BUG-01: a position that both fills AND closes inside
+                        # this single runner.backtest() call (same-day round
+                        # trip -- e.g. a stop/target touched on the fill bar
+                        # itself) is invisible to both loops above: it's
+                        # never in `known_open_ids` (never seen open at a
+                        # prior check) and never in `current_open` (already
+                        # closed by the time we query "open" just above). Find
+                        # it by querying closed positions and keeping only
+                        # ones that exited THIS iteration's day and weren't
+                        # already handled by the fill/close loops above --
+                        # the date filter is required because status="closed"
+                        # returns every closed position ever, not just today's
+                        # (without it, a normal multi-day close from an
+                        # earlier iteration would be re-processed forever).
+                        for pos in client.positions.list(account_name=account_name, status="closed"):
+                            if pos.id in known_open_ids or pos.id in current_open_ids:
+                                continue  # already handled above
+                            if pos.exit_datetime is None or pos.exit_datetime.date() != day_start.date():
+                                continue  # closed on a different day; not this iteration's concern
+                            include_notional = _use_full_notional(pos.ticker, margin_config, args.max_leverage)
+                            corrected_cash += _fill_cash_delta(pos, include_notional=include_notional)
+                            corrected_cash += _close_cash_delta(pos, include_notional=include_notional)
+
                         known_open_ids = current_open_ids
 
                         # Daily MTM snapshot + financing accrual (DESIGN_DOC_
