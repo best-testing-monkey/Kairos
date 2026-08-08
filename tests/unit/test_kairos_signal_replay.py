@@ -10,6 +10,7 @@ from unittest.mock import patch, MagicMock
 
 import pandas as pd
 import pytest
+import price_cache
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
@@ -17,7 +18,9 @@ from kairos_signal_replay import (
     _ensure_signal_replay_tables,
     unpack_signals_cache_to_papertrade_signals,
     resolve_interval_for_signal,
-    max_adverse_excursion_pct
+    max_adverse_excursion_pct,
+    compute_closure,
+    compute_closures_for_window,
 )
 
 
@@ -765,3 +768,329 @@ def test_max_adverse_excursion_pct_invalid_direction():
 
     with pytest.raises(ValueError, match="direction must be"):
         max_adverse_excursion_pct("LONG", entry_price, bars)
+
+
+# ==============================================================================
+# Tests for compute_closure / compute_closures_for_window
+# ==============================================================================
+
+
+def _insert_papertrade_signal(
+    conn,
+    signal_id: str,
+    ticker: str = "AAPL",
+    direction: str = "long",
+    interval: str = "1h",
+    as_of: str = "2026-08-01",
+    entry: float = 100.0,
+    stop: float = 95.0,
+    target: float = 105.0,
+) -> None:
+    """Helper: insert a minimal papertrade_signals row for closure tests."""
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals (
+            signal_id, strategy_name, ticker, direction, interval, as_of,
+            entry, stop, target, expected_value, base_win_rate, n,
+            model_label, checkpoint_fingerprint, source_cache_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (signal_id, "test_strategy", ticker, direction, interval, as_of,
+         entry, stop, target, None, None, None, "base", "", None,
+         "2026-08-01T00:00:00Z")
+    )
+    conn.commit()
+
+
+def test_compute_closure_resolves_at_target_hand_computed():
+    """Resolvable long signal that hits target on the second forward bar.
+
+    Setup: entry=100, stop=95, target=110, direction=long, fee_pct=0.001.
+
+    Hand derivation of _check_exit's bar-by-bar walk (LONG branch order:
+    open-gap-through-stop, open-gap-through-target, intrabar stop touch,
+    intrabar target touch, else fall back to close):
+    - Bar 1 (Open=100.5, High=104, Low=99, Close=102): open not <=95 or
+      >=110; low=99 not <=95; high=104 not >=110 -> falls back to
+      (close=102, "close"). "close" is treated as NON-terminal here (see
+      _TERMINAL_EXIT_REASONS), so the walk continues to bar 2.
+      MAE at bar 1: (Low - entry) / entry * 100 = (99-100)/100*100 = -1.0%.
+    - Bar 2 (Open=103, High=111, Low=101, Close=109): open not <=95 or
+      >=110; low=101 not <=95; high=111 >= 110 -> exit at (target=110,
+      "target"). Terminal, loop stops here.
+      MAE at bar 2: (101-100)/100*100 = +1.0% (not worse than -1.0%).
+    - worst_pct_move = -1.0% -> max_drawdown_pct = 1.0.
+    - pnl = (exit_price - entry) * size - exit_price * size * fee_pct
+          = (110 - 100) * 1.0 - 110 * 1.0 * 0.001 = 10 - 0.11 = 9.89
+    - pct_profit = pnl / (entry * size) = 9.89 / 100 = 0.0989
+    """
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    dates = pd.date_range(start="2026-08-01T00:00:00", periods=2, freq="h", tz="UTC")
+    bars_df = pd.DataFrame({
+        "Open": [100.5, 103.0],
+        "High": [104.0, 111.0],
+        "Low": [99.0, 101.0],
+        "Close": [102.0, 109.0],
+        "Volume": [1000, 1000],
+    }, index=dates)
+
+    signal_row = {
+        "signal_id": "sig_target_hit",
+        "ticker": "AAPL",
+        "direction": "long",
+        "entry": 100.0,
+        "stop": 95.0,
+        "target": 110.0,
+        "as_of": "2026-08-01",
+    }
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+        compute_closure(
+            conn, signal_row, interval_ladder=["1h"],
+            fee_pct=0.001, slippage_pct=0.0005,
+            db_path="/tmp/test.db", engine_version="v1",
+        )
+
+    cursor = conn.execute(
+        "SELECT resolved, interval_used, pct_profit, max_drawdown_pct, "
+        "exit_reason, engine_version, trigger_datetime, exit_datetime "
+        "FROM papertrade_signals_closure WHERE signal_id = ?",
+        ("sig_target_hit",)
+    )
+    row = cursor.fetchone()
+    assert row is not None, "Expected a closure row to be written"
+    (resolved, interval_used, pct_profit, max_drawdown_pct,
+     exit_reason, engine_version, trigger_datetime, exit_datetime) = row
+
+    assert resolved == 1
+    assert interval_used == "1h"
+    assert pct_profit == pytest.approx(0.0989)
+    assert max_drawdown_pct == pytest.approx(1.0)
+    assert exit_reason == "target"
+    assert engine_version == "v1"
+    assert trigger_datetime is not None
+    assert exit_datetime is not None
+
+    conn.close()
+
+
+def test_compute_closure_disqualified_no_interval_resolves():
+    """Disqualification path 1: every interval in the ladder fails to resolve
+    (price_cache.get_price_data returns empty for all of them). No exit walk
+    is ever attempted; the closure row is resolved=0 with every other column
+    NULL except engine_version/computed_at."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    signal_row = {
+        "signal_id": "sig_no_interval",
+        "ticker": "ZZZ",
+        "direction": "long",
+        "entry": 10.0,
+        "stop": 9.0,
+        "target": 11.0,
+        "as_of": "2026-08-01",
+    }
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = pd.DataFrame()  # empty for every interval tried
+        compute_closure(
+            conn, signal_row, interval_ladder=["1h", "4h", "1d"],
+            fee_pct=0.001, slippage_pct=0.0005,
+            db_path="/tmp/test.db", engine_version="v1",
+        )
+
+    cursor = conn.execute(
+        "SELECT resolved, interval_used, pct_profit, max_drawdown_pct, "
+        "trigger_datetime, exit_datetime, exit_reason, engine_version "
+        "FROM papertrade_signals_closure WHERE signal_id = ?",
+        ("sig_no_interval",)
+    )
+    row = cursor.fetchone()
+    assert row is not None
+    (resolved, interval_used, pct_profit, max_drawdown_pct,
+     trigger_datetime, exit_datetime, exit_reason, engine_version) = row
+
+    assert resolved == 0
+    assert interval_used is None
+    assert pct_profit is None
+    assert max_drawdown_pct is None
+    assert trigger_datetime is None
+    assert exit_datetime is None
+    assert exit_reason is None
+    assert engine_version == "v1"
+
+    conn.close()
+
+
+def test_compute_closure_disqualified_bars_exhausted_without_resolving():
+    """Disqualification path 2: the interval resolves and bars are fetched,
+    but neither ever triggers a genuine stop/target/gap exit -- every bar
+    falls back to _check_exit's ("close", "close") result, which this module
+    treats as non-terminal. The walk exhausts all fetched bars and the
+    signal is disqualified the same way as an interval-resolution failure.
+    """
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    # entry=100, stop=90, target=120 -- bars stay strictly inside that band,
+    # never gapping through or touching stop/target intrabar.
+    dates = pd.date_range(start="2026-08-01T00:00:00", periods=2, freq="h", tz="UTC")
+    bars_df = pd.DataFrame({
+        "Open": [101.0, 104.0],
+        "High": [105.0, 107.0],
+        "Low": [98.0, 99.0],
+        "Close": [103.0, 105.0],
+        "Volume": [1000, 1000],
+    }, index=dates)
+
+    signal_row = {
+        "signal_id": "sig_exhausted",
+        "ticker": "AAPL",
+        "direction": "long",
+        "entry": 100.0,
+        "stop": 90.0,
+        "target": 120.0,
+        "as_of": "2026-08-01",
+    }
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+        compute_closure(
+            conn, signal_row, interval_ladder=["1h"],
+            fee_pct=0.001, slippage_pct=0.0005,
+            db_path="/tmp/test.db", engine_version="v1",
+        )
+
+    cursor = conn.execute(
+        "SELECT resolved, pct_profit, exit_reason FROM papertrade_signals_closure "
+        "WHERE signal_id = ?",
+        ("sig_exhausted",)
+    )
+    row = cursor.fetchone()
+    assert row is not None
+    resolved, pct_profit, exit_reason = row
+    assert resolved == 0
+    assert pct_profit is None
+    assert exit_reason is None
+
+    conn.close()
+
+
+def test_compute_closures_for_window_engine_version_mismatch_recomputes():
+    """engine_version mismatch forces recompute: calling
+    compute_closures_for_window twice over the same window with different
+    engine_version values should recompute on the second call, and the
+    stored closure row should end up stamped with the newer version."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+    _insert_papertrade_signal(
+        conn, signal_id="sig_version", as_of="2026-08-05",
+        entry=100.0, stop=95.0, target=105.0, direction="long",
+    )
+
+    # A single bar that immediately gaps through target on open -- resolves
+    # in one bar so the version-mismatch behavior, not the walk logic, is
+    # what's under test here.
+    dates = pd.date_range(start="2026-08-05T00:00:00", periods=1, freq="h", tz="UTC")
+    bars_df = pd.DataFrame({
+        "Open": [106.0],
+        "High": [107.0],
+        "Low": [105.5],
+        "Close": [106.5],
+        "Volume": [1000],
+    }, index=dates)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+        count_v1 = compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-31", interval_ladder=["1h"],
+            engine_version="v1", db_path="/tmp/test.db",
+        )
+    assert count_v1 == 1, f"First call should compute 1 closure, got {count_v1}"
+
+    cursor = conn.execute(
+        "SELECT engine_version FROM papertrade_signals_closure WHERE signal_id = ?",
+        ("sig_version",)
+    )
+    assert cursor.fetchone()[0] == "v1"
+
+    # Same window, no new signals -- but a DIFFERENT engine_version should
+    # force the existing row to be recomputed.
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+        count_v2 = compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-31", interval_ladder=["1h"],
+            engine_version="v2", db_path="/tmp/test.db",
+        )
+    assert count_v2 == 1, (
+        f"engine_version mismatch should trigger recompute, got count={count_v2}"
+    )
+
+    cursor = conn.execute(
+        "SELECT engine_version FROM papertrade_signals_closure WHERE signal_id = ?",
+        ("sig_version",)
+    )
+    assert cursor.fetchone()[0] == "v2", "Closure row should now be stamped with v2"
+
+    conn.close()
+
+
+def test_compute_closures_for_window_default_db_path_no_crash():
+    """Regression test for the E7-S19 class of bug: an explicit db_path=None
+    forwarded straight into price_cache.get_price_data overrides its own
+    real default and crashes deep inside price_cache._get_conn. Exercises
+    compute_closures_for_window's default (db_path omitted) against an
+    in-memory DB with zero matching papertrade_signals rows, so the loop
+    body never actually reaches price_cache.get_price_data -- but the
+    function's own default-resolution logic still runs for real, unmocked.
+    """
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    count = compute_closures_for_window(
+        conn, "2026-01-01", "2026-01-31", interval_ladder=["1h"],
+        engine_version="v1",
+        # db_path intentionally omitted
+    )
+
+    assert count == 0
+    conn.close()
+
+
+def test_compute_closures_for_window_default_db_path_resolves_to_real_string():
+    """Verifies the resolved db_path actually passed to price_cache is
+    price_cache.DB_PATH (a real string), never a literal None -- the precise
+    mechanism behind the E7-S19 bug class, checked directly rather than only
+    inferred from the no-crash smoke test above."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+    _insert_papertrade_signal(
+        conn, signal_id="sig_dbpath", as_of="2026-08-01",
+        entry=100.0, stop=95.0, target=105.0, direction="long",
+    )
+
+    dates = pd.date_range(start="2026-08-01T00:00:00", periods=1, freq="h", tz="UTC")
+    bars_df = pd.DataFrame({
+        "Open": [106.0], "High": [107.0], "Low": [105.5], "Close": [106.5],
+        "Volume": [1000],
+    }, index=dates)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+        compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-31", interval_ladder=["1h"],
+            engine_version="v1",
+            # db_path intentionally omitted -- must resolve to price_cache.DB_PATH
+        )
+
+    assert mock_get.call_count > 0, "Expected price_cache.get_price_data to be called"
+    for call in mock_get.call_args_list:
+        called_db_path = call.kwargs.get("db_path")
+        assert called_db_path is not None, "db_path must not be forwarded as None"
+        assert called_db_path == price_cache.DB_PATH
+
+    conn.close()

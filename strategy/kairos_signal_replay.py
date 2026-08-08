@@ -14,9 +14,31 @@ plan.
 import hashlib
 import json
 from datetime import datetime, timezone, timedelta
+from typing import Any
 
 import pandas as pd
 import price_cache  # type: ignore
+
+from kairos_backtest import BacktestEngine, Direction
+
+# Forward window used when re-fetching bars for closure computation, matching
+# resolve_interval_for_signal's own forward window (kept as a separate literal
+# rather than a shared import so this module's two 30-day windows can diverge
+# independently if a future story needs that).
+_CLOSURE_FORWARD_DAYS = 30
+
+# _check_exit's real contract (confirmed against strategy/kairos_backtest.py's
+# current source, ~line 1997) is NOT "returns (None, None) to keep walking" as
+# an earlier draft of the design doc assumed -- it ALWAYS returns a resolved
+# (price, reason) tuple for whatever single bar it's given, falling back to
+# ("close" price, "close") when neither a gap-through nor an intrabar
+# stop/target touch occurred. That fallback exists because BacktestEngine.run()
+# only ever calls it once, against the very next bar, and forces the position
+# closed either way. Closure computation instead has many forward bars
+# available, so "close" is treated as NON-terminal here (keep walking to the
+# next bar) and only a genuine stop/target/gap exit ends the walk. See
+# DESIGN_DOC_offline_signal_replay.md §3.3.
+_TERMINAL_EXIT_REASONS = frozenset({"stop_open", "target_open", "stop", "target"})
 
 
 def _ensure_signal_replay_tables(conn) -> None:
@@ -365,3 +387,257 @@ def max_adverse_excursion_pct(direction: str, entry_price: float, bars: pd.DataF
 
     # Return the magnitude as a positive percentage, or 0.0 if never underwater
     return abs(worst_pct_move) if worst_pct_move < 0.0 else 0.0
+
+
+def _write_disqualified_closure(conn, signal_id: str, engine_version: str, computed_at: str) -> None:
+    """Write a resolved=0 papertrade_signals_closure row for signal_id.
+
+    Per DESIGN_DOC_offline_signal_replay.md §3.1: a disqualified signal is a
+    real, present row marked unresolved, not a silently absent one. Every
+    column besides signal_id/resolved/engine_version/computed_at is NULL.
+    """
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO papertrade_signals_closure (
+            signal_id, resolved, interval_used, pct_profit, max_drawdown_pct,
+            trigger_datetime, exit_datetime, exit_reason, computed_at, engine_version
+        ) VALUES (?, 0, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+        """,
+        (signal_id, computed_at, engine_version)
+    )
+    conn.commit()
+
+
+def compute_closure(
+    conn,
+    signal_row: dict[str, Any],
+    interval_ladder: list[str],
+    fee_pct: float,
+    slippage_pct: float,
+    db_path: str,
+    engine_version: str,
+) -> None:
+    """Resolve and persist one papertrade_signals row's isolated outcome.
+
+    Reuses BacktestEngine's private, predictor-free _check_exit/_calculate_pnl
+    primitives (see DESIGN_DOC_offline_signal_replay.md §3.3) to resolve an
+    ALREADY-DECIDED signal (entry/stop/target/direction from signal_row)
+    against forward price bars -- no prediction/routing step, since the
+    decision is already made.
+
+    signal_row must provide: signal_id, ticker, direction ("long"/"short",
+    case-insensitive), entry, stop, target, and as_of. papertrade_signals has
+    no separate "entry_datetime" column; as_of (the signal-generation
+    timestamp, per the table's own schema comment) is parsed as the entry
+    datetime and used as the start of the forward bar-fetch window.
+
+    Writes exactly one papertrade_signals_closure row (INSERT OR REPLACE
+    keyed on signal_id):
+    - resolved=0, every other column NULL (except engine_version/computed_at)
+      if resolve_interval_for_signal finds no usable interval, OR if the
+      forward-bar walk exhausts every fetched bar without a genuine
+      stop/target/gap exit (see _TERMINAL_EXIT_REASONS above for why "close"
+      alone does not count as resolving -- both are documented disqualification
+      paths, not errors).
+    - resolved=1 with interval_used/pct_profit/max_drawdown_pct/
+      trigger_datetime/exit_datetime/exit_reason populated otherwise.
+
+    Args:
+        conn: sqlite3 connection to pipeline_results.db (tables assumed to
+            already exist, e.g. via compute_closures_for_window)
+        signal_row: mapping with the fields described above (a papertrade_signals
+            row, as a dict)
+        interval_ladder: intervals to try, smallest-first (passed through to
+            resolve_interval_for_signal)
+        fee_pct: flat fee fraction of notional, per BacktestEngine's own
+            cost convention (NOT phantom's per-broker model -- see §3.3)
+        slippage_pct: flat slippage fraction, same convention
+        db_path: price_cache SQLite database path
+        engine_version: cache-busting tag; stored on the written row so a
+            future bump forces recompute (see compute_closures_for_window)
+    """
+    signal_id = signal_row["signal_id"]
+    ticker = signal_row["ticker"]
+    direction_str = str(signal_row["direction"]).lower()
+    entry = float(signal_row["entry"])
+    stop = float(signal_row["stop"])
+    target = float(signal_row["target"])
+    entry_datetime = pd.to_datetime(signal_row["as_of"])
+
+    computed_at = datetime.now(timezone.utc).isoformat()
+
+    resolved_interval = resolve_interval_for_signal(
+        ticker=ticker,
+        entry_datetime=entry_datetime,
+        interval_ladder=interval_ladder,
+        db_path=db_path,
+    )
+    if resolved_interval is None:
+        _write_disqualified_closure(conn, signal_id, engine_version, computed_at)
+        return
+
+    end_datetime = entry_datetime + timedelta(days=_CLOSURE_FORWARD_DAYS)
+    try:
+        bars = price_cache.get_price_data(
+            ticker,
+            start_date=entry_datetime.date().isoformat(),
+            end_date=end_datetime.date().isoformat(),
+            interval=resolved_interval,
+            db_path=db_path,
+        )
+    except Exception:
+        bars = None
+
+    if bars is None or bars.empty:
+        # resolve_interval_for_signal just confirmed sufficient bars exist at
+        # this interval/window; an empty refetch here is unexpected, but the
+        # safe response is the same disqualification path, not a crash.
+        _write_disqualified_closure(conn, signal_id, engine_version, computed_at)
+        return
+
+    direction = Direction.LONG if direction_str == "long" else Direction.SHORT
+    position_size = 1.0  # isolated per-signal PnL; pct_profit is size-invariant
+    position: dict[str, Any] = {
+        "direction": direction,
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "size": position_size,
+    }
+    engine = BacktestEngine(predictor=None, fee_pct=fee_pct, slippage_pct=slippage_pct)  # type: ignore[arg-type]
+
+    worst_pct_move = 0.0  # max adverse excursion bookkeeping, same loop, no second pass
+    exit_price: float | None = None
+    exit_reason: str | None = None
+    exit_timestamp: pd.Timestamp | None = None
+
+    for ts, row in bars.iterrows():
+        low = float(row["Low"])
+        high = float(row["High"])
+
+        if direction == Direction.LONG:
+            pct_move = (low - entry) / entry * 100.0
+        else:
+            pct_move = (entry - high) / entry * 100.0
+        if pct_move < worst_pct_move:
+            worst_pct_move = pct_move
+
+        # _check_exit reads lowercase open/high/low/close (its own internal
+        # convention) -- price_cache returns capitalized Open/High/Low/Close,
+        # so the bar is rebuilt with lowercase keys before being handed over.
+        bar = pd.Series({
+            "open": float(row["Open"]),
+            "high": high,
+            "low": low,
+            "close": float(row["Close"]),
+        })
+        candidate_price, candidate_reason = engine._check_exit(position, bar)
+        if candidate_reason in _TERMINAL_EXIT_REASONS:
+            exit_price = candidate_price
+            exit_reason = candidate_reason
+            exit_timestamp = ts
+            break
+
+    if exit_price is None or exit_reason is None or exit_timestamp is None:
+        # Bars ran out without a genuine stop/target/gap exit -- disqualified,
+        # same path as an interval-resolution failure (documented choice,
+        # per this story's acceptance criteria).
+        _write_disqualified_closure(conn, signal_id, engine_version, computed_at)
+        return
+
+    pnl = engine._calculate_pnl(position, exit_price)
+    # Trade.pnl_pct's own convention (BacktestEngine.run(), same file):
+    # pnl / (entry_price * size).
+    pct_profit = pnl / (entry * position_size)
+    max_drawdown_pct = abs(worst_pct_move) if worst_pct_move < 0.0 else 0.0
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO papertrade_signals_closure (
+            signal_id, resolved, interval_used, pct_profit, max_drawdown_pct,
+            trigger_datetime, exit_datetime, exit_reason, computed_at, engine_version
+        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            signal_id,
+            resolved_interval,
+            pct_profit,
+            max_drawdown_pct,
+            entry_datetime.isoformat(),
+            exit_timestamp.isoformat(),
+            exit_reason,
+            computed_at,
+            engine_version,
+        )
+    )
+    conn.commit()
+
+
+def compute_closures_for_window(
+    conn,
+    start_date: str,
+    end_date: str,
+    interval_ladder: list[str],
+    engine_version: str,
+    fee_pct: float = 0.001,
+    slippage_pct: float = 0.0005,
+    db_path: str | None = None,
+) -> int:
+    """Compute closures for every papertrade_signals row in [start_date, end_date]
+    that needs one: no closure row yet, or its closure row's engine_version
+    doesn't match the current engine_version (forces recompute, mirroring
+    signals_cache/kairos_predcache's own fingerprint-based invalidation).
+
+    db_path defaults to None here so the common call site doesn't have to name
+    price_cache.DB_PATH explicitly, but None is resolved to the real default
+    BEFORE being passed to compute_closure/price_cache -- forwarding a literal
+    None through would override price_cache.get_price_data's own db_path
+    default and crash inside price_cache._get_conn (this is the exact bug
+    class E7-S19 hit).
+
+    Args:
+        conn: sqlite3 connection to pipeline_results.db
+        start_date: ISO date string, inclusive (compared against as_of)
+        end_date: ISO date string, inclusive
+        interval_ladder: intervals to try per signal, smallest-first
+        engine_version: current engine version tag; rows stamped with a
+            different (or missing) engine_version are recomputed
+        fee_pct: flat fee fraction, passed through to compute_closure
+        slippage_pct: flat slippage fraction, passed through
+        db_path: price_cache SQLite database path, or None to use
+            price_cache.DB_PATH
+
+    Returns:
+        Count of papertrade_signals rows for which compute_closure was called
+    """
+    _ensure_signal_replay_tables(conn)
+    resolved_db_path = db_path if db_path is not None else price_cache.DB_PATH
+
+    cursor = conn.execute(
+        """
+        SELECT s.signal_id, s.ticker, s.direction, s.entry, s.stop, s.target, s.as_of
+        FROM papertrade_signals s
+        LEFT JOIN papertrade_signals_closure c ON s.signal_id = c.signal_id
+        WHERE s.as_of >= ? AND s.as_of <= ?
+          AND (c.signal_id IS NULL OR c.engine_version != ?)
+        """,
+        (start_date, end_date, engine_version)
+    )
+    rows = cursor.fetchall()
+
+    for signal_id, ticker, direction, entry, stop, target, as_of in rows:
+        signal_row = {
+            "signal_id": signal_id,
+            "ticker": ticker,
+            "direction": direction,
+            "entry": entry,
+            "stop": stop,
+            "target": target,
+            "as_of": as_of,
+        }
+        compute_closure(
+            conn, signal_row, interval_ladder, fee_pct, slippage_pct,
+            resolved_db_path, engine_version,
+        )
+
+    return len(rows)
