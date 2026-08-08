@@ -35,4 +35,35 @@ Ordered by dependency. Check off an item only in the same commit that completes 
 
 ---
 
+# Kairos Offline Signal Replay — Implementation Todo
+
+Ordered by dependency. Check off an item only in the same commit that completes it.
+Source design: `docs/tickets/DESIGN_DOC_offline_signal_replay.md`. **Unleveraged only** —
+see that document's §1/§4 for the explicit phase-scope boundary.
+
+## Epic 6 — Schema & signal ingestion
+
+- [x] E6-S17 Create papertrade_signals / papertrade_signals_closure schema (docs/tickets/E6-S17-signal-replay-schema.md)
+- [ ] E6-S18 Populate papertrade_signals by unpacking signals_cache (docs/tickets/E6-S18-precompute-unpack-signals-cache.md)
+
+## Epic 7 — Interval selection & closure computation
+
+- [ ] E7-S19 Interval-ladder resolution & disqualification (docs/tickets/E7-S19-interval-ladder-disqualification.md)
+- [ ] E7-S20 Max adverse excursion (per-signal isolated drawdown) pure function (docs/tickets/E7-S20-max-adverse-excursion.md)
+- [ ] E7-S21 Closure computation pipeline (docs/tickets/E7-S21-closure-computation-pipeline.md)
+
+## Epic 8 — Offline allocation replay loop
+
+- [ ] E8-S22 Data-driven replay step grid & per-step candidate loading (docs/tickets/E8-S22-replay-step-grid-and-loading.md)
+- [ ] E8-S23 Replay loop core, unleveraged (docs/tickets/E8-S23-replay-loop-core.md)
+
+## Epic 9 — CLI & closeout
+
+- [ ] E9-S24 CLI wiring: --precompute / --replay (docs/tickets/E9-S24-cli-wiring.md)
+- [ ] E9-S25 Dedicated cache-reuse & engine_version-bump regression tests (docs/tickets/E9-S25-cache-reuse-tests.md)
+- [ ] E9-S26 Document non-goals in --help and module docstring (docs/tickets/E9-S26-docs-non-goals.md)
+- [ ] E9-S27 End-to-end integration smoke test (docs/tickets/E9-S27-integration-smoke-test.md)
+
+---
+
 See `docs/tickets/APPENDIX-A-standards.md` for code style, test conventions, and commit rules that apply to every story.
