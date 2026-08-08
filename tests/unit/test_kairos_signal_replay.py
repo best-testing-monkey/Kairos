@@ -21,6 +21,8 @@ from kairos_signal_replay import (
     max_adverse_excursion_pct,
     compute_closure,
     compute_closures_for_window,
+    replay_steps,
+    load_step_candidates,
 )
 
 
@@ -1094,5 +1096,409 @@ def test_compute_closures_for_window_default_db_path_resolves_to_real_string():
         called_db_path = call.kwargs.get("db_path")
         assert called_db_path is not None, "db_path must not be forwarded as None"
         assert called_db_path == price_cache.DB_PATH
+
+    conn.close()
+
+
+# ==============================================================================
+# Tests for replay_steps and load_step_candidates (E8-S22)
+# ==============================================================================
+
+
+def test_replay_steps_returns_sorted_distinct_as_of():
+    """Verify replay_steps returns SORTED, DISTINCT as_of values for an interval
+    within a date range (inclusive on both ends)."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    # Insert signals at various as_of values
+    as_of_values = ["2026-08-05", "2026-08-03", "2026-08-07", "2026-08-05", "2026-08-04"]
+    for i, as_of in enumerate(as_of_values):
+        conn.execute(
+            """
+            INSERT INTO papertrade_signals (
+                signal_id, strategy_name, ticker, direction, interval, as_of,
+                entry, stop, target, expected_value, base_win_rate, n,
+                model_label, checkpoint_fingerprint, source_cache_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (f"sig_{i}", "test_strategy", "AAPL", "long", "1d", as_of,
+             100.0, 95.0, 105.0, None, None, None, "base", "", None,
+             "2026-08-01T00:00:00Z")
+        )
+    conn.commit()
+
+    result = replay_steps(conn, "1d", "2026-08-03", "2026-08-07")
+
+    # Should return sorted, distinct values in the range
+    expected = ["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-07"]
+    assert result == expected, (
+        f"Expected {expected}, got {result}"
+    )
+
+    conn.close()
+
+
+def test_replay_steps_respects_interval_filter():
+    """Verify replay_steps only returns as_of values for the specified interval."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    # Insert signals at different intervals
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals (
+            signal_id, strategy_name, ticker, direction, interval, as_of,
+            entry, stop, target, expected_value, base_win_rate, n,
+            model_label, checkpoint_fingerprint, source_cache_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("sig_1h", "test_strategy", "AAPL", "long", "1h", "2026-08-05T10:00:00",
+         100.0, 95.0, 105.0, None, None, None, "base", "", None,
+         "2026-08-01T00:00:00Z")
+    )
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals (
+            signal_id, strategy_name, ticker, direction, interval, as_of,
+            entry, stop, target, expected_value, base_win_rate, n,
+            model_label, checkpoint_fingerprint, source_cache_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("sig_1d", "test_strategy", "BTC-USD", "short", "1d", "2026-08-05",
+         50000.0, 49000.0, 51000.0, None, None, None, "base", "", None,
+         "2026-08-01T00:00:00Z")
+    )
+    conn.commit()
+
+    # Query only 1d interval
+    result_1d = replay_steps(conn, "1d", "2026-08-01", "2026-08-31")
+    assert result_1d == ["2026-08-05"], (
+        f"Expected ['2026-08-05'] for 1d, got {result_1d}"
+    )
+
+    # Query only 1h interval
+    result_1h = replay_steps(conn, "1h", "2026-08-01", "2026-08-31")
+    assert result_1h == ["2026-08-05T10:00:00"], (
+        f"Expected ['2026-08-05T10:00:00'] for 1h, got {result_1h}"
+    )
+
+    conn.close()
+
+
+def test_replay_steps_non_daily_spaced_timestamps():
+    """Test that replay_steps returns EXACTLY the non-daily-spaced timestamps
+    present in the data, proving the step grid is data-driven and not a
+    synthesized daily range.
+
+    This is a key test from the acceptance criteria: signals at 1h interval
+    with timestamps a few hours apart, not calendar-day-spaced. The function
+    should return exactly those timestamps in sorted order."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    # Insert 1h signals at non-daily-spaced times
+    as_of_values = [
+        "2026-08-01T09:00:00",
+        "2026-08-01T14:00:00",
+        "2026-08-02T03:00:00",
+    ]
+    for i, as_of in enumerate(as_of_values):
+        conn.execute(
+            """
+            INSERT INTO papertrade_signals (
+                signal_id, strategy_name, ticker, direction, interval, as_of,
+                entry, stop, target, expected_value, base_win_rate, n,
+                model_label, checkpoint_fingerprint, source_cache_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (f"sig_1h_{i}", "test_strategy", "AAPL", "long", "1h", as_of,
+             100.0, 95.0, 105.0, None, None, None, "base", "", None,
+             "2026-08-01T00:00:00Z")
+        )
+    conn.commit()
+
+    result = replay_steps(conn, "1h", "2026-08-01T00:00:00", "2026-08-03T00:00:00")
+
+    # Should return exactly the as_of values present, in sorted order
+    assert result == as_of_values, (
+        f"Expected {as_of_values}, got {result}"
+    )
+
+    conn.close()
+
+
+def test_load_step_candidates_only_resolved_signals():
+    """Test that load_step_candidates returns ONLY resolved signals (resolved=1),
+    excluding unresolved (resolved=0) and signals with no closure row at all."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    # Insert signals with different resolution states
+    signal_ids = ["sig_resolved1", "sig_resolved2", "sig_unresolved", "sig_no_closure"]
+
+    for i, sig_id in enumerate(signal_ids):
+        conn.execute(
+            """
+            INSERT INTO papertrade_signals (
+                signal_id, strategy_name, ticker, direction, interval, as_of,
+                entry, stop, target, expected_value, base_win_rate, n,
+                model_label, checkpoint_fingerprint, source_cache_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (sig_id, "test_strategy", f"TICKER{i}", "long", "1d", "2026-08-05",
+             100.0, 95.0, 105.0, 1.5, 0.6, 10, "base", "", None,
+             "2026-08-01T00:00:00Z")
+        )
+
+    # Add closure rows for some
+    # sig_resolved1: resolved=1
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals_closure (
+            signal_id, resolved, interval_used, pct_profit, max_drawdown_pct,
+            trigger_datetime, exit_datetime, exit_reason, computed_at, engine_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("sig_resolved1", 1, "1d", 5.2, 2.1, "2026-08-05T00:00:00Z",
+         "2026-08-06T00:00:00Z", "target", "2026-08-01T00:00:00Z", "v1")
+    )
+
+    # sig_resolved2: resolved=1
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals_closure (
+            signal_id, resolved, interval_used, pct_profit, max_drawdown_pct,
+            trigger_datetime, exit_datetime, exit_reason, computed_at, engine_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("sig_resolved2", 1, "1d", 3.1, 1.5, "2026-08-05T00:00:00Z",
+         "2026-08-07T00:00:00Z", "target", "2026-08-01T00:00:00Z", "v1")
+    )
+
+    # sig_unresolved: resolved=0
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals_closure (
+            signal_id, resolved, interval_used, pct_profit, max_drawdown_pct,
+            trigger_datetime, exit_datetime, exit_reason, computed_at, engine_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("sig_unresolved", 0, None, None, None, None, None, None, "2026-08-01T00:00:00Z", "v1")
+    )
+
+    # sig_no_closure: no closure row at all
+
+    conn.commit()
+
+    result = load_step_candidates(conn, "1d", "2026-08-05")
+
+    # Should return exactly 2 pairs (the resolved ones)
+    assert len(result) == 2, (
+        f"Expected 2 resolved candidates, got {len(result)}"
+    )
+
+    # Verify the returned candidates are the resolved ones
+    tickers = [stats_row["symbol"] for stats_row, _ in result]
+    assert "TICKER0" in tickers, "sig_resolved1 should be included"
+    assert "TICKER1" in tickers, "sig_resolved2 should be included"
+    assert "TICKER2" not in tickers, "sig_unresolved should not be included"
+    assert "TICKER3" not in tickers, "sig_no_closure should not be included"
+
+    conn.close()
+
+
+def test_load_step_candidates_dict_structure_and_values():
+    """Test that load_step_candidates returns dicts with the correct structure
+    and values for feeding into fetch_signals."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    # Insert one signal with known values
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals (
+            signal_id, strategy_name, ticker, direction, interval, as_of,
+            entry, stop, target, expected_value, base_win_rate, n,
+            model_label, checkpoint_fingerprint, source_cache_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("sig_test", "test_strategy", "AAPL", "short", "1d", "2026-08-05",
+         100.0, 105.0, 95.0, 2.5, 0.65, 15, "base", "", None,
+         "2026-08-01T00:00:00Z")
+    )
+
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals_closure (
+            signal_id, resolved, interval_used, pct_profit, max_drawdown_pct,
+            trigger_datetime, exit_datetime, exit_reason, computed_at, engine_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("sig_test", 1, "1d", 3.2, 1.8, "2026-08-05T00:00:00Z",
+         "2026-08-06T12:00:00Z", "target", "2026-08-01T00:00:00Z", "v1")
+    )
+
+    conn.commit()
+
+    result = load_step_candidates(conn, "1d", "2026-08-05")
+
+    assert len(result) == 1
+    stats_row, advice_row = result[0]
+
+    # Verify stats_row structure
+    assert "strategy" in stats_row
+    assert "symbol" in stats_row
+    assert "direction" in stats_row
+    assert "entry" in stats_row
+    assert "stop" in stats_row
+    assert "target" in stats_row
+    assert "expected_value" in stats_row
+    assert "base_win_rate" in stats_row
+
+    # Verify stats_row values
+    assert stats_row["strategy"] == "test_strategy"
+    assert stats_row["symbol"] == "AAPL"
+    assert stats_row["direction"] == "short"
+    assert stats_row["entry"] == 100.0
+    assert stats_row["stop"] == 105.0
+    assert stats_row["target"] == 95.0
+    assert stats_row["expected_value"] == 2.5
+    assert stats_row["base_win_rate"] == 0.65
+
+    # Verify advice_row structure
+    assert "expected_value" in advice_row
+    assert "entry" in advice_row
+    assert "base_win_rate" in advice_row
+    assert "base_signals" in advice_row
+    assert "oracle_signals" in advice_row
+    assert "signal" in advice_row
+
+    # Verify advice_row values
+    assert advice_row["expected_value"] == 2.5
+    assert advice_row["entry"] == 100.0
+    assert advice_row["base_win_rate"] == 0.65
+    assert advice_row["base_signals"] == 15
+    assert advice_row["oracle_signals"] is None
+    assert "AAPL" in advice_row["signal"]
+    assert "short" in advice_row["signal"]
+
+    conn.close()
+
+
+def test_load_step_candidates_integration_with_fetch_signals():
+    """Integration test: verify that load_step_candidates' output dicts work
+    correctly when passed to strategy/allocation.py's fetch_signals function.
+
+    This confirms the dict structure is exactly what fetch_signals expects."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    # Insert a few signals with different characteristics
+    signals = [
+        {
+            "signal_id": "sig_long_1",
+            "strategy_name": "TestStrategy1",
+            "ticker": "AAPL",
+            "direction": "long",
+            "interval": "1d",
+            "as_of": "2026-08-05",
+            "entry": 150.0,
+            "stop": 145.0,
+            "target": 160.0,
+            "expected_value": 3.5,
+            "base_win_rate": 0.62,
+            "n": 20,
+        },
+        {
+            "signal_id": "sig_short_1",
+            "strategy_name": "TestStrategy2",
+            "ticker": "MSFT",
+            "direction": "short",
+            "interval": "1d",
+            "as_of": "2026-08-05",
+            "entry": 400.0,
+            "stop": 410.0,
+            "target": 390.0,
+            "expected_value": 2.1,
+            "base_win_rate": 0.55,
+            "n": 12,
+        },
+    ]
+
+    for sig in signals:
+        conn.execute(
+            """
+            INSERT INTO papertrade_signals (
+                signal_id, strategy_name, ticker, direction, interval, as_of,
+                entry, stop, target, expected_value, base_win_rate, n,
+                model_label, checkpoint_fingerprint, source_cache_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (sig["signal_id"], sig["strategy_name"], sig["ticker"],
+             sig["direction"], sig["interval"], sig["as_of"],
+             sig["entry"], sig["stop"], sig["target"],
+             sig["expected_value"], sig["base_win_rate"], sig["n"],
+             "base", "", None, "2026-08-01T00:00:00Z")
+        )
+
+        # Add resolved closure row
+        conn.execute(
+            """
+            INSERT INTO papertrade_signals_closure (
+                signal_id, resolved, interval_used, pct_profit, max_drawdown_pct,
+                trigger_datetime, exit_datetime, exit_reason, computed_at, engine_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (sig["signal_id"], 1, "1d", 2.0, 1.5, "2026-08-05T00:00:00Z",
+             "2026-08-06T00:00:00Z", "target", "2026-08-01T00:00:00Z", "v1")
+        )
+
+    conn.commit()
+
+    # Load candidates
+    result = load_step_candidates(conn, "1d", "2026-08-05")
+
+    assert len(result) == 2, f"Expected 2 candidates, got {len(result)}"
+
+    # Extract stats_rows and advice_rows
+    stats_rows = [stats_row for stats_row, _ in result]
+    advice_rows = [advice_row for _, advice_row in result]
+
+    # Import fetch_signals from allocation
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
+    from allocation import fetch_signals
+
+    # Call fetch_signals with the loaded candidates
+    # This is the integration check: if the dict structure is wrong, fetch_signals
+    # will fail or produce incorrect results.
+    candidates = fetch_signals(stats_rows, advice_rows)
+
+    # Verify candidates were successfully created
+    assert len(candidates) == 2, (
+        f"fetch_signals should produce 2 Candidate objects, got {len(candidates)}"
+    )
+
+    # Verify first candidate (long AAPL)
+    c1 = candidates[0]
+    assert c1.ticker == "AAPL"
+    assert c1.direction == "long"
+    assert c1.entry == 150.0
+    assert c1.stop == 145.0
+    assert c1.target == 160.0
+    assert c1.base_win_rate == 0.62
+    assert c1.n == 20
+    assert c1.strategy == "TestStrategy1"
+
+    # Verify second candidate (short MSFT)
+    c2 = candidates[1]
+    assert c2.ticker == "MSFT"
+    assert c2.direction == "short"
+    assert c2.entry == 400.0
+    assert c2.stop == 410.0
+    assert c2.target == 390.0
+    assert c2.base_win_rate == 0.55
+    assert c2.n == 12
+    assert c2.strategy == "TestStrategy2"
 
     conn.close()

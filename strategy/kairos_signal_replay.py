@@ -579,6 +579,149 @@ def compute_closure(
     conn.commit()
 
 
+def replay_steps(
+    conn,
+    interval: str,
+    start_ts: str,
+    end_ts: str,
+) -> list[str]:
+    """Return the SORTED, DISTINCT `as_of` values present in `papertrade_signals`
+    for the given `interval`, within `[start_ts, end_ts]` (inclusive).
+
+    Does NOT synthesize a fixed-cadence date range (no `range()`/`timedelta`
+    stepping). Only timestamps that actually have signal data appear in the result.
+
+    Per DESIGN_DOC_offline_signal_replay.md §3.4: the replay loop steps through
+    whichever distinct `as_of` timestamps actually have data, not a fixed
+    calendar-day grid. This makes the replay interval-agnostic: 1h signals
+    generate hourly step points, 1d signals generate daily step points, etc.
+
+    Args:
+        conn: sqlite3 connection to pipeline_results.db
+        interval: interval string (e.g. "1h", "4h", "1d") to filter on
+        start_ts: start timestamp (inclusive), string comparison
+        end_ts: end timestamp (inclusive), string comparison
+
+    Returns:
+        Sorted list of distinct as_of values (strings) that have papertrade_signals
+        rows in the given interval and window
+    """
+    cursor = conn.execute(
+        """
+        SELECT DISTINCT as_of FROM papertrade_signals
+        WHERE interval = ? AND as_of >= ? AND as_of <= ?
+        ORDER BY as_of
+        """,
+        (interval, start_ts, end_ts)
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+
+def load_step_candidates(
+    conn,
+    interval: str,
+    as_of: str,
+) -> list[tuple[dict, dict]]:
+    """Load (stats_row, advice_row) dict pairs for a single replay step.
+
+    Returns pairs for every `papertrade_signals` row at the given `(interval, as_of)`
+    that has a corresponding `papertrade_signals_closure` row with `resolved=1`
+    (INNER JOIN semantics). Rows with no closure row or with `resolved=0` are
+    EXCLUDED entirely — not included with null/zero stats.
+
+    Each `stats_row` dict has keys matching `strategy/allocation.py`'s
+    `fetch_signals` expectations:
+    - strategy (from papertrade_signals.strategy_name)
+    - symbol (from papertrade_signals.ticker)
+    - direction (from papertrade_signals.direction)
+    - entry
+    - stop
+    - target
+    - expected_value
+    - base_win_rate
+
+    Each `advice_row` dict has keys:
+    - expected_value (same as stats_row's)
+    - entry (same as stats_row's)
+    - base_win_rate (same as stats_row's)
+    - base_signals (from papertrade_signals.n)
+    - oracle_signals (None — this table only stores one n value, not separate
+                      base/oracle counts, per the design decision in E8-S22)
+    - signal (a short descriptive string for clarity, e.g. "replay AAPL long")
+
+    Per DESIGN_DOC_offline_signal_replay.md §3.2: unresolved signals are truly
+    absent from the replay loop's point of view, not included with fabricated
+    or interpolated stats. This reflects the disqualification rule: a signal
+    with no resolved closure is not tradeable at this step.
+
+    Args:
+        conn: sqlite3 connection to pipeline_results.db
+        interval: interval string (e.g. "1h", "4h", "1d") to filter on
+        as_of: as_of timestamp to load for (string)
+
+    Returns:
+        List of (stats_row, advice_row) tuples, where each tuple represents
+        one tradeable candidate at this step. Returns empty list if no resolved
+        signals exist at this (interval, as_of).
+    """
+    # INNER JOIN ensures we only get signals with resolved=1 closure rows
+    cursor = conn.execute(
+        """
+        SELECT
+            s.strategy_name,
+            s.ticker,
+            s.direction,
+            s.entry,
+            s.stop,
+            s.target,
+            s.expected_value,
+            s.base_win_rate,
+            s.n
+        FROM papertrade_signals s
+        INNER JOIN papertrade_signals_closure c ON s.signal_id = c.signal_id
+        WHERE s.interval = ? AND s.as_of = ? AND c.resolved = 1
+        ORDER BY s.signal_id
+        """,
+        (interval, as_of)
+    )
+
+    results = []
+    for (strategy_name, ticker, direction, entry, stop, target,
+         expected_value, base_win_rate, n_value) in cursor.fetchall():
+
+        # Build stats_row
+        stats_row = {
+            "strategy": strategy_name,
+            "symbol": ticker,
+            "direction": direction,
+            "entry": entry,
+            "stop": stop,
+            "target": target,
+            "expected_value": expected_value,
+            "base_win_rate": base_win_rate,
+        }
+
+        # Build advice_row
+        # base_signals comes from papertrade_signals.n (the signal count from
+        # the original kairos_signals run — either base_signals or oracle_signals,
+        # whichever was available; see kairos_signal_replay.py's
+        # unpack_signals_cache_to_papertrade_signals function).
+        # oracle_signals is None because this table only stores one count, not
+        # separate base/oracle versions.
+        advice_row = {
+            "expected_value": expected_value,
+            "entry": entry,
+            "base_win_rate": base_win_rate,
+            "base_signals": n_value,
+            "oracle_signals": None,
+            "signal": f"replay {ticker} {direction}",
+        }
+
+        results.append((stats_row, advice_row))
+
+    return results
+
+
 def compute_closures_for_window(
     conn,
     start_date: str,
