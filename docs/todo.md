@@ -60,7 +60,7 @@ see that document's §1/§4 for the explicit phase-scope boundary.
 ## Epic 9 — CLI & closeout
 
 - [x] E9-S24 CLI wiring: --precompute / --replay (docs/tickets/E9-S24-cli-wiring.md)
-- [ ] E9-S25 Dedicated cache-reuse & engine_version-bump regression tests (docs/tickets/E9-S25-cache-reuse-tests.md)
+- [x] E9-S25 Dedicated cache-reuse & engine_version-bump regression tests (docs/tickets/E9-S25-cache-reuse-tests.md)
 - [ ] E9-S26 Document non-goals in --help and module docstring (docs/tickets/E9-S26-docs-non-goals.md)
 - [ ] E9-S27 End-to-end integration smoke test (docs/tickets/E9-S27-integration-smoke-test.md)
 

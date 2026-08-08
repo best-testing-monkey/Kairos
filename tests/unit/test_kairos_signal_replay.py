@@ -1865,3 +1865,277 @@ class TestBuildArgParser:
             "--precompute", "--start", "2026-08-01", "--end", "2026-08-07"
         ])
         assert args.capital is None
+
+
+# ==============================================================================
+# E9-S25: Dedicated cache-reuse & engine_version-bump regression tests
+# ==============================================================================
+
+
+def test_precompute_is_idempotent():
+    """Dedicated idempotency test for the full precompute pipeline.
+
+    Calls BOTH unpack_signals_cache_to_papertrade_signals AND
+    compute_closures_for_window twice over the exact same window and data,
+    asserting:
+    - The SECOND pass inserts/recomputes zero rows (both functions return 0)
+    - created_at timestamps on papertrade_signals rows are UNCHANGED between passes
+    - computed_at timestamps on papertrade_signals_closure rows are UNCHANGED between passes
+
+    Per DESIGN_DOC_offline_signal_replay.md §5 (Testing plan, "Cache reuse" row):
+    "Run --precompute twice over the same window | Second run touches zero new rows,
+    confirmed via row-count/`created_at` check"
+
+    This proves the cache-reuse behavior works end-to-end: both the signal
+    unpacking and closure computation phases are idempotent.
+    """
+    conn = sqlite3.connect(":memory:")
+    _build_signals_cache_table(conn)
+    _ensure_signal_replay_tables(conn)
+
+    # Build synthetic signals_cache row with one LONG signal
+    stats_json = json.dumps([
+        {
+            "strategy": "test_strategy_cache_reuse",
+            "symbol": "BTC-USD",
+            "direction": "LONG",
+            "entry": 50000.0,
+            "stop": 49000.0,
+            "target": 51000.0,
+            "expected_value": 0.8,
+            "base_win_rate": 0.62,
+        },
+    ])
+
+    advice_json = json.dumps([
+        {
+            "expected_value": 0.8,
+            "base_signals": 25,
+            "oracle_signals": 20,
+        },
+    ])
+
+    conn.execute(
+        """
+        INSERT INTO signals_cache (
+            cache_key, strategy_name, assets, interval, as_of, lookback,
+            pred_samples, min_ev_pct, model_label, model_path,
+            checkpoint_fingerprint, stats_json, advice_json, skipped_json,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("cache_key_idempotent_1", "test_strategy_cache_reuse", "BTC-USD", "1d",
+         "2026-08-07", 100, 50, 0.0, "base", None, "", stats_json,
+         advice_json, "[]", "2026-08-07T10:00:00Z")
+    )
+    conn.commit()
+
+    # Create synthetic bars for closure computation
+    dates = pd.date_range(start="2026-08-07T00:00:00", periods=3, freq="h", tz="UTC")
+    bars_df = pd.DataFrame({
+        "Open": [50100.0, 50300.0, 50800.0],
+        "High": [50200.0, 50500.0, 51100.0],
+        "Low": [50000.0, 50200.0, 50700.0],
+        "Close": [50150.0, 50400.0, 51050.0],
+        "Volume": [100, 100, 100],
+    }, index=dates)
+
+    # ===== FIRST PASS =====
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+
+        unpacked_first = unpack_signals_cache_to_papertrade_signals(
+            conn, "2026-08-01", "2026-08-31"
+        )
+        assert unpacked_first == 1, f"First unpack should insert 1 row, got {unpacked_first}"
+
+        computed_first = compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-31", interval_ladder=["1h"],
+            engine_version="v1", db_path="/tmp/test.db",
+        )
+        assert computed_first == 1, f"First compute should process 1 signal, got {computed_first}"
+
+    # Capture timestamps after first pass
+    cursor = conn.execute(
+        "SELECT signal_id, created_at FROM papertrade_signals WHERE as_of = '2026-08-07'"
+    )
+    signal_first_pass = cursor.fetchone()
+    assert signal_first_pass is not None, "Signal should exist after first unpack"
+    signal_id, created_at_first = signal_first_pass
+
+    cursor = conn.execute(
+        "SELECT computed_at, engine_version FROM papertrade_signals_closure WHERE signal_id = ?",
+        (signal_id,)
+    )
+    closure_first_pass = cursor.fetchone()
+    assert closure_first_pass is not None, "Closure should exist after first compute"
+    computed_at_first, engine_version_first = closure_first_pass
+    assert engine_version_first == "v1"
+
+    # ===== SECOND PASS (idempotent, same window) =====
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+
+        unpacked_second = unpack_signals_cache_to_papertrade_signals(
+            conn, "2026-08-01", "2026-08-31"
+        )
+        assert unpacked_second == 0, \
+            f"Second unpack over same window should insert 0 rows, got {unpacked_second}"
+
+        computed_second = compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-31", interval_ladder=["1h"],
+            engine_version="v1", db_path="/tmp/test.db",
+        )
+        assert computed_second == 0, \
+            f"Second compute with same engine_version should compute 0 rows, got {computed_second}"
+
+    # Verify timestamps are UNCHANGED
+    cursor = conn.execute(
+        "SELECT created_at FROM papertrade_signals WHERE signal_id = ?",
+        (signal_id,)
+    )
+    created_at_second = cursor.fetchone()[0]
+    assert created_at_second == created_at_first, \
+        f"created_at should be unchanged: first={created_at_first}, second={created_at_second}"
+
+    cursor = conn.execute(
+        "SELECT computed_at, engine_version FROM papertrade_signals_closure WHERE signal_id = ?",
+        (signal_id,)
+    )
+    computed_at_second, engine_version_second = cursor.fetchone()
+    assert computed_at_second == computed_at_first, \
+        f"computed_at should be unchanged: first={computed_at_first}, second={computed_at_second}"
+    assert engine_version_second == "v1", "engine_version should remain v1"
+
+    conn.close()
+
+
+def test_engine_version_bump_forces_recompute():
+    """Dedicated test for engine_version cache invalidation.
+
+    Calls compute_closures_for_window twice with the same window but different
+    engine_version values, asserting:
+    - First call (engine_version="v1") computes closure rows
+    - Second call (engine_version="v2") recomputes EXISTING rows (count > 0)
+    - computed_at timestamp reflects the new computation time
+    - engine_version column is updated to "v2"
+
+    Per DESIGN_DOC_offline_signal_replay.md §5 (Testing plan, "engine_version
+    bump forces recompute" row): "Bump the constant, rerun --precompute |
+    Existing closure rows get recomputed, not silently left stale"
+
+    This proves that an engine_version mismatch properly invalidates and
+    recomputes cached closure rows, matching the design's cache-busting
+    pattern (similar to signals_cache/kairos_predcache's checkpoint_fingerprint).
+    """
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    # Insert a papertrade_signals row directly (bypass unpacking)
+    signal_id = "sig_engine_version_test"
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals (
+            signal_id, strategy_name, ticker, direction, interval, as_of,
+            entry, stop, target, expected_value, base_win_rate, n,
+            model_label, checkpoint_fingerprint, source_cache_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (signal_id, "test_strategy", "ETH-USD", "long", "1h", "2026-08-08T12:00:00",
+         3000.0, 2900.0, 3100.0, 1.2, 0.65, 30, "base", "", None,
+         "2026-08-08T00:00:00Z")
+    )
+    conn.commit()
+
+    # Create synthetic bars for closure computation
+    dates = pd.date_range(start="2026-08-08T12:00:00", periods=2, freq="h", tz="UTC")
+    bars_df = pd.DataFrame({
+        "Open": [3010.0, 3040.0],
+        "High": [3020.0, 3110.0],
+        "Low": [3005.0, 3035.0],
+        "Close": [3015.0, 3105.0],
+        "Volume": [50, 50],
+    }, index=dates)
+
+    # ===== FIRST CALL: engine_version="v1" =====
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+        count_v1 = compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-31", interval_ladder=["1h"],
+            engine_version="v1", db_path="/tmp/test.db",
+        )
+
+    assert count_v1 == 1, f"First call should compute 1 closure, got {count_v1}"
+
+    # Capture v1 closure state
+    cursor = conn.execute(
+        "SELECT resolved, engine_version, computed_at FROM papertrade_signals_closure "
+        "WHERE signal_id = ?",
+        (signal_id,)
+    )
+    closure_v1 = cursor.fetchone()
+    assert closure_v1 is not None, "Closure row should exist after v1 computation"
+    resolved_v1, engine_version_v1, computed_at_v1 = closure_v1
+    assert resolved_v1 == 1, "Closure should be resolved (not disqualified)"
+    assert engine_version_v1 == "v1"
+    assert computed_at_v1 is not None
+
+    # Sleep briefly to ensure computed_at timestamp differs (and to separate wall-clock time)
+    import time
+    time.sleep(0.01)
+
+    # ===== SECOND CALL: engine_version="v2" (forces recompute) =====
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+        count_v2 = compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-31", interval_ladder=["1h"],
+            engine_version="v2", db_path="/tmp/test.db",
+        )
+
+    # This is the key assertion: engine_version mismatch should force recompute
+    assert count_v2 == 1, (
+        f"engine_version bump should recompute existing row, got count={count_v2} "
+        "(expected 1 since there's 1 signal needing recompute)"
+    )
+
+    # Capture v2 closure state
+    cursor = conn.execute(
+        "SELECT resolved, engine_version, computed_at FROM papertrade_signals_closure "
+        "WHERE signal_id = ?",
+        (signal_id,)
+    )
+    closure_v2 = cursor.fetchone()
+    assert closure_v2 is not None, "Closure row should still exist after v2 recompute"
+    resolved_v2, engine_version_v2, computed_at_v2 = closure_v2
+    assert resolved_v2 == 1, "Closure should still be resolved"
+    assert engine_version_v2 == "v2", \
+        f"engine_version should be updated to v2, got {engine_version_v2}"
+    assert computed_at_v2 is not None, "computed_at should be set"
+    assert computed_at_v2 != computed_at_v1, \
+        f"computed_at should change on recompute: v1={computed_at_v1}, v2={computed_at_v2}"
+
+    # ===== THIRD CALL: engine_version="v2" again (should be idempotent) =====
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        mock_get.return_value = bars_df
+        count_v2_again = compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-31", interval_ladder=["1h"],
+            engine_version="v2", db_path="/tmp/test.db",
+        )
+
+    assert count_v2_again == 0, (
+        f"Calling with same engine_version again should be idempotent, "
+        f"got count={count_v2_again} (expected 0)"
+    )
+
+    # Verify timestamp hasn't changed
+    cursor = conn.execute(
+        "SELECT computed_at FROM papertrade_signals_closure WHERE signal_id = ?",
+        (signal_id,)
+    )
+    computed_at_v2_again = cursor.fetchone()[0]
+    assert computed_at_v2_again == computed_at_v2, (
+        f"computed_at should not change when version matches: "
+        f"expected {computed_at_v2}, got {computed_at_v2_again}"
+    )
+
+    conn.close()
