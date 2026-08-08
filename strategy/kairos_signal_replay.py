@@ -441,6 +441,9 @@ def compute_closure(
       paths, not errors).
     - resolved=1 with interval_used/pct_profit/max_drawdown_pct/
       trigger_datetime/exit_datetime/exit_reason populated otherwise.
+      pct_profit and max_drawdown_pct are both percentage NUMBERS on the same
+      scale (5.2 means 5.2%, not 0.052) -- consumers (e.g. the E8 replay
+      loop) can treat both columns identically.
 
     Args:
         conn: sqlite3 connection to pipeline_results.db (tables assumed to
@@ -546,9 +549,12 @@ def compute_closure(
         return
 
     pnl = engine._calculate_pnl(position, exit_price)
-    # Trade.pnl_pct's own convention (BacktestEngine.run(), same file):
-    # pnl / (entry_price * size).
-    pct_profit = pnl / (entry * position_size)
+    # Trade.pnl_pct's own convention (BacktestEngine.run(), same file) is a raw
+    # fraction (pnl / (entry_price * size)); scaled by 100 here so pct_profit
+    # is on the same "percentage number" scale as max_drawdown_pct below (both
+    # papertrade_signals_closure columns mean e.g. 5.2 for 5.2%, NOT 0.052 --
+    # see the schema note in this function's docstring).
+    pct_profit = pnl / (entry * position_size) * 100.0
     max_drawdown_pct = abs(worst_pct_move) if worst_pct_move < 0.0 else 0.0
 
     conn.execute(

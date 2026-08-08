@@ -822,7 +822,9 @@ def test_compute_closure_resolves_at_target_hand_computed():
     - worst_pct_move = -1.0% -> max_drawdown_pct = 1.0.
     - pnl = (exit_price - entry) * size - exit_price * size * fee_pct
           = (110 - 100) * 1.0 - 110 * 1.0 * 0.001 = 10 - 0.11 = 9.89
-    - pct_profit = pnl / (entry * size) = 9.89 / 100 = 0.0989
+    - pct_profit = pnl / (entry * size) * 100.0 = 9.89 / 100 * 100.0 = 9.89
+      (same "percentage number" scale as max_drawdown_pct, e.g. 9.89 means
+      a 9.89% gain, not 0.0989)
     """
     conn = sqlite3.connect(":memory:")
     _ensure_signal_replay_tables(conn)
@@ -867,7 +869,7 @@ def test_compute_closure_resolves_at_target_hand_computed():
 
     assert resolved == 1
     assert interval_used == "1h"
-    assert pct_profit == pytest.approx(0.0989)
+    assert pct_profit == pytest.approx(9.89)
     assert max_drawdown_pct == pytest.approx(1.0)
     assert exit_reason == "target"
     assert engine_version == "v1"
