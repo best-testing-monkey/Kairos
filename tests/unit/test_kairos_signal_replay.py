@@ -23,7 +23,9 @@ from kairos_signal_replay import (
     compute_closures_for_window,
     replay_steps,
     load_step_candidates,
+    replay,
 )
+from allocation import AllocationConfig
 
 
 def test_ensure_signal_replay_tables_creates_tables():
@@ -1500,5 +1502,206 @@ def test_load_step_candidates_integration_with_fetch_signals():
     assert c2.base_win_rate == 0.55
     assert c2.n == 12
     assert c2.strategy == "TestStrategy2"
+
+    conn.close()
+
+
+# ==============================================================================
+# Tests for replay() (E8-S23)
+# ==============================================================================
+
+
+def _insert_replay_signal(
+    conn,
+    signal_id: str,
+    strategy: str,
+    ticker: str,
+    direction: str,
+    interval: str,
+    as_of: str,
+    entry: float,
+    stop: float,
+    target: float,
+    ev_pct: float,
+    base_win_rate: float,
+    n: int,
+    pct_profit: float,
+) -> None:
+    """Helper: insert one fully-resolved (papertrade_signals +
+    papertrade_signals_closure) row pair for replay() tests.
+
+    expected_value is stored as an ABSOLUTE value (not a percentage) since
+    allocation.fetch_signals() recovers ev_pct via
+    _ev_pct_value(expected_value, entry) = expected_value / entry * 100.0 --
+    so expected_value = ev_pct * entry / 100.0 reproduces the desired ev_pct
+    exactly.
+    """
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals (
+            signal_id, strategy_name, ticker, direction, interval, as_of,
+            entry, stop, target, expected_value, base_win_rate, n,
+            model_label, checkpoint_fingerprint, source_cache_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (signal_id, strategy, ticker, direction, interval, as_of,
+         entry, stop, target, ev_pct * entry / 100.0, base_win_rate, n,
+         "base", "", None, "2026-08-01T00:00:00Z")
+    )
+    conn.execute(
+        """
+        INSERT INTO papertrade_signals_closure (
+            signal_id, resolved, interval_used, pct_profit, max_drawdown_pct,
+            trigger_datetime, exit_datetime, exit_reason, computed_at, engine_version
+        ) VALUES (?, 1, ?, ?, 0.0, ?, ?, 'target', '2026-08-01T00:00:00Z', 'v1')
+        """,
+        (signal_id, interval, pct_profit, as_of, as_of)
+    )
+    conn.commit()
+
+
+def test_replay_hand_derived_two_step_scenario():
+    """Hand-derived total_profit_eur/num_trades/pct_max_drawdown across 2
+    replay steps, each with exactly one (gating-surviving) candidate, using
+    a plain default AllocationConfig().
+
+    Step 1 (2026-08-01), candidate AAA: entry=100, stop=90, target=130 ->
+    risk_pct=10.0, reward_pct=30.0. avg_win/avg_loss are always None from
+    this replay path, so compute_derived's geometry fallback applies:
+    b = reward_pct/risk_pct = 3.0, loss_pct = risk_pct = 10.0.
+    base_win_rate=0.6, n=100, AllocationConfig defaults n0=100 ->
+    shrink = 100/(100+100) = 0.5.
+    p_shrunk = 0.5 + (0.6-0.5)*0.5 = 0.55.
+    kelly_raw = 0.55 - (1-0.55)/3.0 = 0.55 - 0.15 = 0.40.
+    kelly_frac = max(0.40, 0)*kelly_mult(0.35) = 0.14 -> alloc_raw =
+    min(14.0, max_pos_pct=15) = 14.0 (not capped).
+    ev_pct=5.0 -> ev_shrunk = 5.0*0.5 = 2.5; ev_net = 2.5 -
+    round_trip_cost_pct(0.15) = 2.35 > 0 (passes NEG_EV_NET gate); n=100 >=
+    min_n=50 (passes LOW_N gate). Sole candidate at this step -> SELECTED,
+    alloc=14.0.
+    starting_capital=1000.0 -> step_start_capital=1000.0.
+    notional = 14.0/100 * 1000.0 = 140.0.
+    closure pct_profit=10.0 (a +10% outcome) -> cash_delta =
+    140.0 * (10.0/100.0) = 14.0. capital: 1000.0 -> 1014.0.
+
+    Step 2 (2026-08-02), candidate BBB: entry=200, stop=180, target=260 ->
+    same risk_pct=10.0/reward_pct=30.0/base_win_rate=0.6/n=100/ev_pct=5.0 as
+    step 1, so identically alloc=14.0 (same math as above, price-scale
+    invariant).
+    step_start_capital = 1014.0 (running capital from step 1).
+    notional = 14.0/100 * 1014.0 = 141.96.
+    closure pct_profit=-20.0 (a -20% outcome) -> cash_delta =
+    141.96 * (-20.0/100.0) = -28.392. capital: 1014.0 -> 985.608.
+
+    Final: total_profit_eur = 985.608 - 1000.0 = -14.392.
+    pct_profit = -14.392/1000.0*100.0 = -1.4392.
+    num_trades = 2.
+    Equity curve: [1000.0, 1014.0, 985.608]. Peak-to-trough drawdown:
+    peak tracks 1000.0 -> 1014.0 (equity exceeds peak); at 985.608,
+    dd = (1014.0-985.608)/1014.0*100.0 = 28.392/1014.0*100.0 = 2.8
+    (exact, since 1014.0*0.028 == 28.392). pct_max_drawdown = 2.8.
+    """
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    _insert_replay_signal(
+        conn, signal_id="sig_aaa", strategy="S1", ticker="AAA",
+        direction="long", interval="1d", as_of="2026-08-01",
+        entry=100.0, stop=90.0, target=130.0,
+        ev_pct=5.0, base_win_rate=0.6, n=100, pct_profit=10.0,
+    )
+    _insert_replay_signal(
+        conn, signal_id="sig_bbb", strategy="S1", ticker="BBB",
+        direction="long", interval="1d", as_of="2026-08-02",
+        entry=200.0, stop=180.0, target=260.0,
+        ev_pct=5.0, base_win_rate=0.6, n=100, pct_profit=-20.0,
+    )
+
+    config = AllocationConfig()
+    result = replay(
+        conn, interval="1d", start_ts="2026-08-01", end_ts="2026-08-02",
+        alloc_config=config, starting_capital=1000.0,
+    )
+
+    assert result["total_profit_eur"] == pytest.approx(-14.392)
+    assert result["pct_profit"] == pytest.approx(-1.4392)
+    assert result["num_trades"] == 2
+    assert result["pct_max_drawdown"] == pytest.approx(2.8)
+
+    conn.close()
+
+
+def test_replay_respects_allocate_top_k_cap():
+    """More candidates than alloc_config.top_k at one step -- proves the
+    replay loop only applies the pct_profit of the row allocate() actually
+    marked SELECTED, not every candidate at that step.
+
+    Candidate AAA: entry=100, stop=90, target=140 -> risk_pct=10.0,
+    reward_pct=40.0, b=4.0 (geometry fallback), base_win_rate=0.6, n=100 ->
+    shrink=0.5, p_shrunk=0.55.
+    kelly_raw = 0.55 - 0.45/4.0 = 0.55 - 0.1125 = 0.4375.
+    kelly_frac = 0.4375*0.35 = 0.153125 -> alloc_raw = min(15.3125,
+    max_pos_pct=15) = 15.0 (POS_CAPPED, doesn't affect this test).
+    ev_pct=8.0 -> ev_net = 8.0*0.5 - 0.15 = 3.85; score = 3.85/10.0 = 0.385.
+
+    Candidate BBB: entry=50, stop=45, target=60 -> risk_pct=10.0,
+    reward_pct=20.0, b=2.0, base_win_rate=0.6, n=100 -> same shrink/p_shrunk.
+    ev_pct=2.0 -> ev_net = 2.0*0.5 - 0.15 = 0.85; score = 0.85/10.0 = 0.085.
+
+    AAA's score (0.385) > BBB's score (0.085), so with top_k=1 only AAA
+    survives ("SELECTED"); BBB is rejected as BELOW_TOPK. BBB's closure
+    pct_profit is set to a huge -50.0 -- if the replay loop wrongly applied
+    it (bypassing allocate()'s cap), num_trades would be 2 and the profit
+    would be strongly negative instead of the small positive value below.
+
+    Expected (AAA only): step_start_capital=1000.0, notional =
+    15.0/100*1000.0 = 150.0, pct_profit=5.0 -> cash_delta =
+    150.0*(5.0/100.0) = 7.5. total_profit_eur=7.5, num_trades=1.
+    """
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    _insert_replay_signal(
+        conn, signal_id="sig_aaa_topk", strategy="S1", ticker="AAA",
+        direction="long", interval="1d", as_of="2026-08-01",
+        entry=100.0, stop=90.0, target=140.0,
+        ev_pct=8.0, base_win_rate=0.6, n=100, pct_profit=5.0,
+    )
+    _insert_replay_signal(
+        conn, signal_id="sig_bbb_topk", strategy="S1", ticker="BBB",
+        direction="long", interval="1d", as_of="2026-08-01",
+        entry=50.0, stop=45.0, target=60.0,
+        ev_pct=2.0, base_win_rate=0.6, n=100, pct_profit=-50.0,
+    )
+
+    config = AllocationConfig(top_k=1)
+    result = replay(
+        conn, interval="1d", start_ts="2026-08-01", end_ts="2026-08-01",
+        alloc_config=config, starting_capital=1000.0,
+    )
+
+    assert result["num_trades"] == 1, (
+        "Only the top_k=1 SELECTED candidate (AAA) should have traded; "
+        "BBB's pct_profit must not have been applied"
+    )
+    assert result["total_profit_eur"] == pytest.approx(7.5)
+    assert result["pct_profit"] == pytest.approx(0.75)
+
+    conn.close()
+
+
+def test_replay_rejects_leveraged_config():
+    """replay() must fail loudly (not silently) when alloc_config.max_leverage
+    is anything above the unleveraged-only invariant of 1.0."""
+    conn = sqlite3.connect(":memory:")
+    _ensure_signal_replay_tables(conn)
+
+    config = AllocationConfig(max_leverage=2.0)
+
+    with pytest.raises(AssertionError):
+        replay(
+            conn, interval="1d", start_ts="2026-08-01", end_ts="2026-08-02",
+            alloc_config=config, starting_capital=1000.0,
+        )
 
     conn.close()

@@ -19,6 +19,7 @@ from typing import Any
 import pandas as pd
 import price_cache  # type: ignore
 
+from allocation import AllocationConfig, allocate, fetch_signals
 from kairos_backtest import BacktestEngine, Direction
 
 # Forward window used when re-fetching bars for closure computation, matching
@@ -790,3 +791,182 @@ def compute_closures_for_window(
         )
 
     return len(rows)
+
+
+def _step_signal_pct_profit_lookup(conn, interval: str, as_of: str) -> dict[tuple, float]:
+    """Map each tradeable candidate at one replay step back to its precomputed
+    `pct_profit`, keyed on the exact fields a `select_candidates()`/`size_selected()`
+    output row carries (`strategy`, `ticker`, `direction`, `entry`, `stop`, `target`).
+
+    Why this key and not `signal_id` directly: `allocate()` (per
+    `strategy/allocation.py`, UNCHANGED here) works on `Candidate` objects/dict
+    rows that never carry `signal_id` -- `fetch_signals()`'s `Candidate` has no
+    such field, so a selected row coming back out of `allocate()` has nothing
+    to join with directly. But every field in this tuple is copied verbatim
+    (same Python float objects, no reformatting) from the `papertrade_signals`
+    row through `load_step_candidates` -> `fetch_signals` -> `Candidate` ->
+    `_candidate_to_dict`, so the tuple is exact-match safe -- no float
+    tolerance needed. Restricted to the SAME `(interval, as_of)` step and
+    `resolved=1` (mirrors `load_step_candidates`'s own WHERE clause) so this
+    can only match a candidate actually visible to the replay loop at this
+    step.
+
+    Edge case, deliberately not guarded further: two DIFFERENT signal_ids at
+    the same step could in principle share an identical
+    (strategy, ticker, direction, entry, stop, target) tuple (e.g. two
+    models producing bit-identical entry/stop/target for the same
+    strategy+ticker+direction). `Candidate` itself carries no field that
+    would let `allocate()`'s output distinguish them either, so this is not
+    a precision loss introduced by this lookup -- it is a pre-existing
+    ambiguity in what `allocate()`'s output can express. On a key collision
+    the later row silently wins.
+    """
+    cursor = conn.execute(
+        """
+        SELECT s.strategy_name, s.ticker, s.direction, s.entry, s.stop, s.target, c.pct_profit
+        FROM papertrade_signals s
+        INNER JOIN papertrade_signals_closure c ON s.signal_id = c.signal_id
+        WHERE s.interval = ? AND s.as_of = ? AND c.resolved = 1
+        """,
+        (interval, as_of)
+    )
+    lookup: dict[tuple, float] = {}
+    for strategy_name, ticker, direction, entry, stop, target, pct_profit in cursor.fetchall():
+        lookup[(strategy_name, ticker, direction, entry, stop, target)] = pct_profit
+    return lookup
+
+
+def _peak_to_trough_drawdown_pct(equity_values: list[float]) -> float:
+    """Max peak-to-trough drawdown, as a positive percentage number.
+
+    Reimplements the SAME convention as `phantom.reports.metrics.calculate_metrics`'s
+    `max_drawdown_pct` (track a running peak forward through the curve; at each
+    point `dd = (peak - equity) / peak * 100`; keep the running max) -- see
+    `strategy/kairos_papertrade.py`'s `compute_final_metrics`, which is that
+    function's live-execution-path caller. Reimplemented rather than imported
+    because `kairos_signal_replay.py` must stay unit-testable with no `phantom`
+    install (APPENDIX-A-standards.md's "Pure modules" rule) and phantom's
+    version operates on `EquityPoint` (timestamped) objects for a duration
+    metric this story doesn't need -- a plain float list is all `replay()`
+    tracks.
+    """
+    if not equity_values:
+        return 0.0
+    peak = equity_values[0]
+    max_dd = 0.0
+    for equity in equity_values:
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            dd = (peak - equity) / peak * 100.0
+            if dd > max_dd:
+                max_dd = dd
+    return max_dd
+
+
+def replay(
+    conn,
+    interval: str,
+    start_ts: str,
+    end_ts: str,
+    alloc_config: AllocationConfig,
+    starting_capital: float,
+) -> dict:
+    """Offline allocation replay loop (unleveraged only).
+
+    Per DESIGN_DOC_offline_signal_replay.md §3.4/§1: steps through the
+    data-driven replay grid (`replay_steps`), and at each step runs that
+    step's candidates through `fetch_signals()`/`allocate()` UNCHANGED --
+    the exact same selection/sizing code a live run uses -- then applies
+    each SELECTED row's PRECOMPUTED, isolated `pct_profit` (from
+    `papertrade_signals_closure`, via `_step_signal_pct_profit_lookup`) to a
+    simple running cash ledger. `pct_profit` is a percentage NUMBER (5.2
+    means +5.2%, not 0.052 -- see `compute_closure`'s docstring, fixed by
+    commit 85eccb6), so `cash_delta = notional * (pct_profit / 100.0)`.
+
+    Sizing: each SELECTED row's `alloc` field (from `size_selected()`, a
+    percentage of equity, e.g. 15.0 for 15%) is applied against the capital
+    value AT THE START OF THIS STEP (before any of this step's own trades
+    are applied) -- not compounded trade-by-trade within the same step, and
+    not the capital value at the time `allocate()` was actually called
+    (which is the same value, since `allocate()` itself is capital-agnostic
+    -- it only produces a percentage). This matches `AllocationConfig`'s own
+    "percentage of equity" framing for `alloc`.
+
+    This is simple spot/full-notional bookkeeping only: no margin lock, no
+    `admission_check`, no liquidation modeling. `alloc_config.max_leverage`
+    must stay at its `1.0` default throughout -- asserted below so a caller
+    mistake (e.g. accidentally passing a leveraged config built for the live
+    path) fails loudly here rather than silently producing a leveraged
+    result mislabeled as unleveraged.
+
+    Known simplification (documented, not hidden -- per DESIGN_DOC §3.4):
+    a position "opened" at replay step N is resolved using its closure's
+    OWN isolated `exit_datetime`, not by checking whether a later replay
+    step's reallocation would have closed it early. Fine for strategies
+    with independent per-position sizing; not exact for strategies that
+    behave very differently under concurrent-position pressure.
+
+    Args:
+        conn: sqlite3 connection to pipeline_results.db
+        interval: interval string (e.g. "1h", "1d") -- scopes both
+            `replay_steps` and `load_step_candidates` to one signal-generation
+            cadence per run (§3.4)
+        start_ts: replay window start (inclusive), passed through to
+            `replay_steps`
+        end_ts: replay window end (inclusive), passed through to `replay_steps`
+        alloc_config: AllocationConfig to replay unchanged against every step;
+            `max_leverage` must be <= 1.0 (asserted)
+        starting_capital: initial cash ledger value
+
+    Returns:
+        dict with `total_profit_eur`, `pct_profit`, `num_trades`,
+        `pct_max_drawdown` (peak-to-trough over the tracked equity curve,
+        one point per replay step plus the starting point).
+    """
+    assert alloc_config.max_leverage <= 1.0, "replay() is unleveraged-only"
+
+    capital = starting_capital
+    equity_curve = [starting_capital]
+    num_trades = 0
+
+    for as_of in replay_steps(conn, interval, start_ts, end_ts):
+        pairs = load_step_candidates(conn, interval, as_of)
+        if pairs:
+            stats_rows = [pair[0] for pair in pairs]
+            advice_rows = [pair[1] for pair in pairs]
+            candidates = fetch_signals(stats_rows, advice_rows)
+            result = allocate(candidates, alloc_config)
+            outcomes = _step_signal_pct_profit_lookup(conn, interval, as_of)
+            step_start_capital = capital
+
+            for row in result.rows:
+                if row["status"] != "SELECTED":
+                    continue
+                key = (row["strategy"], row["ticker"], row["direction"],
+                       row["entry"], row["stop"], row["target"])
+                pct_profit = outcomes.get(key)
+                if pct_profit is None:
+                    # Should not happen: load_step_candidates only surfaces
+                    # candidates with a resolved=1 closure row, so every
+                    # SELECTED row's key must be present in outcomes. Skip
+                    # rather than fabricate a zero outcome if it ever does.
+                    continue
+
+                notional = row["alloc"] / 100.0 * step_start_capital
+                cash_delta = notional * (pct_profit / 100.0)
+                capital += cash_delta
+                num_trades += 1
+
+        equity_curve.append(capital)
+
+    total_profit_eur = capital - starting_capital
+    pct_profit = (total_profit_eur / starting_capital * 100.0) if starting_capital else 0.0
+    pct_max_drawdown = _peak_to_trough_drawdown_pct(equity_curve)
+
+    return {
+        "total_profit_eur": total_profit_eur,
+        "pct_profit": pct_profit,
+        "num_trades": num_trades,
+        "pct_max_drawdown": pct_max_drawdown,
+    }

@@ -55,7 +55,7 @@ see that document's §1/§4 for the explicit phase-scope boundary.
 ## Epic 8 — Offline allocation replay loop
 
 - [x] E8-S22 Data-driven replay step grid & per-step candidate loading (docs/tickets/E8-S22-replay-step-grid-and-loading.md)
-- [ ] E8-S23 Replay loop core, unleveraged (docs/tickets/E8-S23-replay-loop-core.md)
+- [x] E8-S23 Replay loop core, unleveraged (docs/tickets/E8-S23-replay-loop-core.md)
 
 ## Epic 9 — CLI & closeout
 
