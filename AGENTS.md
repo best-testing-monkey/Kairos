@@ -78,12 +78,18 @@ Also: `sqlitedict` (persistent dict-on-SQLite, used for papertrade report de-dup
 │   ├── kairos_pipeline.py  # 5-stage asset-discovery pipeline
 │   ├── kairos_signals.py   # Current-signals report generator
 │   ├── kairos_papertrade.py # Paper-trade executor (Phantom Ledger, roadmap Phase 4)
+│   ├── kairos_margin.py    # Margin config loader + symbol classifier (pure, no GPU)
+│   ├── kairos_mtm.py       # MTM snapshot math, admission/liquidation checks, financing (pure)
+│   ├── kairos_signal_replay.py # Offline signal replay (fast selection/allocation iteration, no GPU)
 │   ├── kairos_predcache.py # Disk-backed prediction cache + in-memory LRU
 │   ├── signal_selection.py # --signal-selection DSL grammar + column registry
 │   ├── allocation.py       # Signal gating/ranking (default min_n + EV gate, top-K)
 │   ├── kairos_gpu.py       # CUDA recovery helpers
 │   ├── PIPELINE.md         # Pipeline usage docs
 │   └── README.md           # Strategy framework docs
+│
+├── config/
+│   └── margin_ibkr.yaml    # Default IBKR retail margin config (per-asset-class rates)
 │
 ├── tests/
 │   ├── conftest.py         # Adds strategy/ to sys.path for tests
@@ -178,6 +184,26 @@ uv run ./strategy/kairos_papertrade.py --no-pred-cache   # bypass the prediction
 ```
 
 Replays `kairos_signals.py` reports through Phantom Ledger with a one-report lag (report `i`'s candidates execute at report `i+1`'s next-bar open). Sends Telegram lifecycle/slow-iteration alerts (`--no-telegram` to mute); see the papertrade gotchas in §7.
+
+Optional margin/leverage simulation: `--margin-config config/margin_ibkr.yaml --max-leverage 2.0 --margin-utilization 0.5` (default `--max-leverage 1.0` is cash-only). See `CLAUDE.md`'s "MTM margin/leverage system" section for the module breakdown (`kairos_margin.py`/`kairos_mtm.py`) and three bugs already found and fixed there.
+
+### Offline signal replay (fast selection/allocation iteration)
+
+```bash
+# Precompute: unpack signals_cache + resolve interval-ladder closures for a window
+uv run ./strategy/kairos_signal_replay.py --precompute \
+  --start 2026-08-01 --end 2026-08-07 --interval-ladder 1h,4h,1d
+
+# Replay: run an allocation config against the precomputed closures (no GPU, no phantom)
+uv run ./strategy/kairos_signal_replay.py --replay \
+  --interval 1d --start 2026-08-01 --end 2026-08-07 \
+  --capital 200 --max-pos-pct 15 --top-k 3
+```
+
+Unleveraged only (no margin/CFD/liquidation) and interval-agnostic (a
+data-driven replay-step grid, not a daily-only assumption). See CLAUDE.md's
+"Offline Signal Replay" section and `docs/tickets/DESIGN_DOC_offline_signal_replay.md`
+for the full design and non-goals.
 
 ### Start the web UI
 
@@ -334,6 +360,10 @@ All `generate_signal()` implementations must return either a `Signal` dataclass 
 - **Per-strategy signals cache**: `kairos_signals.run()` caches each strategy's rows in the `signals_cache` table in `pipeline_results.db`, keyed by `(strategy, assets, interval, as_of_date, lookback, pred_samples, min_ev_pct, model_path, checkpoint_fingerprint)`. `as_of` is a *date*, not a timestamp, so overlapping backtest windows hit. Disabled strategies are never served stale (live registry check happens before any cache lookup). `--no-signal-cache` disables it (`use_signal_cache=True` is the default); writes are `INSERT OR REPLACE`, so growth is bounded by unique-key space.
 - **Ops during report generation**: the shared `kairos.ops.GpuLock` is held for the whole `generate_and_dedupe_reports()` loop (other Kairos GPU jobs block meanwhile). Slow iterations (> `_SLOW_ITERATION_THRESHOLD_SECONDS`, 60s) trigger a Telegram heads-up plus a forensic snapshot (own PID/VmRSS, `free -h`, `nvidia-smi`) appended to `data/papertrade_watchdog.log`; per-group timing lines for slow or shared-cache-MISS groups go there too via `_log_group_timing`.
 
+### price_cache configuration
+
+Every module that calls `price_cache.get_price_data()`/`fetch_bars_bulk_from_local()` must call `price_cache.configure(remote=False, local_mirror_path=<db_path>)` before its first real lookup — `price_cache.configure()` defaults to `remote=True`, which needs a local PostgreSQL proxy this environment doesn't have. `kairos_signal_replay.py` missed this initially (unit tests mock the price_cache calls directly, so the gap wasn't caught until a real run) and silently disqualified 100% of signals; see `_ensure_configured_db()` in that module and CLAUDE.md's writeup. Separately, `price_cache`'s own `no_data_tickers` marker no longer gates reads as of 2026-08 (upstream fix) — see CLAUDE.md for the incident and `price_cache/README.md` for current behavior.
+
 ### Pipeline storage
 
 The discovery pipeline persists results to:
@@ -341,7 +371,7 @@ The discovery pipeline persists results to:
 - `data/pipeline_results.db` (SQLite, source of truth)
 - `results/<stage>_<table>_<timestamp>.csv` (point-in-time mirrors)
 
-Tables include `runs`, `universe_screen`, `correlation_pairs`, `suggested_groups`, `oracle_results`, `model_results`, `viability_report`, and `signals_cache` (per-strategy signals cache, see above).
+Tables include `runs`, `universe_screen`, `correlation_pairs`, `suggested_groups`, `oracle_results`, `model_results`, `viability_report`, `signals_cache` (per-strategy signals cache, see above), and `papertrade_signals`/`papertrade_signals_closure` (offline signal replay tool's unpacked-signal + closure-stats cache, see `kairos_signal_replay.py` above and CLAUDE.md).
 
 ---
 

@@ -26,6 +26,10 @@ uv run --with pytest python -m pytest tests/unit/test_kairos_distribution.py -v
 
 # Run the asset-discovery pipeline (screening/correlation/oracle/base/finetuned stages)
 uv run ./strategy/kairos_pipeline.py --stage universe   # see strategy/PIPELINE.md for all stages/flags
+
+# Offline signal replay: fast selection/allocation iteration with no GPU/live papertrade
+uv run ./strategy/kairos_signal_replay.py --precompute --start 2026-08-01 --end 2026-08-07 --interval-ladder 1h,4h,1d
+uv run ./strategy/kairos_signal_replay.py --replay --interval 1d --start 2026-08-01 --end 2026-08-07 --capital 200 --max-pos-pct 15 --top-k 3
 ```
 
 ## Known gotchas (hard-won)
@@ -325,6 +329,116 @@ Strategy, Dir, Entry, Stop, Target, Risk %, Reward %, b, n, Win raw, Win
 shrunk, EV raw %, EV net %, Kelly raw, Score, Sharpe) — `Alloc %`/`Alloc
 EUR`/`Flags`/`Advised liq %` aren't available to filter/sort on since they're
 only computed after top-K selection.
+
+### MTM margin/leverage system
+`kairos_papertrade.py` can optionally simulate margin/leverage instead of
+cash-only trading, gated by three CLI flags: `--margin-config` (path to a YAML
+config, default `config/margin_ibkr.yaml`), `--max-leverage` (default `1.0` —
+cash-only; only setting this above `1.0` turns margin math on), and
+`--margin-utilization` (fraction of equity usable as initial margin, default
+`0.8`). The math lives in two pure, GPU-free modules:
+
+- `strategy/kairos_margin.py` — `load_margin_config()`/`MarginConfig` parses
+  the YAML (per-asset-class initial/maintenance margin rates, overrides per
+  symbol); `classify_symbol()` maps a ticker to a `MarginClass`.
+- `strategy/kairos_mtm.py` — `compute_daily_snapshot()` builds a
+  `DailySnapshot` (equity, margin used, utilization) from open position rows
+  + a close price, entirely independent of phantom's own cash/equity
+  numbers (`phantom` is source of truth for order fill/SL/TP mechanics only,
+  never for margin math — see `APPENDIX-A-standards.md`). `admission_check()`
+  gates new orders against margin utilization before they're placed.
+  `liquidation_check()`/`daily_financing()`/`compute_daily_financing_total()`
+  handle forced-exit and daily borrow-cost accrual.
+
+`kairos_papertrade.py` persists one `DailySnapshot` per day and drives its
+MTM metrics block + the HTML report's MTM panel (equity/drawdown/margin
+utilization/liquidation markers) from that history.
+
+**Three subtle bugs found via live `/verify` runs, all fixed — read before
+touching same-day fill/close or admission-check code:**
+
+- **Same-day fill/close blind spot (fixed, `24ff318`).** The day-loop's
+  `corrected_cash` bookkeeping diffed positions at day boundaries; a position
+  that both filled *and* closed within a single `runner.backtest()` call
+  never appeared in either diff and was silently dropped from cash tracking.
+- **Admission check defeated by same-day round trips (fixed, `79dbbb0`).**
+  Fixing the bug above wasn't sufficient on its own — the admission-check
+  margin gate also needed same-day round trips' margin contribution folded
+  into the persisted snapshot, or a same-day open+close round trip could
+  still be invisible to `admission_check()` for the *next* order that day.
+- **Stale-signal-cache brackets (fixed, `7cc66d4`).** `close_reason='sl'`
+  positions were showing up with *positive* realized P&L. Root cause: two
+  price mirrors can drift apart intraday — `kairos_signals`' cached mirror
+  can stop advancing while the papertrade day loop's own
+  `_IntradayFallbackProvider` mirror keeps moving, so a stop/target computed
+  from the stale mirror no longer bracketed the fresher fill-day price by the
+  time the order actually placed. Fixed with a guard that rejects an order
+  outright if its stop/target don't bracket the current price at fill time,
+  rather than letting phantom silently fill it into a nonsensical bracket.
+
+### Offline Signal Replay (`kairos_signal_replay.py`)
+Fast, GPU-free tool for iterating on selection/allocation rules without
+re-running a live `kairos_papertrade.py` pass. It does **not** call
+`BacktestEngine.run()` (which needs a live model predictor to *generate*
+signals) — signals are already decided by the time this tool runs, so it
+reuses only `BacktestEngine`'s private, predictor-free `_check_exit`/
+`_calculate_pnl` methods to resolve an already-known signal's outcome against
+historical bars. **Unleveraged only** — asserts `max_leverage <= 1.0`; no
+margin, CFD, or liquidation simulation (see
+`docs/tickets/DESIGN_DOC_offline_signal_replay.md` §1/§4 for the explicit
+scope boundary, and the module's own docstring/`--help` for the non-goals).
+Its cost model (flat fee/slippage) diverges from phantom's live per-instrument
+model, so results are directional signals for testing selection rules, not
+P&L predictions — validate anything promising with a real
+`kairos_papertrade.py` run before trusting it.
+
+Two modes, both operating on `pipeline_results.db`:
+- `--precompute --start <date> --end <date> --interval-ladder 1h,4h,1d`:
+  unpacks `signals_cache` rows into a new `papertrade_signals` table, then
+  walks a data-driven interval ladder per signal — smallest interval first,
+  first one with enough bars wins (`resolve_interval_for_signal()`), not a
+  calendar-day assumption, so a 1h replay and a 1d replay both work off the
+  same mechanism. A signal that can't resolve on *any* rung of the ladder is
+  disqualified (closure stats not computed, excluded from replay) rather than
+  blocking the whole precompute run. Closure stats land in
+  `papertrade_signals_closure`, keyed to also invalidate on `--engine-version`
+  bumps.
+- `--replay --interval <interval> --start <date> --end <date> --capital
+  <float> [--max-pos-pct ...] [--top-k ...] [--signal-selection ...]`: replays
+  `strategy/allocation.py`'s `allocate()` against the precomputed closures for
+  a data-driven step grid (`SELECT DISTINCT as_of`, so it's interval-agnostic
+  rather than daily-only) — this is the fast iteration loop; it never touches
+  the GPU or phantom.
+
+`papertrade_signals`/`papertrade_signals_closure` double as a cache:
+`--precompute` is safe to re-run over the same window (`INSERT OR REPLACE`
+semantics) and only recomputes what `--engine-version` or the window actually
+changed.
+
+Like every other price_cache caller in this codebase, this module must call
+`price_cache.configure(remote=False, local_mirror_path=db_path)` before its
+first real lookup (`_ensure_configured_db()`) — `price_cache.configure()`
+defaults to `remote=True`, which needs an unreachable local PostgreSQL proxy
+in this environment. This was missed initially (every unit test mocks
+`price_cache.get_price_data` directly and never exercises real configuration
+state) and silently produced 100% signal disqualification against real data
+until fixed (`d4124ed`).
+
+### price_cache: `no_data_tickers` no longer gates reads (fixed 2026-08, upstream)
+`price_cache` (sibling repo, vendored into Kairos via `phantom_ledger`'s
+submodule — see `pyproject.toml`'s `[tool.uv.sources]`) used to let a single
+stale `no_data_tickers` row permanently block `get_price_data()`/
+`fetch_bars_bulk_from_local()` for an entire ticker, any date range, forever.
+This silently returned `None`/omitted tickers with hundreds of thousands of
+genuinely cached rows. Fixed at the source (price_cache commit `b6f990d`,
+propagated through `phantom_ledger`'s submodule bump and this repo's
+`uv.lock`) — `no_data_tickers` is now a diagnostic-only, TTL'd audit trail
+that neither function consults. If you see old references (docs, comments,
+memory) describing "delisted ticker" as a reason `price_cache` returns no
+data for a range that should be cached, that description is stale; see
+`price_cache/README.md`'s `no_data_tickers` schema section for the current
+behavior. `kairos_signal_replay.py`'s real-data disqualification rate was the
+symptom that surfaced this bug in this repo.
 
 ## Test suite
 

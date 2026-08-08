@@ -422,6 +422,31 @@ via three flags:
 uv run ./strategy/kairos_papertrade.py --max-leverage 2.0 --margin-utilization 0.5 --months-back 1
 ```
 
+### Offline signal replay
+
+`strategy/kairos_signal_replay.py` iterates on selection/allocation rules without
+a live GPU or Phantom Ledger run — it precomputes closure statistics for
+already-decided signals from historical price bars once, then replays
+`strategy/allocation.py` allocation configs against those closures in seconds.
+Unleveraged only, and interval-agnostic (works with `1h`, `1d`, or any other
+`price_cache` interval, not just daily).
+
+```bash
+# Precompute closures for a window (interval ladder tries 1h, then 4h, then 1d)
+uv run ./strategy/kairos_signal_replay.py --precompute \
+  --start 2026-08-01 --end 2026-08-07 --interval-ladder 1h,4h,1d
+
+# Replay an allocation config against the precomputed closures
+uv run ./strategy/kairos_signal_replay.py --replay \
+  --interval 1d --start 2026-08-01 --end 2026-08-07 \
+  --capital 200 --max-pos-pct 15 --top-k 3
+```
+
+Results are directional signals for comparing selection rules, not P&L
+predictions (its cost model is a flat fee/slippage, unlike phantom's live
+per-instrument model) — validate anything promising with a real
+`kairos_papertrade.py` run before trusting it.
+
 ---
 
 ## Upstream: Kronos
