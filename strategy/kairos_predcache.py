@@ -336,6 +336,24 @@ def get_cache() -> Optional[PredictionCache]:
             max_disk_bytes = int(env_max_bytes)
         except ValueError:
             pass
-    _singleton = PredictionCache(cache_dir, max_disk_bytes=max_disk_bytes)
+    # mem_budget_bytes defaults (in PredictionCache.__init__) to 25% of
+    # available RAM *at construction time* -- on a small box that's still
+    # multiple GB, and even with _dfs_nbytes fixed to a real accounting,
+    # two live kairos_papertrade debug runs climbed toward an 8GB cgroup cap
+    # before finishing a single model's prewarm pass (2026-08-08). Rather
+    # than keep chasing which allocator/accounting quirk explains the last
+    # GB, this env var (mirrors KAIROS_PRED_CACHE_MAX_BYTES for disk) lets a
+    # caller pin an explicit, much lower ceiling instead of trusting the
+    # available-RAM-fraction default.
+    mem_budget_bytes = None
+    env_mem_bytes = os.environ.get("KAIROS_PRED_CACHE_MEM_BYTES")
+    if env_mem_bytes:
+        try:
+            mem_budget_bytes = int(env_mem_bytes)
+        except ValueError:
+            pass
+    _singleton = PredictionCache(
+        cache_dir, max_disk_bytes=max_disk_bytes, mem_budget_bytes=mem_budget_bytes,
+    )
     _singleton_dir = cache_dir
     return _singleton

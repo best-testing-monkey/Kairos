@@ -201,6 +201,35 @@ def test_get_cache_defaults_max_bytes_when_env_var_unset(monkeypatch, tmp_path):
     pc._singleton_dir = None
 
 
+def test_get_cache_honors_mem_bytes_env_var(monkeypatch, tmp_path):
+    monkeypatch.setenv("KAIROS_PRED_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("KAIROS_PRED_CACHE_MEM_BYTES", "54321")
+    pc._singleton = None
+    pc._singleton_dir = None
+    cache = pc.get_cache()
+    assert cache is not None
+    assert cache.mem_budget_bytes == 54321
+    monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+    monkeypatch.delenv("KAIROS_PRED_CACHE_MEM_BYTES", raising=False)
+    pc._singleton = None
+    pc._singleton_dir = None
+
+
+def test_get_cache_defaults_mem_bytes_when_env_var_unset(monkeypatch, tmp_path):
+    # No explicit env var -> falls through to PredictionCache's own
+    # available-RAM-fraction default (the thing this env var exists to
+    # override), so just assert it's a positive int, not a specific value.
+    monkeypatch.setenv("KAIROS_PRED_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("KAIROS_PRED_CACHE_MEM_BYTES", raising=False)
+    pc._singleton = None
+    pc._singleton_dir = None
+    cache = pc.get_cache()
+    assert cache.mem_budget_bytes > 0
+    monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+    pc._singleton = None
+    pc._singleton_dir = None
+
+
 # ── disk size cap + eviction ─────────────────────────────────────────────────
 
 class TestDiskEviction:
