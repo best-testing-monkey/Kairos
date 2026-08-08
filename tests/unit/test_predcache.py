@@ -126,6 +126,16 @@ def test_corrupt_cache_file_treated_as_miss(tmp_path):
     assert not os.path.exists(path)
 
 
+def test_dfs_nbytes_counts_real_footprint_not_just_raw_buffer():
+    # Regression for the eviction-accounting bug: raw .nbytes ignores Index/
+    # DataFrame/block-manager overhead, so _mem's LRU eviction thought it was
+    # under budget while real RSS climbed past it (see _dfs_nbytes docstring).
+    dfs = _make_samples(3)
+    raw_buffer_bytes = sum(df.to_numpy(dtype="float64", copy=False).nbytes for df in dfs)
+    real_bytes = pc._dfs_nbytes(dfs)
+    assert real_bytes > raw_buffer_bytes
+
+
 def test_lru_eviction_under_tiny_byte_budget(tmp_path):
     # Each sample set is a handful of KB; force eviction with a tiny budget.
     cache = pc.PredictionCache(str(tmp_path), mem_budget_bytes=1)

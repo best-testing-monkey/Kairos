@@ -93,9 +93,21 @@ def _read_mem_available_bytes() -> int:
 
 
 def _dfs_nbytes(sample_dfs: List[pd.DataFrame]) -> int:
+    """Real per-entry memory footprint, used by _mem_put's eviction accounting.
+
+    Was `df.to_numpy().nbytes` -- only the raw float buffer, ignoring the
+    Index/DataFrame/block-manager object overhead that `has()`'s docstring
+    already identified as "dominating the real memory footprint" for these
+    small sample DataFrames. That undercount applies equally to put()'s
+    legitimate write path (not just the already-fixed is_batch_cached()
+    misuse of get()): _mem_bytes stayed "under budget" while two live
+    kairos_papertrade debug runs climbed to 7-8GB RSS and had to be killed
+    before the machine started swapping. memory_usage(deep=True) walks the
+    real object graph (including the Index) instead of just the buffer.
+    """
     total = 0
     for df in sample_dfs:
-        total += df.to_numpy(dtype=np.float64, copy=False).nbytes
+        total += int(df.memory_usage(deep=True, index=True).sum())
     return total
 
 
