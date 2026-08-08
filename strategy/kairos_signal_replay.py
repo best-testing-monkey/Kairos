@@ -11,8 +11,11 @@ See DESIGN_DOC_offline_signal_replay.md for full design, schema, and testing
 plan.
 """
 
+import argparse
 import hashlib
 import json
+import sqlite3
+import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -21,6 +24,8 @@ import price_cache  # type: ignore
 
 from allocation import AllocationConfig, allocate, fetch_signals
 from kairos_backtest import BacktestEngine, Direction
+from kairos_signals import DB_PATH as SIGNALS_DB_PATH
+from signal_selection import parse_signal_selection, SignalSelectionError
 
 # Forward window used when re-fetching bars for closure computation, matching
 # resolve_interval_for_signal's own forward window (kept as a separate literal
@@ -970,3 +975,188 @@ def replay(
         "num_trades": num_trades,
         "pct_max_drawdown": pct_max_drawdown,
     }
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser for main().
+
+    Supports two modes via mutually relevant flags:
+    - `--precompute`: unpacks signals_cache and computes closures over a window
+    - `--replay`: runs the offline allocation replay loop against precomputed closures
+
+    Both modes require `--db` (default: kairos_signals.DB_PATH).
+    Precompute requires `--start`/`--end` (ISO date strings) and
+    `--interval-ladder` (comma-separated, e.g. "1h,4h,1d").
+    Replay requires `--interval`, `--start`, `--end`, `--capital`, and allocation flags.
+    """
+    parser = argparse.ArgumentParser(
+        description="Offline signal replay and allocation testing (E9-S24)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Usage examples:\n"
+            "  Precompute closures for a window:\n"
+            "    uv run ./strategy/kairos_signal_replay.py --precompute "
+            "--start 2026-08-01 --end 2026-08-07 --interval-ladder 1h,4h,1d\n"
+            "\n"
+            "  Replay allocation over precomputed closures:\n"
+            "    uv run ./strategy/kairos_signal_replay.py --replay "
+            "--interval 1d --start 2026-08-01 --end 2026-08-07 "
+            "--capital 200 --max-pos-pct 15 --top-k 3\n"
+        )
+    )
+    parser.add_argument(
+        "--precompute", action="store_true", default=False,
+        help="Unpack signals_cache and compute closures for the given window"
+    )
+    parser.add_argument(
+        "--replay", action="store_true", default=False,
+        help="Run offline allocation replay against precomputed closures"
+    )
+    parser.add_argument(
+        "--db", default=SIGNALS_DB_PATH,
+        help="Path to pipeline_results.db (default: kairos_signals.DB_PATH)"
+    )
+    parser.add_argument(
+        "--start", required=True,
+        help="Window start date (ISO format: YYYY-MM-DD, inclusive)"
+    )
+    parser.add_argument(
+        "--end", required=True,
+        help="Window end date (ISO format: YYYY-MM-DD, inclusive)"
+    )
+    parser.add_argument(
+        "--interval-ladder", dest="interval_ladder", default="1h,4h,1d",
+        help="Comma-separated interval list for precompute fallback ladder "
+             "(default: 1h,4h,1d). Used ONLY with --precompute"
+    )
+    parser.add_argument(
+        "--interval", default=None,
+        help="Single interval for replay (e.g. 1h, 4h, 1d). Required for --replay"
+    )
+    parser.add_argument(
+        "--engine-version", dest="engine_version", default="v1",
+        help="Engine version tag for closure cache invalidation "
+             "(default: v1). Used ONLY with --precompute"
+    )
+    parser.add_argument(
+        "--capital", type=float, default=None,
+        help="Starting capital for replay (required for --replay)"
+    )
+    parser.add_argument(
+        "--max-pos-pct", dest="max_pos_pct", type=float, default=15.0,
+        help="Max position size as %% of equity (default: 15.0). Used ONLY with --replay"
+    )
+    parser.add_argument(
+        "--top-k", dest="top_k", type=int, default=12,
+        help="Max number of positions to allocate (default: 12). Used ONLY with --replay"
+    )
+    parser.add_argument(
+        "--signal-selection", dest="signal_selection", default=None,
+        help="Optional selection rule that fully replaces default gating and ranking. "
+             "Grammar: comma-separated clauses, each either a condition "
+             "\"'col' OP value\" (OP one of > >= < <= == !=), an "
+             "\"ORDER 'col' [ASC|DESC]\" clause (default DESC, at most one), "
+             "or a \"TOP <int>\" clause (at most one). "
+             "Example: \"'n' > 60, 'Win raw' > 0.6, ORDER 'EV raw %%' DESC, TOP 3\". "
+             "Used ONLY with --replay"
+    )
+    return parser
+
+
+def main(argv=None):
+    """Main CLI entrypoint for offline signal replay.
+
+    Supports two modes:
+    1. `--precompute`: unpacks signals_cache and computes closures via `BacktestEngine`.
+       Prints count of unpacked signals and computed closures.
+    2. `--replay`: runs offline allocation replay against precomputed closures.
+       Prints metrics dict as JSON.
+    """
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    # Validate mode selection
+    if not args.precompute and not args.replay:
+        parser.error("Must specify either --precompute or --replay")
+    if args.precompute and args.replay:
+        parser.error("Cannot specify both --precompute and --replay simultaneously")
+
+    conn = sqlite3.connect(args.db)
+
+    try:
+        if args.precompute:
+            # PRECOMPUTE mode: unpack signals_cache and compute closures
+            print(f"[precompute] Unpacking signals_cache from {args.start} to {args.end}...",
+                  file=sys.stderr)
+            unpacked = unpack_signals_cache_to_papertrade_signals(
+                conn, args.start, args.end
+            )
+            print(f"[precompute] Unpacked {unpacked} signals", file=sys.stderr)
+
+            # Parse interval ladder (comma-separated string -> list)
+            interval_ladder = [i.strip() for i in args.interval_ladder.split(",")]
+            print(f"[precompute] Computing closures with interval ladder: {interval_ladder}",
+                  file=sys.stderr)
+            computed = compute_closures_for_window(
+                conn, args.start, args.end, interval_ladder,
+                engine_version=args.engine_version, db_path=args.db
+            )
+            print(f"[precompute] Computed closures for {computed} signals",
+                  file=sys.stderr)
+
+            # Output summary to stdout
+            print(json.dumps({
+                "status": "ok",
+                "mode": "precompute",
+                "unpacked": unpacked,
+                "computed": computed,
+                "window": {"start": args.start, "end": args.end},
+                "engine_version": args.engine_version,
+            }))
+
+        else:  # args.replay
+            # REPLAY mode: run offline allocation replay
+            if args.interval is None:
+                parser.error("--replay requires --interval")
+            if args.capital is None:
+                parser.error("--replay requires --capital")
+
+            print(f"[replay] Running allocation replay for {args.interval} interval "
+                  f"from {args.start} to {args.end}", file=sys.stderr)
+
+            # Parse signal selection rule if provided
+            parsed_signal_selection = None
+            if args.signal_selection:
+                try:
+                    parsed_signal_selection = parse_signal_selection(args.signal_selection)
+                except SignalSelectionError as e:
+                    parser.error(str(e))
+
+            # Build allocation config (unleveraged only: max_leverage fixed at 1.0)
+            alloc_config = AllocationConfig(
+                top_k=args.top_k,
+                max_pos_pct=args.max_pos_pct,
+                max_leverage=1.0,  # Fixed: unleveraged only per DESIGN_DOC_offline_signal_replay.md §1
+                selection_rule=parsed_signal_selection,
+            )
+
+            # Run replay
+            metrics = replay(
+                conn, args.interval, args.start, args.end,
+                alloc_config, args.capital
+            )
+            print(f"[replay] Complete. Profit: {metrics['total_profit_eur']:.2f} EUR "
+                  f"({metrics['pct_profit']:.2f}%), {metrics['num_trades']} trades",
+                  file=sys.stderr)
+
+            # Output metrics as JSON (matching kairos_papertrade.write_json_report style)
+            print(json.dumps(metrics))
+
+        return metrics if args.replay else None
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

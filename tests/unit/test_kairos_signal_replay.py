@@ -24,6 +24,7 @@ from kairos_signal_replay import (
     replay_steps,
     load_step_candidates,
     replay,
+    _build_arg_parser,
 )
 from allocation import AllocationConfig
 
@@ -1705,3 +1706,162 @@ def test_replay_rejects_leveraged_config():
         )
 
     conn.close()
+
+
+# ==============================================================================
+# Tests for _build_arg_parser (CLI wiring)
+# ==============================================================================
+
+
+class TestBuildArgParser:
+    """Tests for the CLI argument parser."""
+
+    def test_parser_accepts_precompute_flag(self):
+        """Verify parser accepts --precompute flag."""
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07"
+        ])
+        assert args.precompute is True
+        assert args.replay is False
+
+    def test_parser_accepts_replay_flag(self):
+        """Verify parser accepts --replay flag."""
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "1d", "--capital", "200"
+        ])
+        assert args.replay is True
+        assert args.precompute is False
+
+    def test_parser_start_end_required(self):
+        """Verify --start and --end are required for both modes."""
+        parser = _build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--precompute"])
+
+    def test_parser_interval_ladder_default(self):
+        """Verify --interval-ladder defaults to '1h,4h,1d'."""
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07"
+        ])
+        assert args.interval_ladder == "1h,4h,1d"
+
+    def test_parser_interval_ladder_custom(self):
+        """Verify --interval-ladder accepts custom comma-separated values."""
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval-ladder", "1h,1d"
+        ])
+        assert args.interval_ladder == "1h,1d"
+
+    def test_parser_engine_version_default(self):
+        """Verify --engine-version defaults to 'v1'."""
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07"
+        ])
+        assert args.engine_version == "v1"
+
+    def test_parser_engine_version_custom(self):
+        """Verify --engine-version accepts custom value."""
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--engine-version", "v2"
+        ])
+        assert args.engine_version == "v2"
+
+    def test_parser_db_default_is_SIGNALS_DB_PATH(self):
+        """Verify --db defaults to kairos_signals.DB_PATH."""
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07"
+        ])
+        from kairos_signals import DB_PATH as SIGNALS_DB_PATH
+        assert args.db == SIGNALS_DB_PATH
+
+    def test_parser_db_custom(self):
+        """Verify --db accepts custom path."""
+        custom_path = "/tmp/custom.db"
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--db", custom_path
+        ])
+        assert args.db == custom_path
+
+    def test_parser_replay_capital_float(self):
+        """Verify --capital accepts float values."""
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "1d", "--capital", "500.5"
+        ])
+        assert args.capital == 500.5
+
+    def test_parser_replay_max_pos_pct_default(self):
+        """Verify --max-pos-pct defaults to 15.0."""
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "1d", "--capital", "200"
+        ])
+        assert args.max_pos_pct == 15.0
+
+    def test_parser_replay_max_pos_pct_custom(self):
+        """Verify --max-pos-pct accepts custom value."""
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "1d", "--capital", "200", "--max-pos-pct", "10"
+        ])
+        assert args.max_pos_pct == 10.0
+
+    def test_parser_replay_top_k_default(self):
+        """Verify --top-k defaults to 12."""
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "1d", "--capital", "200"
+        ])
+        assert args.top_k == 12
+
+    def test_parser_replay_top_k_custom(self):
+        """Verify --top-k accepts custom integer value."""
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "1d", "--capital", "200", "--top-k", "5"
+        ])
+        assert args.top_k == 5
+
+    def test_parser_replay_signal_selection_default_none(self):
+        """Verify --signal-selection defaults to None."""
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "1d", "--capital", "200"
+        ])
+        assert args.signal_selection is None
+
+    def test_parser_replay_signal_selection_custom(self):
+        """Verify --signal-selection accepts a rule string."""
+        rule = "'n' > 60, 'Win raw' > 0.6, ORDER 'EV raw %' DESC, TOP 3"
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "1d", "--capital", "200",
+            "--signal-selection", rule
+        ])
+        assert args.signal_selection == rule
+
+    def test_parser_interval_none_by_default(self):
+        """Verify --interval defaults to None."""
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07"
+        ])
+        assert args.interval is None
+
+    def test_parser_interval_custom_for_replay(self):
+        """Verify --interval accepts custom value for replay mode."""
+        args = _build_arg_parser().parse_args([
+            "--replay", "--start", "2026-08-01", "--end", "2026-08-07",
+            "--interval", "4h", "--capital", "200"
+        ])
+        assert args.interval == "4h"
+
+    def test_parser_capital_default_none(self):
+        """Verify --capital defaults to None (must be provided for replay)."""
+        args = _build_arg_parser().parse_args([
+            "--precompute", "--start", "2026-08-01", "--end", "2026-08-07"
+        ])
+        assert args.capital is None
