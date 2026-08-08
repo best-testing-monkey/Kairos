@@ -35,6 +35,22 @@ from kairos_backtest import BacktestEngine, Direction
 from kairos_signals import DB_PATH as SIGNALS_DB_PATH
 from signal_selection import parse_signal_selection, SignalSelectionError
 
+# Mirrors kairos_papertrade.py's _ensure_configured_db/_configured_dbs pattern
+# (price_cache.configure() defaults to remote=True, which requires a local
+# PostgreSQL proxy -- every other price_cache caller in this codebase
+# explicitly configures local mode first; this module's real-data run was
+# silently stuck in remote mode until this was added, since every unit test
+# mocks price_cache.get_price_data directly and never exercises real
+# configuration state).
+_configured_dbs: set[str] = set()
+
+
+def _ensure_configured_db(db_path: str) -> None:
+    if db_path not in _configured_dbs:
+        price_cache.configure(remote=False, local_mirror_path=db_path)
+        _configured_dbs.add(db_path)
+
+
 # Forward window used when re-fetching bars for closure computation, matching
 # resolve_interval_for_signal's own forward window (kept as a separate literal
 # rather than a shared import so this module's two 30-day windows can diverge
@@ -322,6 +338,8 @@ def resolve_interval_for_signal(
         end_date = end_datetime.date().isoformat()
     else:
         end_date = end_datetime.isoformat()
+
+    _ensure_configured_db(db_path)
 
     for interval in interval_ladder:
         try:
