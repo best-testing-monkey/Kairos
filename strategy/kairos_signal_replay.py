@@ -15,6 +15,7 @@ import hashlib
 import json
 from datetime import datetime, timezone, timedelta
 
+import pandas as pd
 import price_cache  # type: ignore
 
 
@@ -308,3 +309,59 @@ def resolve_interval_for_signal(
 
     # No interval succeeded
     return None
+
+
+def max_adverse_excursion_pct(direction: str, entry_price: float, bars: pd.DataFrame) -> float:
+    """Compute the worst (most adverse) direction-aware % move from entry price.
+
+    Walks each bar in the provided DataFrame and tracks the worst adverse move
+    relative to entry price. Returns the magnitude of that worst move as a
+    positive percentage (0.0 if never underwater).
+
+    For long positions: adverse move is when price falls (uses bar's Low).
+    For short positions: adverse move is when price rises (uses bar's High).
+
+    The returned value reflects the most negative PnL-equivalent move (expressed
+    as a percentage of entry price). This matches the direction-aware convention
+    from kairos_mtm.unrealized_pnl():
+    - long: (price - entry_price) * quantity
+    - short: (entry_price - price) * quantity
+
+    Args:
+        direction: "long" or "short" (case-sensitive, lowercase required)
+        entry_price: Entry price of the position
+        bars: DataFrame with at least "Low" and "High" columns (capitalized)
+
+    Returns:
+        Worst adverse excursion as a positive percentage, or 0.0 if:
+        - bars is empty
+        - position was never underwater at any bar
+
+    Raises:
+        ValueError: If direction is not "long" or "short"
+    """
+    if direction not in ("long", "short"):
+        raise ValueError(f"direction must be 'long' or 'short', got {direction!r}")
+
+    if bars.empty:
+        return 0.0
+
+    worst_pct_move = 0.0  # Track the most negative move; start at 0.0
+
+    if direction == "long":
+        # For long: adverse move uses Low price
+        # pct_move = (Low - entry_price) / entry_price * 100.0 (negative when underwater)
+        for low_price in bars["Low"]:
+            pct_move = (low_price - entry_price) / entry_price * 100.0
+            if pct_move < worst_pct_move:
+                worst_pct_move = pct_move
+    else:  # direction == "short"
+        # For short: adverse move uses High price
+        # pct_move = (entry_price - High) / entry_price * 100.0 (negative when underwater)
+        for high_price in bars["High"]:
+            pct_move = (entry_price - high_price) / entry_price * 100.0
+            if pct_move < worst_pct_move:
+                worst_pct_move = pct_move
+
+    # Return the magnitude as a positive percentage, or 0.0 if never underwater
+    return abs(worst_pct_move) if worst_pct_move < 0.0 else 0.0

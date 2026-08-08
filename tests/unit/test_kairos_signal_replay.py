@@ -9,13 +9,15 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
 from kairos_signal_replay import (
     _ensure_signal_replay_tables,
     unpack_signals_cache_to_papertrade_signals,
-    resolve_interval_for_signal
+    resolve_interval_for_signal,
+    max_adverse_excursion_pct
 )
 
 
@@ -630,3 +632,136 @@ def test_resolve_interval_min_bars_default():
         )
 
         assert result == "1h", f"Expected '1h' with default min_bars=2, got {result}"
+
+
+# ==============================================================================
+# Tests for max_adverse_excursion_pct
+# ==============================================================================
+
+
+def test_max_adverse_excursion_pct_long_direction_hand_computed():
+    """Test long position with hand-computed worst-case value.
+
+    Setup: entry_price=100, bars with Low=[98, 95, 97]
+    - Bar 1: (98-100)/100*100 = -2.0%
+    - Bar 2: (95-100)/100*100 = -5.0%  <-- worst
+    - Bar 3: (97-100)/100*100 = -3.0%
+    Expected return: 5.0 (magnitude of worst move)
+    """
+    entry_price = 100.0
+    bars = pd.DataFrame({
+        "Open": [99.0, 94.0, 96.0],
+        "High": [101.0, 99.0, 100.0],
+        "Low": [98.0, 95.0, 97.0],
+        "Close": [99.5, 96.0, 98.0],
+        "Volume": [1000000, 1000000, 1000000],
+    })
+
+    result = max_adverse_excursion_pct("long", entry_price, bars)
+    assert result == 5.0, (
+        f"Long position: expected 5.0 (worst Low=95), got {result}"
+    )
+
+
+def test_max_adverse_excursion_pct_short_direction_hand_computed():
+    """Test short position with hand-computed worst-case value.
+
+    Setup: entry_price=100, bars with High=[101, 105, 102]
+    - Bar 1: (100-101)/100*100 = -1.0%
+    - Bar 2: (100-105)/100*100 = -5.0%  <-- worst
+    - Bar 3: (100-102)/100*100 = -2.0%
+    Expected return: 5.0 (magnitude of worst move)
+    """
+    entry_price = 100.0
+    bars = pd.DataFrame({
+        "Open": [101.0, 104.0, 101.0],
+        "High": [101.0, 105.0, 102.0],
+        "Low": [99.0, 103.0, 100.0],
+        "Close": [100.5, 104.0, 101.5],
+        "Volume": [1000000, 1000000, 1000000],
+    })
+
+    result = max_adverse_excursion_pct("short", entry_price, bars)
+    assert result == 5.0, (
+        f"Short position: expected 5.0 (worst High=105), got {result}"
+    )
+
+
+def test_max_adverse_excursion_pct_long_never_underwater():
+    """Test long position that never goes underwater.
+
+    All bars have Low >= entry_price; expected return is 0.0.
+    """
+    entry_price = 100.0
+    bars = pd.DataFrame({
+        "Open": [100.5, 102.0, 101.0],
+        "High": [102.0, 104.0, 103.0],
+        "Low": [100.0, 101.5, 100.5],  # All >= entry_price
+        "Close": [101.0, 103.0, 102.0],
+        "Volume": [1000000, 1000000, 1000000],
+    })
+
+    result = max_adverse_excursion_pct("long", entry_price, bars)
+    assert result == 0.0, (
+        f"Long position never underwater: expected 0.0, got {result}"
+    )
+
+
+def test_max_adverse_excursion_pct_short_never_underwater():
+    """Test short position that never goes underwater.
+
+    All bars have High <= entry_price; expected return is 0.0.
+    """
+    entry_price = 100.0
+    bars = pd.DataFrame({
+        "Open": [99.5, 98.0, 99.0],
+        "High": [100.0, 98.5, 99.5],  # All <= entry_price
+        "Low": [98.0, 96.5, 98.5],
+        "Close": [99.0, 97.0, 99.0],
+        "Volume": [1000000, 1000000, 1000000],
+    })
+
+    result = max_adverse_excursion_pct("short", entry_price, bars)
+    assert result == 0.0, (
+        f"Short position never underwater: expected 0.0, got {result}"
+    )
+
+
+def test_max_adverse_excursion_pct_empty_bars():
+    """Test empty bars DataFrame returns 0.0 without raising."""
+    entry_price = 100.0
+    bars = pd.DataFrame({
+        "Open": [],
+        "High": [],
+        "Low": [],
+        "Close": [],
+        "Volume": [],
+    })
+
+    result = max_adverse_excursion_pct("long", entry_price, bars)
+    assert result == 0.0, (
+        f"Empty bars: expected 0.0, got {result}"
+    )
+
+    result = max_adverse_excursion_pct("short", entry_price, bars)
+    assert result == 0.0, (
+        f"Empty bars (short): expected 0.0, got {result}"
+    )
+
+
+def test_max_adverse_excursion_pct_invalid_direction():
+    """Test that invalid direction raises ValueError."""
+    entry_price = 100.0
+    bars = pd.DataFrame({
+        "Open": [100.0],
+        "High": [101.0],
+        "Low": [99.0],
+        "Close": [100.5],
+        "Volume": [1000000],
+    })
+
+    with pytest.raises(ValueError, match="direction must be"):
+        max_adverse_excursion_pct("up", entry_price, bars)
+
+    with pytest.raises(ValueError, match="direction must be"):
+        max_adverse_excursion_pct("LONG", entry_price, bars)
