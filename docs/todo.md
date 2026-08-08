@@ -44,7 +44,7 @@ see that document's §1/§4 for the explicit phase-scope boundary.
 ## Epic 6 — Schema & signal ingestion
 
 - [x] E6-S17 Create papertrade_signals / papertrade_signals_closure schema (docs/tickets/E6-S17-signal-replay-schema.md)
-- [ ] E6-S18 Populate papertrade_signals by unpacking signals_cache (docs/tickets/E6-S18-precompute-unpack-signals-cache.md)
+- [x] E6-S18 Populate papertrade_signals by unpacking signals_cache (docs/tickets/E6-S18-precompute-unpack-signals-cache.md)
 
 ## Epic 7 — Interval selection & closure computation
 
