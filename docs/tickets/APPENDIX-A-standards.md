@@ -1,25 +1,66 @@
-# Appendix A: Implementation Standards
+# Appendix A — Implementation Standards
 
-- **generate_signal() must return a Signal dataclass or None**: All `generate_signal()` implementations must return a `Signal` dataclass (from `kairos_backtest.py`) or `None`, never a plain `dict`. Returning a dict silently breaks the `LiquidityFilterStrategy` wrapper which accesses `.metadata`.
+Applies to every story in this breakdown. Do not inline these rules; reference this file.
 
-- **Percentile stats dict keys use int format**: Percentile stats dict keys are formatted as `f"pct_{int(x)}"` (int, no decimal). Always cast float percentile params to `int` before formatting into the key, e.g., `f"pct_{int(self.stop_pct)}"`.
+## Project tooling
 
-- **Hard dependencies are numpy, scipy, pandas only**: Only `numpy`, `scipy`, `pandas` are hard dependencies in `strategy/` code. `sklearn` may be used optionally with a manual fallback (see `shrunk_covariance` in kairos_portfolio.py). Never import `arch`, `statsmodels`, `cvxpy`, or `stumpy` in strategy code — each has a small pure-numpy/scipy implementation specified in the design doc, validated against reference fixtures generated once from the real library and checked in as CSV.
+- **Package manager / runner:** `uv`. Always use `uv run <cmd>`; never bare `python`/`python3`.
+- **One-off test deps:** `uv run --with pytest python -m pytest ...` if pytest is not already synced.
 
-- **Stateful strategies must cache fits on fixed cadence**: Anything that fits a model (GARCH, GBM, LPPLS, meta-labeler, GA allocator) must cache its fit and refit only on a fixed cadence (e.g., weekly) — never per-bar. This protects the ~0.42s/iteration GPU backtest budget; fitting must be CPU-only and off the inference hot path.
+## Code style
 
-- **Stateful strategies/allocators must expose reset() method**: Stateful strategies/allocators (universal portfolio, meta-labeler, changepoint guard) keep state on the instance (following the `StrategyPerformanceTracker` pattern) and must expose a `reset()` method so walk-forward folds start clean.
+- Max line length: 120 characters (`tool.flake8.max-line-length = 120` in `pyproject.toml`).
+- Type hints: Python 3.11 syntax; prefer `str | None` over `Optional[str]`.
+- Imports: group stdlib, third-party, then local; use absolute imports inside `kairos/`.
+- Docstrings: every public module/function gets one; tag new modules with the `KAI-N` ticket style used elsewhere only if a matching ticket exists, otherwise omit.
+- Naming: follow the existing repo (snake_case, descriptive).
 
-- **strategy/ modules import by bare module name**: `strategy/` modules import each other by bare module name (no package prefix) since `strategy/` has no `__init__.py` and is not a Python package; `tests/conftest.py` adds `strategy/` to `sys.path` for all test files, so tests do not need to do this themselves.
+## Error handling
 
-- **Run unit tests with uv**: Unit tests are run with: `uv run --with pytest python -m pytest tests/unit/<file> -q`.
+- Raise typed exceptions from `kairos.errors` (`KairosError` hierarchy) for Kairos-specific failures.
+- Generic `ValueError`/`RuntimeError` are acceptable only for truly internal/impossible states.
 
-- **Commit convention with trailers**: Commit each story individually with a message of the form `"<story-id>: <title>"`, and the commit message must end with these two trailer lines exactly:
+## Testing conventions
+
+- **Pure modules** (`kairos_margin.py`, `kairos_mtm.py`, `kairos_signal_replay.py`) must be unit-testable with **no GPU, no network, and no `phantom` install**.
+- Tests live in `tests/unit/`. Use `pytest`.
+- To import strategy modules, start each test file with:
+  ```python
+  import sys, os
+  sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
   ```
-  Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
-  Claude-Session: https://claude.ai/code/session_0178edBvkUKM6QXCicY2erxQ
-  ```
+- Use synthetic fixtures; mock external dependencies (`phantom`, price_cache, Telegram) when testing engine wiring.
+- Run tests with `uv run --with pytest python -m pytest tests/unit/<file> -q`.
 
-- **Update todo.md after commit**: After committing a story, check off its line in `docs/todo.md` (change `- [ ]` to `- [x]`).
+## Quality gates (run before every commit)
 
-- **Reuse thresholds from OrchestratorConfig**: Reuse the existing `OrchestratorConfig` entropy/kurtosis thresholds (`entropy_threshold` default 3.0, `kurtosis_max` default 10.0) wherever a strategy needs entropy or kurtosis gating — never introduce a parallel/duplicate threshold constant.
+Scope `flake8`/`mypy` to the specific files your story touches — **do not** run them against
+the whole repo (`kairos/`, `tests/`) or the whole `strategy/` tree. This codebase has large,
+pre-existing, unrelated violations outside whatever module your story modifies; fixing those is
+out of scope and will burn your whole budget on someone else's debt. Example, for a story that
+only touches `strategy/kairos_signal_replay.py`:
+
+```bash
+uv run --with flake8 python -m flake8 strategy/kairos_signal_replay.py
+uv run --with mypy python -m mypy strategy/kairos_signal_replay.py
+uv run --with pytest python -m pytest tests/unit/test_kairos_signal_replay.py -q
+```
+
+Only your own new/changed lines need to be flake8/mypy-clean — if the tool reports a violation
+on a line you didn't touch, that's pre-existing debt, not yours to fix (verify via `git diff`
+or `git blame` before assuming otherwise). If a gate fails on YOUR lines, fix it before
+committing. Do not widen thresholds or suppress warnings unless the story explicitly calls for
+it.
+
+## Git / commit rules
+
+- Branch from `main` per story; small, single-purpose commits.
+- Do **not** add a `Co-Authored-By` trailer.
+- In the same commit that completes a story, mark its `docs/todo.md` item `[x]`.
+- Do not commit generated outputs (`results/`, `output/`, `data/`, model weights, `.env`).
+
+## Module-specific notes
+
+- `strategy/` deliberately has **no `__init__.py`**. Import strategy modules by adding `strategy/` to `sys.path`; do not try to make it a package.
+- `phantom` cash/equity numbers are **not** source of truth for margin math. All MTM and margin math is computed Kairos-side from position rows + price bars; phantom is used for order fill/SL/TP mechanics only.
+- When touching `AllocationConfig`, keep defaults unchanged so existing callers are unaffected.
