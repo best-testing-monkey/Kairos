@@ -236,7 +236,7 @@ def resolve_interval_for_signal(
     entry_datetime,
     interval_ladder: list[str],
     min_bars: int = 2,
-    db_path: str | None = None
+    db_path: str = price_cache.DB_PATH
 ) -> str | None:
     """Resolve the smallest available interval for a signal's closure computation.
 
