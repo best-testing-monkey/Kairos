@@ -2139,3 +2139,181 @@ def test_engine_version_bump_forces_recompute():
     )
 
     conn.close()
+
+
+# ==============================================================================
+# E9-S27: Full pipeline integration smoke test
+# ==============================================================================
+
+
+def _signals_cache_row(symbol, direction, entry, stop, target, ev_pct=5.0, base_win_rate=0.6, n=100):
+    """Build one (stats_row, advice_row) dict pair in the exact shape
+    unpack_signals_cache_to_papertrade_signals expects inside a signals_cache
+    row's stats_json/advice_json lists (see test_unpack_signals_cache_basic).
+
+    expected_value is stored as an ABSOLUTE value (ev_pct * entry / 100.0),
+    matching _insert_replay_signal's own convention above -- allocation.py's
+    fetch_signals() recovers ev_pct via expected_value / entry * 100.0.
+    """
+    stats = {
+        "strategy": "S1", "symbol": symbol, "direction": direction,
+        "entry": entry, "stop": stop, "target": target,
+        "expected_value": ev_pct * entry / 100.0,
+        "base_win_rate": base_win_rate,
+    }
+    advice = {
+        "expected_value": ev_pct * entry / 100.0,
+        "base_signals": n, "oracle_signals": None,
+    }
+    return stats, advice
+
+
+def test_full_pipeline_integration_smoke():
+    """End-to-end smoke test: signals_cache -> unpack -> compute_closures ->
+    replay, with ONLY price_cache.get_price_data mocked (per
+    DESIGN_DOC_offline_signal_replay.md Sec 5's "Replay vs. live sanity
+    check" row and this ticket's acceptance criteria) -- every other
+    function in this module runs for real, including
+    allocation.fetch_signals/allocate.
+
+    Scenario: 3 signals_cache rows (as_of 2026-08-01/02/03, strategy "S1",
+    interval "1d"), 5 total stats/advice entries:
+    - 2026-08-01: FLAT BTC-USD (must be excluded by unpack) + LONG AAA
+      (entry=100, stop=90, target=130; resolves by hitting TARGET)
+    - 2026-08-02: LONG BBB (entry=50, stop=45, target=65; resolves by
+      hitting STOP) + LONG CCC (entry=20, stop=18, target=24; DISQUALIFIED --
+      price_cache returns an empty DataFrame for CCC on every interval
+      attempt, so resolve_interval_for_signal never finds a usable interval)
+    - 2026-08-03: LONG AAA again (same entry/stop/target as the first AAA
+      signal but a different as_of -> a distinct signal_id; also resolves
+      at TARGET)
+
+    Expected unpacked count: 4 (FLAT excluded, never even reaches
+    papertrade_signals). Expected resolved closures: 3 (AAA x2, BBB);
+    expected disqualified: 1 (CCC). All three resolved signals share
+    ev_pct=5.0/base_win_rate=0.6/n=100 with entry/stop/target shaped for
+    risk_pct=10.0/reward_pct=30.0 (b=3.0) -- the exact parameters from
+    test_replay_hand_derived_two_step_scenario's AAA/BBB candidates, already
+    proven above to clear AllocationConfig()'s default gates (n0=100,
+    min_n=50). Each is the sole candidate at its own (interval, as_of) step,
+    so each should be SELECTED, giving num_trades == 3 -- verified against
+    papertrade_signals/papertrade_signals_closure row counts directly, not
+    just trusted from replay()'s return value.
+    """
+    conn = sqlite3.connect(":memory:")
+    _build_signals_cache_table(conn)
+    _ensure_signal_replay_tables(conn)
+
+    def _cache_rows(*pairs):
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+
+    day1_stats, day1_advice = _cache_rows(
+        _signals_cache_row("BTC-USD", "FLAT", 100.0, 99.0, 101.0),
+        _signals_cache_row("AAA", "LONG", 100.0, 90.0, 130.0),
+    )
+    day2_stats, day2_advice = _cache_rows(
+        _signals_cache_row("BBB", "LONG", 50.0, 45.0, 65.0),
+        _signals_cache_row("CCC", "LONG", 20.0, 18.0, 24.0),
+    )
+    day3_stats, day3_advice = _cache_rows(
+        _signals_cache_row("AAA", "LONG", 100.0, 90.0, 130.0),
+    )
+
+    for cache_key, as_of, stats_rows, advice_rows in [
+        ("ck_day1", "2026-08-01", day1_stats, day1_advice),
+        ("ck_day2", "2026-08-02", day2_stats, day2_advice),
+        ("ck_day3", "2026-08-03", day3_stats, day3_advice),
+    ]:
+        conn.execute(
+            """
+            INSERT INTO signals_cache (
+                cache_key, strategy_name, assets, interval, as_of, lookback,
+                pred_samples, min_ev_pct, model_label, model_path,
+                checkpoint_fingerprint, stats_json, advice_json, skipped_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (cache_key, "S1", "AAA,BBB,CCC,BTC-USD", "1d", as_of, 100, 50, 0.0,
+             "base", None, "", json.dumps(stats_rows), json.dumps(advice_rows),
+             "[]", f"{as_of}T00:00:00Z")
+        )
+    conn.commit()
+
+    # AAA hits TARGET intrabar on the first bar (High=135 >= target=130);
+    # BBB hits STOP intrabar on the first bar (Low=43 <= stop=45); CCC (and
+    # anything unrecognized) gets an empty DataFrame -- no data at all, on
+    # every interval attempt, so it's disqualified rather than resolved.
+    # Two bars each (not one): resolve_interval_for_signal's own min_bars
+    # default is 2, so a single-bar mock would disqualify EVERY signal at
+    # the interval-resolution stage before compute_closure's exit walk (which
+    # does terminate on bar 1) ever runs -- caught by this smoke test itself.
+    aaa_bars = pd.DataFrame({
+        "Open": [105.0, 106.0], "High": [135.0, 121.0], "Low": [95.0, 96.0],
+        "Close": [120.0, 119.0], "Volume": [1000, 1000],
+    }, index=pd.date_range("2026-08-01T00:00:00", periods=2, freq="h", tz="UTC"))
+    bbb_bars = pd.DataFrame({
+        "Open": [48.0, 47.0], "High": [52.0, 51.0], "Low": [43.0, 44.0],
+        "Close": [46.0, 45.5], "Volume": [1000, 1000],
+    }, index=pd.date_range("2026-08-02T00:00:00", periods=2, freq="h", tz="UTC"))
+
+    def _fake_get_price_data(ticker, start_date=None, end_date=None, interval=None, db_path=None):
+        if ticker == "AAA":
+            return aaa_bars
+        if ticker == "BBB":
+            return bbb_bars
+        return pd.DataFrame()  # CCC: no data anywhere -> disqualified
+
+    with patch("kairos_signal_replay.price_cache.get_price_data", side_effect=_fake_get_price_data):
+        unpacked = unpack_signals_cache_to_papertrade_signals(
+            conn, "2026-08-01", "2026-08-03"
+        )
+        assert unpacked == 4, f"Expected 4 unpacked signals (FLAT excluded), got {unpacked}"
+
+        computed = compute_closures_for_window(
+            conn, "2026-08-01", "2026-08-03", interval_ladder=["1d"],
+            engine_version="v1", db_path="/tmp/test.db",
+        )
+        assert computed == 4, f"Expected compute_closure called for all 4 rows, got {computed}"
+
+        config = AllocationConfig()
+        metrics = replay(
+            conn, interval="1d", start_ts="2026-08-01", end_ts="2026-08-03",
+            alloc_config=config, starting_capital=1000.0,
+        )
+
+    # No exception raised anywhere above through unpack -> compute_closures ->
+    # replay -- that is this test's primary assertion.
+
+    # E8-S23's DoD: all four metrics keys must be present.
+    for key in ("total_profit_eur", "pct_profit", "num_trades", "pct_max_drawdown"):
+        assert key in metrics, f"Missing required metrics key: {key}"
+
+    # Cross-check num_trades against the DB directly rather than trusting
+    # replay()'s return value blindly.
+    total_signals = conn.execute("SELECT COUNT(*) FROM papertrade_signals").fetchone()[0]
+    assert total_signals == 4, f"Expected 4 unpacked papertrade_signals rows, got {total_signals}"
+
+    resolved_count = conn.execute(
+        "SELECT COUNT(*) FROM papertrade_signals_closure WHERE resolved = 1"
+    ).fetchone()[0]
+    disqualified_count = conn.execute(
+        "SELECT COUNT(*) FROM papertrade_signals_closure WHERE resolved = 0"
+    ).fetchone()[0]
+    assert resolved_count == 3, f"Expected AAA x2 + BBB resolved, got {resolved_count}"
+    assert disqualified_count == 1, f"Expected CCC disqualified, got {disqualified_count}"
+
+    # FLAT exclusion must hold end-to-end: BTC-USD never reaches papertrade_signals.
+    flat_ticker_count = conn.execute(
+        "SELECT COUNT(*) FROM papertrade_signals WHERE ticker = 'BTC-USD'"
+    ).fetchone()[0]
+    assert flat_ticker_count == 0, "FLAT-direction signal must be excluded end-to-end"
+
+    # Each resolved signal is the sole candidate at its own (interval, as_of)
+    # step and clears AllocationConfig()'s default gates, so all 3 should be
+    # SELECTED and traded -- num_trades must equal the resolved count.
+    assert metrics["num_trades"] == resolved_count == 3, (
+        f"Expected num_trades == resolved_count == 3, got "
+        f"num_trades={metrics['num_trades']}, resolved_count={resolved_count}"
+    )
+
+    conn.close()
