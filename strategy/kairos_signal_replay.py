@@ -7,6 +7,14 @@ model inference — closure statistics are computed once from historical price
 bars, then the replay loop runs arbitrary allocation configs against those
 precomputed outcomes in seconds instead of hours.
 
+Non-goals (see DESIGN_DOC_offline_signal_replay.md §4): This tool is
+unleveraged-only — no margin, CFD, or liquidation simulation. Its cost model
+(flat fee/slippage via BacktestEngine's _check_exit/_calculate_pnl) diverges
+from phantom's live per-instrument cost model, so results are directional
+signals, not P&L predictions. Any promising selection/allocation rule found
+here must still be validated with a real kairos_papertrade.py run before being
+trusted.
+
 See DESIGN_DOC_offline_signal_replay.md for full design, schema, and testing
 plan.
 """
@@ -990,7 +998,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     Replay requires `--interval`, `--start`, `--end`, `--capital`, and allocation flags.
     """
     parser = argparse.ArgumentParser(
-        description="Offline signal replay and allocation testing (E9-S24)",
+        description=(
+            "Offline signal replay and allocation testing (E9-S24). "
+            "Unleveraged-only, no margin/CFD/liquidation. Cost model (flat fee/slippage) "
+            "diverges from phantom's live model — results are directional signals, not "
+            "P&L predictions. Promising rules found here must be validated with "
+            "kairos_papertrade.py before being trusted."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Usage examples:\n"
@@ -1002,6 +1016,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "    uv run ./strategy/kairos_signal_replay.py --replay "
             "--interval 1d --start 2026-08-01 --end 2026-08-07 "
             "--capital 200 --max-pos-pct 15 --top-k 3\n"
+            "\n"
+            "Note: This is a fast iteration tool for testing selection/allocation rules "
+            "offline. Results reflect unleveraged, isolated signal outcomes (no portfolio "
+            "simulation, no liquidation) and a simplified flat-fee cost model. Always "
+            "validate findings with a live kairos_papertrade.py run."
         )
     )
     parser.add_argument(
