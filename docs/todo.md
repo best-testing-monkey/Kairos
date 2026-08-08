@@ -48,7 +48,7 @@ see that document's §1/§4 for the explicit phase-scope boundary.
 
 ## Epic 7 — Interval selection & closure computation
 
-- [ ] E7-S19 Interval-ladder resolution & disqualification (docs/tickets/E7-S19-interval-ladder-disqualification.md)
+- [x] E7-S19 Interval-ladder resolution & disqualification (docs/tickets/E7-S19-interval-ladder-disqualification.md)
 - [ ] E7-S20 Max adverse excursion (per-signal isolated drawdown) pure function (docs/tickets/E7-S20-max-adverse-excursion.md)
 - [ ] E7-S21 Closure computation pipeline (docs/tickets/E7-S21-closure-computation-pipeline.md)
 

@@ -5,13 +5,17 @@ import sys
 import os
 import json
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from unittest.mock import patch, MagicMock
+
+import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
 from kairos_signal_replay import (
     _ensure_signal_replay_tables,
-    unpack_signals_cache_to_papertrade_signals
+    unpack_signals_cache_to_papertrade_signals,
+    resolve_interval_for_signal
 )
 
 
@@ -416,3 +420,213 @@ def test_unpack_signals_cache_deterministic_signal_id():
     assert unique_count == 1, f"Expected 1 unique signal_id, got {unique_count}"
 
     conn.close()
+
+
+# ==============================================================================
+# Tests for resolve_interval_for_signal
+# ==============================================================================
+
+
+def _make_price_df(num_bars: int) -> pd.DataFrame:
+    """Helper to create a synthetic OHLCV DataFrame with num_bars rows."""
+    dates = pd.date_range(start="2026-08-01", periods=num_bars, freq="D", tz="UTC")
+    return pd.DataFrame({
+        "Open": [100.0] * num_bars,
+        "High": [101.0] * num_bars,
+        "Low": [99.0] * num_bars,
+        "Close": [100.5] * num_bars,
+        "Volume": [1000000] * num_bars,
+    }, index=dates)
+
+
+def test_resolve_interval_sufficient_data_first_interval():
+    """Test that the function returns the first interval when it has sufficient data.
+
+    Verifies that price_cache.get_price_data is called exactly once (no unnecessary
+    fallback attempts).
+    """
+    entry_dt = datetime(2026, 8, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        # First interval has 10 bars (more than min_bars=2)
+        mock_get.return_value = _make_price_df(10)
+
+        result = resolve_interval_for_signal(
+            ticker="AAPL",
+            entry_datetime=entry_dt,
+            interval_ladder=["1h", "4h", "1d"],
+            min_bars=2,
+            db_path="/tmp/test.db"
+        )
+
+        assert result == "1h", f"Expected '1h', got {result}"
+        # Should only call price_cache once (for the first interval)
+        assert mock_get.call_count == 1, (
+            f"Expected 1 call to price_cache, got {mock_get.call_count}"
+        )
+
+
+def test_resolve_interval_fallback_to_second():
+    """Test fallback when the smallest interval has insufficient data.
+
+    The first interval returns an empty DataFrame, the second returns sufficient
+    data. Verifies that the second interval is returned and price_cache is called
+    twice (once for each interval tried).
+    """
+    entry_dt = datetime(2026, 8, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        # First interval: empty
+        # Second interval: 5 bars
+        mock_get.side_effect = [
+            pd.DataFrame(),  # 1h returns empty
+            _make_price_df(5)  # 4h returns 5 bars
+        ]
+
+        result = resolve_interval_for_signal(
+            ticker="BTC-USD",
+            entry_datetime=entry_dt,
+            interval_ladder=["1h", "4h", "1d"],
+            min_bars=2,
+            db_path="/tmp/test.db"
+        )
+
+        assert result == "4h", f"Expected '4h', got {result}"
+        assert mock_get.call_count == 2, (
+            f"Expected 2 calls to price_cache, got {mock_get.call_count}"
+        )
+
+
+def test_resolve_interval_all_empty():
+    """Test that None is returned when all intervals yield insufficient data."""
+    entry_dt = datetime(2026, 8, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        # All intervals return either None or empty
+        mock_get.side_effect = [
+            None,  # 1h returns None
+            pd.DataFrame(),  # 4h returns empty
+            _make_price_df(1)  # 1d returns only 1 bar (less than min_bars=2)
+        ]
+
+        result = resolve_interval_for_signal(
+            ticker="ETH-USD",
+            entry_datetime=entry_dt,
+            interval_ladder=["1h", "4h", "1d"],
+            min_bars=2,
+            db_path="/tmp/test.db"
+        )
+
+        assert result is None, f"Expected None, got {result}"
+        assert mock_get.call_count == 3, (
+            f"Expected 3 calls (one per interval), got {mock_get.call_count}"
+        )
+
+
+def test_resolve_interval_exception_handling():
+    """Test that exceptions in price_cache calls are caught and don't propagate.
+
+    When one interval's call raises an exception, the function moves to the next
+    interval without propagating the exception.
+    """
+    entry_dt = datetime(2026, 8, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        # First interval raises exception
+        # Second interval succeeds
+        mock_get.side_effect = [
+            ValueError("Network error"),  # 1h raises
+            _make_price_df(8)  # 4h succeeds with 8 bars
+        ]
+
+        result = resolve_interval_for_signal(
+            ticker="SOL-USD",
+            entry_datetime=entry_dt,
+            interval_ladder=["1h", "4h", "1d"],
+            min_bars=2,
+            db_path="/tmp/test.db"
+        )
+
+        assert result == "4h", f"Expected '4h', got {result}"
+        assert mock_get.call_count == 2, (
+            f"Expected 2 calls to price_cache, got {mock_get.call_count}"
+        )
+
+
+def test_resolve_interval_empty_ladder():
+    """Test that None is returned when interval_ladder is empty."""
+    entry_dt = datetime(2026, 8, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        result = resolve_interval_for_signal(
+            ticker="AAPL",
+            entry_datetime=entry_dt,
+            interval_ladder=[],
+            min_bars=2,
+            db_path="/tmp/test.db"
+        )
+
+        assert result is None, f"Expected None for empty ladder, got {result}"
+        assert mock_get.call_count == 0, (
+            f"Expected no calls for empty ladder, got {mock_get.call_count}"
+        )
+
+
+def test_resolve_interval_empty_ticker():
+    """Test that None is returned when ticker is empty."""
+    entry_dt = datetime(2026, 8, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        result = resolve_interval_for_signal(
+            ticker="",
+            entry_datetime=entry_dt,
+            interval_ladder=["1h", "4h"],
+            min_bars=2,
+            db_path="/tmp/test.db"
+        )
+
+        assert result is None, f"Expected None for empty ticker, got {result}"
+        assert mock_get.call_count == 0, (
+            f"Expected no calls for empty ticker, got {mock_get.call_count}"
+        )
+
+
+def test_resolve_interval_min_bars_boundary():
+    """Test that min_bars boundary is respected (exactly min_bars should pass)."""
+    entry_dt = datetime(2026, 8, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        # First interval returns exactly min_bars (should succeed)
+        mock_get.return_value = _make_price_df(3)
+
+        result = resolve_interval_for_signal(
+            ticker="XRP-USD",
+            entry_datetime=entry_dt,
+            interval_ladder=["1h", "4h"],
+            min_bars=3,
+            db_path="/tmp/test.db"
+        )
+
+        assert result == "1h", f"Expected '1h' with exactly min_bars, got {result}"
+        assert mock_get.call_count == 1, (
+            f"Expected 1 call, got {mock_get.call_count}"
+        )
+
+
+def test_resolve_interval_min_bars_default():
+    """Test that min_bars defaults to 2."""
+    entry_dt = datetime(2026, 8, 7, 10, 0, 0, tzinfo=timezone.utc)
+
+    with patch("kairos_signal_replay.price_cache.get_price_data") as mock_get:
+        # Return exactly 2 bars
+        mock_get.return_value = _make_price_df(2)
+
+        result = resolve_interval_for_signal(
+            ticker="ADA-USD",
+            entry_datetime=entry_dt,
+            interval_ladder=["1h"],
+            db_path="/tmp/test.db"
+            # No min_bars specified; should default to 2
+        )
+
+        assert result == "1h", f"Expected '1h' with default min_bars=2, got {result}"

@@ -13,7 +13,9 @@ plan.
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+import price_cache  # type: ignore
 
 
 def _ensure_signal_replay_tables(conn) -> None:
@@ -227,3 +229,82 @@ def unpack_signals_cache_to_papertrade_signals(conn, start_date: str, end_date: 
 
     # Return count of newly inserted rows
     return conn.total_changes - initial_changes
+
+
+def resolve_interval_for_signal(
+    ticker: str,
+    entry_datetime,
+    interval_ladder: list[str],
+    min_bars: int = 2,
+    db_path: str | None = None
+) -> str | None:
+    """Resolve the smallest available interval for a signal's closure computation.
+
+    Tries each interval in interval_ladder (smallest-first, order as provided by
+    caller) for the given ticker. Returns the first interval whose price data has
+    at least min_bars bars within a forward window from entry_datetime. Returns
+    None if no interval succeeds.
+
+    The forward window is 30 days from entry_datetime — sufficient time for most
+    trades to hit a stop/target or time out. Intraday intervals (1h, 5m, etc.)
+    still resolve within this window; daily intervals step through dates as usual.
+
+    Does not raise on price_cache.get_price_data returning None, raising an
+    exception, or returning an empty DataFrame. Instead, silently moves to the
+    next interval in the ladder.
+
+    Args:
+        ticker: Stock ticker symbol (e.g. "AAPL")
+        entry_datetime: Entry timestamp (datetime object) — used as start of
+            forward window
+        interval_ladder: List of interval strings to try, in order
+            (e.g. ["1h", "4h", "1d"]). Caller is responsible for sorting
+            smallest-first
+        min_bars: Minimum bars required for a successful interval (default 2)
+        db_path: Path to price_cache SQLite database
+
+    Returns:
+        The interval string from interval_ladder that succeeded, or None if all
+        failed
+    """
+    if not interval_ladder or not ticker:
+        return None
+
+    # Forward window: 30 days from entry_datetime
+    # This gives enough time for most trades to resolve (hit stop/target/timeout)
+    forward_days = 30
+
+    # Convert entry_datetime to date strings for price_cache
+    if hasattr(entry_datetime, 'date'):
+        start_date = entry_datetime.date().isoformat()
+    else:
+        start_date = entry_datetime.isoformat()
+
+    end_datetime = entry_datetime + timedelta(days=forward_days)
+    if hasattr(end_datetime, 'date'):
+        end_date = end_datetime.date().isoformat()
+    else:
+        end_date = end_datetime.isoformat()
+
+    for interval in interval_ladder:
+        try:
+            df = price_cache.get_price_data(
+                ticker,
+                start_date=start_date,
+                end_date=end_date,
+                interval=interval,
+                db_path=db_path
+            )
+        except Exception:
+            # price_cache call failed; try next interval
+            continue
+
+        if df is None or df.empty or len(df) < min_bars:
+            # Not enough bars for this interval; try next
+            continue
+
+        # Success — return the first interval with sufficient data
+        return interval
+
+    # No interval succeeded
+    return None
