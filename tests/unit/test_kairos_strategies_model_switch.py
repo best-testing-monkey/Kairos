@@ -41,6 +41,34 @@ class TestPredictionCachePut:
         kairos_strategies._prediction_cache.clear()
 
 
+class TestDistCachePut:
+    """Regression guard for the 2026-08-08 leak: _dist_cache had NO cap at
+    all (unlike its sibling _prediction_cache), only clearing on a model
+    switch -- so the same-model prewarm base sweep grew it unbounded for
+    the whole sweep, the actual dominant contributor across three live
+    kairos_papertrade debug runs that each climbed toward an 8GB cgroup
+    cap chasing fixes in the OTHER two overlapping prediction caches."""
+
+    def test_normal_writes_are_retained_under_the_cap(self):
+        kairos_strategies._dist_cache.clear()
+        kairos_strategies._dist_cache_put(("BTC-USD", "t0"), "fake_dist")
+        assert kairos_strategies._dist_cache == {("BTC-USD", "t0"): "fake_dist"}
+        kairos_strategies._dist_cache.clear()
+
+    def test_exceeding_max_entries_clears_the_cache(self, monkeypatch):
+        kairos_strategies._dist_cache.clear()
+        monkeypatch.setattr(kairos_strategies, "_DIST_CACHE_MAX_ENTRIES", 3)
+
+        for i in range(3):
+            kairos_strategies._dist_cache_put((f"SYM{i}", "t0"), "fake_dist")
+        assert len(kairos_strategies._dist_cache) == 3
+
+        kairos_strategies._dist_cache_put(("SYM_OVER", "t0"), "fake_dist")
+        # Cap crossed -> cleared entirely, including the entry that pushed it over.
+        assert kairos_strategies._dist_cache == {}
+        kairos_strategies._dist_cache.clear()
+
+
 class _FakeTokenizer:
     def __init__(self, src):
         self.src = src

@@ -67,6 +67,7 @@ _dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
 # base-model predictions for the finetuned pass.
 
 _PREDICTION_CACHE_MAX_ENTRIES = 5000  # see _prediction_cache_put's docstring
+_DIST_CACHE_MAX_ENTRIES = 5000  # see _dist_cache_put's docstring
 
 
 def _prediction_cache_put(key, value) -> None:
@@ -85,6 +86,29 @@ def _prediction_cache_put(key, value) -> None:
     _prediction_cache[key] = value
     if len(_prediction_cache) > _PREDICTION_CACHE_MAX_ENTRIES:
         _prediction_cache.clear()
+
+
+def _dist_cache_put(key, value) -> None:
+    """Write to _dist_cache with a hard size cap, mirroring _prediction_cache_put.
+
+    Found 2026-08-08: unlike its sibling _prediction_cache, _dist_cache had
+    NO cap at all -- only cleared on model switch, same as _prediction_cache,
+    but with no entry-count guard for the same-model prewarm sweep in
+    between. It's also the fattest of the three overlapping prediction
+    caches in this codebase (kairos_predcache's disk-backed _mem,
+    _prediction_cache, and this one): each KairosDistribution holds
+    `self.predictions` (the full raw sample list -- already duplicated in
+    the other two caches) *and* `self.df` (a concatenated copy) *and* a
+    stats dict. Three live kairos_papertrade debug runs climbed toward an
+    8GB cgroup cap chasing fixes in the OTHER two caches before this one
+    was found to be the actual unbounded one. Entries are a convenience
+    mirror (recomputing distribution_for(preds) from an already-fetched
+    sample list is cheap), so clearing early costs a recompute, not
+    correctness -- same tradeoff as _prediction_cache_put.
+    """
+    _dist_cache[key] = value
+    if len(_dist_cache) > _DIST_CACHE_MAX_ENTRIES:
+        _dist_cache.clear()
 _no_data_fallback_warned: set = set()  # symbols we've already printed the
 # "price_cache returned None; using direct local SQLite fallback" line for.
 # fetch_data_raw is called once per (symbol, date) pair, and callers like
@@ -505,7 +529,7 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
         if dist is None:
             from kairos_backtest import distribution_for
             dist = distribution_for(preds)
-            _dist_cache[dist_key] = dist
+            _dist_cache_put(dist_key, dist)
         result[symbol] = AssetPrediction(
             symbol=symbol,
             dist=dist,
