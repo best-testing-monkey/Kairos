@@ -87,6 +87,9 @@ _SLOW_ITERATION_THRESHOLD_SECONDS = 60.0
 # even 30s is worth a line -- see _log_group_timing's docstring.
 _SLOW_GROUP_THRESHOLD_SECONDS = 30.0
 
+# script_dir = os.path.dirname(os.path.abspath(__file__))
+#exec(open(os.path.join(script_dir, 'memory_monitor_heap.py')).read())
+import memory_monitor_heap
 
 def _format_slow_threshold(seconds: float = _SLOW_ITERATION_THRESHOLD_SECONDS) -> str:
     """Human-readable threshold for watchdog messages, e.g. '60s' or '5min'."""
@@ -1949,7 +1952,7 @@ def main(argv=None):
 
     parsed_signal_selection = None
     if args.signal_selection:
-        from signal_selection import parse_signal_selection, SignalSelectionError
+        from .signal_selection import parse_signal_selection, SignalSelectionError
         try:
             parsed_signal_selection = parse_signal_selection(args.signal_selection)
         except SignalSelectionError as e:

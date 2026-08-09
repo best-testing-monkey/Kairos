@@ -42,7 +42,7 @@ from kairos_papertrade import (
     compute_corrected_realized_pnl,
     DEFAULT_PRED_CACHE_DIR,
 )
-from allocation import AllocationConfig
+from ..allocation import AllocationConfig
 from kairos_margin import load_margin_config
 from kairos_mtm import DailySnapshot, OpenPositionView, compute_daily_snapshot, liquidation_check
 import kairos_papertrade as kp

@@ -1,0 +1,4 @@
+# Top 3 candidates from the 2026-02..2026-08 sweep, for per-month consistency checking.
+'Strategy' != 'path_execution', 'Strategy' != 'tail_asymmetry', 'Strategy' != 'rl_meta_controller', 'Strategy' != 'matrix_profile_anomaly', 'Strategy' != 'multi_factor_rank', 'Strategy' != 'implementation_shortfall', 'Strategy' != 'trend_following', 'Strategy' != 'onchain_flow_filter', 'Strategy' != 'insider_cluster', 'Strategy' != 'gaussian_process', 'Strategy' != 'fractal_dimension', 'Strategy' != 'dark_pool_filter', 'Strategy' != 'cot_positioning_filter', 'Strategy' != 'cds_spread_filter', 'Strategy' != 'atr_bracket', 'n' > 50, ORDER 'EV raw %' DESC, TOP 8
+'Strategy' == 'inverse_variance', 'n' > 30, ORDER 'Score' DESC, TOP 3
+'Strategy' == 'path_v_shape', 'n' > 20, ORDER 'Score' DESC, TOP 3

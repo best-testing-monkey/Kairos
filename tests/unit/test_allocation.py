@@ -12,7 +12,7 @@ import tempfile
 
 import pytest
 
-from allocation import (
+from ..allocation import (
     Candidate, fetch_signals, validate_candidate, AllocationConfig, compute_derived,
     compute_ev_ratio, select_candidates, size_selected, allocate, load_cluster_map,
     AllocationResult

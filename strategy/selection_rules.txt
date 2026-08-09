@@ -1,0 +1,38 @@
+# Candidate --signal-selection DSL rules for kairos_replay_sweep.py.
+# One rule per line; blank lines and lines starting with # are ignored.
+# The sweep always also runs the no-override default (min_n/ev_net>0 gate) for comparison.
+#
+# Context (2026-08-08 diagnostic pass over 2026-02-01..2026-08-01, 52833 resolved signals):
+# correlation(predicted EV, realized pct_profit) ~ 0.006 -- the model's own EV/win-rate
+# estimate is close to noise as a ranking signal in this window. Per-strategy breakdown
+# showed real heterogeneity though: path_execution (largest bucket, n=10588) realized
+# -0.31% avg / 31.7% win despite high predicted EV -- single biggest drag on every sweep
+# so far. A cluster of 9 strategies (implementation_shortfall, trend_following,
+# onchain_flow_filter, insider_cluster, gaussian_process, fractal_dimension,
+# dark_pool_filter, cot_positioning_filter, cds_spread_filter, atr_bracket) all show
+# n=32, ~9.4% win rate, and byte-identical stats -- looks like a shared/broken signal
+# path, not real edge either way; excluded pending investigation. Genuine positive-edge
+# candidates: path_v_shape (n=2100, 85.4% win, +1.05% avg), path_high_low_execution
+# (n=5487, 52.7% win, +0.43% avg), support_confluence, inverse_variance, close_direction.
+
+# --- Generic tighter numeric gates (no strategy filter) ---
+'n' > 100, 'Win raw' > 0.55, ORDER 'EV net %' DESC, TOP 3
+'n' > 150, 'EV net %' > 1.0, ORDER 'Score' DESC, TOP 3
+'n' > 60, 'Win raw' > 0.6, ORDER 'Win raw' DESC, TOP 5
+'Sharpe' > 0.5, 'n' > 60, ORDER 'Sharpe' DESC, TOP 5
+
+# --- Exclude the diagnostically-bad strategies, vary gate/order on the rest ---
+'Strategy' != 'path_execution', 'Strategy' != 'tail_asymmetry', 'Strategy' != 'rl_meta_controller', 'Strategy' != 'matrix_profile_anomaly', 'Strategy' != 'multi_factor_rank', 'Strategy' != 'implementation_shortfall', 'Strategy' != 'trend_following', 'Strategy' != 'onchain_flow_filter', 'Strategy' != 'insider_cluster', 'Strategy' != 'gaussian_process', 'Strategy' != 'fractal_dimension', 'Strategy' != 'dark_pool_filter', 'Strategy' != 'cot_positioning_filter', 'Strategy' != 'cds_spread_filter', 'Strategy' != 'atr_bracket', 'n' > 50, ORDER 'Score' DESC, TOP 5
+'Strategy' != 'path_execution', 'Strategy' != 'tail_asymmetry', 'Strategy' != 'rl_meta_controller', 'Strategy' != 'matrix_profile_anomaly', 'Strategy' != 'multi_factor_rank', 'Strategy' != 'implementation_shortfall', 'Strategy' != 'trend_following', 'Strategy' != 'onchain_flow_filter', 'Strategy' != 'insider_cluster', 'Strategy' != 'gaussian_process', 'Strategy' != 'fractal_dimension', 'Strategy' != 'dark_pool_filter', 'Strategy' != 'cot_positioning_filter', 'Strategy' != 'cds_spread_filter', 'Strategy' != 'atr_bracket', 'n' > 100, 'Win raw' > 0.5, ORDER 'EV net %' DESC, TOP 3
+'Strategy' != 'path_execution', 'Strategy' != 'tail_asymmetry', 'Strategy' != 'rl_meta_controller', 'Strategy' != 'matrix_profile_anomaly', 'Strategy' != 'multi_factor_rank', 'Strategy' != 'implementation_shortfall', 'Strategy' != 'trend_following', 'Strategy' != 'onchain_flow_filter', 'Strategy' != 'insider_cluster', 'Strategy' != 'gaussian_process', 'Strategy' != 'fractal_dimension', 'Strategy' != 'dark_pool_filter', 'Strategy' != 'cot_positioning_filter', 'Strategy' != 'cds_spread_filter', 'Strategy' != 'atr_bracket', 'n' > 50, ORDER 'EV raw %' DESC, TOP 8
+
+# --- Just drop the single biggest drag (path_execution), keep everything else ---
+'Strategy' != 'path_execution', 'n' > 50, ORDER 'Score' DESC, TOP 5
+'Strategy' != 'path_execution', 'n' > 100, ORDER 'EV net %' DESC, TOP 8
+
+# --- Isolate individual strategies with diagnostically real edge ---
+'Strategy' == 'path_v_shape', 'n' > 20, ORDER 'Score' DESC, TOP 3
+'Strategy' == 'path_high_low_execution', 'n' > 50, ORDER 'Score' DESC, TOP 5
+'Strategy' == 'support_confluence', 'n' > 30, ORDER 'Score' DESC, TOP 3
+'Strategy' == 'inverse_variance', 'n' > 30, ORDER 'Score' DESC, TOP 3
+'Strategy' == 'close_direction', 'n' > 50, ORDER 'Score' DESC, TOP 5

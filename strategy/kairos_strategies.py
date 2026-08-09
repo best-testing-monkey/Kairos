@@ -6,6 +6,7 @@ from pandas import DataFrame
 
 from kairos.adapter import to_kronos_frame
 from kairos.calendars import future_timestamps
+import kairos_predcache
 
 sys.path.insert(0, '.')
 
@@ -400,7 +401,6 @@ def _shared_cache_key(symbol, df, mdl_src, pred_len):
     function's real cache-lookup path and is_batch_cached's read-only
     precheck build byte-identical keys off a single source of truth.
     """
-    import kairos_predcache
 
     lookback_for_hash = min(KairosSettings.lookback, len(df))
     content_hash = kairos_predcache.content_hash_for_closes(

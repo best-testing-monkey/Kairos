@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy
 
 import pytest  # noqa: E402
 
-from allocation import AllocationConfig  # noqa: E402
+from ..allocation import AllocationConfig  # noqa: E402
 from kairos_margin import load_margin_config  # noqa: E402
 from kairos_mtm import (  # noqa: E402
     admission_check,

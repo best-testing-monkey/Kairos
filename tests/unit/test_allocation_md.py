@@ -4,7 +4,7 @@ Verifies the RFC §6 Markdown "Portfolio Allocation" section renderer produces
 all required lines in the correct order, using a hand-built AllocationResult.
 """
 
-from allocation import AllocationResult, AllocationConfig, write_md_section
+from ..allocation import AllocationResult, AllocationConfig, write_md_section
 from signal_selection import parse_signal_selection
 
 
