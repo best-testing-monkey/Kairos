@@ -187,23 +187,28 @@ def fast_concat(predictions: List[pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(predictions, ignore_index=True)
 
 
-_dist_memo: dict = {}
-
-
 def distribution_for(predictions: List[pd.DataFrame]) -> "KairosDistribution":
     """
-    Memoized KairosDistribution construction, keyed by the identity of the
-    predictions list. The list is retained in the memo so ids stay valid.
-    Callers that reuse the same cached predictions list get the same
-    (immutable in practice) distribution back instead of rebuilding it.
+    Construct a KairosDistribution from a predictions list.
+
+    Used to be memoized by id(predictions) in a module-level dict
+    (_dist_memo) that was never cleared -- every call permanently retained
+    its predictions list (and the resulting KairosDistribution, holding a
+    concatenated DataFrame + stats dict on top) so that id() values would
+    never be reused via garbage collection. That "protection" cost an
+    unbounded per-process leak and bought nothing: every call site
+    (kairos_strategies.predict_all_batch, kairos_horizon.HorizonPredictor,
+    kairos_meta.MultiAssetKairosPredictor) always passes a freshly built
+    `predictions` list -- a fresh model prediction, or a fresh object
+    unpickled from kairos_predcache's SqliteDict-backed cache on every
+    access -- so id(predictions) was always a first-time key and the memo
+    never produced a single hit. The real cross-call caching already
+    happens one level up, in kairos_strategies._dist_cache (keyed by
+    (symbol, last_bar_ts), capped, cleared on model switch) -- removed
+    2026-08 after this was found to be the dominant contributor to a
+    string of live papertrade runs climbing toward an 8GB RSS ceiling.
     """
-    key = id(predictions)
-    entry = _dist_memo.get(key)
-    if entry is not None and entry[0] is predictions:
-        return entry[1]
-    dist = KairosDistribution(predictions)
-    _dist_memo[key] = (predictions, dist)
-    return dist
+    return KairosDistribution(predictions)
 
 
 class KairosDistribution:
