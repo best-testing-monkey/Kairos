@@ -16,8 +16,8 @@ in this order):
     of an ever-growing Python dict, so a hit never costs process heap.
   - Disk layer (one .npz file per key) so predictions survive across
     subprocess boundaries within the same run -- pre-dates the sqlite
-    layer and is still written on every put() (see PredictionCache.put),
-    but is no longer the layer callers read from first.
+    layer, is no longer written on new put() calls (see PredictionCache.put),
+    but still readable for backward compatibility with pre-existing .npz files.
   - An in-memory LRU (`_mem`) bounded by a byte budget derived from
     /proc/meminfo's MemAvailable (stdlib only, no psutil). As of the
     sqlite-layer change, put() no longer writes through to `_mem` at all
@@ -128,9 +128,11 @@ _DEFAULT_MAX_DISK_BYTES = 2 * 1024**3  # 2GiB
 
 
 class PredictionCache:
-    """Sqlite-backed prediction cache, with a legacy .npz-per-key disk store
-    and in-memory LRU still underneath (see module docstring for the
-    current three-layer read/write order).
+    """Sqlite-backed prediction cache, with a legacy read-only .npz-per-key
+    disk store and in-memory LRU still underneath (see module docstring for
+    the current three-layer read/write order). New entries are written to
+    sqlite only; pre-existing .npz files are still readable for backward
+    compatibility.
 
     get(key) -> Optional[List[pd.DataFrame]]
     put(key, sample_dfs)
@@ -138,12 +140,12 @@ class PredictionCache:
 
     def __init__(self, cache_dir, mem_fraction: float = 0.25, mem_budget_bytes: Optional[int] = None,
                  max_disk_bytes: int = _DEFAULT_MAX_DISK_BYTES):
+        self.cache_dir = cache_dir
+        os.makedirs(self.cache_dir, exist_ok=True)
         # Primary store as of 2026-08-11 -- see module docstring. autocommit=True
         # so a crash mid-run doesn't lose already-written entries (matches
         # kairos_papertrade.py's own SqliteDict usage for report_seen.db).
         self._sqlite_cache = SqliteDict(filename=cache_dir.rstrip("/") + "/caches.db", tablename="prediction_cache", autocommit=True)
-        self.cache_dir = cache_dir
-        os.makedirs(self.cache_dir, exist_ok=True)
         if mem_budget_bytes is not None:
             self.mem_budget_bytes = int(mem_budget_bytes)
         else:
@@ -233,71 +235,7 @@ class PredictionCache:
                 pass
             return None
 
-    def _disk_write(self, key: str, sample_dfs: List[pd.DataFrame]):
-        if not sample_dfs:
-            return
-        columns = list(sample_dfs[0].columns)
-        n_rows = len(sample_dfs[0])
-        # All samples share the same shape in practice (pred_len fixed per call).
-        values = np.stack([
-            df[columns].to_numpy(dtype=np.float32) for df in sample_dfs
-        ], axis=0)
-        index_iso = np.array([
-            [pd.Timestamp(ts).isoformat() for ts in df.index]
-            for df in sample_dfs
-        ])
-        path = self._disk_path(key)
-        tmp_path = path + f".tmp{os.getpid()}"
-        old_size = 0
-        try:
-            old_size = os.path.getsize(path)
-        except OSError:
-            pass
-        with open(tmp_path, "wb") as f:
-            np.savez(f, values=values, columns=np.array(columns), index=index_iso)
-        os.replace(tmp_path, path)
-        new_size = os.path.getsize(path)
-        with self._lock:
-            self._disk_bytes += new_size - old_size
-        self._evict_disk_if_over_budget(skip_path=path)
 
-    def _evict_disk_if_over_budget(self, skip_path: Optional[str] = None):
-        """Evict oldest-st_mtime files under cache_dir until _disk_bytes is
-        back under max_disk_bytes. Mirrors _mem_put's LRU-eviction pattern,
-        file-based instead of dict-based -- mtime stands in for "oldest"
-        since files on disk have no separate access-order structure.
-        `skip_path` (the entry we just wrote) is never evicted, matching
-        _mem_put's guard against evicting the entry just inserted.
-        """
-        with self._lock:
-            if self._disk_bytes <= self.max_disk_bytes:
-                return
-            try:
-                entries = []
-                with os.scandir(self.cache_dir) as it:
-                    for entry in it:
-                        if not entry.name.endswith(".npz"):
-                            continue
-                        try:
-                            if not entry.is_file():
-                                continue
-                            st = entry.stat()
-                        except OSError:
-                            continue
-                        entries.append((st.st_mtime, entry.path, st.st_size))
-            except OSError:
-                return
-            entries.sort(key=lambda t: t[0])  # oldest mtime first
-            for _mtime, path, size in entries:
-                if self._disk_bytes <= self.max_disk_bytes:
-                    break
-                if skip_path is not None and os.path.abspath(path) == os.path.abspath(skip_path):
-                    continue
-                try:
-                    os.remove(path)
-                except OSError:
-                    continue
-                self._disk_bytes -= size
 
     # ── public API ───────────────────────────────────────────────────────
     def get(self, key: str) -> Optional[List[pd.DataFrame]]:
@@ -359,18 +297,17 @@ class PredictionCache:
         return filecache_has
 
     def put(self, key: str, sample_dfs: List[pd.DataFrame]):
-        """Write `key` to the sqlite table and the legacy .npz disk file.
+        """Write `key` to the sqlite table.
 
-        As of 2026-08-11, this no longer writes through to the in-memory
-        LRU (`_mem_put` is commented out below) -- sqlite is the fast path
-        now, so `_mem` is populated only as a get()-side-effect on a
-        disk-only hit, not on every write. The .npz disk write is kept
-        (not yet removed -- see the "cashing fixes WIP" commit that made
-        this change, which still needs to decide whether to drop it).
+        As of 2026-08-11, this only writes to the sqlite table -- the
+        in-memory LRU is no longer written to (`_mem_put` is commented out
+        below). `_mem` is populated only as a get()-side-effect on a
+        disk-only hit, not on every write. Legacy .npz disk files are no
+        longer written (existing ones are still readable via get()/has()'s
+        fallback path for backward compatibility).
         """
         self._sqlite_cache[key] = sample_dfs
         # self._mem_put(key, sample_dfs)
-        self._disk_write(key, sample_dfs)
 
 
 _singleton: Optional[PredictionCache] = None

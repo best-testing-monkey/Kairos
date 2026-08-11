@@ -21,7 +21,7 @@ def _make_asset_df(n=310, base=100.0):
 def _reset_state(monkeypatch, tmp_path):
     # Reset module-level in-process caches so each test starts clean, and
     # give KairosSettings deterministic values.
-    ks._prediction_cache.clear()
+    ks._shared_keys.clear()
     ks._dist_cache.clear()
     monkeypatch.setattr(KairosSettings, "lookback", 300)
     monkeypatch.setattr(KairosSettings, "pred_samples", 5)
@@ -31,7 +31,7 @@ def _reset_state(monkeypatch, tmp_path):
     pc._singleton = None
     pc._singleton_dir = None
     yield
-    ks._prediction_cache.clear()
+    ks._shared_keys.clear()
     ks._dist_cache.clear()
     monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
     pc._singleton = None
@@ -91,7 +91,7 @@ def test_cache_disabled_by_default_calls_model_every_time(monkeypatch):
 
     # Simulate a fresh subprocess: clear the in-process cache. Without
     # KAIROS_PRED_CACHE_DIR set, the model must be called again.
-    ks._prediction_cache.clear()
+    ks._shared_keys.clear()
     ks._dist_cache.clear()
     ks.predict_all_batch(assets)
     assert stub.calls == 2
@@ -110,7 +110,7 @@ def test_shared_cache_hit_across_simulated_subprocess_boundary(monkeypatch, tmp_
 
     # Simulate a new subprocess: clear the in-process caches, but the shared
     # disk cache (KAIROS_PRED_CACHE_DIR) persists.
-    ks._prediction_cache.clear()
+    ks._shared_keys.clear()
     ks._dist_cache.clear()
 
     result2 = ks.predict_all_batch(assets)
@@ -129,7 +129,7 @@ def test_mixed_hit_and_miss_batch_only_predicts_misses(monkeypatch, tmp_path):
     ks.predict_all_batch(assets1)
     assert stub.symbols_predicted == 1
 
-    ks._prediction_cache.clear()
+    ks._shared_keys.clear()
     ks._dist_cache.clear()
 
     # BTC-USD is an exact repeat (cache hit); ETH-USD is new (cache miss).
@@ -152,7 +152,7 @@ def test_different_content_hash_is_a_cache_miss(monkeypatch, tmp_path):
     ks.predict_all_batch(assets_a)
     assert stub.symbols_predicted == 1
 
-    ks._prediction_cache.clear()
+    ks._shared_keys.clear()
     ks._dist_cache.clear()
 
     # Same symbol, same last-bar timestamp, but different lookback content

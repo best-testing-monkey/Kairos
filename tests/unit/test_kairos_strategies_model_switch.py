@@ -15,30 +15,12 @@ import pytest
 import kairos_strategies
 
 
-class TestPredictionCachePut:
-    """Regression guard for the 2026-07-29 leak: _prediction_cache is only
-    cleared on a model switch, but prewarm_prediction_cache's base sweep
-    processes many groups x dates against ONE model with no switch at all,
-    so without a size cap it grows unbounded for the whole sweep."""
-
-    def test_normal_writes_are_retained_under_the_cap(self):
-        kairos_strategies._prediction_cache.clear()
-        kairos_strategies._prediction_cache_put(("BTC-USD", "t0"), ["pred"])
-        assert kairos_strategies._prediction_cache == {("BTC-USD", "t0"): ["pred"]}
-        kairos_strategies._prediction_cache.clear()
-
-    def test_exceeding_max_entries_clears_the_cache(self, monkeypatch):
-        kairos_strategies._prediction_cache.clear()
-        monkeypatch.setattr(kairos_strategies, "_PREDICTION_CACHE_MAX_ENTRIES", 3)
-
-        for i in range(3):
-            kairos_strategies._prediction_cache_put((f"SYM{i}", "t0"), ["pred"])
-        assert len(kairos_strategies._prediction_cache) == 3
-
-        kairos_strategies._prediction_cache_put(("SYM_OVER", "t0"), ["pred"])
-        # Cap crossed -> cleared entirely, including the entry that pushed it over.
-        assert kairos_strategies._prediction_cache == {}
-        kairos_strategies._prediction_cache.clear()
+# TestPredictionCachePut was deleted: it tested _prediction_cache_put()/
+# _PREDICTION_CACHE_MAX_ENTRIES, both removed 2026-08-11 along with the
+# per-process _prediction_cache dict (every prediction lookup/write now goes
+# straight through the shared kairos_predcache module). The analogous
+# cap-on-overflow behavior for _dist_cache is already covered below by
+# TestDistCachePut, so there's no equivalent left to test in this shape.
 
 
 class TestDistCachePut:
@@ -104,7 +86,7 @@ def _reset_model_globals():
         kairos_strategies.bt_predictor = None
         kairos_strategies._loaded_model_src = None
         kairos_strategies._weights_loaded_src = None
-        kairos_strategies._prediction_cache.clear()
+        kairos_strategies._shared_keys.clear()
         kairos_strategies._dist_cache.clear()
 
     _clear()
@@ -113,13 +95,19 @@ def _reset_model_globals():
 
 
 def _patch_model_loading(monkeypatch, cuda_available=True):
-    """Patch model.Kronos/KronosTokenizer/KronosPredictor and
-    kairos_gpu.ensure_cuda so _ensure_model_loaded never touches a real
-    model, HuggingFace Hub, or GPU/recovery ladder."""
-    import model as model_module
-    monkeypatch.setattr(model_module, "Kronos", _FakeModel, raising=False)
-    monkeypatch.setattr(model_module, "KronosTokenizer", _FakeTokenizer, raising=False)
-    monkeypatch.setattr(model_module, "KronosPredictor", _FakePredictor, raising=False)
+    """Patch Kronos/KronosTokenizer/KronosPredictor and kairos_gpu.ensure_cuda
+    so _ensure_model_loaded never touches a real model, HuggingFace Hub, or
+    GPU/recovery ladder.
+
+    kairos_strategies.py does `from model import Kronos, KronosTokenizer,
+    KronosPredictor`, binding those names directly into its own module
+    namespace -- patching model_module's attributes doesn't affect calls
+    made via kairos_strategies' own bound names, so the fakes must be
+    patched onto kairos_strategies itself.
+    """
+    monkeypatch.setattr(kairos_strategies, "Kronos", _FakeModel)
+    monkeypatch.setattr(kairos_strategies, "KronosTokenizer", _FakeTokenizer)
+    monkeypatch.setattr(kairos_strategies, "KronosPredictor", _FakePredictor)
 
     import kairos_gpu
     monkeypatch.setattr(kairos_gpu, "ensure_cuda", lambda *a, **kw: cuda_available)
@@ -192,23 +180,25 @@ class TestEnsureModelLoadedSwitching:
         kairos_strategies._ensure_model_loaded(model_path="repo/a")
 
         # Seed the caches as if a prediction had already run against "a".
-        kairos_strategies._prediction_cache[("BTC-USD", "t0")] = ["fake_pred"]
+        # _shared_keys replaced the old per-process _prediction_cache dict
+        # (2026-08-11) -- it just remembers symbol -> shared-cache key.
+        kairos_strategies._shared_keys["BTC-USD"] = "some-shared-key"
         kairos_strategies._dist_cache[("BTC-USD", "t0")] = "fake_dist"
 
         kairos_strategies._ensure_model_loaded(model_path="repo/b")
 
-        assert kairos_strategies._prediction_cache == {}
+        assert kairos_strategies._shared_keys == {}
         assert kairos_strategies._dist_cache == {}
 
     def test_same_model_reload_does_not_clear_caches(self, monkeypatch):
         _patch_model_loading(monkeypatch)
         kairos_strategies._ensure_model_loaded(model_path="repo/a")
-        kairos_strategies._prediction_cache[("BTC-USD", "t0")] = ["fake_pred"]
+        kairos_strategies._shared_keys["BTC-USD"] = "some-shared-key"
         kairos_strategies._dist_cache[("BTC-USD", "t0")] = "fake_dist"
 
         kairos_strategies._ensure_model_loaded(model_path="repo/a")
 
-        assert kairos_strategies._prediction_cache == {("BTC-USD", "t0"): ["fake_pred"]}
+        assert kairos_strategies._shared_keys == {"BTC-USD": "some-shared-key"}
         assert kairos_strategies._dist_cache == {("BTC-USD", "t0"): "fake_dist"}
 
     def test_switch_calls_gc_collect(self, monkeypatch):
@@ -294,14 +284,14 @@ class TestPredictAllBatchForwardsModelPath:
 class TestPrepareModelSwitch:
     def test_clears_caches_and_updates_loaded_src_on_switch(self):
         kairos_strategies._loaded_model_src = ("tok/a", "repo/a")
-        kairos_strategies._prediction_cache[("BTC-USD", "t0")] = ["fake_pred"]
+        kairos_strategies._shared_keys["BTC-USD"] = "some-shared-key"
         kairos_strategies._dist_cache[("BTC-USD", "t0")] = "fake_dist"
 
         requested = kairos_strategies._prepare_model_switch(model_path="repo/b")
 
         assert requested == ("NeoQuasar/Kronos-Tokenizer-base", "repo/b")
         assert kairos_strategies._loaded_model_src == requested
-        assert kairos_strategies._prediction_cache == {}
+        assert kairos_strategies._shared_keys == {}
         assert kairos_strategies._dist_cache == {}
 
     def test_does_not_touch_weights_loaded_src_or_predictor(self):
@@ -318,14 +308,14 @@ class TestPrepareModelSwitch:
 
     def test_noop_when_requested_src_matches_loaded_src(self):
         kairos_strategies._loaded_model_src = ("NeoQuasar/Kronos-Tokenizer-base", "repo/a")
-        kairos_strategies._prediction_cache[("BTC-USD", "t0")] = ["fake_pred"]
+        kairos_strategies._shared_keys["BTC-USD"] = "some-shared-key"
         kairos_strategies._dist_cache[("BTC-USD", "t0")] = "fake_dist"
 
         requested = kairos_strategies._prepare_model_switch(model_path="repo/a")
 
         assert requested == ("NeoQuasar/Kronos-Tokenizer-base", "repo/a")
         # No switch needed -> caches must survive untouched.
-        assert kairos_strategies._prediction_cache == {("BTC-USD", "t0"): ["fake_pred"]}
+        assert kairos_strategies._shared_keys == {"BTC-USD": "some-shared-key"}
         assert kairos_strategies._dist_cache == {("BTC-USD", "t0"): "fake_dist"}
 
     def test_never_imports_or_touches_model_loading(self, monkeypatch):
@@ -469,18 +459,22 @@ class TestPredictAllBatchLazyMaterialize:
         monkeypatch.setattr(kairos_strategies, "future_timestamps", fake_future_timestamps)
 
         df = self._make_asset_df()
+        cache = kairos_predcache.get_cache()
         kairos_strategies.predict_all_batch({"BTC-USD": df}, model_path=None)
-        files_after_base = set(os.listdir(tmp_path))
+        # put() writes to the sqlite table now (no more per-key .npz files --
+        # see kairos_predcache module docstring), so the write-path check
+        # below looks at sqlite keys instead of files on disk.
+        keys_after_base = set(cache._sqlite_cache.keys())
 
-        kairos_strategies._prediction_cache.clear()
+        kairos_strategies._shared_keys.clear()
         kairos_strategies._dist_cache.clear()
         kairos_strategies.predict_all_batch({"BTC-USD": df}, model_path="repo/finetuned")
-        files_after_finetuned = set(os.listdir(tmp_path))
+        keys_after_finetuned = set(cache._sqlite_cache.keys())
 
-        new_files = files_after_finetuned - files_after_base
-        assert len(new_files) == 1, (
+        new_keys = keys_after_finetuned - keys_after_base
+        assert len(new_keys) == 1, (
             "base and finetuned model_path must produce distinct shared-cache "
-            "keys/files, not collide under KairosSettings.model"
+            "keys, not collide under KairosSettings.model"
         )
 
         monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
@@ -589,7 +583,7 @@ class TestIsBatchCached:
         kairos_predcache._singleton_dir = None
 
     def test_never_materializes_model_or_writes_to_cache(self, monkeypatch, tmp_path):
-        """Read-only contract: no model load, no in-process _prediction_cache
+        """Read-only contract: no model load, no in-process _shared_keys
         mutation, no shared-cache writes."""
         import kairos_predcache
 
@@ -606,9 +600,13 @@ class TestIsBatchCached:
         result = kairos_strategies.is_batch_cached({"BTC-USD": df})
 
         assert result is False  # genuine miss, but no exception raised above
-        assert kairos_strategies._prediction_cache == {}
-        files_written = list(tmp_path.iterdir())
-        assert files_written == []
+        assert kairos_strategies._shared_keys == {}
+        # PredictionCache.__init__ creates caches.db as a side effect of
+        # constructing the SqliteDict (even with zero entries written), so
+        # "no shared-cache writes" is checked at the entry level, not by
+        # asserting the directory is empty.
+        cache = kairos_predcache.get_cache()
+        assert len(cache._sqlite_cache) == 0
 
         monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
         kairos_predcache._singleton = None

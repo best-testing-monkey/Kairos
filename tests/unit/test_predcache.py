@@ -109,19 +109,19 @@ def test_disk_persists_across_new_cache_instance(tmp_path):
 
 
 def test_corrupt_cache_file_treated_as_miss(tmp_path):
+    # put() no longer writes .npz files (sqlite is the only write path now),
+    # so there's no way to get a corrupt on-disk file via put()+corrupt
+    # anymore. Simulate a legacy .npz file (written by a pre-sqlite-layer
+    # version of this module, or manually dropped in place) for a key that
+    # was never put through sqlite, to exercise _disk_read's corruption
+    # handling via get()'s disk-fallback path.
     cache = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024)
-    samples = _make_samples(2)
-    cache.put("corrupt-key", samples)
-
-    path = cache._disk_path("corrupt-key")
-    assert os.path.exists(path)
-    # Corrupt the file on disk.
+    key = "corrupt-key"
+    path = cache._disk_path(key)
     with open(path, "wb") as f:
         f.write(b"not a valid npz file")
 
-    # New instance so the in-memory LRU doesn't mask the corrupt disk file.
-    cache2 = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024)
-    assert cache2.get("corrupt-key") is None
+    assert cache.get(key) is None
     # Corrupt file should have been cleaned up.
     assert not os.path.exists(path)
 
@@ -231,53 +231,10 @@ def test_get_cache_defaults_mem_bytes_when_env_var_unset(monkeypatch, tmp_path):
 
 
 # ── disk size cap + eviction ─────────────────────────────────────────────────
-
-class TestDiskEviction:
-    def _dir_size(self, cache_dir) -> int:
-        total = 0
-        for name in os.listdir(cache_dir):
-            total += os.path.getsize(os.path.join(cache_dir, name))
-        return total
-
-    def test_writing_past_budget_evicts_oldest_mtime_first(self, tmp_path):
-        # Each entry is a few KB on disk; use a tiny budget so a handful of
-        # writes forces eviction without needing thousands of entries.
-        cache = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024,
-                                    max_disk_bytes=6 * 1024)
-
-        keys = [f"k{i}" for i in range(6)]
-        paths = {}
-        for i, key in enumerate(keys):
-            cache.put(key, _make_samples(3, base_price=100.0 + i))
-            paths[key] = cache._disk_path(key)
-            # Ensure distinct, increasing mtimes so "oldest" is unambiguous
-            # even on filesystems with coarse mtime resolution.
-            os.utime(paths[key], (i * 10, i * 10))
-
-        # Total on-disk size must stay under budget after every write.
-        assert self._dir_size(str(tmp_path)) <= cache.max_disk_bytes
-
-        # The earliest-written keys should have been evicted first; the
-        # most recently written key must still be present.
-        assert not os.path.exists(paths[keys[0]])
-        assert os.path.exists(paths[keys[-1]])
-        assert cache.get(keys[-1]) is not None
-
-    def test_disk_bytes_tracks_actual_directory_size(self, tmp_path):
-        cache = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024,
-                                    max_disk_bytes=10 * 1024 * 1024)
-        cache.put("a", _make_samples(2))
-        cache.put("b", _make_samples(2))
-        assert cache._disk_bytes == self._dir_size(str(tmp_path))
-
-    def test_seeds_disk_bytes_from_existing_directory_on_init(self, tmp_path):
-        cache1 = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024,
-                                     max_disk_bytes=10 * 1024 * 1024)
-        cache1.put("seed-key", _make_samples(2))
-        on_disk_size = self._dir_size(str(tmp_path))
-
-        # A fresh instance over the same (already populated) cache_dir must
-        # seed its byte counter from what's actually on disk, not start at 0.
-        cache2 = pc.PredictionCache(str(tmp_path), mem_budget_bytes=10 * 1024 * 1024,
-                                     max_disk_bytes=10 * 1024 * 1024)
-        assert cache2._disk_bytes == on_disk_size
+#
+# TestDiskEviction (test_writing_past_budget_evicts_oldest_mtime_first,
+# test_disk_bytes_tracks_actual_directory_size,
+# test_seeds_disk_bytes_from_existing_directory_on_init) was deleted: it
+# tested _evict_disk_if_over_budget()/_disk_write(), both removed along with
+# all new .npz writes (put() now writes only to sqlite). There is no
+# replacement to test since writes no longer touch disk at all.

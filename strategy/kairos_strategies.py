@@ -107,7 +107,8 @@ def _dist_cache_put(key, value) -> None:
     _dist_cache[key] = value
     if len(_dist_cache) > _DIST_CACHE_MAX_ENTRIES:
         _dist_cache.clear()
-    _no_data_fallback_warned: set = set()  # symbols we've already printed the
+
+_no_data_fallback_warned: set = set()  # symbols we've already printed the
 
 # ─────────────────────────────────────────────────────────────────────────────
 
