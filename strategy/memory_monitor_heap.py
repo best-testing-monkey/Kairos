@@ -8,44 +8,12 @@ import gc
 import inspect
 import ctypes
 
-THRESHOLD_MB = 4000
+THRESHOLD_MB = 6000
 CHECK_INTERVAL = 0.5
 
 process = psutil.Process(os.getpid())
 main_thread_id = threading.current_thread().ident
 tracemalloc.start()
-
-def get_object_size(obj, seen=None):
-    if seen is None:
-        seen = set()
-    obj_id = id(obj)
-    if obj_id in seen:
-        return 0
-    seen.add(obj_id)
-    
-    try:
-        size = sys.getsizeof(obj)
-    except (TypeError, AttributeError):
-        return 0
-    
-    try:
-        if isinstance(obj, dict):
-            try:
-                size += sum(get_object_size(v, seen) for v in list(obj.values()))
-                size += sum(get_object_size(k, seen) for k in list(obj.keys()))
-            except RuntimeError:
-                pass
-        elif isinstance(obj, (list, tuple)):
-            try:
-                size += sum(get_object_size(i, seen) for i in list(obj))
-            except (RuntimeError, ValueError):
-                pass
-        elif hasattr(obj, '__dict__'):
-            size += get_object_size(obj.__dict__, seen)
-    except (TypeError, AttributeError, RecursionError):
-        pass
-    
-    return size
 
 def find_variable_by_object(obj, depth=3):
     """Traverse frames to find variable names that reference obj"""
@@ -102,23 +70,22 @@ def find_referrer_info(obj):
     return None, None, None, None
 
 def analyze_heap():
-    """Walk garbage collector heap and identify largest objects with variable names"""
+    """Quickly identify largest objects by syscall size, skip recursive traversal"""
     try:
         gc.collect()
     except:
         pass
     
-    objects = gc.get_objects()
     object_sizes = []
     
-    for obj in objects:
+    for obj in gc.get_objects():
         try:
-            size = get_object_size(obj)
+            size = sys.getsizeof(obj)
             if size > 1024 * 100:
                 type_name = type(obj).__name__
                 var_name, filepath, lineno, func_name = find_referrer_info(obj)
                 object_sizes.append((size, type_name, obj, var_name, filepath, lineno, func_name))
-        except (TypeError, AttributeError, RecursionError, RuntimeError):
+        except (TypeError, AttributeError, RuntimeError):
             pass
     
     object_sizes.sort(reverse=True)
@@ -131,12 +98,12 @@ def memory_monitor():
             memory_mb = process.memory_info().rss / 1024 / 1024
             
             if memory_mb >= THRESHOLD_MB:
+                suspend_main_thread(main_thread_id)
+                time.sleep(0.5)
+                
                 print(f"\n{'='*70}", flush=True)
                 print(f"MEMORY THRESHOLD EXCEEDED: {memory_mb:.1f}MB", flush=True)
                 print(f"{'='*70}\n", flush=True)
-                suspend_main_thread(main_thread_id)
-                time.sleep(0.5)                
-                
                 
                 print(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
                 print(f"Current memory: {memory_mb:.1f}MB", flush=True)
@@ -147,65 +114,74 @@ def memory_monitor():
                 print("-" * 70)
                 snapshot = tracemalloc.take_snapshot()
                 top_stats = snapshot.statistics('lineno')
-                for i, stat in enumerate(top_stats[:15], 1):
-                    print(f"{i:2d}. {stat}")
+                count = 0
+                for i, stat in enumerate(top_stats, 1):
+                    if isinstance(stat, tracemalloc.Statistic):
+                        frames: tracemalloc.Traceback = stat.traceback
+                        for frame in frames:
+                            if not ("site-packages" in f"{frame.filename}") and (frame.filename.startswith("/") and ("/Kairos/" in f"{frame.filename}")) :
+                                print(f"{count:2d}. {frame.filename}:{frame.lineno} size={stat.size / 1024 / 1024:.2f}MB count={stat.count}")
+                                count +=1
+                                break;
+                    if count >= 15:
+                        break
                 
-                print("\n" + "="*70)
-                print("HEAP ANALYSIS - Largest objects in memory:")
-                print("="*70 + "\n")
+                # print("\n" + "="*70)
+                # print("HEAP ANALYSIS - Largest objects in memory:")
+                # print("="*70 + "\n")
                 
-                heap_objects = analyze_heap()
+                # heap_objects = analyze_heap()
                 
-                for i, (size, type_name, obj, var_name, filepath, lineno, func_name) in enumerate(heap_objects[:30], 1):
-                    size_mb = size / 1024 / 1024
+                # for i, (size, type_name, obj, var_name, filepath, lineno, func_name) in enumerate(heap_objects[:30], 1):
+                #     size_mb = size / 1024 / 1024
                     
-                    var_display = var_name if var_name else "unknown"
-                    if filepath and lineno and func_name:
-                        location = f"{filepath}:{lineno} in {func_name}"
-                    else:
-                        location = "unknown location"
+                #     var_display = var_name if var_name else "unknown"
+                #     if filepath and lineno and func_name:
+                #         location = f"{filepath}:{lineno} in {func_name}"
+                #     else:
+                #         location = "unknown location"
                     
-                    print(f"{i:2d}. {var_display:25s} {size_mb:8.2f}MB  (id: {id(obj)}, {location})")
+                #     print(f"{i:2d}. {var_display:25s} {size_mb:8.2f}MB  (id: {id(obj)}, {location})")
                     
-                    if type_name == 'list':
-                        print(f"    list (Length: {len(obj)}, First few items: {str(obj[:3])[:70]})")
-                    elif type_name == 'dict':
-                        print(f"    dict (Keys: {len(obj)}, Sample keys: {str(list(obj.keys())[:3])[:70]})")
-                    elif type_name == 'ndarray':
-                        try:
-                            print(f"    ndarray (Shape: {obj.shape}, dtype: {obj.dtype})")
-                        except:
-                            print(f"    ndarray")
-                    elif type_name in ('str', 'bytes'):
-                        content_preview = str(obj)[:70]
-                        print(f"    {type_name} ({content_preview})")
-                    else:
-                        print(f"    {type_name}")
+                #     if type_name == 'list':
+                #         print(f"    list (Length: {len(obj)}, First few items: {str(obj[:3])[:70]})")
+                #     elif type_name == 'dict':
+                #         print(f"    dict (Keys: {len(obj)}, Sample keys: {str(list(obj.keys())[:3])[:70]})")
+                #     elif type_name == 'ndarray':
+                #         try:
+                #             print(f"    ndarray (Shape: {obj.shape}, dtype: {obj.dtype})")
+                #         except:
+                #             print(f"    ndarray")
+                #     elif type_name in ('str', 'bytes'):
+                #         content_preview = str(obj)[:70]
+                #         print(f"    {type_name} ({content_preview})")
+                #     else:
+                #         print(f"    {type_name}")
                     
-                    referrers = gc.get_referrers(obj)
-                    if referrers:
-                        print(f"    Referrers ({len(referrers)}):")
-                        for ref in referrers[:3]:
-                            ref_type = type(ref).__name__
-                            if ref_type == 'frame':
-                                frame = ref
-                                print(f"      - Frame: {frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}")
-                                for vname, vobj in list(frame.f_locals.items())[:3]:
-                                    if vobj is obj:
-                                        print(f"        variable {vname}")
-                            elif ref_type == 'dict':
-                                for k, v in list(ref.items())[:1]:
-                                    if v is obj:
-                                        print(f"      - Dict key: {repr(k)}")
-                            elif ref_type == 'list':
-                                try:
-                                    idx = ref.index(obj)
-                                    print(f"      - List index: {idx}")
-                                except ValueError:
-                                    pass
-                            else:
-                                print(f"      - {ref_type}")
-                    print()
+                #     referrers = gc.get_referrers(obj)
+                #     if referrers:
+                #         print(f"    Referrers ({len(referrers)}):")
+                #         for ref in referrers[:3]:
+                #             ref_type = type(ref).__name__
+                #             if ref_type == 'frame':
+                #                 frame = ref
+                #                 print(f"      - Frame: {frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}")
+                #                 for vname, vobj in list(frame.f_locals.items())[:3]:
+                #                     if vobj is obj:
+                #                         print(f"        variable {vname}")
+                #             elif ref_type == 'dict':
+                #                 for k, v in list(ref.items())[:1]:
+                #                     if v is obj:
+                #                         print(f"      - Dict key: {repr(k)}")
+                #             elif ref_type == 'list':
+                #                 try:
+                #                     idx = ref.index(obj)
+                #                     print(f"      - List index: {idx}")
+                #                 except ValueError:
+                #                     pass
+                #             else:
+                #                 print(f"      - {ref_type}")
+                #     print()
                 
                 print("="*70)
                 print("Memory monitor exiting.")

@@ -401,10 +401,6 @@ def generate_and_dedupe_reports(base_now, interval, months_back, run_kwargs, not
     base_now = floor_dt(base_now,interval=step);
 
     hash_v2, hash_legacy = _make_report_hash(base_now, interval, run_kwargs)
-    # todo: install SqliteDict un uv (and lockfile or something.. don't know how that works with u)
-    #   d = SqliteDict('mydata.sqlite', autocommit=True)
-    #   d['key'] = {'some': 'value'}
-    #   d.close()
 
     seen_table = _pick_seen_table("report_seen.db", hash_v2, hash_legacy)
     seen = SqliteDict(filename="report_seen.db", tablename=seen_table, autocommit=True)
@@ -677,51 +673,63 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
     base_check_pbar = tqdm(
         total=len(groups) * len(dates), desc="Prewarm check: Base", unit="req",
     )
-    for (assets_str, grp_interval), _group_rows in groups.items():
-        if base_needs_load:
-            break
-        assets = assets_str.split(",")
-        for date in dates:
-            base_check_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
-            try:
-                data = {
-                    sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
-                    for sym in assets
-                }
-            except Exception as e:
-                failures.append(
-                    f"prewarm base group assets={assets_str} interval={grp_interval} "
-                    f"date={date}: {e}"
-                )
-                base_check_pbar.update(1)
-                continue
-            base_check_pbar.update(1)
-            if not kairos_strategies.is_batch_cached(data, model_path=None):
-                base_needs_load = True
-                break
-            if base_check_pbar.n % _PREWARM_GC_INTERVAL == 0:
-                gc.collect()
-    base_check_pbar.close()
+    # for (assets_str, grp_interval), _group_rows in groups.items():
+    #     if base_needs_load:
+    #         break
+    #     assets = assets_str.split(",")
+    #     for date in dates:
+    #         base_check_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
+    #         try:
+    #             data = {
+    #                 sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
+    #                 for sym in assets
+    #             }
+    #         except Exception as e:
+    #             failures.append(
+    #                 f"prewarm base group assets={assets_str} interval={grp_interval} "
+    #                 f"date={date}: {e}"
+    #             )
+    #             base_check_pbar.update(1)
+    #             continue
+    #         base_check_pbar.update(1)
+    #         if not kairos_strategies.is_batch_cached(data, model_path=None):
+    #             base_needs_load = True
+    #             break
+    #         if base_check_pbar.n % _PREWARM_GC_INTERVAL == 0:
+    #             gc.collect()
+    # base_check_pbar.close()
 
-    if base_needs_load and dates:
+
+    if dates:
         _notify(_format_prewarm_load_message("Base", dates), enabled=notify)
-        base_all_entries = [
+        base_all_entries: list[tuple[str, str, datetime]] = [
             (assets_str, grp_interval, date)
             for (assets_str, grp_interval) in groups.keys()
             for date in dates
         ]
+
+        # base_all_entries.sort(key=lambda item: item[2], reverse=True)
+
         base_load_pbar = tqdm(
             base_all_entries, desc="Prewarm load: Base", unit="req", total=len(base_all_entries),
         )
+
         for i, (assets_str, grp_interval, date) in enumerate(base_load_pbar, start=1):
-            base_load_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
+            assets_str_fixedw = (assets_str + "                           ")[:30]
+            if len(assets_str_fixedw) < len(assets_str):
+                assets_str_fixedw = assets_str_fixedw[:27]+"..."
+
+            base_load_pbar.set_postfix_str(f"{assets_str_fixedw} @ {date:%Y-%m-%d}")
             assets = assets_str.split(",")
             try:
                 data = {
                     sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
                     for sym in assets
                 }
-                kairos_strategies.predict_all_batch(data, model_path=None)
+                if kairos_strategies.is_batch_cached(data, model_path=None):
+                    continue
+                else:
+                    kairos_strategies.predict_all_batch(data, model_path=None)
             except Exception as e:
                 failures.append(
                     f"prewarm base group assets={assets_str} interval={grp_interval} "
@@ -749,30 +757,8 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
 
             assets = assets_str.split(",")
             model_label = f"Finetuned({assets_str})"
-            group_needs_load = False
-            group_check_pbar = tqdm(
-                dates, desc=f"Prewarm check: {model_label}", unit="req", total=len(dates),
-            )
-            for i, date in enumerate(group_check_pbar, start=1):
-                group_check_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
-                try:
-                    data = {
-                        sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
-                        for sym in assets
-                    }
-                except Exception as e:
-                    failures.append(
-                        f"prewarm finetuned group assets={assets_str} interval={grp_interval} "
-                        f"date={date} (model_path={model_path}): {e}"
-                    )
-                    continue
-                if not kairos_strategies.is_batch_cached(data, model_path=model_path):
-                    group_needs_load = True
-                    break
-                if i % _PREWARM_GC_INTERVAL == 0:
-                    gc.collect()
 
-            if group_needs_load and dates:
+            if dates:
                 _notify(_format_prewarm_load_message(model_label, dates), enabled=notify)
                 group_load_pbar = tqdm(
                     dates, desc=f"Prewarm load: {model_label}", unit="req", total=len(dates),
@@ -784,7 +770,10 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
                             sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
                             for sym in assets
                         }
-                        kairos_strategies.predict_all_batch(data, model_path=model_path)
+                        if kairos_strategies.is_batch_cached(data, model_path=None):
+                            continue
+                        else:
+                            kairos_strategies.predict_all_batch(data, model_path=model_path)
                     except Exception as e:
                         failures.append(
                             f"prewarm finetuned group assets={assets_str} interval={grp_interval} "
@@ -1952,7 +1941,7 @@ def main(argv=None):
 
     parsed_signal_selection = None
     if args.signal_selection:
-        from .signal_selection import parse_signal_selection, SignalSelectionError
+        from signal_selection import parse_signal_selection, SignalSelectionError
         try:
             parsed_signal_selection = parse_signal_selection(args.signal_selection)
         except SignalSelectionError as e:

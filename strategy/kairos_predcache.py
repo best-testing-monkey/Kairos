@@ -29,6 +29,7 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+from sqlitedict import SqliteDict
 
 # Columns persisted for each prediction sample DataFrame.
 _DEFAULT_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
@@ -123,6 +124,7 @@ class PredictionCache:
 
     def __init__(self, cache_dir, mem_fraction: float = 0.25, mem_budget_bytes: Optional[int] = None,
                  max_disk_bytes: int = _DEFAULT_MAX_DISK_BYTES):
+        self._sqlite_cache = SqliteDict(filename=cache_dir.rstrip("/") + "/caches.db", tablename="prediction_cache", autocommit=True)
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
         if mem_budget_bytes is not None:
@@ -199,6 +201,9 @@ class PredictionCache:
                     for s in index_iso[i]
                 ])
                 dfs.append(pd.DataFrame(values[i].astype(np.float64), columns=columns, index=idx))
+            del values
+            del columns
+            del index_iso
             return dfs
         except Exception:
             # Corrupt/unreadable file: treat as a miss and clean it up.
@@ -279,12 +284,19 @@ class PredictionCache:
 
     # ── public API ───────────────────────────────────────────────────────
     def get(self, key: str) -> Optional[List[pd.DataFrame]]:
+        if (key in self._sqlite_cache):
+            return self._sqlite_cache[key]
+
         cached = self._mem_get(key)
         if cached is not None:
+            self._sqlite_cache[key] = cached
             return cached
         from_disk = self._disk_read(key)
         if from_disk is not None:
+            self._sqlite_cache[key] = from_disk
             self._mem_put(key, from_disk)
+
+            
         return from_disk
 
     def has(self, key: str) -> bool:
@@ -306,21 +318,27 @@ class PredictionCache:
         prediction had been written to disk. Existence-only callers should
         use this method instead of get() to avoid the same trap.
         """
+        if (key in self._sqlite_cache):
+            return True
+
         with self._lock:
             if key in self._mem:
                 return True
-        return os.path.exists(self._disk_path(key))
+        filecache_has = os.path.exists(self._disk_path(key))
+        if filecache_has:
+            self.get(key) # to get in the sqlite_cache with the same code as get
+        return filecache_has
 
     def put(self, key: str, sample_dfs: List[pd.DataFrame]):
-        self._mem_put(key, sample_dfs)
+        self._sqlite_cache[key] = sample_dfs
+        # self._mem_put(key, sample_dfs)
         self._disk_write(key, sample_dfs)
 
 
 _singleton: Optional[PredictionCache] = None
 _singleton_dir: Optional[str] = None
 
-
-def get_cache() -> Optional[PredictionCache]:
+def get_cache(mem_budget_bytes: Optional[int] = None) -> Optional[PredictionCache]:
     """Return the process-wide PredictionCache singleton, or None if the
     cache is disabled (KAIROS_PRED_CACHE_DIR unset)."""
     global _singleton, _singleton_dir
@@ -347,7 +365,7 @@ def get_cache() -> Optional[PredictionCache]:
     # available-RAM-fraction default.
     mem_budget_bytes = None
     env_mem_bytes = os.environ.get("KAIROS_PRED_CACHE_MEM_BYTES")
-    if env_mem_bytes:
+    if env_mem_bytes and not mem_budget_bytes:
         try:
             mem_budget_bytes = int(env_mem_bytes)
         except ValueError:

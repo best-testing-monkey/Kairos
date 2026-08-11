@@ -1279,7 +1279,7 @@ def main(argv=None):
 
     parsed_signal_selection = None
     if args.signal_selection:
-        from .signal_selection import parse_signal_selection, SignalSelectionError
+        from signal_selection import parse_signal_selection, SignalSelectionError
         try:
             parsed_signal_selection = parse_signal_selection(args.signal_selection)
         except SignalSelectionError as e:

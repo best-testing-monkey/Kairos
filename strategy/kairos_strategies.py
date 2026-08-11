@@ -1,3 +1,4 @@
+from narwhals.dtypes import Unknown
 import sys
 from collections import Counter
 from tabnanny import verbose
@@ -25,20 +26,26 @@ import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 
+from sqlitedict import SqliteDict
+
 warnings.filterwarnings('ignore')
+
+import torch
+from model import Kronos, KronosTokenizer, KronosPredictor
 
 sys.path.append("../")
 import price_cache
 from kairos.data import get_forecast_window, fetch_price_data_local_fallback
 # model imports are deferred to _ensure_model_loaded() so --no-prediction
 # runs never touch HuggingFace Hub or trigger its auth warning.
-from typing import List
+from typing import Callable, List, Optional, Sequence
 
 import pandas as pd
 
 from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig, print_results
 from kairos_backtest import KairosSettings
 from kairos.config import _state
+from kairos_predcache import PredictionCache
 
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
@@ -52,70 +59,31 @@ PRED_SAMPLES = KairosSettings.pred_samples
 INITIAL_CAPITAL = KairosSettings.initial_capital
 OUTPUT_DIR = KairosSettings.output_dir
 
-bt_tokenizer = None
+bt_tokenizer :KronosTokenizer | None = None
 bt_model = None
-bt_predictor = None
+bt_predictor: None | KronosPredictor = None
 _loaded_model_src = None  # (tokenizer_src, model_src) requested/resolved by the most recent
                           # _prepare_model_switch() call -- used for cache-clearing bookkeeping.
                           # NOT necessarily materialized into bt_predictor yet; see _weights_loaded_src.
 _weights_loaded_src = None  # (tokenizer_src, model_src) actually materialized into bt_predictor, or None
 
-_prediction_cache: dict = {}  # (symbol, last_bar_ts) -> List[pd.DataFrame]
+_shared_keys: dict[str, str] = {}  # symbol -> cache key
+
 _dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
 # NOTE: neither cache carries model identity. Whenever _ensure_model_loaded
 # switches to a different (tokenizer_src, model_src) pair, both caches MUST
 # be cleared or a two-pass (base -> finetuned) flow would silently reuse
 # base-model predictions for the finetuned pass.
 
-_PREDICTION_CACHE_MAX_ENTRIES = 5000  # see _prediction_cache_put's docstring
 _DIST_CACHE_MAX_ENTRIES = 5000  # see _dist_cache_put's docstring
 
-
-def _prediction_cache_put(key, value) -> None:
-    """Write to _prediction_cache with a hard size cap.
-
-    _prediction_cache is only cleared on a model switch (_prepare_model_switch)
-    -- correct for the base -> finetuned two-pass flow, but
-    prewarm_prediction_cache's model-major base sweep processes ~150 groups x
-    ~183 dates against the SAME model without ever switching, so it never
-    clears there. A live 6-month papertrade run's RSS grew unbounded with
-    this cache as a contributing factor (2026-07-29 leak investigation).
-    Entries here are just a convenience mirror of kairos_predcache's real,
-    bounded, persistent shared cache, so clearing early costs an extra disk
-    lookup on the next miss, not correctness.
-    """
-    _prediction_cache[key] = value
-    if len(_prediction_cache) > _PREDICTION_CACHE_MAX_ENTRIES:
-        _prediction_cache.clear()
-
-
 def _dist_cache_put(key, value) -> None:
-    """Write to _dist_cache with a hard size cap, mirroring _prediction_cache_put.
-
-    Found 2026-08-08: unlike its sibling _prediction_cache, _dist_cache had
-    NO cap at all -- only cleared on model switch, same as _prediction_cache,
-    but with no entry-count guard for the same-model prewarm sweep in
-    between. It's also the fattest of the three overlapping prediction
-    caches in this codebase (kairos_predcache's disk-backed _mem,
-    _prediction_cache, and this one): each KairosDistribution holds
-    `self.predictions` (the full raw sample list -- already duplicated in
-    the other two caches) *and* `self.df` (a concatenated copy) *and* a
-    stats dict. Three live kairos_papertrade debug runs climbed toward an
-    8GB cgroup cap chasing fixes in the OTHER two caches before this one
-    was found to be the actual unbounded one. Entries are a convenience
-    mirror (recomputing distribution_for(preds) from an already-fetched
-    sample list is cheap), so clearing early costs a recompute, not
-    correctness -- same tradeoff as _prediction_cache_put.
+    """Write to _dist_cache with a hard size cap.
     """
     _dist_cache[key] = value
     if len(_dist_cache) > _DIST_CACHE_MAX_ENTRIES:
         _dist_cache.clear()
-_no_data_fallback_warned: set = set()  # symbols we've already printed the
-# "price_cache returned None; using direct local SQLite fallback" line for.
-# fetch_data_raw is called once per (symbol, date) pair, and callers like
-# prewarm_prediction_cache call it for every date in a backtest window, so
-# without this the same line prints hundreds of times per symbol per run.
-
+    _no_data_fallback_warned: set = set()  # symbols we've already printed the
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -202,7 +170,7 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None, as_of=None) -> D
         # observed in production: a finetune_next backtest crashed here for a
         # symbol whose *training* fetch, moments earlier in the same run, had
         # already succeeded via this exact fallback. Try it before giving up.
-        raw = fetch_price_data_local_fallback(symbol, start_dt, end_dt, interval, price_cache.DB_PATH)
+        raw = fetch_price_data_local_fallback(symbol, pd.Timestamp(start_dt), pd.Timestamp(end_dt), interval, price_cache.DB_PATH)
         if raw is not None and not raw.empty:
             if symbol not in _no_data_fallback_warned:
                 print(f"  [{symbol}] price_cache returned None; using direct local SQLite fallback")
@@ -262,12 +230,8 @@ def _prepare_model_switch(model_path=None, tokenizer_path=None):
     requested_src = (tok_src, mdl_src)
 
     if _model_switch_needed(requested_src, _loaded_model_src):
-        # No model identity in these caches' keys -- see the note by
-        # _prediction_cache/_dist_cache above. Clear them the moment we know
-        # the caller wants a different model, even though the weights for
-        # that model may not be materialized until _materialize_model runs.
-        _prediction_cache.clear()
         _dist_cache.clear()
+        _shared_keys.clear()
         _loaded_model_src = requested_src
 
     return requested_src
@@ -287,9 +251,6 @@ def _materialize_model(requested_src):
         return
 
     tok_src, mdl_src = requested_src
-
-    import torch
-    from model import Kronos, KronosTokenizer, KronosPredictor
 
     if bt_predictor is not None:
         # Switching to a different model: unload the old one first.
@@ -336,6 +297,8 @@ def _ensure_model_loaded(model_path=None, tokenizer_path=None):
 def run_model(x_df, x_ts, y_ts, pred_len, sample_count=1,
               model_path=None, tokenizer_path=None, return_samples=False):
     _ensure_model_loaded(model_path, tokenizer_path)
+    assert bt_predictor != None, "predictor is None!!"
+
     return bt_predictor.predict(
         df=x_df,
         x_timestamp=x_ts,
@@ -428,8 +391,8 @@ def is_batch_cached(assets: dict, model_path=None, pred_len=1) -> bool:
 
     False if the shared cache is inactive (kairos_predcache.get_cache()
     returns None -- KAIROS_PRED_CACHE_DIR unset) or if any symbol is a
-    miss. Never loads a model, never touches _prediction_cache, never
-    writes to the shared cache -- purely a lookup.
+    miss. Never loads a model, never writes to the shared cache 
+    -- purely a lookup.
 
     Uses PredictionCache.has(), NOT .get(): .get() always deserializes a
     disk hit and promotes it into the in-memory LRU as a side effect, which
@@ -439,7 +402,7 @@ def is_batch_cached(assets: dict, model_path=None, pred_len=1) -> bool:
     """
     import kairos_predcache
 
-    shared_cache = kairos_predcache.get_cache()
+    shared_cache = kairos_predcache.get_cache(0)
     if shared_cache is None:
         return False
 
@@ -469,25 +432,20 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
     pred_len = 1
     requested_src = _prepare_model_switch(model_path, tokenizer_path)
 
-    shared_cache = kairos_predcache.get_cache()
-    shared_keys = {}  # symbol -> cache key (only computed when shared_cache is active)
+    shared_cache = kairos_predcache.get_cache(0)
 
     df_list, x_ts_list, y_ts_list = [], [], []
     cached_results = {}
     uncached_symbols = []
 
     for symbol, df in assets.items():
-        cache_key = (symbol, df.index[-1])
-        if cache_key in _prediction_cache:
-            cached_results[symbol] = _prediction_cache[cache_key]
-            continue
+        # cache_key = (symbol, df.index[-1])
+        shared_key = _shared_cache_key(symbol, df, requested_src[1], pred_len)
+        _shared_keys[symbol] = shared_key
 
         if shared_cache is not None:
-            shared_key = _shared_cache_key(symbol, df, requested_src[1], pred_len)
-            shared_keys[symbol] = shared_key
             shared_hit = shared_cache.get(shared_key)
             if shared_hit is not None:
-                _prediction_cache_put(cache_key, shared_hit)
                 cached_results[symbol] = shared_hit
                 continue
 
@@ -501,6 +459,8 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
 
     if uncached_symbols:
         _materialize_model(requested_src)
+        assert bt_predictor != None, "predictor is None!!"
+
         seq_lens = [x.shape[0] for x in df_list]
         return_samples = KairosSettings.pred_samples > 1
         if len(set(seq_lens)) == 1:
@@ -517,11 +477,10 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
         for symbol, preds in zip(uncached_symbols, pred_lists):
             if not isinstance(preds, list):
                 preds = [preds]
-            _prediction_cache_put((symbol, assets[symbol].index[-1]), preds)
             cached_results[symbol] = preds
-            if shared_cache is not None and symbol in shared_keys:
-                shared_cache.put(shared_keys[symbol], preds)
-
+            if shared_cache is not None and symbol in _shared_keys:
+                shared_cache.put(_shared_keys[symbol], preds)
+    
     result = {}
     for symbol, preds in cached_results.items():
         dist_key = (symbol, assets[symbol].index[-1])
@@ -627,7 +586,7 @@ def parse_signals_config(signals_str):
     """Parse '--signals' CLI string into a config dict."""
     if not signals_str or signals_str.lower() == 'none':
         return {}
-    config = {
+    config: dict[str, list[int] | list[Unknown] | list[int]| dict[str, int|float]  | None] = {
         'sma_periods': [],
         'ema_periods': [],
         'bb': None,
@@ -706,10 +665,10 @@ def compute_signals(df, config):
 
     return out
 
+def predict_kairos_cloud(signal: Optional[pd.DataFrame]= None, **kwargs) -> List[pd.DataFrame]:
+    shared_cache: Optional[PredictionCache] = kairos_predcache.get_cache(0)
+    assert shared_cache is not None, "kairos_predcache.get_cache() failed to supply an object"
 
-# ── Interactive control panel ─────────────────────────────────────────────────
-
-def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataFrame]:
     pred_historic = kwargs.get('pred_historic', 0)
     pred_num = kwargs.get('pred_num', 1)
     model_path = kwargs.get("model") or KairosSettings.model or "NeoQuasar/Kronos-base"
@@ -718,6 +677,7 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataF
     lookback = KairosSettings.lookback
     pred_samples = KairosSettings.pred_samples
 
+    shared_key = _shared_keys[symbol]
     if signal is None:
         print("Kairos prediction cloud")
         print(f"   Symbol:             {symbol}")
@@ -727,9 +687,9 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataF
         print("Step 1: Fetching data ...")
         x_df, x_ts, y_ts, actual = fetch_data(symbol, lookback, pred_historic)
     else:
-        cache_key = (symbol, signal.index[-1])
-        if cache_key in _prediction_cache:
-            return _prediction_cache[cache_key]
+        if shared_cache.has(shared_key):
+            # pyrefly: ignore [bad-return]
+            return shared_cache.get(shared_key)
         lookback = min(KairosSettings.lookback, len(signal))
         x_df, x_ts = to_kronos_frame(signal, lookback, amount="auto")
         y_ts = future_timestamps(x_ts.iloc[-1], KairosSettings.interval, 1, _state.calendar, _state.tz)
@@ -743,8 +703,8 @@ def predict_kairos_cloud(signal: pd.DataFrame = None, **kwargs) -> List[pd.DataF
     if not isinstance(result_list, list):
         result_list = [result_list]
 
-    if signal is not None:
-        _prediction_cache_put(cache_key, result_list)
+    if signal is not None and shared_key is not None and result_list is not None:
+        shared_cache.put(shared_key , result_list)
     return result_list
 
 

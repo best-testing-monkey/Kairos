@@ -33,7 +33,7 @@ import price_cache  # type: ignore
 from allocation import AllocationConfig, allocate, fetch_signals
 from kairos_backtest import BacktestEngine, Direction
 from kairos_signals import DB_PATH as SIGNALS_DB_PATH
-from .signal_selection import parse_signal_selection, SignalSelectionError
+from signal_selection import parse_signal_selection, SignalSelectionError
 
 # Mirrors kairos_papertrade.py's _ensure_configured_db/_configured_dbs pattern
 # (price_cache.configure() defaults to remote=True, which requires a local
