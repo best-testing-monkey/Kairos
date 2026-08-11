@@ -67,6 +67,14 @@ _loaded_model_src = None  # (tokenizer_src, model_src) requested/resolved by the
                           # NOT necessarily materialized into bt_predictor yet; see _weights_loaded_src.
 _weights_loaded_src = None  # (tokenizer_src, model_src) actually materialized into bt_predictor, or None
 
+# _shared_keys replaced the old per-process _prediction_cache dict
+# (2026-08-11): rather than caching prediction DataFrames here too (on top
+# of kairos_predcache's own disk/sqlite/mem layers -- see that module's
+# docstring), this just remembers which shared-cache key predict_all_batch
+# resolved for each symbol during its cache-lookup loop, so the later
+# _dist_cache-population loop and predict_kairos_cloud don't need to
+# recompute _shared_cache_key(). Much smaller footprint than caching actual
+# prediction data a second time in-process.
 _shared_keys: dict[str, str] = {}  # symbol -> cache key
 
 _dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
@@ -78,7 +86,23 @@ _dist_cache: dict = {}  # (symbol, last_bar_ts) -> KairosDistribution
 _DIST_CACHE_MAX_ENTRIES = 5000  # see _dist_cache_put's docstring
 
 def _dist_cache_put(key, value) -> None:
-    """Write to _dist_cache with a hard size cap.
+    """Write to _dist_cache with a hard size cap, clearing the whole dict
+    (not per-entry LRU eviction) on overflow.
+
+    _dist_cache is only cleared on a model switch (_prepare_model_switch),
+    same as _shared_keys -- correct for the base -> finetuned two-pass flow,
+    but prewarm_prediction_cache's model-major base sweep processes many
+    groups x dates against the SAME model without ever switching, so without
+    this cap it grows for the whole sweep. Originally found 2026-08-08 as
+    the actual dominant leak after fixes to the OTHER two overlapping
+    prediction caches (kairos_predcache's in-memory LRU, and the
+    now-removed _prediction_cache dict this file used to also keep) each
+    only partially helped -- each KairosDistribution held here carries the
+    full raw sample list *and* a concatenated DataFrame copy *and* a stats
+    dict, making it the fattest of the (then-three, now-two) overlapping
+    caches. Entries are a convenience mirror (recomputing
+    distribution_for(preds) from an already-cached prediction is cheap), so
+    clearing early costs a recompute, not correctness.
     """
     _dist_cache[key] = value
     if len(_dist_cache) > _DIST_CACHE_MAX_ENTRIES:
@@ -213,7 +237,7 @@ def _model_switch_needed(requested_src, loaded_src) -> bool:
 def _prepare_model_switch(model_path=None, tokenizer_path=None):
     """Cheap, pure bookkeeping: resolve the requested (tokenizer_src,
     model_src) pair and, if it differs from what's currently "loaded"
-    (`_loaded_model_src`), clear the prediction/dist caches and update
+    (`_loaded_model_src`), clear `_dist_cache`/`_shared_keys` and update
     `_loaded_model_src`.
 
     Does NOT touch disk/HF/GPU -- no from_pretrained, no KronosPredictor
@@ -391,8 +415,8 @@ def is_batch_cached(assets: dict, model_path=None, pred_len=1) -> bool:
 
     False if the shared cache is inactive (kairos_predcache.get_cache()
     returns None -- KAIROS_PRED_CACHE_DIR unset) or if any symbol is a
-    miss. Never loads a model, never writes to the shared cache 
-    -- purely a lookup.
+    miss. Never loads a model, never writes to the shared cache --
+    purely a lookup.
 
     Uses PredictionCache.has(), NOT .get(): .get() always deserializes a
     disk hit and promotes it into the in-memory LRU as a side effect, which
@@ -421,10 +445,15 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
     _prepare_model_switch()/_materialize_model(). Passing a different
     model_path than what's currently loaded triggers an in-process model
     swap (see _model_switch_needed) -- but only if at least one requested
-    symbol isn't already satisfied by the (per-process or shared-disk)
-    prediction cache: _materialize_model() (the actual from_pretrained /
-    GPU-move work) is deferred until after the cache-lookup loop below, and
-    skipped entirely when every symbol is a cache hit.
+    symbol isn't already satisfied by the shared kairos_predcache (see that
+    module's docstring for its sqlite/disk/mem layers): _materialize_model()
+    (the actual from_pretrained / GPU-move work) is deferred until after the
+    cache-lookup loop below, and skipped entirely when every symbol is a
+    cache hit. There's no per-process prediction cache here anymore (the old
+    _prediction_cache dict was removed 2026-08-11) -- every lookup and write
+    goes through the shared cache directly; `_shared_keys` below just
+    remembers the resolved key per symbol for the _dist_cache-population
+    loop and predict_kairos_cloud to reuse.
     """
     from kairos_meta import AssetPrediction, KairosDistribution
     import kairos_predcache
@@ -665,7 +694,20 @@ def compute_signals(df, config):
 
     return out
 
+# ── Interactive control panel ─────────────────────────────────────────────────
+
 def predict_kairos_cloud(signal: Optional[pd.DataFrame]= None, **kwargs) -> List[pd.DataFrame]:
+    """Interactive/scripted single-symbol prediction entry point.
+
+    Unlike predict_all_batch (the batched path used by the papertrade/signal
+    generation loops), this asserts the shared kairos_predcache is active
+    (KAIROS_PRED_CACHE_DIR must be set) rather than tolerating it being off --
+    there's no per-process fallback cache to fall back to since
+    _prediction_cache was removed (2026-08-11). `signal is None` triggers the
+    interactive "fetch fresh data and describe the run" path; otherwise it
+    checks the shared cache for `_shared_keys[symbol]` (populated by a prior
+    predict_all_batch call for this symbol) before predicting.
+    """
     shared_cache: Optional[PredictionCache] = kairos_predcache.get_cache(0)
     assert shared_cache is not None, "kairos_predcache.get_cache() failed to supply an object"
 

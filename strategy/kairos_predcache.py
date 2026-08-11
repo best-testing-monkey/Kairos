@@ -7,12 +7,24 @@ backtested in its own subprocess (kairos_strategies.py via
 run_backtest_subprocess), so identical per-bar Kronos predictions would
 otherwise be recomputed once per group.
 
-This module provides a two-layer cache:
+This module provides a three-layer cache (get()/has()/put() check/write them
+in this order):
+  - A SqliteDict-backed table (caches.db, tablename="prediction_cache") --
+    added 2026-08-11 as the primary store after live papertrade runs kept
+    climbing toward an 8GB RSS ceiling chasing fixes in the OTHER two
+    layers below; pickled sample DataFrames live on disk via sqlite instead
+    of an ever-growing Python dict, so a hit never costs process heap.
   - Disk layer (one .npz file per key) so predictions survive across
-    subprocess boundaries within the same run.
-  - An in-memory LRU on top, bounded by a byte budget derived from
-    /proc/meminfo's MemAvailable (stdlib only, no psutil), to avoid holding
-    an unbounded amount of decoded DataFrame data in RAM within one process.
+    subprocess boundaries within the same run -- pre-dates the sqlite
+    layer and is still written on every put() (see PredictionCache.put),
+    but is no longer the layer callers read from first.
+  - An in-memory LRU (`_mem`) bounded by a byte budget derived from
+    /proc/meminfo's MemAvailable (stdlib only, no psutil). As of the
+    sqlite-layer change, put() no longer writes through to `_mem` at all
+    (see PredictionCache.put's docstring) -- it's now only populated as a
+    read-side-effect of get() on a disk-only hit (sqlite and mem both
+    missed), so its practical footprint is much smaller than when it was
+    the primary write path.
 
 The cache is opt-in: it only activates when KAIROS_PRED_CACHE_DIR is set in
 the environment (kairos_pipeline.py sets this for the lifetime of a --stage
@@ -116,7 +128,9 @@ _DEFAULT_MAX_DISK_BYTES = 2 * 1024**3  # 2GiB
 
 
 class PredictionCache:
-    """Disk-backed prediction cache with an in-memory LRU on top.
+    """Sqlite-backed prediction cache, with a legacy .npz-per-key disk store
+    and in-memory LRU still underneath (see module docstring for the
+    current three-layer read/write order).
 
     get(key) -> Optional[List[pd.DataFrame]]
     put(key, sample_dfs)
@@ -124,6 +138,9 @@ class PredictionCache:
 
     def __init__(self, cache_dir, mem_fraction: float = 0.25, mem_budget_bytes: Optional[int] = None,
                  max_disk_bytes: int = _DEFAULT_MAX_DISK_BYTES):
+        # Primary store as of 2026-08-11 -- see module docstring. autocommit=True
+        # so a crash mid-run doesn't lose already-written entries (matches
+        # kairos_papertrade.py's own SqliteDict usage for report_seen.db).
         self._sqlite_cache = SqliteDict(filename=cache_dir.rstrip("/") + "/caches.db", tablename="prediction_cache", autocommit=True)
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -284,6 +301,12 @@ class PredictionCache:
 
     # ── public API ───────────────────────────────────────────────────────
     def get(self, key: str) -> Optional[List[pd.DataFrame]]:
+        """Look up `key`, checking sqlite -> in-memory LRU -> .npz disk file,
+        in that order, and backfilling sqlite (and, on a disk-only hit, the
+        in-memory LRU too) so a repeat lookup for the same key gets faster
+        each time it's promoted a layer closer to sqlite. Returns None on a
+        miss across all three layers.
+        """
         if (key in self._sqlite_cache):
             return self._sqlite_cache[key]
 
@@ -296,13 +319,18 @@ class PredictionCache:
             self._sqlite_cache[key] = from_disk
             self._mem_put(key, from_disk)
 
-            
+
         return from_disk
 
     def has(self, key: str) -> bool:
-        """Existence check that never deserializes the entry or promotes it
-        into the in-memory LRU -- unlike get(), which always calls
-        _mem_put() on a disk hit as a read-side-effect.
+        """Existence check. A sqlite or in-memory-LRU hit returns True
+        without deserializing anything. A disk-only hit (sqlite and `_mem`
+        both missed) is the one case that still pays a deserialize cost: it
+        calls self.get(key) to backfill sqlite (and `_mem`) via the same
+        code path as a normal get(), rather than duplicating that logic
+        here -- so, as of the 2026-08-11 sqlite layer, has() is no longer
+        unconditionally side-effect-free the way the note below describes;
+        it only skips deserialization on a sqlite/mem hit, not on every hit.
 
         Added 2026-07-29: kairos_strategies.is_batch_cached() was calling
         get() purely to check existence (discarding the returned data), so
@@ -316,7 +344,8 @@ class PredictionCache:
         before eviction ever kicked in. A live 6-month papertrade run's RSS
         climbed to ~9GB during the check pass alone, before a single new
         prediction had been written to disk. Existence-only callers should
-        use this method instead of get() to avoid the same trap.
+        still prefer this method over get() -- it's cheaper on the sqlite/mem
+        hit paths, which is the common case once a run has warmed the cache.
         """
         if (key in self._sqlite_cache):
             return True
@@ -330,6 +359,15 @@ class PredictionCache:
         return filecache_has
 
     def put(self, key: str, sample_dfs: List[pd.DataFrame]):
+        """Write `key` to the sqlite table and the legacy .npz disk file.
+
+        As of 2026-08-11, this no longer writes through to the in-memory
+        LRU (`_mem_put` is commented out below) -- sqlite is the fast path
+        now, so `_mem` is populated only as a get()-side-effect on a
+        disk-only hit, not on every write. The .npz disk write is kept
+        (not yet removed -- see the "cashing fixes WIP" commit that made
+        this change, which still needs to decide whether to drop it).
+        """
         self._sqlite_cache[key] = sample_dfs
         # self._mem_put(key, sample_dfs)
         self._disk_write(key, sample_dfs)
@@ -340,7 +378,22 @@ _singleton_dir: Optional[str] = None
 
 def get_cache(mem_budget_bytes: Optional[int] = None) -> Optional[PredictionCache]:
     """Return the process-wide PredictionCache singleton, or None if the
-    cache is disabled (KAIROS_PRED_CACHE_DIR unset)."""
+    cache is disabled (KAIROS_PRED_CACHE_DIR unset).
+
+    `mem_budget_bytes`, if truthy, takes precedence over the
+    KAIROS_PRED_CACHE_MEM_BYTES env var for the in-memory LRU's budget (see
+    the comment below) -- but only on the FIRST call for a given cache_dir,
+    since the cache is a singleton and later calls just return it unchanged
+    regardless of what's passed. Callers in this codebase currently always
+    pass 0, which is falsy, so in practice the env var (or the
+    available-RAM-fraction default, if that's unset too) still wins; the
+    parameter exists to let a caller assert "I don't need the in-memory
+    layer" without needing an env var, but doesn't quite do that yet given
+    truthiness -- see kairos_strategies.py callers, all of which now go
+    through the sqlite-backed layer for the common case anyway (see this
+    module's docstring), so the in-memory LRU's exact size matters less
+    than it used to.
+    """
     global _singleton, _singleton_dir
     cache_dir = os.environ.get("KAIROS_PRED_CACHE_DIR")
     if not cache_dir:

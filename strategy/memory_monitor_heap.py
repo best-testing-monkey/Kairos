@@ -1,3 +1,40 @@
+"""In-process RSS watchdog, imported unconditionally by kairos_papertrade.py
+(see the `import memory_monitor_heap` line near its top) as the last line of
+defense against the same class of runaway-memory freeze that repeatedly took
+the machine down in early August 2026 while root-causing kairos_predcache's
+and kairos_strategies' overlapping prediction caches (see CLAUDE.md's
+"Prewarm leak sources" section for that history). Importing this module has
+the side effect of starting a daemon thread (`monitor_thread`, started at
+import time below) that polls this process's own RSS every CHECK_INTERVAL
+(0.5s) seconds via psutil, and the moment it crosses THRESHOLD_MB (6000MB):
+
+  1. Suspends the main thread (`suspend_main_thread`, via
+     ctypes.pythonapi.PyThreadState_SetAsyncExc) so the heap snapshot below
+     isn't racing against further allocations.
+  2. Dumps the top 15 tracemalloc allocation sites (filtered to frames under
+     this repo's own path, excluding site-packages) by size -- tracemalloc
+     is started at import time (`tracemalloc.start()` below) so every
+     allocation from process start is attributed to its call site.
+  3. Hard-exits the process (`os._exit(1)`) -- deliberately NOT a clean
+     `sys.exit()`, since the whole point is to stop growing before the
+     8GB-class cgroup/OOM kill that used to only get caught externally (by
+     hand, or by a wrapping systemd-run --scope -p MemoryMax=... during
+     live debugging) has a chance to happen, or worse, before the box starts
+     swapping and freezes outright with no diagnostic dump at all.
+
+THRESHOLD_MB (6000) is deliberately well under a typical cgroup/container
+cap (8GB was used during the live debugging that motivated this file) so
+there's headroom for the dump itself and for whatever RSS the process is
+using at the moment of the check, not just the threshold value.
+
+analyze_heap()/find_variable_by_object()/find_referrer_info() are a second,
+currently-disabled (commented out in memory_monitor()) diagnostic pass that
+walks gc.get_objects() for large live objects and tries to name the
+variable/dict-key/frame referencing each one -- much slower and more
+invasive than the tracemalloc dump above (calls gc.collect() and iterates
+every tracked object), kept here for a deeper manual dig if the tracemalloc
+top-15 alone isn't enough to identify a future leak.
+"""
 import psutil
 import os
 import sys
@@ -93,6 +130,9 @@ def analyze_heap():
     return object_sizes[:50]
 
 def memory_monitor():
+    """Polling loop run on `monitor_thread` (daemon, started at import time
+    below). See this module's docstring for the threshold-crossing behavior;
+    this function is just the sleep/check loop around it."""
     while True:
         try:
             memory_mb = process.memory_info().rss / 1024 / 1024

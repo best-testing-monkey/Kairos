@@ -155,11 +155,27 @@ loop visits base → finetuned-group-1 → ... → finetuned-group-G → (next d
 `prewarm_prediction_cache()` before the whole `generate_and_dedupe_reports()`
 loop: it sweeps **model-major** — every date for the base model, then every
 date for each finetuned group's model, in `strategy/kairos_predcache.py`'s
-shared disk cache — so each model loads exactly once for the whole run. The
+shared cache — so each model loads exactly once for the whole run. The
 date-major `run()` loop that follows then finds every `(symbol, bar, model)`
 prediction already cached and never reloads at all
 (`kairos_strategies.predict_all_batch` defers `_materialize_model` until
 *after* the shared-cache lookup, and skips it entirely on a full hit).
+
+**Prewarm is now a single inline-checked pass, not two (changed 2026-08-11).**
+Earlier, each unit (base, or a finetuned group) ran a separate *check* pass
+first (stopping at the first cache miss) and only ran a *load* pass if the
+check found one — see the now-superseded "Prewarm speed" bullet in the
+dated section below, which described that design. As of the "cashing fixes
+WIP" commit, the check pass is commented out entirely in
+`prewarm_prediction_cache()`; the load pass runs unconditionally and calls
+`kairos_strategies.is_batch_cached()` inline per `(group, date)` entry,
+`continue`-ing past it when already cached instead of calling
+`predict_all_batch()`. Net effect on behavior is similar (a fully-warm unit
+still does no real GPU work), but the periodic `gc.collect()` calls that
+used to live in the check-pass loop (`_PREWARM_GC_INTERVAL`, every 500
+iterations) went with it — see "GC starvation" in the dated section below,
+now effectively dormant again since nothing calls it in the current load
+loop.
 
 The cache is a **persistent disk cache** at `data/predcache/`
 (`DEFAULT_PRED_CACHE_DIR` in `kairos_papertrade.py`) — deliberately NOT
@@ -199,7 +215,10 @@ A `--months-back 6` overnight run repeatedly froze the machine or crashed
 before completing; root-causing it took several rounds. In addition to the
 `base_entries`/`group_entries` DataFrame-retention leak (fixed earlier, see
 commit `e2cf607`), three more accumulation sources and two crash classes had
-to be fixed before a full 6-month run finished cleanly (RSS stable ~5.28GB):
+to be fixed before a full 6-month run finished cleanly (RSS stable ~5.28GB).
+**Two of the bullets below were later superseded by the 2026-08-08/11 work
+further down — read that section too before assuming either fix still
+applies as described:**
 
 - **`is_batch_cached()` was mutating the shared LRU.** It called
   `PredictionCache.get()` purely for a boolean check, but `get()` always
@@ -207,21 +226,29 @@ to be fixed before a full 6-month run finished cleanly (RSS stable ~5.28GB):
   check-pass lookup was silently growing the in-memory cache the same as a
   real prediction would. Fixed with `PredictionCache.has()`, an
   existence-only check that never touches `_mem`. If you ever need a
-  read-only cache-hit check elsewhere, use `.has()`, not `.get()`.
-- **`_prediction_cache` (the per-process dict in `kairos_strategies.py`,
+  read-only cache-hit check elsewhere, use `.has()`, not `.get()`. Still
+  true as of 2026-08-11, though `has()`'s own behavior picked up a new
+  wrinkle that same date — see its docstring.
+- ~~**`_prediction_cache` (the per-process dict in `kairos_strategies.py`,
   distinct from `kairos_predcache`'s disk-backed `PredictionCache`) is only
-  cleared on a model switch** (`_prepare_model_switch`). The base sweep
-  processes one model for its entire ~20k-entry pass with no switch, so
-  this dict grew unbounded for the whole sweep. Fixed with a hard 5000-entry
-  cap (`_PREDICTION_CACHE_MAX_ENTRIES`) in `_prediction_cache_put()` —
-  clears the whole dict on overflow rather than evicting individually.
+  cleared on a model switch** (`_prepare_model_switch`). Fixed with a hard
+  5000-entry cap (`_PREDICTION_CACHE_MAX_ENTRIES`), clearing the whole dict
+  on overflow.~~ **Superseded 2026-08-11: `_prediction_cache` was removed
+  entirely**, not just capped — see the dated section below. Every lookup
+  now goes straight through the shared `kairos_predcache`; `_shared_keys` (a
+  much smaller symbol→cache-key map) replaced it.
 - **GC starvation during long same-model sweeps.** `gc.collect()` previously
   only fired inside `_materialize_model()` on a model switch. CPython's
   generational GC thresholds are allocation-*count* based, not memory-size
   based, so large-but-few pandas DataFrames can sit as uncollected garbage
   for a long time with nothing triggering a collection. Fixed with a
   periodic `gc.collect()` every `_PREWARM_GC_INTERVAL` (500) iterations in
-  all four prewarm check/load loops (base and finetuned).
+  all four prewarm check/load loops (base and finetuned). **Currently
+  dormant as of 2026-08-11**: those loops' *check*-pass halves (the ones
+  containing the `gc.collect()` calls) are commented out in the current
+  `prewarm_prediction_cache()` — see "Prewarm is now a single inline-checked
+  pass" above. Nothing calls `gc.collect()` periodically in the load loop
+  that replaced them. Worth restoring if long-run RSS growth resurfaces.
 - **`sqlite3.OperationalError: unable to open database file`** and
   **`OSError: [Errno 24] Too many open files`** both crashed live runs.
   Mitigated (not root-caused with full certainty — never deterministically
@@ -230,14 +257,96 @@ to be fixed before a full 6-month run finished cleanly (RSS stable ~5.28GB):
   `prewarm_prediction_cache()`) and `kairos_papertrade._raise_fd_limit()`
   (raises the process's soft `RLIMIT_NOFILE` to its hard cap, called as the
   first line of `main()`, best-effort/non-fatal on failure).
-- **Prewarm speed**: the check pass now stops at the first cache miss per
-  unit (base, or a finetuned group) instead of exhaustively checking every
-  remaining entry — one miss is already enough to know a load is needed.
-  When a unit's check pass finds zero misses, the load pass is skipped
-  entirely (logged to console: `"Prewarm load: <unit> skipped -- check pass
-  found no cache misses"`). When a load pass does run, it always covers the
-  *full* cross product for that unit, not just what the check pass happened
-  to see before stopping early.
+- ~~**Prewarm speed**: the check pass now stops at the first cache miss per
+  unit... When a load pass does run, it always covers the *full* cross
+  product for that unit.~~ **Superseded 2026-08-11**: there is no separate
+  check pass anymore (see above) — every entry is checked and, on a miss,
+  predicted inline in one pass.
+
+### Overlapping prediction caches, three fix attempts, and a rewrite (2026-08-08/11)
+Three more live `kairos_papertrade` debug runs (all `--months-back 6`,
+default selection) climbed toward an 8GB memory ceiling and had to be killed
+by hand before finishing even the base model's prewarm pass, each time after
+a fix that turned out to only partially help. In order:
+
+1. **`kairos_predcache._dfs_nbytes()` undercounted real memory** (commit
+   `8dd5b1e`) — it summed `df.to_numpy().nbytes` (the raw float buffer
+   only), not pandas' Index/DataFrame/block-manager overhead, so the
+   in-memory LRU's `mem_budget_bytes` eviction compared against a number far
+   below actual RSS and fired too late. Fixed with `df.memory_usage(deep=True)`.
+   Real bug, verified by a regression test, but alone didn't stop growth —
+   `mem_budget_bytes` itself (25% of available RAM *at construction time*)
+   was still multiple GB on this box.
+2. **`KAIROS_PRED_CACHE_MEM_BYTES` env var added** (commit `e208edc`) to pin
+   an explicit, low ceiling instead of trusting the available-RAM-fraction
+   default (mirrors `KAIROS_PRED_CACHE_MAX_BYTES` for the disk side). Tried
+   at 512MB. Also didn't stop growth on its own — RSS still climbed to
+   similar levels as before, which was the first strong signal that the
+   in-memory LRU wasn't the dominant contributor after all.
+3. **`kairos_strategies._dist_cache` had no size cap at all** (commit
+   `c70941f`) — unlike its sibling `_prediction_cache` (5000-entry capped
+   since 2026-07-30, see above), `_dist_cache` was only cleared on a model
+   switch, which never happens during the same-model base sweep. Each entry
+   is a `KairosDistribution` holding the full raw prediction sample list
+   *and* a concatenated DataFrame copy *and* a stats dict, making it the
+   fattest of the three then-overlapping caches. Fixed with the same
+   entry-count-cap pattern as `_prediction_cache` (`_DIST_CACHE_MAX_ENTRIES`,
+   5000, clear-on-overflow). Real bug, but a live retry afterward showed
+   total RSS growth at matched progress was statistically the *same or
+   slightly worse* than before this fix — meaning none of the three
+   Python-dict-level fixes above were actually the dominant leak source.
+
+**The actual fix (commit `4c3659f`, marked WIP — "still need to remove old
+predcache"): a ground-up rearchitecture, not another cap.**
+`kairos_predcache.PredictionCache` gained a `SqliteDict`-backed table
+(`caches.db`, tablename `prediction_cache`) as its primary store —
+`get()`/`has()`/`put()` all check/write it first now, ahead of the
+in-memory LRU and the legacy `.npz`-per-key disk files (see the module's
+docstring for the current three-layer order). `put()` no longer writes
+through to the in-memory LRU at all (that call is commented out); the LRU
+is now populated only as a `get()`-side-effect on a disk-only hit, so its
+footprint is much smaller than when it was the primary write path.
+Separately, `kairos_strategies._prediction_cache` was **removed entirely**
+(not just capped) — every symbol now goes straight through the shared
+`kairos_predcache`, with a small `_shared_keys: dict[str, str]` (symbol →
+cache key) replacing it purely to avoid recomputing `_shared_cache_key()`
+later in the same call. A new **in-process safety net**,
+`strategy/memory_monitor_heap.py` (imported unconditionally near the top of
+`kairos_papertrade.py`), runs a daemon thread that polls this process's own
+RSS every 0.5s and, past 6000MB, suspends the main thread, dumps the top 15
+`tracemalloc` allocation sites under this repo's own path, and hard-exits
+(`os._exit(1)`) — a debugging tool that's also a production safety net,
+since it stops growth well before an external cgroup/OOM kill (or an
+un-contained freeze) would.
+
+**Known issues in the WIP commit, not yet fixed (flagged, not fixed here —
+docstring-only pass):**
+- `kairos_strategies.py`'s `_no_data_fallback_warned: set = set()` (the
+  de-dup guard for a repeated warning line in `fetch_data_raw`) got
+  accidentally re-indented *inside* `_dist_cache_put()`'s function body
+  during the refactor, so it's no longer a module-level binding at all —
+  any call into the `fetch_data_raw` code path that references it will
+  raise `NameError`. Needs to move back to module scope.
+- `kairos_predcache.PredictionCache.__init__` now constructs
+  `self._sqlite_cache = SqliteDict(...)` *before* `os.makedirs(self.cache_dir,
+  exist_ok=True)` runs — if `cache_dir` doesn't already exist, `SqliteDict`
+  will fail trying to create its file in a nonexistent directory. Latent on
+  this machine only because `data/predcache/` already exists from prior
+  runs; a genuinely fresh cache_dir would hit this.
+- `_evict_disk_if_over_budget()` only ever deletes `.npz` files, but
+  `_scan_disk_bytes()`/`_disk_bytes` count *every* file under `cache_dir`,
+  including the new `caches.db` (and its `-journal`/`-wal` siblings). If
+  `caches.db` alone grows past `max_disk_bytes`, eviction can delete every
+  `.npz` file and still never bring the total back under budget. Reproduced
+  by `tests/unit/test_predcache.py::TestDiskEviction::
+  test_writing_past_budget_evicts_oldest_mtime_first`, now failing.
+- The rearchitecture broke a substantial slice of the test suite (48 tests
+  across `test_predcache.py`, `test_kairos_strategies_model_switch.py`, and
+  `test_predict_all_batch_cache.py` as of this writing) — mostly collection
+  errors in tests that still reference the now-removed
+  `_prediction_cache`/`_prediction_cache_put`, plus the two `test_predcache.py`
+  failures above. Needs a pass to update or remove the stale tests before
+  merging past WIP.
 
 ### Per-strategy signals cache (`signals_cache` table)
 `kairos_signals.py`'s `run()` caches each strategy's rows (the output of
