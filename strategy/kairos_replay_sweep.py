@@ -23,9 +23,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .allocation import AllocationConfig
+from allocation import AllocationConfig
 from kairos_signal_replay import _ensure_configured_db, replay, SIGNALS_DB_PATH
-from .signal_selection import parse_signal_selection, SignalSelectionError
+from signal_selection import parse_signal_selection, SignalSelectionError
 
 
 def load_selection_rules(path: str | None) -> list[str | None]:
