@@ -287,6 +287,21 @@ def _materialize_model(requested_src):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # gc.collect() frees the Python-level tensor/module objects, but glibc's
+        # malloc doesn't return those freed arena pages back to the OS on its
+        # own -- RSS keeps a high-water mark per switch instead of shrinking,
+        # which live papertrade runs showed as a ~1-1.3GB step at EVERY model
+        # switch (not per-date -- confirmed 2026-08-13 via memory_monitor_heap's
+        # growth checkpoints landing exactly at switches, flat within a group's
+        # 183-date sweep), eventually exhausting the 6-8GB budget once enough
+        # finetuned groups had been swept. malloc_trim(0) explicitly asks glibc
+        # to release free contiguous pages back to the OS; Linux/glibc only
+        # (matches this module's other Linux-only assumptions, e.g. GPU recovery).
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except OSError:
+            pass
 
     print(f"Loading Kronos model from {mdl_src} ...")
     bt_tokenizer = KronosTokenizer.from_pretrained(tok_src)
@@ -439,7 +454,7 @@ def is_batch_cached(assets: dict, model_path=None, pred_len=1) -> bool:
     return True
 
 
-def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dict:
+def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None, build_distributions: bool = True) -> dict:
     """Predict all assets in one batched GPU call instead of N sequential calls.
 
     model_path / tokenizer_path: optional HF repo id or local path forwarded to
@@ -455,6 +470,18 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
     goes through the shared cache directly; `_shared_keys` below just
     remembers the resolved key per symbol for the _dist_cache-population
     loop and predict_kairos_cloud to reuse.
+
+    build_distributions=False (used by kairos_papertrade.py's
+    prewarm_prediction_cache(), which discards this function's return value
+    entirely -- its only purpose is the shared-cache put() side effect
+    above) skips building AssetPrediction/KairosDistribution and writing to
+    _dist_cache. Root-caused 2026-08-13: _dist_cache only clears on a model
+    switch (once per finetuned group's ~183-date sweep), so a full group's
+    worth of KairosDistribution objects -- each holding the full raw sample
+    list *and* a concatenated DataFrame copy *and* a stats dict, per
+    _dist_cache_put's docstring -- accumulated every prewarm sweep even
+    though prewarm never reads a single one, matching the ~1GB-per-group RSS
+    growth observed live across several runs. Returns {} in this mode.
     """
     from kairos_meta import AssetPrediction, KairosDistribution
     import kairos_predcache
@@ -511,6 +538,9 @@ def predict_all_batch(assets: dict, model_path=None, tokenizer_path=None) -> dic
             if shared_cache is not None and symbol in _shared_keys:
                 shared_cache.put(_shared_keys[symbol], preds)
     
+    if not build_distributions:
+        return {}
+
     result = {}
     for symbol, preds in cached_results.items():
         dist_key = (symbol, assets[symbol].index[-1])

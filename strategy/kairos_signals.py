@@ -996,10 +996,25 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     """
     from kairos_backtest import KairosSettings, Direction
     from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig
+    import kairos_strategies
     from kairos_strategies import (
         fetch_data_raw, resolve_disabled_strategies, LOOKBACK, is_batch_cached,
         _model_checkpoint_fingerprint,
     )
+
+    # Explicit day-boundary clear, on top of predict_all_batch's existing
+    # clear-on-model-switch: Pass 1 below calls predict_all_batch with the
+    # same model_path=None for every base group in this day, so _dist_cache
+    # otherwise accumulates across however many base groups exist before
+    # Pass 2's first model switch clears it -- bounded to one day's group
+    # count today, but that bound is an emergent property of loop order, not
+    # a guarantee. Root-caused 2026-08-13 after the same unbounded-across-
+    # dates version of this pattern blew up RSS during prewarm's model-major
+    # sweep (see kairos_strategies.predict_all_batch's build_distributions
+    # param) -- cheap to make the per-day reset explicit here too rather
+    # than rely on run()'s current Pass 1/Pass 2 ordering to keep providing it.
+    kairos_strategies._dist_cache.clear()
+    kairos_strategies._shared_keys.clear()
 
     if predict_fn is None:
         predict_fn = _real_predict_fn

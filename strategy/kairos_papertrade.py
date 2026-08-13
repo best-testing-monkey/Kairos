@@ -729,7 +729,7 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
                 if kairos_strategies.is_batch_cached(data, model_path=None):
                     continue
                 else:
-                    kairos_strategies.predict_all_batch(data, model_path=None)
+                    kairos_strategies.predict_all_batch(data, model_path=None, build_distributions=False)
             except Exception as e:
                 failures.append(
                     f"prewarm base group assets={assets_str} interval={grp_interval} "
@@ -770,10 +770,10 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
                             sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
                             for sym in assets
                         }
-                        if kairos_strategies.is_batch_cached(data, model_path=None):
+                        if kairos_strategies.is_batch_cached(data, model_path=model_path):
                             continue
                         else:
-                            kairos_strategies.predict_all_batch(data, model_path=model_path)
+                            kairos_strategies.predict_all_batch(data, model_path=model_path, build_distributions=False)
                     except Exception as e:
                         failures.append(
                             f"prewarm finetuned group assets={assets_str} interval={grp_interval} "
