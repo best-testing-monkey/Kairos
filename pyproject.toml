@@ -25,6 +25,7 @@ dependencies = [
     "odfpy>=1.4.1",
     "phantom-ledger @ git+https://github.com/best-testing-monkey/phantom_ledger.git",
     "sqlitedict>=2.1.0",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
