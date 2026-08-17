@@ -1,5 +1,43 @@
 # Kairos paper-trade loss analysis (run 2026-07-23)
 
+## Update (2026-08-17): both confirmed phantom_ledger bugs now fixed upstream
+
+The two accounting bugs this document root-causes (Section 1: direction-blind
+cash tracking for short positions, and `fx_conversion_cost` omitted from
+`realized_pnl`) are now fixed AT THE SOURCE in `phantom_ledger`:
+
+- The direction-blind cash bug: fixed for `runner.backtest()`'s own internal
+  close path by commit `ee31835` (2026-08-17), and for the standalone
+  `ph.positions.close()` manual-close endpoint by ticket E17-S06 (commit
+  `0f204b6`, same date) -- both now share one `PositionManager.
+  close_cash_return()` implementation.
+- The `fx_conversion_cost` omission: fixed by ticket E17-S05 (commit
+  `0f204b6`) -- `PositionManager.close()`'s `realized_pnl` includes it
+  natively now, for every close path.
+
+Kairos's client-side workarounds for both (`compute_corrected_realized_pnl()`,
+and the `build_closed_trade_equity_curve()` closed-trade curve built to avoid
+phantom's own untrustworthy-for-shorts continuous curve) have been updated
+accordingly in `strategy/kairos_papertrade.py`:
+`compute_corrected_realized_pnl()` has been REMOVED (applying it on top of an
+already-corrected `realized_pnl` would double-subtract the fx cost) --
+`realized_pnl` is now trusted as-is everywhere it's read. See
+`_close_cash_delta`'s docstring for the current, verified-correct cash
+identity. `build_closed_trade_equity_curve()` is still used as the reporting
+default (switching to phantom's own now-trustworthy continuous curve is a
+separate, larger change to the reporting pipeline, left as a follow-up), but
+its docstring no longer claims phantom's continuous curve is untrustworthy --
+only that the closed-trade step-function approximation still understates
+intra-trade drawdown, independent of any accounting bug.
+
+`tests/unit/test_kairos_papertrade_loss_repro.py` and
+`test_kairos_papertrade_mtm_repro.py`'s frozen-fixture-based pinned values
+were re-computed and re-pinned against the same frozen fixtures (which predate
+the upstream fix and still contain old-format, fx-omitting `realized_pnl` --
+replaying them through the new, non-double-correcting code reproduces higher
+P&L numbers than before, by each run's total fx cost). See those files' own
+2026-08-17 update notes for the full explanation.
+
 ## 0. Update (2026-07-26): fixes applied, and what a fresh rerun actually showed
 
 Three fixes from this analysis were implemented and verified:

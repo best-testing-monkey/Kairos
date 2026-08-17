@@ -865,41 +865,10 @@ def _get_field(obj, key):
     return getattr(obj, key, None)
 
 
-def compute_corrected_realized_pnl(position):
-    """True per-trade economic P&L, correcting a confirmed `phantom_ledger`
-    accounting bug (see docs/papertrade_loss_analysis.md, "1. Equity/PnL
-    accounting & reporting" for the full derivation and reproduction).
-
-    The stored `realized_pnl` (phantom/engine/position_manager.py,
-    `PositionManager.close()`, ~lines 314-327) is direction-AWARE -- it
-    already flips gross P&L's sign correctly for "short" positions
-    (`gross_pnl = (entry_price - exit_price) * quantity` for shorts) -- but
-    it OMITS `fx_conversion_cost` from its cost deduction (`all_costs` only
-    sums commission + spread + slippage). That fx cost IS real money that
-    left the account: it's charged to `account.cash` at entry via
-    `phantom/engine/order_manager.py`'s `OrderManager.handle_fill`
-    (~line 300: `total_deduction = order.fill_price * order.quantity +
-    costs.total`, where `costs.total` includes fx), but `close()` never
-    subtracts it back out of `realized_pnl`. This helper applies that one
-    missing correction. (There is a SEPARATE, larger phantom bug in how
-    `account.cash` itself is tracked for short positions -- see
-    `build_closed_trade_equity_curve`'s docstring -- but it does not affect
-    `realized_pnl`'s own direction, only phantom's raw cash/equity curve.)
-
-    Duck-typed (dict or attribute object, matching `compute_pct_profit_per_trade`).
-    Returns None if realized_pnl is unavailable.
-    """
-    realized_pnl = _get_field(position, "realized_pnl")
-    if realized_pnl is None:
-        return None
-    fx_cost = _get_field(position, "fx_conversion_cost") or 0.0
-    return realized_pnl - fx_cost
-
-
 def _entry_costs(position):
     """Sum of the four entry-side cost fields phantom's OrderManager.handle_fill
     debits from cash at fill time (commission + spread + slippage + fx).
-    Duck-typed like compute_corrected_realized_pnl."""
+    Duck-typed (dict or attribute object) like `_get_field`'s other callers."""
     return (
         (_get_field(position, "commission_entry") or 0.0)
         + (_get_field(position, "spread_cost") or 0.0)
@@ -919,7 +888,7 @@ def _fill_cash_delta(position, include_notional=True):
     notional is only *locked* as margin, never actually spent -- pass
     `include_notional=False` so only entry costs are debited. See
     `_use_full_notional` for how callers decide which mode applies.
-    Duck-typed like compute_corrected_realized_pnl."""
+    Duck-typed like `_entry_costs`."""
     entry_price = _get_field(position, "entry_price")
     quantity = _get_field(position, "quantity")
     notional = entry_price * quantity if include_notional else 0.0
@@ -929,35 +898,38 @@ def _fill_cash_delta(position, include_notional=True):
 def _close_cash_delta(position, include_notional=True):
     """Cash effect to ADD to corrected_cash when `position` closes: reverses
     the entry debit (entry_notional + entry costs, when `include_notional`
-    is True) and adds back the corrected (direction-aware, fx-corrected)
-    realized P&L.
+    is True) and adds back the stored `realized_pnl`.
 
-    `compute_corrected_realized_pnl` already nets OUT both entry- and
-    exit-side costs (phantom's stored `realized_pnl` = gross_pnl - all_costs,
-    where all_costs spans BOTH entry and exit commission/spread/slippage --
-    see phantom/engine/position_manager.py's `close()`, ~lines 319-327 --
-    plus this helper's own fx subtraction), i.e.
-    `corrected_realized_pnl = gross_pnl - entry_costs - exit_costs`. So
-    entry_costs must be added back explicitly here, or it's debited at fill
-    time and then silently never restored (a real ~EC-per-trade shortfall on
-    every closed position). Verify: `_fill_cash_delta(pos) +
-    _close_cash_delta(pos) == gross_pnl - entry_costs - exit_costs`, matching
-    the true round-trip cash effect phantom's own raw cash mechanics produce
-    (see build_closed_trade_equity_curve's docstring). This identity holds
+    As of phantom_ledger E17-S05 (fixed 2026-08-17), `realized_pnl`
+    (phantom/engine/position_manager.py's `PositionManager.close()`) is
+    computed natively as `gross_pnl - entry_costs - exit_costs`, where
+    `entry_costs`/`exit_costs` both span commission/spread/slippage and
+    `entry_costs` also includes `fx_conversion_cost` (there is no exit-side
+    fx cost anywhere in phantom -- `exit_costs()` is never called with
+    `fx_required=True`). No client-side correction is needed or applied here
+    any more -- read `realized_pnl` as-is. `entry_costs` must still be added
+    back explicitly here, since it was debited at fill time and phantom's own
+    `realized_pnl` already nets it back out (so simply crediting
+    `realized_pnl` alone would under-credit by `entry_costs` on every closed
+    position). Verify: `_fill_cash_delta(pos) + _close_cash_delta(pos) ==
+    gross_pnl - entry_costs - exit_costs == pos.realized_pnl`, matching the
+    true round-trip cash effect phantom's own cash mechanics now produce for
+    both `runner.backtest()`'s internal close path (fixed by `ee31835`) and
+    `ph.positions.close()` (fixed by E17-S06, same date). This identity holds
     for EITHER `include_notional` value -- the notional term cancels between
-    fill and close either way, it's only present (True) or absent (False)
-    on both sides together.
+    fill and close either way, it's only present (True) or absent (False) on
+    both sides together.
 
     E4-S10: for marginable classes, pass `include_notional=False` to match
     the corresponding `_fill_cash_delta` call -- see `_use_full_notional`.
 
-    Duck-typed like compute_corrected_realized_pnl.
+    Duck-typed like `_entry_costs`.
     """
     entry_price = _get_field(position, "entry_price")
     quantity = _get_field(position, "quantity")
-    corrected_pnl = compute_corrected_realized_pnl(position) or 0.0
+    realized_pnl = _get_field(position, "realized_pnl") or 0.0
     notional = entry_price * quantity if include_notional else 0.0
-    return notional + _entry_costs(position) + corrected_pnl
+    return notional + _entry_costs(position) + realized_pnl
 
 
 def _use_full_notional(ticker, margin_config, max_leverage):
@@ -986,20 +958,37 @@ def _liquidate_position(conn, pos, close_price, exit_dt, margin_config, max_leve
     `remove_all_open_positions`), then UPDATEs the position row IN PLACE --
     unlike `remove_all_open_positions` this does not delete the row, it
     writes `status='liquidated'`/`close_reason='margin_call'` so the trade
-    still shows up in reporting. Never calls phantom's `PositionAPI.close()`
-    (its cash/short-PnL handling is wrong for shorts -- see
-    `compute_corrected_realized_pnl`).
+    still shows up in reporting.
 
-    `realized_pnl_to_store` is `gross_pnl` minus the three non-fx entry-side
-    cost fields (NOT `gross_pnl` directly) so that
-    `compute_corrected_realized_pnl` + `_close_cash_delta` reproduce the true
-    round-trip economic effect `gross_pnl - entry_costs`, matching how
-    phantom's own stored `realized_pnl` omits fx (see `_close_cash_delta`'s
-    docstring for the full identity).
+    Does not call phantom's `PositionAPI.close()`, though as of phantom_ledger
+    E17-S06 (fixed 2026-08-17) that would now produce a correct cash result
+    too (its direction/instrument-type-blind formula was replaced with the
+    same `PositionManager.close_cash_return()` `SimulationEngine` already
+    uses) -- this bypass is no longer required for correctness, just not yet
+    switched over. Doing so would also be a real fidelity upgrade over the
+    `# ponytail:` zero-cost assumption below (phantom's `close()` computes
+    real exit costs); left as a follow-up rather than done opportunistically
+    here, since it'd change how corrected_cash accounts for liquidations
+    (crediting phantom's own computed cash delta instead of a hand-derived
+    one) and deserves its own verification pass. This was never a stand-in
+    for phantom's own margin-call/stop-out DECISION logic (`MarginEngine`),
+    which Kairos never used in the first place -- see
+    `kairos_mtm.liquidation_check` for Kairos's own ESMA-closeout-rule-driven
+    liquidation policy, kept independent by design
+    (`docs/tickets/DESIGN_DOC_mtm_margin_leverage.md` Section 2).
 
-    # ponytail: liquidation assumes zero exit cost/fx -- no forced-close
-    # cost model exists yet (no commission/spread/slippage/fx is simulated
-    # for a broker-forced close). Add one if a real cost model is needed.
+    `realized_pnl_to_store` is `gross_pnl` minus all four entry-side cost
+    fields (commission/spread/slippage/fx), matching phantom's own native
+    `realized_pnl` convention since E17-S05 -- `_close_cash_delta` reads it
+    as-is now, no client-side fx correction applied (see its docstring for
+    the full identity).
+
+    # ponytail: liquidation assumes zero exit cost -- no forced-close cost
+    # model exists yet (no commission/spread/slippage is simulated for a
+    # broker-forced close; entry-side fx is still included via
+    # realized_pnl_to_store below, matching phantom's own convention, but
+    # there is no exit-side fx in phantom either way -- see
+    # _close_cash_delta's docstring). Add a real cost model if needed.
     """
     view = OpenPositionView(
         ticker=pos.ticker, direction=pos.direction, entry_price=pos.entry_price,
@@ -1009,7 +998,10 @@ def _liquidate_position(conn, pos, close_price, exit_dt, margin_config, max_leve
         ),
     )
     gross_pnl = unrealized_pnl(view, close_price)
-    realized_pnl_to_store = gross_pnl - pos.commission_entry - pos.spread_cost - pos.slippage_cost
+    realized_pnl_to_store = (
+        gross_pnl - pos.commission_entry - pos.spread_cost - pos.slippage_cost
+        - pos.fx_conversion_cost
+    )
 
     cur = conn.cursor()
     cur.execute("UPDATE orders SET position_id = NULL WHERE position_id = ?", (pos.id,))
@@ -1096,17 +1088,18 @@ def _place_batch_orders(client, account_id, order_requests, effective_dt, snapsh
 
 
 def compute_pct_profit_per_trade(closed_positions):
-    """Mean of corrected_realized_pnl / (entry_price * quantity) across
-    closed positions, as a percentage (see compute_corrected_realized_pnl
-    for the fx-omission correction applied to realized_pnl). Accepts dicts
-    or objects with realized_pnl/entry_price/quantity attributes (no
-    `phantom` import required -- pure math over duck-typed inputs).
+    """Mean of realized_pnl / (entry_price * quantity) across closed
+    positions, as a percentage. `realized_pnl` is phantom's own stored value,
+    fx-corrected natively since phantom_ledger E17-S05 (no client-side
+    correction needed or applied). Accepts dicts or objects with
+    realized_pnl/entry_price/quantity attributes (no `phantom` import
+    required -- pure math over duck-typed inputs).
 
     Returns None if there are no positions with computable P&L.
     """
     pcts = []
     for pos in closed_positions:
-        realized_pnl = compute_corrected_realized_pnl(pos)
+        realized_pnl = _get_field(pos, "realized_pnl")
         entry_price = _get_field(pos, "entry_price")
         quantity = _get_field(pos, "quantity")
         if realized_pnl is None or not entry_price or not quantity:
@@ -1188,6 +1181,67 @@ def _ensure_broker_profile(client, broker_name):
             f"at {profile_path}; load one manually via client.brokers.load(...)."
         )
     client.brokers.load(profile_path)
+
+
+def _sync_margin_classes(client, broker_name, margin_config):
+    """Patch `broker_name`'s loaded phantom broker profile so its per-instrument
+    CFD margin rates (phantom_ledger E17-S01, `MarginModel.classes`/
+    `margin_pct_for()`) match `margin_config` (Kairos's own `config/margin_ibkr.
+    yaml`, parsed via `kairos_margin.load_margin_config`), instead of the
+    bundled profile's own IBKR-native-symbol classes (e.g. "EURUSD", "XAUUSD",
+    "BTC") which can never match Kairos's yfinance-style tickers ("EURUSD=X",
+    "GC=F", "BTC-USD") -- without this, `margin_pct_for()` always falls through
+    to the bundled `default_margin_pct` (25% for IBKR) for every Kairos order,
+    regardless of asset class, silently defeating E17-S01 for this project.
+
+    Idempotent: no-op (no DB write) if the profile's margin config already
+    matches. Safe to call every run, same as `_ensure_broker_profile`.
+
+    No update method exists on `BrokerAPI`/`BrokerRepo` (only create/get/list/
+    delete/load/validate) -- and delete+recreate would mint a new profile `id`,
+    orphaning `account.broker_profile_id` FKs on any account created in a prior
+    run against this same persistent `phantom_data_dir` DB. Patches
+    `broker_profiles.config_json` in place instead, via the same direct-`_conn`
+    pattern as `remove_all_open_positions`/`_ensure_mtm_daily_table`.
+    """
+    from phantom.models.broker import MarginClassRule
+
+    profile = client.brokers.get(broker_name)
+    default_margin_pct = profile.margin.default_margin_pct
+    rules: list[MarginClassRule] = []
+    for cls in margin_config.classes.values():
+        if not cls.enabled:
+            continue
+        if cls.match is None and not cls.symbols:
+            # Kairos's catch-all bucket (e.g. equity_cfd) maps to phantom's
+            # single fallback rate, not a MarginClassRule.
+            default_margin_pct = cls.initial_margin_pct / 100.0
+            continue
+        rules.append(MarginClassRule(
+            label=cls.name,
+            symbols=sorted(cls.symbols) or None,
+            # Kairos's `match` is re.search-style, unanchored at the front
+            # ("=X$", "=F$", "-USD$"); phantom's margin_pct_for() uses
+            # re.fullmatch. Prefix with ".*" so they match equivalently.
+            match=(".*" + cls.match) if cls.match else None,
+            margin_pct=cls.initial_margin_pct / 100.0,
+        ))
+
+    new_margin = profile.margin.model_copy(
+        update={"classes": rules, "default_margin_pct": default_margin_pct}
+    )
+    if new_margin == profile.margin:
+        return
+
+    updated_profile = profile.model_copy(update={"margin": new_margin})
+    row = client._conn.execute(
+        "SELECT id FROM broker_profiles WHERE name = ?", (broker_name,)
+    ).fetchone()
+    client._conn.execute(
+        "UPDATE broker_profiles SET config_json = ? WHERE id = ?",
+        (updated_profile.model_dump_json(), row["id"]),
+    )
+    client._conn.commit()
 
 
 def remove_all_open_positions(ph_instance, account_id, account_name):
@@ -1340,48 +1394,35 @@ def _fetch_day_close_bars(intraday_provider, tickers, day_start, day_end):
 
 def build_closed_trade_equity_curve(closed_positions, capital, start_dt=None):
     """Build a step-function equity curve from CLOSED positions only, using
-    compute_corrected_realized_pnl (direction + fx corrected), sorted by
-    exit_datetime -- one point per trade close, prefixed with a starting
-    point at `capital`. Returns a list of `phantom.reports.metrics.EquityPoint`.
+    each position's stored `realized_pnl`, sorted by exit_datetime -- one
+    point per trade close, prefixed with a starting point at `capital`.
+    Returns a list of `phantom.reports.metrics.EquityPoint`.
 
-    WHY NOT phantom's own per-bar `accounts.get_aggregate_equity()` curve:
-    that curve is built from phantom's own bar-by-bar `account.cash`
-    tracking, which has a CONFIRMED direction-blind bug for "short"
-    positions. Root cause (see docs/papertrade_loss_analysis.md, "1.
-    Equity/PnL accounting & reporting" for the full reproduction against
-    the frozen fixture DB): both the entry-side cash debit
-    (phantom/engine/order_manager.py, `OrderManager.handle_fill`, ~line 300:
-    `total_deduction = order.fill_price * order.quantity + costs.total`)
-    and every exit-side cash credit (phantom/engine/simulation_engine.py,
-    `SimulationEngine.run_backtest`, ~line 214:
-    `cash_return = exit_price * position.quantity - exit_costs.total`; and
-    phantom/api/positions.py, `PositionAPI.close`, ~lines 93 and 128, same
-    pattern) use RAW `price * quantity` with no `position.direction` check
-    at all. That's correct for "long" positions (cash effect nets to
-    `(exit-entry)*quantity - costs`, matching gross P&L's sign), but for
-    "short" positions it's backwards: cash still moves by
-    `(exit-entry)*quantity`, the OPPOSITE sign of a short's real gross P&L
-    of `(entry-exit)*quantity`, so a WINNING short trade DECREASES
-    phantom's tracked cash and a LOSING short INCREASES it -- even though
-    `realized_pnl` itself (phantom/engine/position_manager.py,
-    `PositionManager.close`, ~lines 314-317) correctly computes
-    direction-aware gross P&L. Verified by exact reconciliation against the
-    frozen fixture DB (`tests/data/kairos_papertrade_20260723_phantom.db`):
-    `capital + sum(actual per-position cash effect, using phantom's own
-    direction-blind formula)` reproduces the account's real final cash to
-    12 significant figures, and the gap between that and the naive
-    `capital + sum(realized_pnl)` reconciliation is EXACTLY
-    `2 * sum(gross_pnl over short positions) + sum(fx_conversion_cost)`
-    (~€48.71 on that run: ~€39.05 from the short-direction bug + ~€9.67 from
-    the fx omission compute_corrected_realized_pnl already fixes).
+    HISTORICAL WHY NOT phantom's own per-bar `accounts.get_aggregate_equity()`
+    curve: at the time this was written (2026-07-26/27, see
+    docs/papertrade_loss_analysis.md), that curve was built from phantom's
+    own bar-by-bar `account.cash` tracking, which had a direction-blind bug
+    for "short" positions (entry/exit cash debits/credits used raw
+    `price * quantity` with no `position.direction` check) plus an
+    fx_conversion_cost omission in `realized_pnl`. Both are now fixed
+    upstream: the direction-blind cash bug for `runner.backtest()`'s own
+    close path was fixed by `ee31835`; `PositionAPI.close()`'s equivalent bug
+    and the fx omission were fixed by phantom_ledger E17-S05/E17-S06
+    (2026-08-17) -- see `_close_cash_delta`'s docstring for the current,
+    verified-correct cash identity. phantom's own continuous per-bar curve is
+    therefore no longer known to be untrustworthy for this reason. This
+    function is still used as the reporting default rather than switching to
+    phantom's own curve, since that would be a bigger change to the
+    reporting pipeline's primary MTM source (verifying Sharpe/drawdown
+    numbers against a continuous series instead of this step function) --
+    left as a follow-up, not done opportunistically here.
 
-    Tradeoff of this curve vs. phantom's: this is a "closed-trade" equity
-    curve (a step function at each trade's exit), not a true continuous
-    mark-to-market series -- it does not capture intra-trade unrealized
-    drawdown from positions that are still open at some intermediate point.
-    Given phantom's own continuous series can't be trusted whenever shorts
-    are present, this is the most honest approximation available from data
-    phantom exposes correctly.
+    Tradeoff of this curve vs. a true continuous one: it's a step function
+    at each trade's exit, so it still does not capture intra-trade
+    unrealized drawdown from positions open at some intermediate point --
+    `pct_max_drawdown`/`sharpe` remain understated relative to a true
+    continuous mark-to-market series, independent of the accounting bugs
+    above.
 
     `start_dt` anchors the initial (capital) point; if omitted, falls back
     to the earliest closed position's entry_datetime, or `datetime.now()`
@@ -1396,7 +1437,7 @@ def build_closed_trade_equity_curve(closed_positions, capital, start_dt=None):
         entry_dt = _get_field(pos, "entry_datetime")
         if entry_dt is not None:
             entry_dts.append(_naive(entry_dt))
-        pnl = compute_corrected_realized_pnl(pos)
+        pnl = _get_field(pos, "realized_pnl")
         if exit_dt is None or pnl is None:
             continue
         dated_pnls.append((_naive(exit_dt), pnl))
@@ -2027,6 +2068,7 @@ def main(argv=None):
         client = ph.Phantom(data_dir=args.phantom_data_dir)
         intraday_provider = _IntradayFallbackProvider(args.phantom_data_dir)
         _ensure_broker_profile(client, args.broker)
+        _sync_margin_classes(client, args.broker, margin_config)
         account_name = args.account_name or f"kairos_papertrade_{base_now.strftime('%Y%m%d%H%M')}"
         account = client.accounts.create(
             name=account_name, account_type="algorithm", broker=args.broker,
@@ -2042,6 +2084,13 @@ def main(argv=None):
         corrected_cash = args.capital
         financing_accrued_total = 0.0
         margin_rejected_count = 0
+        # Distinct from margin_rejected_count: that's Kairos's OWN pre-admission
+        # gate rejecting an order before orders.place() is ever called.
+        # phantom_fill_rejected_count counts phantom itself rejecting a placed
+        # order AT FILL TIME (BacktestResult.rejected_orders, phantom_ledger
+        # E17-S02) -- margin still insufficient despite passing admission, e.g.
+        # because per-position margin usage shifted between admission and fill.
+        phantom_fill_rejected_count = 0
         ruined = False
         last_snapshot = None  # set at end of each iteration; consumed at admission-check time next iteration
         known_open_ids = set()
@@ -2059,10 +2108,15 @@ def main(argv=None):
                 open_positions = client.positions.list(account_name=account_name, status="open")
                 open_tickers = {p.ticker for p in open_positions}
                 cash = client.accounts.get(account_id).cash
+                ticker_max_leverage = {
+                    c.ticker: 100.0 / classify_symbol(c.ticker, margin_config).initial_margin_pct
+                    for c in prev_candidates
+                }
                 alloc_config = AllocationConfig(
-                    top_k=args.top_n, gross_cap_pct=100, equity=cash, cluster_map=cluster_map,
+                    top_k=args.top_n, gross_cap_pct=100 * args.max_leverage, equity=cash, cluster_map=cluster_map,
                     selection_rule=parsed_signal_selection,
                     max_leverage=args.max_leverage, margin_utilization_cap=args.margin_utilization,
+                    ticker_max_leverage=ticker_max_leverage,
                 )
                 enabled_mask = {c.ticker: (c.ticker not in open_tickers) for c in prev_candidates}
                 alloc_result = allocate(prev_candidates, alloc_config, enabled_mask=enabled_mask)
@@ -2119,21 +2173,42 @@ def main(argv=None):
             if tickers:
                 backtest_start_t = time.monotonic()
                 try:
+                    # fine_data_provider (phantom_ledger E17-S04) is deliberately NOT
+                    # passed here: it would only be consulted with the exact same
+                    # (ticker, day_start, day_end) call intraday_provider already
+                    # serves as the PRIMARY data_provider below, via the same
+                    # 1m->15m->30m->1h ladder -- it can never return anything finer
+                    # than what that primary call already tried. Only relevant again
+                    # if the primary provider is ever downgraded to a fixed coarse
+                    # interval.
                     result = client.runner.backtest(
                         account_id=account_id, tickers=tickers, start=day_start, end=day_end,
                         data_provider=intraday_provider,
                     )
                     equity_curve = result.equity_curve
                 except Exception as e:
+                    # As of phantom_ledger E17-S02, a single order's
+                    # InsufficientFundsError at fill time no longer propagates out of
+                    # runner.backtest() -- it's caught internally and surfaced via
+                    # result.rejected_orders (handled below) instead. This block is
+                    # now only for genuinely unexpected failures (bad ticker, data
+                    # provider crash, etc.), not the margin-rejection path.
                     print(
                         f"WARNING: runner.backtest failed for {effective_dt} "
                         f"(tickers={tickers}): {e}", file=sys.stderr,
                     )
                 else:
+                    for rej in result.rejected_orders:
+                        phantom_fill_rejected_count += 1
+                        print(
+                            f"WARNING: PHANTOM_FILL_REJECTED order for {rej.ticker} "
+                            f"at {effective_dt} (reason={rej.rejection_reason})",
+                            file=sys.stderr,
+                        )
                     try:
-                        # Maintain corrected_cash (same direction-aware, fx-corrected
-                        # philosophy as compute_corrected_realized_pnl) by diffing which
-                        # positions are newly open/closed this iteration -- order fills
+                        # Maintain corrected_cash (see _fill_cash_delta/_close_cash_delta)
+                        # by diffing which positions are newly open/closed this
+                        # iteration -- order fills
                         # happen INSIDE runner.backtest() above, so fill price/cost is
                         # only knowable now, not at orders.place() time.
                         current_open = client.positions.list(account_name=account_name, status="open")
@@ -2184,6 +2259,10 @@ def main(argv=None):
                             corrected_cash += _close_cash_delta(pos, include_notional=include_notional)
                             same_day_round_trip_positions.append(pos)
 
+                        # Rejected orders (result.rejected_orders, handled above) never
+                        # create a Position row, so they're already invisible to every
+                        # diffing loop above (known_open_ids/current_open_ids, the
+                        # same-day-round-trip scan) -- no extra bookkeeping needed here.
                         known_open_ids = current_open_ids
 
                         # Daily MTM snapshot + financing accrual (DESIGN_DOC_
@@ -2374,6 +2453,7 @@ def main(argv=None):
             "base_only": args.base_only, "top_n": args.top_n,
             "num_days": len(dated_rows),
             "margin_rejected_count": margin_rejected_count,
+            "phantom_fill_rejected_count": phantom_fill_rejected_count,
         }
 
         os.makedirs(args.out, exist_ok=True)

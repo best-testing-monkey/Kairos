@@ -66,6 +66,7 @@ external state, so Test 1's baseline P&L is independently hand-derived
 below and cross-checked against the actual pinned output.
 """
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -155,7 +156,7 @@ def _advice_row(entry, expected_value, base_win_rate=0.9, base_signals=1000, tic
     }
 
 
-def _candidate(ticker, entry, stop, target, expected_value=None):
+def _candidate(ticker, entry, stop, target, expected_value=None, base_win_rate=0.9):
     """(stats_row, advice_row) pair for one long candidate.
 
     n=1000 and base_win_rate=0.9 (both hardcoded via the helpers' defaults)
@@ -167,11 +168,18 @@ def _candidate(ticker, entry, stop, target, expected_value=None):
     15%, so alloc is exactly 15.0% regardless of small parameter changes.
     expected_value defaults to 5% of entry, comfortably clearing the
     ev_net>0 / n>=min_n(50) gate (ev_shrunk ~= 5*0.909 = 4.5% > 0.15% cost).
+
+    base_win_rate defaults to 0.9 (kelly_frac~29%, saturates the 15%
+    leverage-off cap) but callers testing leveraged position-size scaling
+    (AllocationConfig.ticker_max_leverage, added when max_pos_pct started
+    scaling per-ticker by leverage) need kelly_frac to clear the NEW,
+    higher cap too -- e.g. 0.99 pushes kelly_frac to ~32.6% for the same
+    entry/stop/target, comfortably saturating a 30%-leveraged cap.
     """
     ev = expected_value if expected_value is not None else entry * 0.05
     return (
-        _stats_row(ticker, "LONG", entry, stop, target, ev),
-        _advice_row(entry, ev, ticker=ticker),
+        _stats_row(ticker, "LONG", entry, stop, target, ev, base_win_rate=base_win_rate),
+        _advice_row(entry, ev, ticker=ticker, base_win_rate=base_win_rate),
     )
 
 
@@ -305,6 +313,11 @@ def test_leverage_off_matches_pinned_baseline(monkeypatch, tmp_path):
             assert metrics[key] == pytest.approx(expected, rel=1e-9), key
 
         assert meta["margin_rejected_count"] == 0
+        # phantom_ledger E17-S02: distinct from margin_rejected_count above
+        # (Kairos's own pre-admission gate) -- this is phantom itself
+        # rejecting a placed order at fill time. Nothing should trigger it
+        # in a fully-funded, unleveraged run.
+        assert meta["phantom_fill_rejected_count"] == 0
 
         closed = client.positions.list(account_name="leverage_off_regression", status="closed")
         assert len(closed) == 2
@@ -338,10 +351,12 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
     establishing a real MTM snapshot. TICK3..TICK6 are then offered as a
     4-candidate batch on day2, admitted/rejected one-by-one against that
     snapshot via `_place_batch_orders`' running initial-margin-used total
-    and the (very tight, 0.1) margin_utilization_cap -- expected to admit
-    only the first of the four (proving the cap is actually load-bearing
-    here, not vacuously satisfied), which the test verifies via
-    margin_rejected_count > 0.
+    and the (tight, 0.2) margin_utilization_cap -- expected to admit only
+    some of the four (proving the cap is actually load-bearing here, not
+    vacuously satisfied), which the test verifies via
+    margin_rejected_count > 0. Candidates use base_win_rate=0.99 (see
+    `_candidate`'s docstring) so Kelly sizing saturates the leveraged
+    (max_leverage=2.0 -> 30%, not the legacy 15%) per-position cap cleanly.
     """
     day0 = datetime(2024, 1, 1)
     day1 = datetime(2024, 1, 2)
@@ -352,8 +367,8 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
     all_tickers = wave1 + wave2
 
     dated_rows = _dated_rows([
-        (day0, [_candidate(t, 100.0, 90.0, 140.0) for t in wave1]),
-        (day1, [_candidate(t, 100.0, 90.0, 140.0) for t in wave2]),
+        (day0, [_candidate(t, 100.0, 90.0, 140.0, base_win_rate=0.99) for t in wave1]),
+        (day1, [_candidate(t, 100.0, 90.0, 140.0, base_win_rate=0.99) for t in wave2]),
         (day2, []),
     ])
 
@@ -372,7 +387,7 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
         monkeypatch, tmp_path, dated_rows, bars_by_ticker,
         argv_extra=[
             "--capital", str(CAPITAL_2), "--top-n", "6",
-            "--max-leverage", "2.0", "--margin-utilization", "0.1",
+            "--max-leverage", "2.0", "--margin-utilization", "0.2",
         ],
         account_name="exposure_cap_test",
     )
@@ -771,16 +786,19 @@ def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path
     Scenario (ticket's suggested structure): wave 1 (TICK1, TICK2) is
     offered on day0 -- admitted unchecked (first-ever batch, `last_snapshot`
     is None) -- and same-day round-trips (fills + take-profits) on day1,
-    each consuming ~300 EUR of initial margin (15%-of-cash Kelly-capped
-    alloc * 20% equity_cfd initial_margin_pct, see `_candidate`'s
-    docstring). Wave 2 (TICK3..TICK6) is then offered on day1 too, so it is
-    admission-checked against `last_snapshot` from day1 -- the same
-    snapshot day1's round trips should have fed into. `margin_utilization`
-    is set tight enough (0.13) that wave 2's aggregate notional fits
-    entirely if day1's (already-closed) usage is ignored (0 rejected -- the
-    pre-fix/BUG-02 symptom, confirmed empirically) but must partially
-    breach the cap once day1's real usage is correctly counted (2 of 4
-    rejected, confirmed empirically on the fixed code).
+    each consuming ~600 EUR of initial margin (30%-of-cash leveraged
+    Kelly-capped alloc -- max_leverage=2.0 doubles the legacy 15% cap to
+    30% for equity_cfd's 20% margin class, see `_candidate`'s docstring --
+    * 20% equity_cfd initial_margin_pct). Wave 2 (TICK3..TICK6) is then
+    offered on day1 too, so it is admission-checked against `last_snapshot`
+    from day1 -- the same snapshot day1's round trips should have fed into.
+    `margin_utilization` is set tight enough (0.26) that wave 2's aggregate
+    notional fits entirely if day1's (already-closed) usage is ignored (0
+    rejected -- the pre-fix/BUG-02 symptom, confirmed empirically) but must
+    partially breach the cap once day1's real usage is correctly counted
+    (some but not all of wave 2 rejected, confirmed empirically on the
+    fixed code). Candidates use base_win_rate=0.99 (see `_candidate`'s
+    docstring) so Kelly sizing saturates the leveraged 30% cap cleanly.
     """
     day0 = datetime(2024, 1, 1)
     day1 = datetime(2024, 1, 2)
@@ -791,8 +809,8 @@ def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path
     all_tickers = wave1 + wave2
 
     dated_rows = _dated_rows([
-        (day0, [_candidate(t, 100.0, 90.0, 140.0) for t in wave1]),
-        (day1, [_candidate(t, 100.0, 90.0, 140.0) for t in wave2]),
+        (day0, [_candidate(t, 100.0, 90.0, 140.0, base_win_rate=0.99) for t in wave1]),
+        (day1, [_candidate(t, 100.0, 90.0, 140.0, base_win_rate=0.99) for t in wave2]),
         (day2, []),
     ])
 
@@ -815,7 +833,7 @@ def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path
         monkeypatch, tmp_path, dated_rows, bars_by_ticker,
         argv_extra=[
             "--capital", str(CAPITAL_6), "--top-n", "6",
-            "--max-leverage", "2.0", "--margin-utilization", "0.13",
+            "--max-leverage", "2.0", "--margin-utilization", "0.26",
         ],
         account_name="bug02_admission_test",
     )
@@ -840,8 +858,8 @@ def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path
         # stay at 0.0 -- this is the exact BUG-02 symptom confirmed
         # empirically against BUG-01-fixed-but-BUG-02-unfixed code.
         day1_gross_notional, day1_initial_margin = rows["2024-01-02"][1], rows["2024-01-02"][2]
-        assert day1_gross_notional == pytest.approx(3000.0, rel=1e-9)
-        assert day1_initial_margin == pytest.approx(600.0, rel=1e-9)
+        assert day1_gross_notional == pytest.approx(6000.0, rel=1e-9)
+        assert day1_initial_margin == pytest.approx(1200.0, rel=1e-9)
 
         # The cap must actually have been load-bearing for wave 2 (not
         # vacuously satisfied): at least one, but not all, of wave 2's 4
@@ -849,5 +867,104 @@ def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path
         # day1's round-trip usage was invisible to the gate.
         assert meta["margin_rejected_count"] > 0
         assert meta["margin_rejected_count"] < len(wave2)
+    finally:
+        client._conn.close()
+
+
+# =============================================================================
+# Test 7: _sync_margin_classes harmonizes phantom's broker profile
+# =============================================================================
+
+def test_sync_margin_classes_matches_config(monkeypatch, tmp_path):
+    """phantom_ledger E17-S01 added per-instrument-class CFD margin rates, but
+    phantom's bundled ibkr.json profile uses IBKR-native symbol spellings
+    ("EURUSD", "XAUUSD", "BTC") that can never match Kairos's yfinance-style
+    tickers ("EURUSD=X", "GC=F", "BTC-USD") under `MarginModel.margin_pct_for()`
+    (re.fullmatch). `_sync_margin_classes` patches the loaded broker profile
+    with Kairos's own `config/margin_ibkr.yaml` classes so the per-class rates
+    actually apply. Drives a real (minimal) `main()` invocation -- which
+    already calls `_sync_margin_classes` as part of its setup -- rather than
+    calling it directly, so this also proves it's correctly wired in.
+    """
+    day0 = datetime(2024, 1, 1)
+    day1 = datetime(2024, 1, 2)
+    day2 = datetime(2024, 1, 3)
+
+    dated_rows = _dated_rows([
+        (day0, [_candidate("TICKA", 100.0, 90.0, 140.0)]),
+        (day1, []),
+        (day2, []),
+    ])
+    bars_by_ticker = {
+        "TICKA": {
+            day1.date(): (100.0, 101.0, 99.0, 100.5, 1000.0),
+            day2.date(): (105.0, 141.0, 104.0, 138.0, 1000.0),
+        },
+    }
+
+    _metrics, _meta, client = _run_main(
+        monkeypatch, tmp_path, dated_rows, bars_by_ticker,
+        argv_extra=["--capital", "10000", "--top-n", "3", "--max-leverage", "1.0"],
+        account_name="sync_margin_classes_test",
+    )
+    try:
+        margin_config = load_margin_config(MARGIN_CONFIG_PATH)
+        profile = client.brokers.get("IBKR")
+
+        # equity_cfd (Kairos's catch-all, match=None/symbols=None) becomes
+        # phantom's default_margin_pct, not a MarginClassRule -- no longer
+        # the bundled profile's original 0.25.
+        assert profile.margin.default_margin_pct == pytest.approx(0.20)
+
+        by_label = {rule.label: rule for rule in profile.margin.classes}
+        assert set(by_label) == {
+            "fx_major", "fx_minor", "index_gold_major", "commodity_other", "crypto_spot",
+        }
+        # crypto_cfd (enabled: false in the YAML) must be skipped entirely.
+        assert "crypto_cfd" not in by_label
+
+        # Percentage-points -> fraction conversion.
+        assert by_label["fx_major"].margin_pct == pytest.approx(0.0333, rel=1e-6)
+        assert by_label["commodity_other"].margin_pct == pytest.approx(0.10)
+        assert by_label["crypto_spot"].margin_pct == pytest.approx(1.0)
+
+        # Explicit-symbols class carried through unchanged (as a sorted list).
+        assert by_label["fx_major"].symbols == sorted(margin_config.classes["fx_major"].symbols)
+        assert by_label["fx_major"].match is None
+
+        # Regex classes: Kairos's re.search-style, front-unanchored pattern
+        # must be translated for phantom's re.fullmatch -- the untranslated
+        # original pattern must NOT fullmatch a real ticker (proving the `.*`
+        # prefix is load-bearing, not cosmetic), while the translated one must.
+        original_pattern = margin_config.classes["fx_minor"].match
+        assert original_pattern == "=X$"
+        assert re.fullmatch(original_pattern, "EURJPY=X") is None
+        assert by_label["fx_minor"].match == ".*=X$"
+        assert re.fullmatch(by_label["fx_minor"].match, "EURJPY=X") is not None
+        assert by_label["commodity_other"].match == ".*=F$"
+        assert re.fullmatch(by_label["commodity_other"].match, "GC=F") is not None
+        assert by_label["crypto_spot"].match == ".*-USD$"
+        assert re.fullmatch(by_label["crypto_spot"].match, "BTC-USD") is not None
+
+        # margin_pct_for() actually resolves a Kairos ticker now (pre-fix this
+        # always fell through to default_margin_pct=0.25 regardless of class).
+        assert profile.margin.margin_pct_for("BTC-USD") == pytest.approx(1.0)
+        # GC=F is an explicit symbol in index_gold_major (5%), not
+        # commodity_other's =F$ regex fallback (10%) -- explicit symbols win.
+        assert profile.margin.margin_pct_for("GC=F") == pytest.approx(0.05)
+        assert profile.margin.margin_pct_for("CL=F") == pytest.approx(0.10)
+        assert profile.margin.margin_pct_for("EURUSD=X") == pytest.approx(0.0333, rel=1e-6)
+
+        # Idempotency: a second call with the same config must not touch the
+        # DB row (same broker profile `id`, byte-identical config_json).
+        row_before = client._conn.execute(
+            "SELECT id, config_json FROM broker_profiles WHERE name = ?", ("IBKR",)
+        ).fetchone()
+        kairos_papertrade._sync_margin_classes(client, "IBKR", margin_config)
+        row_after = client._conn.execute(
+            "SELECT id, config_json FROM broker_profiles WHERE name = ?", ("IBKR",)
+        ).fetchone()
+        assert row_after["id"] == row_before["id"]
+        assert row_after["config_json"] == row_before["config_json"]
     finally:
         client._conn.close()

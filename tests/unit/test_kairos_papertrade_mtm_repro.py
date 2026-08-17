@@ -265,7 +265,7 @@ class TestFrozenFixtureMtmRepro:
         # Observed on this specific fixture with this specific replay
         # construction (pinned the same way EXPECTED_METRICS_V2 pins values in
         # test_kairos_papertrade_loss_repro.py): the inequality DOES hold here
-        # (mtm_max_drawdown_pct ~58.3% vs pct_max_drawdown ~9.2%) -- driven
+        # (mtm_max_drawdown_pct ~56.6% vs pct_max_drawdown ~7.2%) -- driven
         # mostly by this replay's date-bucketed cash swings while many
         # positions are concurrently filled but not yet closed, not by
         # captured intra-trade price risk (this replay's interim marks are
@@ -275,6 +275,14 @@ class TestFrozenFixtureMtmRepro:
         # a replay with a true daily price-bar fixture could show the
         # opposite ordering in principle (finer-resolution per-trade closes
         # vs. coarser date-bucketed MTM points).
-        assert mtm_dd == pytest.approx(58.33185585472338, rel=1e-6)
-        assert closed_dd == pytest.approx(9.209712710925718, rel=1e-9)
+        #
+        # Both values re-pinned 2026-08-17: phantom_ledger E17-S05 fixed the
+        # fx_conversion_cost omission from realized_pnl at the source, so
+        # Kairos's now-removed compute_corrected_realized_pnl() correction no
+        # longer applies when replaying this frozen, pre-fix fixture -- see
+        # test_kairos_papertrade_loss_repro.py's 2026-08-17 update note for
+        # the full explanation (same root cause shifts pct_max_drawdown here
+        # as it does EXPECTED_METRICS_V2["pct_max_drawdown"] there).
+        assert mtm_dd == pytest.approx(56.62612695615587, rel=1e-6)
+        assert closed_dd == pytest.approx(7.187519642408216, rel=1e-9)
         assert mtm_dd >= closed_dd

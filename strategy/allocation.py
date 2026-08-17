@@ -62,6 +62,7 @@ class AllocationConfig:
     max_leverage: float = 1.0  # >1 enables margin mode; 1.0 preserves legacy cash path
     margin_utilization_cap: float = 0.8  # Fraction of equity usable as initial margin
     cluster_map: dict = field(default_factory=dict)  # ticker -> cluster name, static mapping
+    ticker_max_leverage: dict = field(default_factory=dict)  # ticker -> that asset class's own max leverage (100/initial_margin_pct); missing ticker = 1.0 (no scaling)
     selection_rule: Optional[SignalSelectionRule] = None  # optional --signal-selection override
 
 
@@ -541,17 +542,26 @@ def size_selected(survivors: list[dict], config: AllocationConfig) -> list[dict]
     # =========================================================================
     # Stage 1: POSITION CAP (per-row, on survivors only)
     # =========================================================================
-    # alloc = min(kelly_frac * 100, max_pos_pct)
+    # alloc = min(kelly_frac * 100, max_pos_pct * effective_leverage), where
+    # effective_leverage is THIS row's own asset-class leverage ceiling
+    # (from ticker_max_leverage, e.g. crypto_spot=1x, equity_cfd=5x,
+    # fx_major=30x), clamped to the run's --max-leverage. A position that
+    # would size at X at 1x leverage sizes at X * effective_leverage here --
+    # missing tickers default to 1.0 (no scaling, legacy behavior).
+    def _effective_leverage(ticker: str) -> float:
+        return min(config.max_leverage, config.ticker_max_leverage.get(ticker, 1.0))
+
     for row in result:
         if row["status"] is not None:
             # Rejected row; skip sizing
             continue
 
+        effective_max_pos_pct = config.max_pos_pct * _effective_leverage(row["ticker"])
         kelly_frac = row["derived"]["kelly_frac"]
-        alloc_raw = min(kelly_frac * 100, config.max_pos_pct)
+        alloc_raw = min(kelly_frac * 100, effective_max_pos_pct)
 
         # Flag if capped
-        if kelly_frac * 100 > config.max_pos_pct:
+        if kelly_frac * 100 > effective_max_pos_pct:
             if "POS_CAPPED" not in row["flags"]:
                 row["flags"].append("POS_CAPPED")
 
@@ -577,10 +587,16 @@ def size_selected(survivors: list[dict], config: AllocationConfig) -> list[dict]
 
     for cluster, cluster_rows in cluster_groups.items():
         cluster_sum = sum(row["alloc"] for row in cluster_rows)
+        # Scale the cluster ceiling by its most-leveraged member, so a
+        # leveraged position's Stage 1 sizing isn't clipped straight back
+        # down by an un-leveraged cluster cap (most tickers are their own
+        # singleton cluster -- see cluster_map.get(ticker, ticker) above).
+        cluster_leverage = max(_effective_leverage(row["ticker"]) for row in cluster_rows)
+        effective_max_cluster_pct = config.max_cluster_pct * cluster_leverage
 
-        if cluster_sum > config.max_cluster_pct:
+        if cluster_sum > effective_max_cluster_pct:
             # Scale factor: new_sum / old_sum
-            scale_factor = config.max_cluster_pct / cluster_sum
+            scale_factor = effective_max_cluster_pct / cluster_sum
 
             for row in cluster_rows:
                 row["alloc"] *= scale_factor
