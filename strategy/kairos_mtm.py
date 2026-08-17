@@ -161,6 +161,21 @@ def compute_daily_snapshot(
     Raises:
         KairosError: If a required bar is missing, a bar lacks price/date data,
             or no positions/bars are supplied to infer the snapshot date.
+
+    Equity note: a full-notional (``initial_margin_pct >= 100``, e.g. spot
+    crypto, or any position when the caller is in cash-only/``max_leverage
+    <= 1.0`` mode) position has its FULL notional debited from ``cash`` at
+    entry (see ``kairos_papertrade.py``'s ``_use_full_notional``/
+    ``_fill_cash_delta``) -- unlike a margin-only position, where only the
+    margin requirement leaves cash. ``equity`` must therefore add back such a
+    position's full CURRENT market value (``close_price * quantity``), not
+    just its P&L delta (``unrealized_pnl``) -- adding only the delta leaves
+    the entire invested notional missing from equity, understating it by
+    roughly the position's size. This previously caused ``margin_utilization``
+    to read well over 100% (and could trip ``liquidation_check``'s ESMA
+    close-out rule) for a perfectly healthy account holding open spot
+    positions. The returned ``unrealized_pnl`` field itself is unaffected --
+    it's still the pure P&L delta, for reporting.
     """
     if not positions:
         if not bars_by_ticker:
@@ -187,6 +202,7 @@ def compute_daily_snapshot(
     initial_margin_used = 0.0
     maintenance_margin_used = 0.0
     total_unrealized = 0.0
+    total_equity_contribution = 0.0
 
     for pos in positions:
         bar = bars_by_ticker.get(pos.ticker)
@@ -201,12 +217,20 @@ def compute_daily_snapshot(
         gross_notional += notional
         initial_margin_used += initial_margin
         maintenance_margin_used += maintenance_margin
-        total_unrealized += unrealized_pnl(pos, close_price)
+        delta = unrealized_pnl(pos, close_price)
+        total_unrealized += delta
+        # See the equity note in this function's docstring: full-notional
+        # positions contribute their full current value, margin-only
+        # positions contribute just their P&L delta.
+        if classify_symbol(pos.ticker, cfg).initial_margin_pct >= 100.0:
+            total_equity_contribution += close_price * pos.quantity
+        else:
+            total_equity_contribution += delta
 
     if snap_date is None:
         raise KairosError("No positions to determine snapshot date")
 
-    equity = cash + total_unrealized
+    equity = cash + total_equity_contribution
     free_margin = equity - initial_margin_used
     margin_utilization = initial_margin_used / equity if equity > 0 else 0.0
 

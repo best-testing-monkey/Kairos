@@ -60,16 +60,22 @@ def test_compute_daily_snapshot_two_positions(cfg) -> None:
 
     snapshot = compute_daily_snapshot(positions, bars_by_ticker, cash=8250.0, cfg=cfg)
 
+    # BTC-USD is crypto_spot (initial_margin_pct=100.0): its full current
+    # market value (close_price * quantity = 39000 * 0.1 = 3900.0) is what
+    # contributes to equity, not just its P&L delta (100.0) -- see
+    # compute_daily_snapshot's equity note. AAPL (equity_cfd, 20% margin)
+    # still contributes only its delta (50.0), unaffected.
+    # equity = cash(8250) + AAPL_delta(50) + BTC_full_value(3900) = 12200.0
     expected = DailySnapshot(
         date=datetime.date(2026, 8, 7),
         cash=8250.0,
         unrealized_pnl=150.0,
-        equity=8400.0,
+        equity=12200.0,
         gross_notional=5000.0,
         initial_margin_used=4200.0,
         maintenance_margin_used=100.0,
-        free_margin=4200.0,
-        margin_utilization=0.5,
+        free_margin=8000.0,
+        margin_utilization=4200.0 / 12200.0,
         financing_accrued_day=0.0,
         liquidations=0,
     )

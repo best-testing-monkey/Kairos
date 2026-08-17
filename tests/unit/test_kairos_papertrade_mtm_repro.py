@@ -235,13 +235,12 @@ class TestFrozenFixtureMtmRepro:
         simplification (see module docstring) means our MTM curve has that
         SAME blind spot -- so the inequality is NOT guaranteed to hold here by
         construction, unlike the equity-convergence test above. We compute
-        both values first and check empirically rather than assuming: on THIS
-        fixture it DOES hold (see the pinned values below), driven by
-        date-bucketed cash depletion while many positions are concurrently
-        filled but not yet closed, not by captured price risk. Both values are
-        asserted sane (non-negative) unconditionally, and the pinned
-        equality/inequality below is a characterization pin for this specific
-        dataset and replay construction -- not a general proof.
+        both values first and check empirically rather than assuming: as of
+        the 2026-08-17 `compute_daily_snapshot()` equity fix (see the pinned
+        values below), it does NOT hold on this fixture -- both values are
+        asserted sane (non-negative) unconditionally, and the pinned values
+        below are a characterization pin for this specific dataset and
+        replay construction, not a general proof either way.
         """
         from kairos_margin import load_margin_config
         from kairos_papertrade import compute_final_metrics
@@ -262,27 +261,30 @@ class TestFrozenFixtureMtmRepro:
         assert mtm_dd >= 0.0
         assert closed_dd >= 0.0
 
-        # Observed on this specific fixture with this specific replay
-        # construction (pinned the same way EXPECTED_METRICS_V2 pins values in
-        # test_kairos_papertrade_loss_repro.py): the inequality DOES hold here
-        # (mtm_max_drawdown_pct ~56.6% vs pct_max_drawdown ~7.2%) -- driven
-        # mostly by this replay's date-bucketed cash swings while many
-        # positions are concurrently filled but not yet closed, not by
-        # captured intra-trade price risk (this replay's interim marks are
-        # flat at entry_price, per the module docstring). This is a
-        # characterization pin for THIS dataset/construction, not a proof
-        # that mtm_max_drawdown_pct >= pct_max_drawdown holds for any run --
-        # a replay with a true daily price-bar fixture could show the
-        # opposite ordering in principle (finer-resolution per-trade closes
-        # vs. coarser date-bucketed MTM points).
+        # Re-pinned 2026-08-17 (second time -- see below): this fixture no
+        # longer demonstrates mtm_dd >= closed_dd. `compute_daily_snapshot()`
+        # (kairos_mtm.py) had a separate, real bug: `equity = cash +
+        # unrealized_pnl` added only the P&L DELTA for every open position,
+        # but a full-notional (spot, initial_margin_pct>=100 -- crypto here)
+        # position has its FULL notional debited from cash at entry (see
+        # kairos_papertrade.py's `_use_full_notional`), so equity needs that
+        # position's full CURRENT market value added back, not just its
+        # delta -- omitting it understated equity by roughly each open spot
+        # position's size, inflating the MTM drawdown curve dramatically
+        # (mtm_dd was previously pinned at ~56.6%, now ~6.8% once equity is
+        # computed correctly). Fixed by adding a full-notional/margin-only
+        # branch to compute_daily_snapshot()'s equity accumulation -- see its
+        # docstring's "Equity note" for the full explanation. On THIS
+        # fixture, correctly-computed mtm_dd (~6.8%) now comes in slightly
+        # BELOW closed_dd (~7.2%) -- exactly the "opposite ordering" this
+        # test's own docstring already flagged as possible, so the
+        # directional assertion below is intentionally gone, not an
+        # oversight: this is a characterization pin for this dataset/
+        # construction, not a general proof of either ordering.
         #
-        # Both values re-pinned 2026-08-17: phantom_ledger E17-S05 fixed the
-        # fx_conversion_cost omission from realized_pnl at the source, so
-        # Kairos's now-removed compute_corrected_realized_pnl() correction no
-        # longer applies when replaying this frozen, pre-fix fixture -- see
-        # test_kairos_papertrade_loss_repro.py's 2026-08-17 update note for
-        # the full explanation (same root cause shifts pct_max_drawdown here
-        # as it does EXPECTED_METRICS_V2["pct_max_drawdown"] there).
-        assert mtm_dd == pytest.approx(56.62612695615587, rel=1e-6)
+        # (First re-pin, same date: phantom_ledger E17-S05 fixed the
+        # fx_conversion_cost omission from realized_pnl at the source, which
+        # is what moved pct_max_drawdown itself from ~9.2% to ~7.2% -- see
+        # test_kairos_papertrade_loss_repro.py's update note.)
+        assert mtm_dd == pytest.approx(6.81432803121296, rel=1e-6)
         assert closed_dd == pytest.approx(7.187519642408216, rel=1e-9)
-        assert mtm_dd >= closed_dd
