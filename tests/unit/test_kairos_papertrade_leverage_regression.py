@@ -968,3 +968,65 @@ def test_sync_margin_classes_matches_config(monkeypatch, tmp_path):
         assert row_after["config_json"] == row_before["config_json"]
     finally:
         client._conn.close()
+
+
+# =============================================================================
+# Test 8: BUG-03 -- the first-ever admission-gated batch must actually be gated
+# =============================================================================
+
+def test_first_batch_is_admission_gated_not_skipped():
+    """`main()`'s day loop used to pass `snapshot=None` into
+    `_place_batch_orders` on the very first iteration that places orders
+    (`last_snapshot` starts as `None`), which `_place_order_if_admitted`
+    treats as "skip the check entirely". Fine for a single order, but a
+    multi-position selection rule (e.g. TOP 8) can blow past
+    `margin_utilization_cap` in that one ungated batch alone -- confirmed on
+    a real leveraged run where the first batch alone reached 174.6% margin
+    utilization against an 80% cap. Fixed by building a zero-margin-used
+    bootstrap `DailySnapshot` instead of passing `None` on that first
+    iteration (see BUG-03 at the call site in `main()`).
+
+    This test exercises `_place_batch_orders` directly (the function itself
+    is unchanged -- only main()'s call site is), proving both halves: `None`
+    still means "skip" (kept for other callers), and a bootstrap snapshot
+    with `initial_margin_used=0.0` gates the batch exactly like every
+    subsequent day would.
+    """
+    from unittest.mock import MagicMock
+    from allocation import AllocationConfig
+    from kairos_mtm import DailySnapshot
+
+    margin_config = load_margin_config(MARGIN_CONFIG_PATH)
+    alloc_config = AllocationConfig(max_leverage=5.0, margin_utilization_cap=0.8)
+
+    # 3 plain-ticker (equity_cfd class, 20% margin) orders of notional=300
+    # each: margin_needed = 300*0.20 = 60 per order. Against equity=200 and
+    # an 80% cap (max_margin=160), orders 1+2 fit (60+60=120<=160) but order
+    # 3 doesn't (120+60=180>160) -- IF the batch is actually gated.
+    order_requests = [(f"order-{i}", f"TICK{i}", 300.0) for i in range(3)]
+
+    # Pre-fix behavior: snapshot=None skips the check entirely -- all 3
+    # admitted regardless of how far over the cap they'd push margin usage.
+    client_skip = MagicMock()
+    rejected_skip = kairos_papertrade._place_batch_orders(
+        client_skip, "acct-1", order_requests, datetime(2024, 1, 1),
+        None, margin_config, alloc_config,
+    )
+    assert rejected_skip == 0
+    assert client_skip.orders.place.call_count == 3
+
+    # Fixed behavior: a bootstrap DailySnapshot (equity=200, margin_used=0)
+    # gates the SAME batch -- order 3 must be rejected.
+    bootstrap_snapshot = DailySnapshot(
+        date=datetime(2024, 1, 1).date(), cash=200.0, unrealized_pnl=0.0,
+        equity=200.0, gross_notional=0.0, initial_margin_used=0.0,
+        maintenance_margin_used=0.0, free_margin=200.0,
+        margin_utilization=0.0, financing_accrued_day=0.0, liquidations=0,
+    )
+    client_gated = MagicMock()
+    rejected_gated = kairos_papertrade._place_batch_orders(
+        client_gated, "acct-1", order_requests, datetime(2024, 1, 1),
+        bootstrap_snapshot, margin_config, alloc_config,
+    )
+    assert rejected_gated == 1
+    assert client_gated.orders.place.call_count == 2

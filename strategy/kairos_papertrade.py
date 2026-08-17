@@ -1028,9 +1028,12 @@ def _place_order_if_admitted(
     snapshot, margin_config, alloc_config,
 ):
     """Admission-gate `order` against `snapshot` before calling
-    `client.orders.place`. `snapshot` may be `None` (the very first day of
-    the run, before any positions/margin usage exist) -- nothing can be
-    over-levered yet, so the check is skipped rather than faked.
+    `client.orders.place`. `snapshot=None` skips the check entirely -- kept
+    for callers with genuinely no equity/margin state to gate against yet
+    (e.g. tests). `main()`'s day loop no longer passes `None` on its first
+    iteration (see BUG-03 at its call site): a multi-position selection rule
+    can blow past margin_utilization_cap in that single ungated batch alone,
+    so it builds a zero-margin-used bootstrap `DailySnapshot` instead.
 
     Returns True if the order was placed, False if MARGIN_REJECTED (a log
     line is printed to stderr; the caller is responsible for counting it).
@@ -2159,9 +2162,28 @@ def main(argv=None):
                         stop_loss=row.get("stop"), created_at=effective_dt,
                     )
                     order_requests.append((order, row["ticker"], alloc_eur))
+                # BUG-03: `last_snapshot` is None only on the very first
+                # iteration that ever places orders (no snapshot exists yet
+                # to gate against). _place_batch_orders/_place_order_if_admitted
+                # both treat snapshot=None as "skip the check entirely" --
+                # correct for a single order, but with a multi-position
+                # selection rule (e.g. TOP 8) that first, ungated batch can by
+                # itself already exceed margin_utilization_cap (confirmed
+                # empirically: one such batch alone reached 174.6% utilization
+                # against an 80% cap). Build a zero-margin-used bootstrap
+                # snapshot instead of passing None, so the FIRST batch is
+                # gated exactly like every subsequent one.
+                admission_snapshot = last_snapshot
+                if admission_snapshot is None:
+                    admission_snapshot = DailySnapshot(
+                        date=effective_dt.date(), cash=corrected_cash, unrealized_pnl=0.0,
+                        equity=corrected_cash, gross_notional=0.0, initial_margin_used=0.0,
+                        maintenance_margin_used=0.0, free_margin=corrected_cash,
+                        margin_utilization=0.0, financing_accrued_day=0.0, liquidations=0,
+                    )
                 margin_rejected_count += _place_batch_orders(
                     client, account_id, order_requests, effective_dt,
-                    last_snapshot, margin_config, alloc_config,
+                    admission_snapshot, margin_config, alloc_config,
                 )
 
             all_open_tickers = {p.ticker for p in client.positions.list(account_name=account_name, status="open")}
