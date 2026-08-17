@@ -1188,21 +1188,25 @@ def _sync_margin_classes(client, broker_name, margin_config):
     CFD margin rates (phantom_ledger E17-S01, `MarginModel.classes`/
     `margin_pct_for()`) match `margin_config` (Kairos's own `config/margin_ibkr.
     yaml`, parsed via `kairos_margin.load_margin_config`), instead of the
-    bundled profile's own IBKR-native-symbol classes (e.g. "EURUSD", "XAUUSD",
-    "BTC") which can never match Kairos's yfinance-style tickers ("EURUSD=X",
-    "GC=F", "BTC-USD") -- without this, `margin_pct_for()` always falls through
-    to the bundled `default_margin_pct` (25% for IBKR) for every Kairos order,
-    regardless of asset class, silently defeating E17-S01 for this project.
+    bundled profile's own (broker-house-native, e.g. IBKR-native) symbol
+    classes. As of phantom_ledger E17-S08 (2026-08-17), the bundled profiles
+    also match common yfinance-style tickers ("EURUSD=X", "GC=F", "BTC-USD")
+    alongside their original spellings -- but still at phantom's OWN,
+    generically-IBKR-real-world margin rates (e.g. `default_margin_pct=0.25`
+    for anything unmatched), not Kairos's own risk-tuned scheme
+    (`config/margin_ibkr.yaml`, e.g. `equity_cfd=0.20`, `crypto_cfd` disabled
+    entirely). This function still exists to make phantom enforce Kairos's
+    OWN rates, not phantom's generic bundled ones -- it's a deliberate
+    override, not a workaround for a matching gap any more.
 
-    Idempotent: no-op (no DB write) if the profile's margin config already
+    Idempotent: no-op (no API call) if the profile's margin config already
     matches. Safe to call every run, same as `_ensure_broker_profile`.
 
-    No update method exists on `BrokerAPI`/`BrokerRepo` (only create/get/list/
-    delete/load/validate) -- and delete+recreate would mint a new profile `id`,
-    orphaning `account.broker_profile_id` FKs on any account created in a prior
-    run against this same persistent `phantom_data_dir` DB. Patches
-    `broker_profiles.config_json` in place instead, via the same direct-`_conn`
-    pattern as `remove_all_open_positions`/`_ensure_mtm_daily_table`.
+    Uses `client.brokers.update()` (phantom_ledger E17-S07, 2026-08-17) --
+    before that existed, this had to patch `broker_profiles.config_json`
+    directly via `client._conn` (delete+recreate would have minted a new
+    profile `id`, orphaning `account.broker_profile_id` FKs on any account
+    created in a prior run against the same persistent `phantom_data_dir`).
     """
     from phantom.models.broker import MarginClassRule
 
@@ -1234,14 +1238,7 @@ def _sync_margin_classes(client, broker_name, margin_config):
         return
 
     updated_profile = profile.model_copy(update={"margin": new_margin})
-    row = client._conn.execute(
-        "SELECT id FROM broker_profiles WHERE name = ?", (broker_name,)
-    ).fetchone()
-    client._conn.execute(
-        "UPDATE broker_profiles SET config_json = ? WHERE id = ?",
-        (updated_profile.model_dump_json(), row["id"]),
-    )
-    client._conn.commit()
+    client.brokers.update(broker_name, updated_profile)
 
 
 def remove_all_open_positions(ph_instance, account_id, account_name):
