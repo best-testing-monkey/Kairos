@@ -795,15 +795,33 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
 _CFD_TICKER_RE = re.compile(r"(=F|=X|-USD)$")
 
 
-def map_instrument_type(candidate_or_row):
+def map_instrument_type(candidate_or_row, margin_config=None, max_leverage=1.0):
     """Map a Candidate (or an allocation.py result-row dict) to Phantom
     Ledger's InstrumentType ("stock" or "cfd").
 
-    "cfd" for any short direction, or a ticker matching Kairos's futures
+    "cfd" for any short direction, a ticker matching Kairos's futures
     (e.g. "CL=F", "NG=F"), forex (e.g. "EURUSD=X", "AUDCAD=X"), or crypto
     (e.g. "BTC-USD", "WIF-USD", "UNI7083-USD") ticker conventions (see real
-    examples in results/*.md); "stock" for everything else (plain equity
-    tickers like "AAPL", "NFLX").
+    examples in results/*.md), OR (when `margin_config` is supplied) any
+    ticker `_use_full_notional()` would treat as margin-locked rather than
+    full-notional. "stock" for everything else (plain equity tickers like
+    "AAPL", "NFLX", when unleveraged or `margin_config` is omitted).
+
+    BUG-04: a LONG plain-equity/ETF ticker (no futures/forex/crypto suffix)
+    used to always map to "stock" here, regardless of `--max-leverage` --
+    phantom's `handle_fill()` only applies margin/leverage accounting for
+    `instrument_type == "cfd"`, always charging FULL notional cash for
+    "stock" fills. Meanwhile `ticker_max_leverage`
+    (kairos_margin.classify_symbol's `equity_cfd` class, 20% margin/5x) told
+    `allocation.py`'s Stage 1/2 sizing this ticker COULD be leveraged --
+    the two were completely disconnected, so a long stock/ETF position
+    never actually got margined in phantom no matter what `--max-leverage`
+    requested, even though Kairos's own sizing/risk math assumed it was.
+    `margin_config`/`max_leverage` let this reuse the exact same
+    margin-only-vs-full-notional decision `_use_full_notional()` already
+    makes for Kairos's OWN cash bookkeeping, so the two can't diverge again.
+    Only affects LONG positions in a leverageable class -- short and
+    futures/forex/crypto tickers were already correctly "cfd" regardless.
     """
     if isinstance(candidate_or_row, dict):
         ticker = candidate_or_row.get("ticker", "") or ""
@@ -815,6 +833,8 @@ def map_instrument_type(candidate_or_row):
     if direction == "short":
         return "cfd"
     if ticker and _CFD_TICKER_RE.search(ticker):
+        return "cfd"
+    if margin_config is not None and ticker and not _use_full_notional(ticker, margin_config, max_leverage):
         return "cfd"
     return "stock"
 
@@ -2156,7 +2176,7 @@ def main(argv=None):
                         continue
                     order = Order(
                         account_id=account_id, ticker=row["ticker"],
-                        instrument_type=map_instrument_type(row),
+                        instrument_type=map_instrument_type(row, margin_config, args.max_leverage),
                         direction=row["direction"], order_type="market",
                         quantity=quantity, take_profit=row.get("target"),
                         stop_loss=row.get("stop"), created_at=effective_dt,

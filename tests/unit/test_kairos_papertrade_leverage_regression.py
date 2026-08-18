@@ -1030,3 +1030,55 @@ def test_first_batch_is_admission_gated_not_skipped():
     )
     assert rejected_gated == 1
     assert client_gated.orders.place.call_count == 2
+
+
+# =============================================================================
+# Test 9: BUG-04 -- long stock/ETF positions get margined in phantom too,
+# once leveraged
+# =============================================================================
+
+def test_map_instrument_type_routes_leveraged_stocks_to_cfd():
+    """A long plain-equity/ETF ticker (no futures/forex/crypto suffix) used
+    to always map to phantom's "stock" instrument type, regardless of
+    --max-leverage -- phantom's handle_fill() only applies margin/leverage
+    accounting for instrument_type=="cfd", so it always charged FULL
+    notional cash for a "stock" fill even though ticker_max_leverage
+    (kairos_margin.classify_symbol's equity_cfd class, 20% margin/5x) told
+    allocation.py's sizing this ticker could be leveraged. Confirmed on a
+    real leveraged run: every long stock/ETF position across all 14
+    selection rules showed leverage=1.0/margin_required=0.0 in phantom
+    regardless of --max-leverage, silently defeating leverage for any rule
+    with meaningful long-equity exposure.
+
+    map_instrument_type() now reuses _use_full_notional()'s exact
+    margin-only-vs-full-notional decision (same classify_symbol/
+    max_leverage inputs) so the two can never diverge again. Short
+    positions and futures/forex/crypto tickers are unaffected -- they were
+    already correctly "cfd" via the existing rules.
+    """
+    margin_config = load_margin_config(MARGIN_CONFIG_PATH)
+
+    # Unleveraged (or margin_config omitted): legacy behavior unchanged.
+    assert kairos_papertrade.map_instrument_type({"ticker": "AAPL", "direction": "long"}) == "stock"
+    assert kairos_papertrade.map_instrument_type(
+        {"ticker": "AAPL", "direction": "long"}, margin_config, max_leverage=1.0,
+    ) == "stock"
+
+    # Leveraged: AAPL (equity_cfd, 20% margin < 100%) is now "cfd".
+    assert kairos_papertrade.map_instrument_type(
+        {"ticker": "AAPL", "direction": "long"}, margin_config, max_leverage=5.0,
+    ) == "cfd"
+
+    # Crypto stays "cfd" either way (already matched via the suffix rule,
+    # unaffected by margin_config) -- but its class is 100% margin
+    # (unleveraged), so classify_symbol alone would NOT have routed it to
+    # "cfd" without the pre-existing suffix rule; confirms the two rules
+    # compose correctly rather than one overriding the other.
+    assert kairos_papertrade.map_instrument_type(
+        {"ticker": "BTC-USD", "direction": "long"}, margin_config, max_leverage=5.0,
+    ) == "cfd"
+
+    # Short stays "cfd" regardless of margin_config/leverage (pre-existing rule).
+    assert kairos_papertrade.map_instrument_type(
+        {"ticker": "AAPL", "direction": "short"}, margin_config, max_leverage=1.0,
+    ) == "cfd"
