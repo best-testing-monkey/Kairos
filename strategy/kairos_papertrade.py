@@ -2127,7 +2127,6 @@ def main(argv=None):
             if prev_candidates and not ruined:
                 open_positions = client.positions.list(account_name=account_name, status="open")
                 open_tickers = {p.ticker for p in open_positions}
-                cash = client.accounts.get(account_id).cash
                 ticker_max_leverage = {
                     c.ticker: 100.0 / classify_symbol(c.ticker, margin_config).initial_margin_pct
                     for c in prev_candidates
@@ -2152,8 +2151,19 @@ def main(argv=None):
                     admission_snapshot.initial_margin_used / admission_snapshot.equity * 100.0
                     if admission_snapshot.equity > 0 else 0.0
                 )
+                # Use admission_snapshot.equity (Kairos's MTM-corrected equity),
+                # not phantom's raw account.cash, as the equity base for sizing.
+                # The two diverge -- sometimes by more than the whole starting
+                # capital, see the "cash reconciliation gap" warning below and
+                # docs/papertrade_loss_analysis.md -- and Stage 2.5's margin
+                # target is computed against admission_snapshot.equity too, via
+                # existing_margin_used_pct above. Sizing off raw cash while
+                # targeting a % of a different, smaller equity figure made
+                # Stage 2.5 systematically overshoot margin_utilization_cap
+                # (observed 245% actual vs. an 80% target in a live run).
                 alloc_config = AllocationConfig(
-                    top_k=args.top_n, gross_cap_pct=100 * args.max_leverage, equity=cash, cluster_map=cluster_map,
+                    top_k=args.top_n, gross_cap_pct=100 * args.max_leverage,
+                    equity=admission_snapshot.equity, cluster_map=cluster_map,
                     selection_rule=parsed_signal_selection,
                     max_leverage=args.max_leverage, margin_utilization_cap=args.margin_utilization,
                     ticker_max_leverage=ticker_max_leverage,
@@ -2191,7 +2201,7 @@ def main(argv=None):
                             file=sys.stderr,
                         )
                         continue
-                    alloc_eur = row["alloc"] / 100.0 * cash
+                    alloc_eur = row["alloc"] / 100.0 * admission_snapshot.equity
                     quantity = alloc_eur / entry
                     if quantity <= 0:
                         continue
