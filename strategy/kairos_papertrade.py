@@ -1070,7 +1070,10 @@ def _place_order_if_admitted(
     return True
 
 
-def _place_batch_orders(client, account_id, order_requests, effective_dt, snapshot, margin_config, alloc_config):
+def _place_batch_orders(
+    client, account_id, order_requests, effective_dt, snapshot, margin_config, alloc_config,
+    live_cash=None,
+):
     """Admission-gate and place a whole day's worth of orders in one batch.
 
     `order_requests` is an iterable of `(order, ticker, order_notional)` tuples
@@ -1090,11 +1093,41 @@ def _place_batch_orders(client, account_id, order_requests, effective_dt, snapsh
     untouched -- admitting an order doesn't move cash/equity, only locks
     margin, until the fill actually happens later in `main`'s loop.
 
-    Returns the number of MARGIN_REJECTED orders in this batch.
+    `live_cash` (optional) additionally gates the SAME running total against
+    real spendable cash (`client.accounts.get(account_id).cash` at the top of
+    this batch), not just margin_utilization_cap. Stage 2.5 (allocation.py)
+    sizes off `alloc_config.equity` -- Kairos's own mark-to-market equity,
+    correct for the margin-utilization TARGET, since phantom's own equity has
+    no P&L marking (Position.unrealized_pnl is a permanent stub, see
+    kairos_mtm.py's module docstring) -- but that target can ask for more
+    real cash than phantom actually has, e.g. once earlier days' still-open
+    full-notional (spot) positions have already locked most of it up as
+    share holdings rather than liquid cash. `running_margin_used` already
+    equals cumulative cash committed by this batch so far (order_notional *
+    initial_margin_pct/100 is the exact cash phantom debits for BOTH
+    full-notional instruments, where initial_margin_pct is ~100, and
+    margin-only ones), so no second tracker is needed -- just an extra bound
+    on the same running total. Without this, oversized orders were only
+    ever discovered one at a time as a wasted PHANTOM_FILL_REJECTED at fill
+    time (452 of 756 attempted orders in a live isolate_path_hl_exec run
+    before this fix); checking here catches them before ever calling
+    `client.orders.place`.
+
+    Returns the number of MARGIN_REJECTED + CASH_REJECTED orders in this batch.
     """
     running_margin_used = snapshot.initial_margin_used if snapshot is not None else 0.0
     rejected = 0
     for order, ticker, order_notional in order_requests:
+        order_cash_needed = (
+            order_notional * classify_symbol(ticker, margin_config).initial_margin_pct / 100.0
+        )
+        if live_cash is not None and running_margin_used + order_cash_needed > live_cash:
+            print(
+                f"WARNING: CASH_REJECTED order for {ticker} notional={order_notional:.2f} "
+                f"at {effective_dt} (would exceed live cash {live_cash:.2f})", file=sys.stderr,
+            )
+            rejected += 1
+            continue
         check_snapshot = (
             replace(snapshot, initial_margin_used=running_margin_used) if snapshot is not None else None
         )
@@ -1102,9 +1135,7 @@ def _place_batch_orders(client, account_id, order_requests, effective_dt, snapsh
             client, account_id, order, ticker, order_notional, effective_dt,
             check_snapshot, margin_config, alloc_config,
         ):
-            running_margin_used += (
-                order_notional * classify_symbol(ticker, margin_config).initial_margin_pct / 100.0
-            )
+            running_margin_used += order_cash_needed
         else:
             rejected += 1
     return rejected
@@ -2216,9 +2247,16 @@ def main(argv=None):
                 # admission_snapshot was already built above (needed earlier
                 # for existing_margin_used_pct); reused here to gate this
                 # batch -- see BUG-03 in the comment at its construction.
+                # live_cash is fetched fresh right before placing, since
+                # Stage 2.5 sizes off admission_snapshot.equity (correct for
+                # the margin-utilization TARGET, but not always spendable --
+                # phantom's own equity has no P&L marking, see kairos_mtm.py,
+                # so it can't be used for the target either; see this
+                # function's docstring for why both checks are needed).
                 margin_rejected_count += _place_batch_orders(
                     client, account_id, order_requests, effective_dt,
                     admission_snapshot, margin_config, alloc_config,
+                    live_cash=client.accounts.get(account_id).cash,
                 )
 
             all_open_tickers = {p.ticker for p in client.positions.list(account_name=account_name, status="open")}
