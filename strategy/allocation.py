@@ -64,6 +64,7 @@ class AllocationConfig:
     cluster_map: dict = field(default_factory=dict)  # ticker -> cluster name, static mapping
     ticker_max_leverage: dict = field(default_factory=dict)  # ticker -> that asset class's own max leverage (100/initial_margin_pct); missing ticker = 1.0 (no scaling)
     selection_rule: Optional[SignalSelectionRule] = None  # optional --signal-selection override
+    existing_margin_used_pct: float = 0.0  # margin_utilization_cap budget already spent by currently-open positions, % of equity (0 on day 1 / when unknown)
 
 
 @dataclass
@@ -604,6 +605,83 @@ def size_selected(survivors: list[dict], config: AllocationConfig) -> list[dict]
                 # Add CLUSTER_CAPPED flag if not already present
                 if "CLUSTER_CAPPED" not in row["flags"]:
                     row["flags"].append("CLUSTER_CAPPED")
+
+    # =========================================================================
+    # Stage 2.5: MARGIN UTILIZATION TARGET (scale to margin_utilization_cap,
+    # not just avoid exceeding it -- only when leverage is active)
+    # =========================================================================
+    # `margin_utilization_cap` used to be enforced only as a ceiling, downstream
+    # in kairos_mtm.admission_check() at order-placement time -- size_selected()
+    # itself never referenced it, so Kelly-fraction-dominated sizing (the common
+    # case whenever no single signal's edge alone justifies using the full
+    # leverage headroom) left most of the margin budget unused every day, even
+    # though --margin-utilization was requested as the target deployment level.
+    # This stage scales today's already-Kelly-sized, already-cluster-capped
+    # allocations UP (or down) so their combined margin usage lands on
+    # `margin_utilization_cap`, not merely under it -- via water-filling: scale
+    # everyone uniformly, and any row that would exceed its OWN Stage 1 ceiling
+    # (its asset class's leverage cap) gets pinned there instead, with the
+    # leftover budget re-distributed among the rows that haven't hit their
+    # ceiling yet. `existing_margin_used_pct` (margin already locked by
+    # currently-open positions from prior days, supplied by the caller) is
+    # subtracted first, so this only targets the day's REMAINING headroom --
+    # otherwise a caller with several days' worth of still-open positions would
+    # get resized as if starting from zero, and the downstream admission gate
+    # would reject the excess anyway.
+    if config.max_leverage > 1.0:
+        target_rows = [row for row in result if row["status"] is None]
+        if target_rows:
+            def _margin_pct_for(ticker: str) -> float:
+                leverage = config.ticker_max_leverage.get(ticker, 1.0)
+                return 100.0 / leverage if leverage > 0 else 100.0
+
+            row_margin_pct = {id(row): _margin_pct_for(row["ticker"]) for row in target_rows}
+            row_cap = {
+                id(row): config.max_pos_pct * _effective_leverage(row["ticker"])
+                for row in target_rows
+            }
+
+            def _margin_used(rows) -> float:
+                return sum(row["alloc"] * row_margin_pct[id(row)] / 100.0 for row in rows)
+
+            headroom_pct = max(0.0, config.margin_utilization_cap * 100.0 - config.existing_margin_used_pct)
+            current_margin_pct = _margin_used(target_rows)
+
+            if current_margin_pct > headroom_pct and current_margin_pct > 0:
+                # Over target -- scale down uniformly (no per-row floor applies
+                # when shrinking, only Stage 1's ceiling matters when growing).
+                scale = headroom_pct / current_margin_pct
+                for row in target_rows:
+                    row["alloc"] *= scale
+            elif 0 < current_margin_pct < headroom_pct:
+                # Under target -- water-fill up to each row's own Stage 1 cap.
+                remaining_budget = headroom_pct
+                remaining_rows = list(target_rows)
+                for _ in range(len(target_rows) + 1):
+                    if not remaining_rows:
+                        break
+                    pool_margin = _margin_used(remaining_rows)
+                    if pool_margin <= 0:
+                        break
+                    scale = remaining_budget / pool_margin
+                    if scale <= 1.0:
+                        break
+                    newly_capped_ids = {
+                        id(row) for row in remaining_rows
+                        if row["alloc"] * scale >= row_cap[id(row)]
+                    }
+                    if not newly_capped_ids:
+                        for row in remaining_rows:
+                            row["alloc"] *= scale
+                        remaining_rows = []
+                        break
+                    capped_this_round = [row for row in remaining_rows if id(row) in newly_capped_ids]
+                    for row in capped_this_round:
+                        row["alloc"] = row_cap[id(row)]
+                        if "MARGIN_TARGET_CAPPED" not in row["flags"]:
+                            row["flags"].append("MARGIN_TARGET_CAPPED")
+                    remaining_budget -= _margin_used(capped_this_round)
+                    remaining_rows = [row for row in remaining_rows if id(row) not in newly_capped_ids]
 
     # =========================================================================
     # Stage 3: GROSS CAP (proportional scale-down if total > gross_cap_pct)

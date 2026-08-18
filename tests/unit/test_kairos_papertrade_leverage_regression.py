@@ -345,18 +345,23 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
     `equity_cfd` (initial_margin_pct=20%, IBKR's unmatched-ticker default
     bucket per config/margin_ibkr.yaml) -- computed via classify_symbol
     below, not hardcoded, per the ticket's explicit instruction.
-    TICK1/TICK2 open on day1 UNCHECKED (admission_check is skipped whenever
-    `last_snapshot` is None -- true for the very first order batch of a
-    run, see kairos_papertrade.py's `_place_order_if_admitted` docstring),
-    establishing a real MTM snapshot. TICK3..TICK6 are then offered as a
-    4-candidate batch on day2, admitted/rejected one-by-one against that
-    snapshot via `_place_batch_orders`' running initial-margin-used total
-    and the (tight, 0.2) margin_utilization_cap -- expected to admit only
-    some of the four (proving the cap is actually load-bearing here, not
-    vacuously satisfied), which the test verifies via
-    margin_rejected_count > 0. Candidates use base_win_rate=0.99 (see
-    `_candidate`'s docstring) so Kelly sizing saturates the leveraged
-    (max_leverage=2.0 -> 30%, not the legacy 15%) per-position cap cleanly.
+    TICK1/TICK2 open on day1 (`existing_margin_used_pct=0`, nothing open
+    yet -- see kairos_papertrade.py's bootstrap DailySnapshot), each sized
+    to their full Stage-1-capped 30% (max_pos_pct=15 * effective_leverage=2
+    for --max-leverage 2.0), establishing a real MTM snapshot ~12% into the
+    (tight, 0.2) margin_utilization_cap. TICK3..TICK6 are then offered as a
+    4-candidate batch on day2: `size_selected()`'s margin-utilization-TARGET
+    stage (not just a ceiling -- see allocation.py's Stage 2.5) now
+    proactively scales all four DOWN from their own 30% Stage-1 cap to fit
+    the ~8% of margin budget TICK1/TICK2 left remaining, rather than sizing
+    them at 30% and letting the downstream admission gate reject the
+    excess -- so `margin_rejected_count` is correctly 0 here (everything
+    offered gets admitted, just at a smaller size), which is itself proof
+    the target is load-bearing, not vacuously satisfied. Candidates use
+    base_win_rate=0.99 (see `_candidate`'s docstring) so Kelly sizing
+    saturates the leveraged 30% per-position cap cleanly, so any wave-2
+    ticker sized below that must have been the margin target doing it, not
+    Kelly alone.
     """
     day0 = datetime(2024, 1, 1)
     day1 = datetime(2024, 1, 2)
@@ -417,11 +422,49 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
             f"min_initial_margin_pct={min_initial_margin_pct_fraction})"
         )
 
-        # The cap must actually have been load-bearing for this to be a
-        # meaningful test (not just a vacuously-true inequality): at least
-        # one of the wave-2 candidates should have been rejected.
-        assert meta["margin_rejected_count"] > 0
-        assert meta["margin_rejected_count"] < len(wave2)  # not ALL rejected either
+        # allocation.py's margin-utilization-TARGET stage (Stage 2.5) means
+        # the cap is now load-bearing via proactive sizing, not downstream
+        # rejection -- everything offered gets admitted (0 rejections), but
+        # wave 2 gets scaled DOWN from its own Kelly-saturated 30% Stage-1
+        # cap to fit the ~8% of margin budget wave 1 left remaining.
+        assert meta["margin_rejected_count"] == 0
+        assert meta["phantom_fill_rejected_count"] == 0
+
+        # Positions still open at window end are removed (not force-closed --
+        # see remove_all_open_positions), so the sizing itself is verified via
+        # the persisted kairos_mtm_daily snapshots instead of live position
+        # rows. Day 1 (wave 1 alone, nothing else using margin yet): each of
+        # TICK1/TICK2 sizes at Kelly's own 30% Stage-1 cap, untouched by
+        # Stage 2.5, so day 1's initial_margin_used is ~12% of equity (2 *
+        # 30% * 20% margin_pct = 12% before entry costs shave equity down
+        # slightly; 0.121071... confirmed empirically, pinned exactly like
+        # this file's other hand-derived values).
+        by_date = {r[0]: r for r in client._conn.execute(
+            "SELECT date, equity, gross_notional, initial_margin_used, margin_utilization "
+            "FROM kairos_mtm_daily WHERE account_name = ? ORDER BY date",
+            ("exposure_cap_test",),
+        ).fetchall()}
+        day1_row = by_date["2024-01-02"]
+        assert day1_row[4] == pytest.approx(0.1210714826211976, rel=1e-9)  # margin_utilization
+
+        # Day 2 (wave 1 + wave 2 together): Stage 2.5 targets the day's
+        # REMAINING headroom (0.2 - 0.121071... ~= 0.079) for wave 2, sized
+        # in PERCENTAGE-OF-EQUITY terms against day 1's admission snapshot.
+        # Day 2's own kairos_mtm_daily margin_utilization is computed against
+        # a slightly different equity figure (today's corrected_cash +
+        # unrealized_pnl, drifted from day 1's by financing accrual on
+        # already-open notional even with flat, non-moving bars) -- so the
+        # ACHIEVED utilization (0.1936..., pinned exactly, confirmed
+        # empirically) lands close to but not bit-for-bit on the 20% target.
+        # That gap is inherent to the system using more than one
+        # cash/equity tracker (see docs/papertrade_loss_analysis.md), not a
+        # sizing bug -- what matters here is that it's dramatically closer to
+        # the 20% target than the pre-Stage-2.5 behavior would have left it
+        # (~0.121, since Kelly alone never asked for more and nothing used
+        # to scale allocations up to fill the rest of the budget).
+        day2_row = by_date["2024-01-03"]
+        assert day2_row[4] == pytest.approx(0.1936302241652176, rel=1e-9)  # margin_utilization
+        assert day2_row[4] > day1_row[4]  # meaningfully closer to the 20% target than day 1 was
     finally:
         client._conn.close()
 

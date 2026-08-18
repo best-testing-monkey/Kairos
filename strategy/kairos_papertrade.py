@@ -2132,11 +2132,32 @@ def main(argv=None):
                     c.ticker: 100.0 / classify_symbol(c.ticker, margin_config).initial_margin_pct
                     for c in prev_candidates
                 }
+                # BUG-03: `last_snapshot` is None only on the very first
+                # iteration that ever places orders (no snapshot exists yet
+                # to gate against) -- built here (rather than left as None)
+                # both to gate the first batch (see _place_batch_orders below)
+                # and to tell size_selected() how much of margin_utilization_cap's
+                # budget is already spent by currently-open positions, so its
+                # margin-utilization TARGET (Stage 2.5) sizes today's new
+                # candidates against the REMAINING headroom, not the full cap.
+                admission_snapshot = last_snapshot
+                if admission_snapshot is None:
+                    admission_snapshot = DailySnapshot(
+                        date=effective_dt.date(), cash=corrected_cash, unrealized_pnl=0.0,
+                        equity=corrected_cash, gross_notional=0.0, initial_margin_used=0.0,
+                        maintenance_margin_used=0.0, free_margin=corrected_cash,
+                        margin_utilization=0.0, financing_accrued_day=0.0, liquidations=0,
+                    )
+                existing_margin_used_pct = (
+                    admission_snapshot.initial_margin_used / admission_snapshot.equity * 100.0
+                    if admission_snapshot.equity > 0 else 0.0
+                )
                 alloc_config = AllocationConfig(
                     top_k=args.top_n, gross_cap_pct=100 * args.max_leverage, equity=cash, cluster_map=cluster_map,
                     selection_rule=parsed_signal_selection,
                     max_leverage=args.max_leverage, margin_utilization_cap=args.margin_utilization,
                     ticker_max_leverage=ticker_max_leverage,
+                    existing_margin_used_pct=existing_margin_used_pct,
                 )
                 enabled_mask = {c.ticker: (c.ticker not in open_tickers) for c in prev_candidates}
                 alloc_result = allocate(prev_candidates, alloc_config, enabled_mask=enabled_mask)
@@ -2182,25 +2203,9 @@ def main(argv=None):
                         stop_loss=row.get("stop"), created_at=effective_dt,
                     )
                     order_requests.append((order, row["ticker"], alloc_eur))
-                # BUG-03: `last_snapshot` is None only on the very first
-                # iteration that ever places orders (no snapshot exists yet
-                # to gate against). _place_batch_orders/_place_order_if_admitted
-                # both treat snapshot=None as "skip the check entirely" --
-                # correct for a single order, but with a multi-position
-                # selection rule (e.g. TOP 8) that first, ungated batch can by
-                # itself already exceed margin_utilization_cap (confirmed
-                # empirically: one such batch alone reached 174.6% utilization
-                # against an 80% cap). Build a zero-margin-used bootstrap
-                # snapshot instead of passing None, so the FIRST batch is
-                # gated exactly like every subsequent one.
-                admission_snapshot = last_snapshot
-                if admission_snapshot is None:
-                    admission_snapshot = DailySnapshot(
-                        date=effective_dt.date(), cash=corrected_cash, unrealized_pnl=0.0,
-                        equity=corrected_cash, gross_notional=0.0, initial_margin_used=0.0,
-                        maintenance_margin_used=0.0, free_margin=corrected_cash,
-                        margin_utilization=0.0, financing_accrued_day=0.0, liquidations=0,
-                    )
+                # admission_snapshot was already built above (needed earlier
+                # for existing_margin_used_pct); reused here to gate this
+                # batch -- see BUG-03 in the comment at its construction.
                 margin_rejected_count += _place_batch_orders(
                     client, account_id, order_requests, effective_dt,
                     admission_snapshot, margin_config, alloc_config,
