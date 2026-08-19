@@ -438,7 +438,7 @@ class TestPrewarmPredictionCache:
 
         calls = []
 
-        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None, build_distributions=True):
             calls.append((model_path, tuple(sorted(data.keys()))))
             return {}
 
@@ -488,19 +488,17 @@ class TestPrewarmPredictionCache:
         # The finetuned group's 3 calls are contiguous (not interleaved).
         assert finetuned_positions == list(range(min(finetuned_positions), min(finetuned_positions) + 3))
 
-    def test_data_refetched_not_retained_between_check_and_load_passes(self, monkeypatch):
-        """Regression guard for the 2026-07-29 prewarm memory leak: a live
-        run held every fetched (group, date) DataFrame in a list across the
-        whole base sweep, growing RSS from ~2.4GB to 10.1GB in 18 minutes
-        before a single new predict_all_batch call. The fix re-fetches data
-        fresh in the load pass instead of reusing what the check pass
-        fetched, so the load pass's fetches are always independent re-reads
-        -- this test fails if someone reverts to threading fetched data from
-        check straight into load. With no shared cache active, is_batch_cached
-        is a miss on the very first checked entry, so the check pass stops
-        after just that one date (2026-07-29 speed fix -- see
-        prewarm_prediction_cache's docstring) and the load pass then covers
-        the full 3-date x 2-symbol cross product on its own."""
+    def test_each_entry_fetched_exactly_once(self, monkeypatch):
+        """Regression guard for the 2026-07-29 prewarm memory leak: the old
+        two-pass design fetched every (group, date) DataFrame once in a
+        check pass (retaining them all in a list) and then AGAIN in a load
+        pass, growing RSS from ~2.4GB to 10.1GB in 18 minutes before a
+        single new predict_all_batch call. The 2026-08-11 single-pass
+        rewrite (see prewarm_prediction_cache's docstring) makes the
+        double-fetch structurally impossible -- each entry is fetched,
+        used, and discarded exactly once. This test fails if a second pass
+        (of any kind) is reintroduced: 3 dates x 2 symbols must be exactly
+        6 fetches, not 8 or 12."""
         import kairos_strategies
 
         fetch_calls = []
@@ -511,7 +509,7 @@ class TestPrewarmPredictionCache:
             return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
 
         monkeypatch.setattr(kairos_strategies, "predict_all_batch",
-                             lambda data, model_path=None, tokenizer_path=None: {})
+                             lambda data, model_path=None, tokenizer_path=None, build_distributions=True: {})
         monkeypatch.setattr(kairos_strategies, "fetch_data_raw", counting_fetch_data_raw)
         monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
 
@@ -528,22 +526,21 @@ class TestPrewarmPredictionCache:
         monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda conn: {})
 
         base_now = datetime(2026, 7, 19, 0, 0)
-        # 0.1 months -> 3 dates; 1 group of 2 symbols -> 2 fetches/date/pass.
+        # 0.1 months -> 3 dates; 1 group of 2 symbols -> 2 fetches/date, one pass.
         failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
 
         assert failures == []
-        # Check pass: 1 date x 2 symbols (stops after the first miss) = 2.
-        # Load pass: full cross product, 3 dates x 2 symbols = 6.
-        assert len(fetch_calls) == 8
+        assert len(fetch_calls) == 6
 
-    def test_gc_collect_called_periodically_during_long_check_pass(self, monkeypatch):
+    def test_gc_collect_called_periodically_when_fully_cached(self, monkeypatch):
         """Regression guard for the 2026-07-29 leak: gc.collect() is
         otherwise only called on a model switch (_materialize_model), and
-        the base sweep never switches models, so a long, fully-cached check
-        pass (no misses -> runs to completion, see the early-exit speedup)
-        would previously never trigger a single collection. With
-        _PREWARM_GC_INTERVAL patched down to 3 and every entry a cache hit,
-        2 groups x 3 dates = 6 check iterations must cross it at least once."""
+        the base sweep never switches models, so a long, fully-cached sweep
+        (every entry a cache hit) would previously never trigger a single
+        collection. With _PREWARM_GC_INTERVAL patched down to 3 and every
+        entry a cache hit, 2 groups x 3 dates = 6 iterations must cross it
+        at least once -- the periodic gc.collect() sits in the loop's
+        `finally`, which runs on a `continue`d cache-hit entry too."""
         import kairos_strategies
 
         monkeypatch.setattr(kp, "_PREWARM_GC_INTERVAL", 3)
@@ -555,7 +552,7 @@ class TestPrewarmPredictionCache:
             return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
 
         monkeypatch.setattr(kairos_strategies, "predict_all_batch",
-                             lambda data, model_path=None, tokenizer_path=None: {})
+                             lambda data, model_path=None, tokenizer_path=None, build_distributions=True: {})
         monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
         monkeypatch.setattr(kairos_strategies, "is_batch_cached", lambda data, model_path=None, pred_len=1: True)
         monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
@@ -576,17 +573,16 @@ class TestPrewarmPredictionCache:
         monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda conn: {})
 
         base_now = datetime(2026, 7, 19, 0, 0)
-        # 0.1 months -> 3 dates; 2 groups x 3 dates = 6 check iterations,
-        # no misses -> runs to completion, load pass skipped entirely.
+        # 0.1 months -> 3 dates; 2 groups x 3 dates = 6 iterations, all hits.
         kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
 
         assert gc_calls["n"] >= 1
 
-    def test_gc_collect_called_periodically_during_load_pass(self, monkeypatch):
-        """Companion to the check-pass test above: once a miss triggers the
-        load pass, that loop must also periodically collect -- it iterates
-        the full cross product regardless of how much the check pass
-        covered before stopping early."""
+    def test_gc_collect_called_periodically_on_misses(self, monkeypatch):
+        """Companion to the fully-cached test above: when entries are
+        genuine misses (predict_all_batch actually runs), the same periodic
+        gc.collect() must still fire across the full 2 groups x 3 dates = 6
+        iterations."""
         import kairos_strategies
 
         monkeypatch.setattr(kp, "_PREWARM_GC_INTERVAL", 3)
@@ -598,10 +594,10 @@ class TestPrewarmPredictionCache:
             return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
 
         monkeypatch.setattr(kairos_strategies, "predict_all_batch",
-                             lambda data, model_path=None, tokenizer_path=None: {})
+                             lambda data, model_path=None, tokenizer_path=None, build_distributions=True: {})
         monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
-        # Every entry a miss -> check pass stops after 1, load pass covers
-        # the full 2 groups x 3 dates = 6 iterations.
+        # Every entry a miss -> the full 2 groups x 3 dates = 6 iterations
+        # all predict.
         monkeypatch.setattr(kairos_strategies, "is_batch_cached", lambda data, model_path=None, pred_len=1: False)
         monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
 
@@ -625,52 +621,11 @@ class TestPrewarmPredictionCache:
 
         assert gc_calls["n"] >= 1
 
-    def test_check_pass_stops_checking_at_first_miss(self, monkeypatch):
-        """2026-07-29 speed request: the check pass has all the information
-        it needs (needs_load=True) the moment ONE entry is a miss -- it must
-        not keep calling is_batch_cached (or fetching) for every remaining
-        entry in the unit. 5 groups x 3 dates = 15 possible check iterations;
-        the very first is a miss, so at most 1 should ever be checked."""
-        import kairos_strategies
-
-        is_batch_cached_calls = []
-
-        def fake_fetch_data_raw(sym, lookback, as_of=None):
-            idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
-            return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
-
-        def fake_is_batch_cached(data, model_path=None, pred_len=1):
-            is_batch_cached_calls.append(model_path)
-            return False  # every entry is a miss
-
-        monkeypatch.setattr(kairos_strategies, "predict_all_batch",
-                             lambda data, model_path=None, tokenizer_path=None: {})
-        monkeypatch.setattr(kairos_strategies, "fetch_data_raw", fake_fetch_data_raw)
-        monkeypatch.setattr(kairos_strategies, "is_batch_cached", fake_is_batch_cached)
-        monkeypatch.setattr(kairos_strategies, "LOOKBACK", 10)
-
-        class _FakeConn:
-            def close(self):
-                pass
-
-        monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry", lambda db_path: _FakeConn())
-
-        groups = {(f"SYM{i}", "1d"): [{"assets": f"SYM{i}", "interval": "1d"}] for i in range(5)}
-        monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items",
-                             lambda conn, intervals=None, include_all=False: [])
-        monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
-        monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda conn: {})
-
-        base_now = datetime(2026, 7, 19, 0, 0)
-        failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
-
-        assert failures == []
-        assert len(is_batch_cached_calls) == 1  # stopped after the very first check
-
-    def test_load_pass_skipped_and_logged_when_fully_cached(self, monkeypatch, capsys):
-        """2026-07-29 speed request: if the check pass finds zero misses,
-        the load pass must not run at all (no predict_all_batch calls), and
-        the skip must be visible on the console."""
+    def test_load_skipped_and_logged_when_fully_cached(self, monkeypatch, capsys):
+        """2026-07-29 speed request (still true under the 2026-08-11
+        single-pass rewrite): if every entry in a unit is a cache hit,
+        predict_all_batch must never be called for it, and the skip must be
+        visible on the console."""
         import kairos_strategies
 
         predict_calls = []
@@ -706,7 +661,7 @@ class TestPrewarmPredictionCache:
         failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
 
         assert failures == []
-        assert predict_calls == []  # load pass never ran for either unit
+        assert predict_calls == []  # never predicted for either unit -- all hits
 
         out = capsys.readouterr().out
         assert "Prewarm load: Base skipped" in out
@@ -717,7 +672,7 @@ class TestPrewarmPredictionCache:
 
         calls = []
 
-        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None, build_distributions=True):
             calls.append(model_path)
             return {}
 
@@ -755,6 +710,9 @@ class TestPrewarmPredictionCache:
         assert calls == [None, None, None]
 
     def test_bad_date_does_not_abort_sweep(self, monkeypatch):
+        """A transient fetch failure on one entry only drops that entry --
+        the single-pass loop's try/except catches it, appends a failure,
+        and `continue`s to the next entry rather than aborting the sweep."""
         import kairos_strategies
 
         calls = []
@@ -767,7 +725,7 @@ class TestPrewarmPredictionCache:
             idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
             return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
 
-        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None, build_distributions=True):
             calls.append(model_path)
             return {}
 
@@ -831,7 +789,7 @@ class TestPrewarmPredictionCache:
         self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned)
 
         monkeypatch.setattr(kairos_strategies, "predict_all_batch",
-                             lambda data, model_path=None, tokenizer_path=None: {})
+                             lambda data, model_path=None, tokenizer_path=None, build_distributions=True: {})
         # Fully warm regardless of which model_path is being checked.
         monkeypatch.setattr(kairos_strategies, "is_batch_cached",
                              lambda data, model_path=None, pred_len=1: True)
@@ -856,7 +814,7 @@ class TestPrewarmPredictionCache:
         self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned)
 
         monkeypatch.setattr(kairos_strategies, "predict_all_batch",
-                             lambda data, model_path=None, tokenizer_path=None: {})
+                             lambda data, model_path=None, tokenizer_path=None, build_distributions=True: {})
 
         def fake_is_batch_cached(data, model_path=None, pred_len=1):
             # Base (model_path=None) is never cached; the finetuned group is
@@ -894,7 +852,7 @@ class TestPrewarmPredictionCache:
         self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned)
 
         monkeypatch.setattr(kairos_strategies, "predict_all_batch",
-                             lambda data, model_path=None, tokenizer_path=None: {})
+                             lambda data, model_path=None, tokenizer_path=None, build_distributions=True: {})
 
         def fake_is_batch_cached(data, model_path=None, pred_len=1):
             # Base is already fully warm; the finetuned group is never cached.
@@ -930,7 +888,7 @@ class TestPrewarmPredictionCache:
         self._common_prewarm_mocks(monkeypatch, groups, accepted_finetuned={})
 
         monkeypatch.setattr(kairos_strategies, "predict_all_batch",
-                             lambda data, model_path=None, tokenizer_path=None: {})
+                             lambda data, model_path=None, tokenizer_path=None, build_distributions=True: {})
         monkeypatch.setattr(kairos_strategies, "is_batch_cached",
                              lambda data, model_path=None, pred_len=1: False)
 
@@ -956,7 +914,7 @@ class TestPrewarmPredictionCache:
 
         order = []
 
-        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None, build_distributions=True):
             order.append(("predict", model_path))
             return {}
 
@@ -984,14 +942,13 @@ class TestPrewarmPredictionCache:
         assert notify_positions[0] < min(predict_positions)
 
     def test_tqdm_wrapping_does_not_change_calls_or_failures(self, monkeypatch):
-        """Regression guard for the tqdm progress bars wrapping both passes
-        (fetch+check, real predict) of both sweep units (base, finetuned
-        group): predict_all_batch/_notify must still be invoked with the
-        exact same arguments, and `failures` must still contain the exact
-        same entries, as before the tqdm wrapping was added. tqdm's own
-        console rendering is not asserted on -- only that it's a pure
-        side-effect (progress reporting) with no bearing on the function's
-        real behavior."""
+        """Regression guard for the tqdm progress bar wrapping each sweep
+        unit's single pass: predict_all_batch/_notify must still be invoked
+        with the exact same arguments, and `failures` must still contain
+        the exact same entries, as before the tqdm wrapping was added.
+        tqdm's own console rendering is not asserted on -- only that it's a
+        pure side-effect (progress reporting) with no bearing on the
+        function's real behavior."""
         import kairos_strategies
 
         predict_calls = []
@@ -1005,7 +962,7 @@ class TestPrewarmPredictionCache:
             idx = pd.date_range("2024-01-01", periods=lookback, freq="D")
             return pd.DataFrame({"close": [1.0] * lookback}, index=idx)
 
-        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None):
+        def fake_predict_all_batch(data, model_path=None, tokenizer_path=None, build_distributions=True):
             predict_calls.append((model_path, tuple(sorted(data.keys()))))
             return {}
 
@@ -1027,24 +984,20 @@ class TestPrewarmPredictionCache:
         base_now = datetime(2026, 7, 19, 0, 0)
         failures = kp.prewarm_prediction_cache(base_now, "1d", months_back=0.1, run_kwargs={})
 
-        # 3 dates; the group's 2nd fetch_data_raw call overall (2nd symbol
-        # of the base sweep's 1st date) fails, aborting just that one date's
-        # fetch dict comprehension during the CHECK pass -- recorded as 1
-        # failure. Every entry is a miss, so the check pass stops after its
-        # 2nd date (the 1st failed, the 2nd found the miss); the load pass
-        # then covers the FULL 3-date cross product on its own (it doesn't
-        # depend on what the check pass fetched), re-attempting date0's
-        # fetch too -- which succeeds this time, since the flaky counter
-        # only ever fails once. So all 3 base dates end up predicted despite
-        # date0's transient check-pass failure.
+        # 3 dates; the base sweep's 2nd fetch_data_raw call overall (BBB on
+        # date0) fails, so date0's whole entry is skipped (1 failure, no
+        # predict for it) -- the single pass never re-attempts a failed
+        # entry. date1 and date2 succeed and are genuine misses -> 2 base
+        # predicts. The finetuned sweep's fetches (calls 7-12) all land
+        # after the flaky counter's one-time failure, so all 3 of its
+        # dates succeed and predict -> 3 finetuned predicts.
         assert len(failures) == 1
         assert "simulated fetch failure" in failures[0]
 
-        # 3 base dates + 3 finetuned dates = 6 predict_all_batch calls.
-        assert len(predict_calls) == 6
+        assert len(predict_calls) == 5
         base_predict = [c for c in predict_calls if c[0] is None]
         finetuned_predict = [c for c in predict_calls if c[0] == "repo/finetuned-ab"]
-        assert len(base_predict) == 3
+        assert len(base_predict) == 2
         assert len(finetuned_predict) == 3
         assert all(c[1] == ("AAA", "BBB") for c in predict_calls)
 

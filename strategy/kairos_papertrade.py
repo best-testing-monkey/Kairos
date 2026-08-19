@@ -598,47 +598,35 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
 
     Each sweep unit -- the base sweep (one unit covering every group) and
     each finetuned group's sweep (its own unit, since each has a distinct
-    model_path) -- runs as two passes:
-      1. A fetch+cache-check pass: fetch each (group, date)'s data (each
-         fetch wrapped in its own try/except, mirroring kairos_signals.run()'s
-         Pass 1/Pass 2 loops, so one bad date/symbol never aborts the whole
-         sweep) and check it against kairos_strategies.is_batch_cached() --
-         a read-only lookup that never loads a model. The MOMENT any entry
-         is a genuine miss, the check pass stops entirely (2026-07-29:
-         previously it kept checking every remaining entry even after
-         already knowing a load was needed -- pure wasted fetch+lookup work,
-         since one miss is all the information needed to answer "does this
-         unit need a real load?").
-      2. If step 1 ever found a miss, send one _notify() heads-up (via
-         _format_prewarm_load_message) naming the model and the sweep's
-         date range/count, BEFORE the model actually loads -- then a real
-         predict pass over the FULL (group, date) cross product for this
-         unit (not just what the check pass happened to cover before
-         stopping early -- predict_all_batch() does its own fetch + cache
-         lookup per entry regardless, so the load pass never depended on
-         the check pass's coverage). If the check pass completed with zero
-         misses, the load pass is skipped entirely (nothing to load) and a
-         line is printed to say so.
+    model_path) -- runs as a SINGLE pass over its (group, date) entries
+    (changed 2026-08-11, see CLAUDE.md's "Prewarm is now a single
+    inline-checked pass, not two"): for each entry, fetch the data (wrapped
+    in its own try/except, mirroring kairos_signals.run()'s Pass 1/Pass 2
+    loops, so one bad date/symbol never aborts the whole sweep), then check
+    it against kairos_strategies.is_batch_cached() -- a read-only lookup
+    that never loads a model. A cache hit is skipped outright. On the FIRST
+    genuine miss for a unit, one _notify() heads-up (via
+    _format_prewarm_load_message) is sent naming the model and the sweep's
+    date range/count, BEFORE predict_all_batch() actually triggers a real
+    model load -- every miss after that (same unit) predicts silently, no
+    further notifies. If a unit finishes with zero misses, nothing was ever
+    loaded and a line is printed to say the whole unit was already warm.
 
     Returns the list of (context, error) failure strings collected along
     the way (empty list if nothing failed).
 
     MEMORY NOTE (2026-07-29): earlier versions of this function fetched each
-    (group, date)'s data ONCE in the check pass and kept every fetched
-    DataFrame alive in a list (base_entries / group_entries) for the load
-    pass to consume afterward. For a 6-month/1d run that's ~150 groups x
-    ~183 dates of lookback-window DataFrames held simultaneously -- a live
-    run was caught by a kill-at-10GB monitor: RSS climbed linearly from
-    ~2.4GB to 10.1GB in 18 minutes while still inside the BASE sweep's check
-    pass (data/predcache hadn't gained a single new file), matching this
-    exact accumulation. That per-entry list no longer exists at all (see the
-    early-exit behavior above) -- the load pass, on the rare occasion it
-    runs, builds its own full cross-product freshly and re-fetches each
-    entry's DataFrame right before use, so at most one entry's data is
-    resident at a time. fetch_data_raw reads from the
-    local price_cache (SQLite, remote=False) -- re-fetching doubles that
-    local I/O but is far cheaper than holding tens of thousands of
-    DataFrames in RAM for the whole sweep.
+    (group, date)'s data ONCE in a separate check pass and kept every
+    fetched DataFrame alive in a list for a later load pass to consume. For
+    a 6-month/1d run that's ~150 groups x ~183 dates of lookback-window
+    DataFrames held simultaneously -- a live run was caught by a
+    kill-at-10GB monitor: RSS climbed linearly from ~2.4GB to 10.1GB in 18
+    minutes while still inside the BASE sweep's check pass (data/predcache
+    hadn't gained a single new file), matching this exact accumulation. The
+    single-pass design above makes that accumulation structurally
+    impossible: each entry's DataFrame is built, used, and discarded before
+    the next entry is even fetched, so at most one entry's data is resident
+    at a time.
     """
 
     step = _interval_to_timedelta(interval)
@@ -665,89 +653,55 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
 
     failures = []
 
-    # ── Base sweep: one unit covering every group, every date. ─────────────
-    # Check pass stops the instant a miss is found (see docstring); the load
-    # pass, when it runs, always covers the full (group, date) cross product
-    # directly rather than a list built by the check pass.
-    base_needs_load = False
-    base_check_pbar = tqdm(
-        total=len(groups) * len(dates), desc="Prewarm check: Base", unit="req",
-    )
-    # for (assets_str, grp_interval), _group_rows in groups.items():
-    #     if base_needs_load:
-    #         break
-    #     assets = assets_str.split(",")
-    #     for date in dates:
-    #         base_check_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
-    #         try:
-    #             data = {
-    #                 sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
-    #                 for sym in assets
-    #             }
-    #         except Exception as e:
-    #             failures.append(
-    #                 f"prewarm base group assets={assets_str} interval={grp_interval} "
-    #                 f"date={date}: {e}"
-    #             )
-    #             base_check_pbar.update(1)
-    #             continue
-    #         base_check_pbar.update(1)
-    #         if not kairos_strategies.is_batch_cached(data, model_path=None):
-    #             base_needs_load = True
-    #             break
-    #         if base_check_pbar.n % _PREWARM_GC_INTERVAL == 0:
-    #             gc.collect()
-    # base_check_pbar.close()
-
-
-    if dates:
-        _notify(_format_prewarm_load_message("Base", dates), enabled=notify)
-        base_all_entries: list[tuple[str, str, datetime]] = [
-            (assets_str, grp_interval, date)
-            for (assets_str, grp_interval) in groups.keys()
-            for date in dates
-        ]
-
-        # base_all_entries.sort(key=lambda item: item[2], reverse=True)
-
-        base_load_pbar = tqdm(
-            base_all_entries, desc="Prewarm load: Base", unit="req", total=len(base_all_entries),
-        )
-
-        for i, (assets_str, grp_interval, date) in enumerate(base_load_pbar, start=1):
+    def _sweep_unit(label, kind, entries, model_path):
+        """Single fetch+check+(lazy notify)+predict pass over `entries`
+        (list of (assets_str, grp_interval, date)) for one sweep unit."""
+        notified = False
+        pbar = tqdm(entries, desc=f"Prewarm load: {label}", unit="req", total=len(entries))
+        for i, (assets_str, grp_interval, date) in enumerate(pbar, start=1):
             assets_str_fixedw = (assets_str + "                           ")[:30]
             if len(assets_str_fixedw) < len(assets_str):
-                assets_str_fixedw = assets_str_fixedw[:27]+"..."
-
-            base_load_pbar.set_postfix_str(f"{assets_str_fixedw} @ {date:%Y-%m-%d}")
+                assets_str_fixedw = assets_str_fixedw[:27] + "..."
+            pbar.set_postfix_str(f"{assets_str_fixedw} @ {date:%Y-%m-%d}")
             assets = assets_str.split(",")
             try:
                 data = {
                     sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
                     for sym in assets
                 }
-                if kairos_strategies.is_batch_cached(data, model_path=None):
+                if kairos_strategies.is_batch_cached(data, model_path=model_path):
                     continue
-                else:
-                    kairos_strategies.predict_all_batch(data, model_path=None, build_distributions=False)
+                if not notified:
+                    _notify(_format_prewarm_load_message(label, dates), enabled=notify)
+                    notified = True
+                kairos_strategies.predict_all_batch(data, model_path=model_path, build_distributions=False)
             except Exception as e:
+                suffix = "" if model_path is None else f" (model_path={model_path})"
                 failures.append(
-                    f"prewarm base group assets={assets_str} interval={grp_interval} "
-                    f"date={date}: {e}"
+                    f"prewarm {kind} group assets={assets_str} interval={grp_interval} "
+                    f"date={date}{suffix}: {e}"
                 )
                 continue
             finally:
                 if i % _PREWARM_GC_INTERVAL == 0:
                     gc.collect()
-    else:
-        print(
-            f"Prewarm load: Base skipped -- check pass found no cache misses "
-            f"({len(groups) * len(dates)} entries already warm)."
-        )
+        if not notified:
+            print(
+                f"Prewarm load: {label} skipped -- no cache misses "
+                f"({len(entries)} entries already warm)."
+            )
+
+    # ── Base sweep: one unit covering every group, every date. ─────────────
+    base_entries = [
+        (assets_str, grp_interval, date)
+        for (assets_str, grp_interval) in groups.keys()
+        for date in dates
+    ]
+    _sweep_unit("Base", "base", base_entries, model_path=None)
 
     # ── Finetuned sweep: each group with an accepted finetuned model is its
-    # own unit (own fetch+check pass, own possible notification, own
-    # predict pass) -- distinct model_path means a distinct load event. ────
+    # own unit (own pass, own possible notification) -- distinct model_path
+    # means a distinct load event. ──────────────────────────────────────────
     if not base_only and accepted_finetuned:
         for (assets_str, grp_interval), _group_rows in groups.items():
             sorted_key = ",".join(sorted(assets_str.split(",")))
@@ -755,39 +709,9 @@ def prewarm_prediction_cache(base_now, interval, months_back, run_kwargs, notify
             if model_path is None:
                 continue
 
-            assets = assets_str.split(",")
             model_label = f"Finetuned({assets_str})"
-
-            if dates:
-                _notify(_format_prewarm_load_message(model_label, dates), enabled=notify)
-                group_load_pbar = tqdm(
-                    dates, desc=f"Prewarm load: {model_label}", unit="req", total=len(dates),
-                )
-                for i, date in enumerate(group_load_pbar, start=1):
-                    group_load_pbar.set_postfix_str(f"{assets_str} @ {date:%Y-%m-%d}")
-                    try:
-                        data = {
-                            sym: kairos_strategies.fetch_data_raw(sym, lookback, as_of=date).tail(lookback)
-                            for sym in assets
-                        }
-                        if kairos_strategies.is_batch_cached(data, model_path=model_path):
-                            continue
-                        else:
-                            kairos_strategies.predict_all_batch(data, model_path=model_path, build_distributions=False)
-                    except Exception as e:
-                        failures.append(
-                            f"prewarm finetuned group assets={assets_str} interval={grp_interval} "
-                            f"date={date} (model_path={model_path}): {e}"
-                        )
-                        continue
-                    finally:
-                        if i % _PREWARM_GC_INTERVAL == 0:
-                            gc.collect()
-            else:
-                print(
-                    f"Prewarm load: {model_label} skipped -- check pass found no "
-                    f"cache misses ({len(dates)} entries already warm)."
-                )
+            entries = [(assets_str, grp_interval, date) for date in dates]
+            _sweep_unit(model_label, "finetuned", entries, model_path=model_path)
 
     return failures
 

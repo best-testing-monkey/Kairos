@@ -161,21 +161,29 @@ prediction already cached and never reloads at all
 (`kairos_strategies.predict_all_batch` defers `_materialize_model` until
 *after* the shared-cache lookup, and skips it entirely on a full hit).
 
-**Prewarm is now a single inline-checked pass, not two (changed 2026-08-11).**
-Earlier, each unit (base, or a finetuned group) ran a separate *check* pass
-first (stopping at the first cache miss) and only ran a *load* pass if the
-check found one — see the now-superseded "Prewarm speed" bullet in the
-dated section below, which described that design. As of the "cashing fixes
-WIP" commit, the check pass is commented out entirely in
-`prewarm_prediction_cache()`; the load pass runs unconditionally and calls
+**Prewarm is now a single inline-checked pass, not two (changed 2026-08-11,
+cleaned up 2026-08-19).** Earlier, each unit (base, or a finetuned group) ran
+a separate *check* pass first (stopping at the first cache miss) and only ran
+a *load* pass if the check found one — see the now-superseded "Prewarm speed"
+bullet in the dated section below, which described that design. The
+2026-08-11 "caching fixes WIP" commit collapsed this into one pass per unit
+(`_sweep_unit()` in `prewarm_prediction_cache()`): it calls
 `kairos_strategies.is_batch_cached()` inline per `(group, date)` entry,
 `continue`-ing past it when already cached instead of calling
-`predict_all_batch()`. Net effect on behavior is similar (a fully-warm unit
-still does no real GPU work), but the periodic `gc.collect()` calls that
-used to live in the check-pass loop (`_PREWARM_GC_INTERVAL`, every 500
-iterations) went with it — see "GC starvation" in the dated section below,
-now effectively dormant again since nothing calls it in the current load
-loop.
+`predict_all_batch()`. That WIP commit also left a real regression that sat
+undetected until `TestPrewarmPredictionCache` was brought back in sync with
+it on 2026-08-19: `_notify()` fired unconditionally at the top of every
+sweep unit, regardless of whether anything was actually a cache miss —
+violating this file's own "Telegram notifications" contract above
+("suppressed entirely when that unit's whole period is already a
+`kairos_predcache` hit"). Fixed by tracking a `notified` flag inside
+`_sweep_unit()` and firing `_notify()` lazily, only right before the first
+genuine miss's `predict_all_batch()` call; a unit that turns out fully
+cached now prints a "skipped" line instead, same as before the WIP commit.
+The periodic `gc.collect()` (`_PREWARM_GC_INTERVAL`, every 500 iterations)
+lives in the single loop's `finally` clause, so it still fires on both hits
+and misses — the "GC starvation... now effectively dormant" note in the
+dated section below is itself stale; `gc.collect()` is not dormant.
 
 The cache is a **persistent disk cache** at `data/predcache/`
 (`DEFAULT_PRED_CACHE_DIR` in `kairos_papertrade.py`) — deliberately NOT
