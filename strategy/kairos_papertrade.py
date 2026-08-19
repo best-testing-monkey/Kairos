@@ -1295,6 +1295,28 @@ def _sync_margin_classes(client, broker_name, margin_config):
     client.brokers.update(broker_name, updated_profile)
 
 
+def _refuse_duplicate_account_name(client, account_name):
+    """Raise if `account_name` already exists in `client`'s account table.
+
+    AccountRepo.get_by_name() has no ORDER BY, so a reused --account-name
+    silently resolves to whichever row SQLite returns first (often the
+    oldest matching account) instead of the run's own account -- this has
+    produced bit-identical, silently-stale results across multiple debug
+    re-runs in this project's history. Every run needs a unique name,
+    always, even for a "just rerun it real quick" check.
+    """
+    from phantom.errors import NotFoundError as PhNotFoundError
+    try:
+        client.accounts.get(account_name)
+    except PhNotFoundError:
+        return
+    raise RuntimeError(
+        f"Account name '{account_name}' already exists -- pick a new "
+        f"--account-name and retry (see this function's docstring for why "
+        f"reusing one is never safe)."
+    )
+
+
 def remove_all_open_positions(ph_instance, account_id, account_name):
     """Remove every position still open when the replay window ends, rather
     than manufacturing a same-day "manual" close at the last available price.
@@ -2121,6 +2143,7 @@ def main(argv=None):
         _ensure_broker_profile(client, args.broker)
         _sync_margin_classes(client, args.broker, margin_config)
         account_name = args.account_name or f"kairos_papertrade_{base_now.strftime('%Y%m%d%H%M')}"
+        _refuse_duplicate_account_name(client, account_name)
         account = client.accounts.create(
             name=account_name, account_type="algorithm", broker=args.broker,
             capital=args.capital, currency="EUR", algorithm_id="kairos_papertrade",
