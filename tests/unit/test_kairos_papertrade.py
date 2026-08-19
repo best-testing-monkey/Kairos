@@ -39,10 +39,9 @@ from kairos_papertrade import (
     _place_order_if_admitted,
     _place_batch_orders,
     _liquidate_position,
-    compute_corrected_realized_pnl,
     DEFAULT_PRED_CACHE_DIR,
 )
-from ..allocation import AllocationConfig
+from allocation import AllocationConfig
 from kairos_margin import load_margin_config
 from kairos_mtm import DailySnapshot, OpenPositionView, compute_daily_snapshot, liquidation_check
 import kairos_papertrade as kp
@@ -1069,8 +1068,9 @@ class TestCorrectedCashFillCloseDelta:
     # exit_price=110 -> gross_pnl=(110-100)*10=100. EXC (exit-side
     # commission+spread+slippage, never stored on the position row) = 3, so
     # phantom's stored realized_pnl = gross_pnl - (EC_no_fx + EXC)
-    # = 100 - (4.5 + 3) = 92.5, and corrected_realized_pnl
-    # = realized_pnl - fx = 92.5 - 0.5 = 92 = gross_pnl - EC - EXC.
+    # = 100 - (4.5 + 3) = 92.5. As of phantom_ledger E17-S05 (2026-08-17),
+    # realized_pnl is read as-is (no client-side fx correction) -- see
+    # _close_cash_delta's docstring.
     CLOSED_POSITION = {
         "entry_price": 100.0, "quantity": 10.0,
         "commission_entry": 2.0, "spread_cost": 1.5,
@@ -1082,22 +1082,19 @@ class TestCorrectedCashFillCloseDelta:
         # -(1000 + 5) = -1005
         assert _fill_cash_delta(self.CLOSED_POSITION) == pytest.approx(-1005.0)
 
-    def test_corrected_realized_pnl_sanity(self):
-        assert compute_corrected_realized_pnl(self.CLOSED_POSITION) == pytest.approx(92.0)
-
-    def test_close_delta_restores_entry_costs_and_adds_corrected_pnl(self):
-        # 1000 + 5 (EC) + 92 (corrected_realized_pnl) = 1097
-        assert _close_cash_delta(self.CLOSED_POSITION) == pytest.approx(1097.0)
+    def test_close_delta_restores_entry_costs_and_adds_realized_pnl(self):
+        # 1000 + 5 (EC) + 92.5 (realized_pnl, as-is) = 1097.5
+        assert _close_cash_delta(self.CLOSED_POSITION) == pytest.approx(1097.5)
 
     def test_fill_then_close_round_trip_matches_true_economic_pnl(self):
-        # Net effect of fill + close must equal gross_pnl - EC - EXC = 100 - 5 - 3 = 92,
+        # Net effect of fill + close must equal realized_pnl = 92.5,
         # NOT gross_pnl - 2*EC - EXC = 87 (the bug: EC debited at fill, never restored).
         capital = 10000.0
         cash = capital
         cash += _fill_cash_delta(self.CLOSED_POSITION)
         cash += _close_cash_delta(self.CLOSED_POSITION)
-        assert cash == pytest.approx(10092.0)
-        assert cash - capital == pytest.approx(92.0)
+        assert cash == pytest.approx(10092.5)
+        assert cash - capital == pytest.approx(92.5)
 
 
 # ============================================================================
@@ -1144,27 +1141,27 @@ class TestFillCloseDeltaMarginAware:
         assert _fill_cash_delta(self.POSITION, include_notional=False) == pytest.approx(-5.0)
 
     def test_close_delta_excludes_notional_when_margin_locked(self):
-        # 0 + 5 (EC) + 92 (corrected_realized_pnl) = 97, no notional credited.
-        assert _close_cash_delta(self.POSITION, include_notional=False) == pytest.approx(97.0)
+        # 0 + 5 (EC) + 92.5 (realized_pnl, as-is) = 97.5, no notional credited.
+        assert _close_cash_delta(self.POSITION, include_notional=False) == pytest.approx(97.5)
 
-    def test_fill_then_close_round_trip_still_equals_corrected_pnl(self):
+    def test_fill_then_close_round_trip_still_equals_realized_pnl(self):
         # The notional term cancels out either way -- net effect is exactly
-        # corrected_realized_pnl (92), the true economic P&L when no cash
-        # notional ever actually moved.
+        # realized_pnl (92.5), the true economic P&L when no cash notional
+        # ever actually moved.
         capital = 10000.0
         cash = capital
         cash += _fill_cash_delta(self.POSITION, include_notional=False)
         cash += _close_cash_delta(self.POSITION, include_notional=False)
-        assert cash - capital == pytest.approx(92.0)
+        assert cash - capital == pytest.approx(92.5)
 
     def test_legacy_default_matches_pre_e4_s10_behavior(self):
         # Pinned against the OLD (pre-E4-S10) formulas: fill = -(notional+EC),
-        # close = notional+EC+corrected_pnl. Calling with no include_notional
+        # close = notional+EC+realized_pnl. Calling with no include_notional
         # kwarg (default True) must reproduce them byte-for-byte.
         entry_notional = self.POSITION["entry_price"] * self.POSITION["quantity"]
         ec = 2.0 + 1.5 + 1.0 + 0.5
         old_fill = -(entry_notional + ec)
-        old_close = entry_notional + ec + 92.0
+        old_close = entry_notional + ec + 92.5
         assert _fill_cash_delta(self.POSITION) == pytest.approx(old_fill)
         assert _close_cash_delta(self.POSITION) == pytest.approx(old_close)
 
@@ -1500,13 +1497,14 @@ class TestComputeFinalMetricsMtm:
 class TestLiquidatePosition:
     # entry_price=100, qty=10, long -> entry_notional=1000, EC=2+1.5+1+0.5=5.
     # close_price=80 -> gross_pnl=(80-100)*10=-200 (a losing position, the
-    # realistic liquidation case). realized_pnl_to_store = gross_pnl - the
-    # three non-fx entry costs = -200 -2 -1.5 -1 = -204.5 (NOT gross_pnl
-    # itself -- see _liquidate_position's docstring). corrected_realized_pnl
-    # = -204.5 - fx(0.5) = -205 = gross_pnl - EC. close_delta (include_notional
-    # True) = notional(1000) + EC(5) + corrected_pnl(-205) = 800. Round trip:
-    # fill(-1005) + close(800) = -205 = gross_pnl - EC - EXC(0), matching the
-    # zero-exit-cost liquidation simplification.
+    # realistic liquidation case). realized_pnl_to_store = gross_pnl - all
+    # four entry costs (incl. fx) = -200 -2 -1.5 -1 -0.5 = -205, matching
+    # phantom's own native realized_pnl convention since E17-S05 (see
+    # _liquidate_position's and _close_cash_delta's docstrings -- no
+    # separate client-side fx correction exists any more). close_delta
+    # (include_notional True) = notional(1000) + EC(5) + realized_pnl(-205)
+    # = 800. Round trip: fill(-1005) + close(800) = -205 = gross_pnl - EC -
+    # EXC(0), matching the zero-exit-cost liquidation simplification.
     def _pos(self, **overrides):
         base = dict(
             id="pos1", ticker="AAPL", direction="long",
@@ -1563,7 +1561,7 @@ class TestLiquidatePosition:
         close_price, exit_datetime, realized_pnl, position_id = params
         assert close_price == 80.0
         assert exit_datetime == exit_dt.isoformat()
-        assert realized_pnl == pytest.approx(-204.5)
+        assert realized_pnl == pytest.approx(-205.0)
         assert position_id == "pos1"
         conn.commit.assert_called_once()
 
@@ -1578,7 +1576,7 @@ class TestLiquidatePosition:
             margin_config=margin_cfg, max_leverage=2.0,
         )
 
-        # 0 (no notional) + EC(5) + corrected_pnl(-205) = -200
+        # 0 (no notional) + EC(5) + realized_pnl(-205) = -200
         assert delta == pytest.approx(-200.0)
 
     def test_real_db_writes_and_nulls_order_fk(self, tmp_path):
@@ -1612,7 +1610,7 @@ class TestLiquidatePosition:
                 "SELECT status, exit_price, exit_datetime, realized_pnl, close_reason "
                 "FROM positions WHERE id = 'pos1'"
             ).fetchone()
-            assert row == ("liquidated", 80.0, exit_dt.isoformat(), pytest.approx(-204.5), "margin_call")
+            assert row == ("liquidated", 80.0, exit_dt.isoformat(), pytest.approx(-205.0), "margin_call")
 
             order_row = conn.execute("SELECT position_id FROM orders WHERE id = 'order1'").fetchone()
             assert order_row == (None,)
