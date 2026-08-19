@@ -319,34 +319,25 @@ RSS every 0.5s and, past 6000MB, suspends the main thread, dumps the top 15
 since it stops growth well before an external cgroup/OOM kill (or an
 un-contained freeze) would.
 
-**Known issues in the WIP commit, not yet fixed (flagged, not fixed here —
-docstring-only pass):**
-- `kairos_strategies.py`'s `_no_data_fallback_warned: set = set()` (the
-  de-dup guard for a repeated warning line in `fetch_data_raw`) got
-  accidentally re-indented *inside* `_dist_cache_put()`'s function body
-  during the refactor, so it's no longer a module-level binding at all —
-  any call into the `fetch_data_raw` code path that references it will
-  raise `NameError`. Needs to move back to module scope.
-- `kairos_predcache.PredictionCache.__init__` now constructs
-  `self._sqlite_cache = SqliteDict(...)` *before* `os.makedirs(self.cache_dir,
-  exist_ok=True)` runs — if `cache_dir` doesn't already exist, `SqliteDict`
-  will fail trying to create its file in a nonexistent directory. Latent on
-  this machine only because `data/predcache/` already exists from prior
-  runs; a genuinely fresh cache_dir would hit this.
-- `_evict_disk_if_over_budget()` only ever deletes `.npz` files, but
-  `_scan_disk_bytes()`/`_disk_bytes` count *every* file under `cache_dir`,
-  including the new `caches.db` (and its `-journal`/`-wal` siblings). If
-  `caches.db` alone grows past `max_disk_bytes`, eviction can delete every
-  `.npz` file and still never bring the total back under budget. Reproduced
-  by `tests/unit/test_predcache.py::TestDiskEviction::
-  test_writing_past_budget_evicts_oldest_mtime_first`, now failing.
-- The rearchitecture broke a substantial slice of the test suite (48 tests
-  across `test_predcache.py`, `test_kairos_strategies_model_switch.py`, and
-  `test_predict_all_batch_cache.py` as of this writing) — mostly collection
-  errors in tests that still reference the now-removed
-  `_prediction_cache`/`_prediction_cache_put`, plus the two `test_predcache.py`
-  failures above. Needs a pass to update or remove the stale tests before
-  merging past WIP.
+**WIP issues below are RESOLVED as of commit `ee745c7` (2026-08-13) — kept as
+history, not a live task list. Verified again 2026-08-19: all 62 tests across
+the three files pass, 0 failures.** The four bullets that used to live here
+were all fixed by `ee745c7` ("Fix papertrade prewarm RAM blowup and hardened
+OOM watchdog") without a matching CLAUDE.md update, which is exactly why this
+note exists now — don't trust a "known issues, not yet fixed" bullet list in
+this file without re-checking it against current `git log`/test runs first.
+- `_no_data_fallback_warned` is back at module scope (`kairos_strategies.py`,
+  outside `_dist_cache_put()`).
+- `PredictionCache.__init__` now calls `os.makedirs(...)` before constructing
+  `SqliteDict`.
+- `_evict_disk_if_over_budget()`/`_disk_write()` were removed outright, not
+  patched — `put()` no longer writes `.npz` files at all (sqlite-only), so
+  there was nothing left for disk eviction to do. `test_predcache.py`
+  documents the deletion of `TestDiskEviction` inline rather than replacing
+  it with anything.
+- `test_predcache.py`, `test_kairos_strategies_model_switch.py`, and
+  `test_predict_all_batch_cache.py` no longer reference the removed
+  `_prediction_cache`/`_prediction_cache_put` anywhere; all pass.
 
 ### Per-strategy signals cache (`signals_cache` table)
 `kairos_signals.py`'s `run()` caches each strategy's rows (the output of
