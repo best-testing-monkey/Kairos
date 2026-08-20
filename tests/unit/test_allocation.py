@@ -2802,24 +2802,7 @@ class TestSizeSelected:
         for r in result:
             assert r["status"] == "SELECTED"
 
-    def test_gross_cap_skipped_when_leveraged(self):
-        """Stage 3 gross cap must not undermine Stage 2.5's margin target.
-
-        Regression test for a real bug found 2026-08-20: with uneven leverage
-        across selected tickers (here 5x/20x, matching a real IWM/SPY daily
-        report), hitting an 80% margin-utilization target legitimately
-        requires >100% notional exposure. Before this fix, Stage 3 scaled
-        that back down to the 100% notional gross_cap_pct default, which
-        also dragged margin utilization back down by the same factor (in the
-        real case: 80% -> 8%), silently defeating the margin target. Fixed
-        by skipping Stage 3 entirely whenever max_leverage > 1.0, since
-        Stage 2.5's margin_utilization_cap is the real risk constraint once
-        leverage is active.
-        """
-        survivors = [
-            self._make_survivor("LOWLEV", kelly_frac=0.02),  # small Kelly-sized start
-            self._make_survivor("HILEV", kelly_frac=0.08),
-        ]
+    def _leveraged_config(self, gross_cap_pct: float) -> AllocationConfig:
         config = AllocationConfig(
             # High enough that per-row caps (max_pos_pct * ticker leverage)
             # don't bind -- isolates the gross-cap-vs-margin-target
@@ -2827,28 +2810,61 @@ class TestSizeSelected:
             # (already covered by other tests in this class).
             max_pos_pct=1000.0,
             max_cluster_pct=100.0,
-            gross_cap_pct=100.0,  # would otherwise clobber the >100% notional below
+            gross_cap_pct=gross_cap_pct,
             max_leverage=30.0,
             margin_utilization_cap=0.8,
             ticker_max_leverage={"LOWLEV": 5.0, "HILEV": 20.0},
         )
         config.cluster_map = {}
+        return config
 
-        result = size_selected(survivors, config)
-
-        margin_used = sum(
+    def _margin_used(self, result, config) -> float:
+        return sum(
             r["alloc"] * (100.0 / config.ticker_max_leverage[r["ticker"]]) / 100.0
             for r in result
         )
-        gross_notional = sum(r["alloc"] for r in result)
 
-        # Stage 2.5 must be allowed to actually hit its target...
-        assert abs(margin_used - 80.0) < 0.5, (
-            f"Margin target not reached: {margin_used}% (expected ~80%)"
-        )
-        # ...even though that legitimately means notional exposure > 100%,
-        # which the (skipped) gross cap would otherwise have scaled down.
-        assert gross_notional > 100.0
+    def test_gross_cap_still_applies_at_unleveraged_default_even_when_leveraged(self):
+        """size_selected() does NOT special-case leverage in Stage 3 -- it's the
+        caller's job to set gross_cap_pct appropriately when leverage is active.
+
+        This is the exact mechanism behind a real bug found 2026-08-20:
+        kairos_signals.py's daily report left gross_cap_pct at the unleveraged
+        default (100) even with --max-leverage 30 set, so Stage 3 clobbered
+        Stage 2.5's correctly-sized 80% margin target down to 8% (scaled by
+        the same factor gross notional exceeded the 100% cap by). The fix
+        was at the AllocationConfig construction site in kairos_signals.py
+        (match kairos_papertrade.py's gross_cap_pct=100*max_leverage), NOT
+        here -- this test documents why: size_selected() must stay a pure,
+        leverage-agnostic function of (candidates, config) so both callers
+        can share one reference oracle.
+        """
+        survivors = [
+            self._make_survivor("LOWLEV", kelly_frac=0.02),
+            self._make_survivor("HILEV", kelly_frac=0.08),
+        ]
+        config = self._leveraged_config(gross_cap_pct=100.0)  # the bug: should be 100*30
+
+        result = size_selected(survivors, config)
+
+        # Margin target (80%) is NOT reached -- Stage 3 clobbers it, exactly
+        # like it did in production before the kairos_signals.py fix.
+        assert self._margin_used(result, config) < 80.0
+        assert sum(r["alloc"] for r in result) <= config.gross_cap_pct + 1e-9
+
+    def test_gross_cap_pct_scaled_by_leverage_reaches_margin_target(self):
+        """With gross_cap_pct set the way kairos_papertrade.py actually sets
+        it (100 * max_leverage), Stage 2.5's margin target is reachable --
+        this is the config kairos_signals.py must match exactly."""
+        survivors = [
+            self._make_survivor("LOWLEV", kelly_frac=0.02),
+            self._make_survivor("HILEV", kelly_frac=0.08),
+        ]
+        config = self._leveraged_config(gross_cap_pct=100.0 * 30.0)  # matches papertrade
+
+        result = size_selected(survivors, config)
+
+        assert abs(self._margin_used(result, config) - 80.0) < 0.5
 
     def test_dust_filter_zeroes_small_allocation(self):
         """Dust filter; allocation < dust_min_pct zeroed and marked DUST."""

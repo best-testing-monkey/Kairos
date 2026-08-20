@@ -1160,6 +1160,15 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
             max_leverage=max_leverage,
             margin_utilization_cap=margin_utilization,
             ticker_max_leverage=ticker_max_leverage,
+            # Must match kairos_papertrade.py's AllocationConfig construction
+            # exactly (see its alloc_config there): gross_cap_pct is a cap on
+            # raw notional exposure, not margin -- left at the unleveraged
+            # default (100) it clobbers Stage 2.5's margin-utilization target
+            # whenever leverage is uneven across selected instruments (real
+            # bug found 2026-08-20: 80% margin target scaled down to 8%).
+            # This report's whole purpose is to mirror what papertrade would
+            # actually do, so it must scale this the same way papertrade does.
+            gross_cap_pct=100.0 * max_leverage,
             # existing_margin_used_pct left at its dataclass default (0.0) --
             # deliberate: this report never has a real account, always a
             # clean-slate snapshot.
