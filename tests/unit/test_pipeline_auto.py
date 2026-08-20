@@ -1954,6 +1954,47 @@ class TestSingleStageRegression:
         call_kwargs = mock_universe.call_args[1]
         assert call_kwargs["interval"] == "1h"
 
+    def test_run_stage_universe_uses_native_interval(self, temp_db):
+        """run_stage_universe fetches and computes stats for native interval."""
+        from kairos_pipeline import run_stage_universe, CANDIDATE_UNIVERSE
+        from kairos.data import price_cache
+
+        # Create mock DataFrame to return for all price_cache calls
+        mock_df = pd.DataFrame({
+            'open': [100.0, 101.0, 102.0],
+            'high': [102.0, 103.0, 104.0],
+            'low': [99.0, 100.0, 101.0],
+            'close': [101.0, 102.0, 103.0],
+            'volume': [1000, 1100, 1200],
+        }, index=pd.date_range('2026-08-01', periods=3, freq='1h'))
+
+        with patch("kairos_pipeline.price_cache.get_price_data") as mock_get, \
+             patch("kairos_pipeline.compute_universe_stats") as mock_stats, \
+             patch("kairos_pipeline.evaluate_liquidity") as mock_eval, \
+             patch("kairos_pipeline.insert_universe_row"), \
+             patch("kairos_pipeline.dump_csv"), \
+             patch("kairos_pipeline.start_run", return_value=1):
+
+            mock_get.return_value = mock_df
+            mock_stats.return_value = (3, 101500.0, 0.015, 0.02)
+            mock_eval.return_value = (True, None, "ok")
+
+            # Call run_stage_universe with interval="1h"
+            run_stage_universe(temp_db, interval="1h")
+
+            # Verify price_cache.get_price_data was called with interval="1h"
+            # The first call is the main fetch, not the probe
+            first_call = mock_get.call_args_list[0]
+            assert first_call[1]["interval"] == "1h", \
+                f"Main fetch should use interval='1h', got {first_call[1]['interval']}"
+
+            # Verify compute_universe_stats was called with interval="1h"
+            mock_stats.assert_called()
+            for call_obj in mock_stats.call_args_list:
+                assert call_obj[1].get("interval") == "1h" or (
+                    len(call_obj[0]) > 1 and call_obj[0][1] == "1h"
+                ), f"compute_universe_stats call should include interval='1h'"
+
     def test_correlation_stage_unchanged(self, temp_db):
         """--stage correlation dispatches as before."""
         from kairos_pipeline import main

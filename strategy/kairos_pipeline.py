@@ -504,7 +504,8 @@ def run_stage_universe(conn, interval="1d"):
     price_cache.configure(remote=False)
     run_id = start_run(conn, "universe", interval, {"interval": interval})
     end_dt = date.today()
-    start_dt = end_dt - timedelta(days=400)  # ~1y + buffer
+    max_days = _YF_MAX_DAYS.get(interval, 400)
+    start_dt = end_dt - timedelta(days=min(400, max_days))
 
     inserted_rows = []
     for asset_class, symbols in CANDIDATE_UNIVERSE.items():
@@ -513,7 +514,7 @@ def run_stage_universe(conn, interval="1d"):
             try:
                 df = price_cache.get_price_data(
                     symbol, start_date=start_dt.isoformat(), end_date=end_dt.isoformat(),
-                    interval="1d",
+                    interval=interval,
                 )
                 if df is None or df.empty:
                     row["fail_reason"] = "no_data_returned"
@@ -524,7 +525,7 @@ def run_stage_universe(conn, interval="1d"):
                     idx = pd.to_datetime(df.index)
                     df.index = idx.tz_convert(None) if idx.tz is not None else idx
 
-                    bars, dollar_volume, ann_vol, atr_pct = compute_universe_stats(df)
+                    bars, dollar_volume, ann_vol, atr_pct = compute_universe_stats(df, interval=interval)
                     row.update(bars=bars, dollar_volume=dollar_volume, ann_vol=ann_vol, atr_pct=atr_pct)
 
                     # Probe the requested --interval separately (may differ from 1d).

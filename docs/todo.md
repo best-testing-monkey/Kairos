@@ -78,7 +78,7 @@ supervision; everything else is safe for normal cheap-model automation.
 ## Epic 10 — Universe stage for 1h
 
 - [x] E10-S01 Interval-aware ann_vol annualization in compute_universe_stats (docs/tickets/E10-S01-universe-stats-annualization.md)
-- [ ] E10-S02 Native-interval liquidity fetch in run_stage_universe (docs/tickets/E10-S02-universe-native-interval-fetch.md)
+- [x] E10-S02 Native-interval liquidity fetch in run_stage_universe (docs/tickets/E10-S02-universe-native-interval-fetch.md)
 - [ ] E10-S03 Interval-scaled liquidity thresholds and min_bars (docs/tickets/E10-S03-universe-interval-scaled-thresholds.md)
 - [ ] E10-S04 Real interval_probe_ok gate + hourly-universe-screen playbook (docs/tickets/E10-S04-universe-probe-gate-and-playbook.md)
 
