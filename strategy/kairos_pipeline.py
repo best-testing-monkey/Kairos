@@ -445,10 +445,23 @@ def liquidity_threshold(asset_class: str) -> float:
     return 0.0  # fx / commodities handled separately (ETFs like GLD still use equity-style vol)
 
 
-def evaluate_liquidity(symbol: str, asset_class: str, bars: int, dollar_volume,
-                        ann_vol, atr_pct, min_bars: int = 200, atr_min: float = 0.5):
+def evaluate_liquidity(
+    symbol: str,
+    asset_class: str,
+    bars: int,
+    dollar_volume,
+    ann_vol,
+    atr_pct,
+    interval: str = "1d",
+    min_bars: int = 200,
+    atr_min: float = 0.5,
+):
     """
     Pure logic (no I/O) so it can be unit-tested with synthetic inputs.
+
+    Scales dollar_volume and min_bars to daily-equivalent for comparison against
+    thresholds calibrated for daily bars. For interval="1d", BARS_PER_DAY["1d"]=1,
+    so scaling is a no-op and behavior is unchanged from before.
 
     Returns (passed: bool, fail_reason: str or None, liquidity_note: str or None).
     """
@@ -464,8 +477,20 @@ def evaluate_liquidity(symbol: str, asset_class: str, bars: int, dollar_volume,
         liquidity_note = "fx_exempt_from_dollar_volume_filter"
     else:
         threshold = liquidity_threshold(asset_class)
-        if dollar_volume is None or dollar_volume < threshold:
-            return False, f"low_dollar_volume({dollar_volume}<{threshold})", liquidity_note
+        # Scale dollar_volume to daily-equivalent for comparison against
+        # threshold (which is calibrated for daily bars).
+        dollar_volume_daily_equiv = (
+            dollar_volume * BARS_PER_DAY.get(interval, 1) if dollar_volume is not None else None
+        )
+        if dollar_volume_daily_equiv is None or dollar_volume_daily_equiv < threshold:
+            daily_equiv_str = (
+                f"{dollar_volume_daily_equiv:.0f}" if dollar_volume_daily_equiv is not None else "N/A"
+            )
+            return (
+                False,
+                f"low_dollar_volume(raw={dollar_volume}, daily_equiv={daily_equiv_str}<{threshold})",
+                liquidity_note,
+            )
 
     if atr_pct is None or atr_pct < atr_min:
         return False, f"low_atr_pct({atr_pct}<{atr_min})", liquidity_note
@@ -543,7 +568,8 @@ def run_stage_universe(conn, interval="1d"):
                     row["interval_probe_ok"] = interval_probe_ok
 
                     passed, fail_reason, liquidity_note = evaluate_liquidity(
-                        symbol, asset_class, bars, dollar_volume, ann_vol, atr_pct
+                        symbol, asset_class, bars, dollar_volume, ann_vol, atr_pct,
+                        interval=interval, min_bars=int(200 * BARS_PER_DAY.get(interval, 1))
                     )
                     row["passed"] = passed
                     row["fail_reason"] = fail_reason
