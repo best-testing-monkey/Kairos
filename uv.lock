@@ -1668,7 +1668,7 @@ wheels = [
 [[package]]
 name = "phantom-ledger"
 version = "0.1.0"
-source = { git = "https://github.com/best-testing-monkey/phantom_ledger.git#7cb74c35c5012fd2ea13b2cf33ad83e47b877e27" }
+source = { git = "https://github.com/best-testing-monkey/phantom_ledger.git#8f2d0875f9e8dd67e838d900993fa4643dc6aa2f" }
 dependencies = [
     { name = "apscheduler" },
     { name = "fastapi" },
@@ -1794,7 +1794,7 @@ wheels = [
 [[package]]
 name = "price-cache"
 version = "0.1.0"
-source = { git = "https://github.com/best-testing-monkey/phantom_ledger.git?subdirectory=src%2Fphantom%2Fdata%2Fprice_cache#7cb74c35c5012fd2ea13b2cf33ad83e47b877e27" }
+source = { git = "https://github.com/best-testing-monkey/phantom_ledger.git?subdirectory=src%2Fphantom%2Fdata%2Fprice_cache#8f2d0875f9e8dd67e838d900993fa4643dc6aa2f" }
 dependencies = [
     { name = "json5" },
     { name = "pandas" },
