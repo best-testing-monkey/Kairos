@@ -262,7 +262,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except OpsError as exc:
         logger.error("GPU/lock error: %s", exc)
         try:
-            send_telegram(f"❌ Kairos daily signals GPU/lock error:\n```\n{exc}\n```")
+            send_telegram(f"❌ Kairos daily signals GPU/lock error:\n```\n{exc}\n```", parse_mode=None)
         except OpsError as notify_err:
             logger.error("Failed to send Telegram: %s", notify_err)
         return 1
@@ -274,7 +274,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             send_telegram(
                 f"❌ Kairos daily signals failed (exit {proc.returncode if proc else 'N/A'}):\n"
-                f"```\n{stderr_tail}\n```"
+                f"```\n{stderr_tail}\n```",
+                parse_mode=None,
             )
         except OpsError as notify_err:
             logger.error("Failed to send Telegram: %s", notify_err)
@@ -284,7 +285,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if report_path is None:
         logger.error("No kairos_signals_*.md report found in %s", out_dir)
         try:
-            send_telegram("⚠️ Kairos daily signals ran but no report was found.")
+            send_telegram("⚠️ Kairos daily signals ran but no report was found.", parse_mode=None)
         except OpsError as notify_err:
             logger.error("Failed to send Telegram: %s", notify_err)
         return 2
@@ -296,13 +297,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if selected > 0:
         message = build_success_message(report_path.read_text(), report_path, selected, total, failures)
         try:
-            send_telegram(message)
+            send_telegram(message, parse_mode=None)
         except OpsError as notify_err:
             logger.error("Failed to send Telegram: %s", notify_err)
             return 3
     elif args.notify_empty:
         try:
-            send_telegram(f"📊 Kairos daily signals: no actionable signals selected\nReport: `{report_path.name}`")
+            send_telegram(
+                f"📊 Kairos daily signals: no actionable signals selected\nReport: `{report_path.name}`",
+                parse_mode=None,
+            )
         except OpsError as notify_err:
             logger.error("Failed to send Telegram: %s", notify_err)
             return 3

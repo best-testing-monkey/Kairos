@@ -221,7 +221,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except OpsError as exc:
         logger.error("GPU/lock error: %s", exc)
         try:
-            send_telegram(f"❌ Kairos weekly discovery GPU/lock error:\n```\n{exc}\n```")
+            send_telegram(f"❌ Kairos weekly discovery GPU/lock error:\n```\n{exc}\n```", parse_mode=None)
         except OpsError as notify_err:
             logger.error("Failed to send Telegram: %s", notify_err)
         return 1
@@ -230,7 +230,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if failed:
         message = build_failure_message(stages)
         try:
-            send_telegram(message)
+            send_telegram(message, parse_mode=None)
         except OpsError as notify_err:
             logger.error("Failed to send Telegram: %s", notify_err)
             return 3
@@ -238,7 +238,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     message = build_success_message(stages, results_dir)
     try:
-        send_telegram(message)
+        send_telegram(message, parse_mode=None)
     except OpsError as notify_err:
         logger.error("Failed to send Telegram: %s", notify_err)
         return 3
