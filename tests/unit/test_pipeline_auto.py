@@ -1773,15 +1773,20 @@ class TestCorrelationIntervalThreading:
         from unittest.mock import patch, MagicMock
         import pandas as pd
 
-        # Pre-populate universe_screen with passing survivors
-        temp_db.execute(
-            "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
-            (1, "BTC-USD", "crypto", 1),
-        )
-        temp_db.execute(
-            "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
-            (1, "ETH-USD", "crypto", 1),
-        )
+        # Pre-populate universe_screen with passing survivors for both
+        # intervals under test (correlation now picks the latest universe
+        # run *for its own interval*, via the runs table -- a 1h correlation
+        # call must not silently pick up a 1d universe run, or vice versa).
+        for run_id, ival in [(1, "1h"), (2, "1d")]:
+            temp_db.execute(
+                "INSERT INTO runs (run_id, stage, interval) VALUES (?, 'universe', ?)",
+                (run_id, ival),
+            )
+            for sym, ac in [("BTC-USD", "crypto"), ("ETH-USD", "crypto")]:
+                temp_db.execute(
+                    "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+                    (run_id, sym, ac, 1),
+                )
         temp_db.commit()
 
         # Track fetch calls
@@ -1834,6 +1839,9 @@ class TestCorrelationIntervalThreading:
 
         # Pre-populate universe_screen
         temp_db.execute(
+            "INSERT INTO runs (run_id, stage, interval) VALUES (1, 'universe', '1d')",
+        )
+        temp_db.execute(
             "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
             (1, "BTC-USD", "crypto", 1),
         )
@@ -1857,6 +1865,46 @@ class TestCorrelationIntervalThreading:
         # Verify default is 1d
         assert len(fetch_calls) >= 1
         assert fetch_calls[0]["interval"] == "1d"
+
+    def test_correlation_does_not_leak_across_interval_universe_runs(self, temp_db):
+        """A newer universe run at a different interval must not be picked up
+        by MAX(run_id) -- regression test for the bug where run_stage_correlation
+        grabbed the globally latest universe_screen run_id regardless of interval."""
+        from kairos_pipeline import run_stage_correlation
+        from unittest.mock import patch
+        import pandas as pd
+
+        # Older 1d universe run.
+        temp_db.execute("INSERT INTO runs (run_id, stage, interval) VALUES (1, 'universe', '1d')")
+        temp_db.execute(
+            "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+            (1, "BTC-USD", "crypto", 1),
+        )
+        # Newer 1h universe run, with a DIFFERENT survivor set.
+        temp_db.execute("INSERT INTO runs (run_id, stage, interval) VALUES (2, 'universe', '1h')")
+        temp_db.execute(
+            "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+            (2, "SOL-USD", "crypto", 1),
+        )
+        temp_db.commit()
+
+        fetched_symbols = []
+
+        def mock_get_price_data(symbol, start_date, end_date, interval):
+            fetched_symbols.append(symbol)
+            dates = pd.date_range(start=start_date, end=end_date, freq='D')
+            return pd.DataFrame({
+                "close": [100.0] * len(dates), "volume": [1e6] * len(dates),
+            }, index=dates)
+
+        # A 1d correlation call, run AFTER the newer 1h universe run exists,
+        # must still only see the 1d universe's survivor (BTC-USD), not the
+        # 1h universe's (SOL-USD).
+        with patch("price_cache.get_price_data", side_effect=mock_get_price_data):
+            run_stage_correlation(temp_db, asset_class_filter=None, interval="1d")
+
+        assert "BTC-USD" in fetched_symbols
+        assert "SOL-USD" not in fetched_symbols
 
 
 class TestSingleStageRegression:
@@ -2128,6 +2176,9 @@ class TestCorrelationSingletonsAndCross:
         """A passing survivor with no correlated peer gets a singleton suggested_group row."""
         from kairos_pipeline import run_stage_correlation
 
+        temp_db.execute(
+            "INSERT INTO runs (run_id, stage, interval) VALUES (1, 'universe', '1d')",
+        )
         for sym, ac in [("BTC-USD", "crypto"), ("ETH-USD", "crypto"), ("LONER-USD", "crypto")]:
             temp_db.execute(
                 "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
@@ -2176,6 +2227,9 @@ class TestCorrelationSingletonsAndCross:
         """Correlation across asset classes is no longer skipped; pair row gets asset_class='cross'."""
         from kairos_pipeline import run_stage_correlation
 
+        temp_db.execute(
+            "INSERT INTO runs (run_id, stage, interval) VALUES (1, 'universe', '1d')",
+        )
         for sym, ac in [("BTC-USD", "crypto"), ("AAPL", "equity")]:
             temp_db.execute(
                 "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",

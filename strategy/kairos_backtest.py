@@ -82,6 +82,26 @@ warnings.filterwarnings("ignore")
 # GLOBAL SETTINGS
 # =============================================================================
 
+# Single source of truth for bars-per-calendar-day, by interval. Shared by
+# kairos_strategies.py, kairos_pipeline.py, and kairos_orchestrator.py
+# (previously duplicated three ways and at risk of drifting out of sync).
+BARS_PER_DAY = {
+    "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
+    "60m": 24, "90m": 16, "1h": 24, "1d": 1, "5d": 0.2,
+    "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
+}
+
+
+def bars_per_year(interval: str) -> float:
+    """Approximate annualization base for Sharpe/vol math at a given bar interval.
+
+    Matches this codebase's existing convention of annualizing daily bars
+    against 252 trading days/year (used uniformly for both equities and
+    24/7 crypto today) rather than 365 calendar days.
+    """
+    return BARS_PER_DAY.get(interval, 1) * 252
+
+
 class KairosSettings:
     """Central store for CLI-configured runtime settings.
 
@@ -2063,7 +2083,7 @@ class BacktestEngine:
         returns = np.diff(equity) / np.array(equity[:-1])
         sharpe = 0.0
         if len(returns) > 1 and np.std(returns) > 0:
-            sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(252))
+            sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(bars_per_year(KairosSettings.interval)))
 
         profit_factor = float(abs(sum(wins) / sum(losses))) if sum(losses) != 0 else float("inf")
 

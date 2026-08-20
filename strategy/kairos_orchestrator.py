@@ -62,7 +62,7 @@ try:
     from kairos_backtest import (
         KairosDistribution, KairosPredictor, Direction,
         Signal, Strategy, Trade, BacktestEngine,
-        DecisionTreeRouter, KairosSettings,
+        DecisionTreeRouter, KairosSettings, bars_per_year,
         PercentileEntryStrategy, DynamicBracketStrategy, SkewStrategy,
         RangeTradingStrategy, TrendFollowingStrategy, VolatilityArbStrategy,
         HighLowStrategy, OpenGapStrategy, FadeExtremeStrategy,
@@ -1334,9 +1334,10 @@ class KairosOrchestrator:
             by_strategy[sname].append(pnl_pct)
 
         result = {}
+        ann_factor = np.sqrt(bars_per_year(KairosSettings.interval))
         for sname, pnl_list in by_strategy.items():
             n = len(pnl_list)
-            sharpe = _safe_sharpe(np.array(pnl_list), np.sqrt(252))
+            sharpe = _safe_sharpe(np.array(pnl_list), ann_factor)
             result[sname] = {"pnl_list": pnl_list, "sharpe": sharpe, "signal_count": n}
         return result
 
@@ -1360,7 +1361,7 @@ class KairosOrchestrator:
         returns = np.diff(equity) / np.array(equity[:-1]) if len(equity) > 1 else np.array([0.0])
         sharpe = 0.0
         if len(returns) > 1 and np.std(returns) > 0:
-            sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(252))
+            sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(bars_per_year(KairosSettings.interval)))
 
         profit_factor = float(abs(sum(wins) / sum(losses))) if sum(losses) != 0 else float("inf")
 

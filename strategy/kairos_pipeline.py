@@ -48,7 +48,7 @@ import numpy as np
 import pandas as pd
 
 import price_cache
-from kairos_strategies import asset_class_for, _period_to_weeks, _parse_period
+from kairos_strategies import asset_class_for, _period_to_weeks, _parse_period, BARS_PER_DAY
 from kairos.ops import (
     DEFAULT_GPU_UTIL_THRESHOLD, GpuLock, OpsError, is_gpu_idle, require_gpu, send_telegram,
 )
@@ -717,12 +717,16 @@ def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
 def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_corr=None):
     run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
 
-    # Latest passing universe survivors (most recent universe run only).
+    # Latest passing universe survivors for this interval (most recent
+    # universe run *at this interval*, not just the most recent overall --
+    # a 1h universe run must not silently pick up a later 1d run's rows).
     q = """
         SELECT symbol, asset_class FROM universe_screen
-        WHERE passed = 1 AND run_id = (SELECT MAX(run_id) FROM universe_screen)
+        WHERE passed = 1 AND run_id = (
+            SELECT MAX(run_id) FROM runs WHERE stage = 'universe' AND interval = ?
+        )
     """
-    params = []
+    params = [interval]
     if asset_class_filter:
         q += " AND asset_class = ?"
         params.append(asset_class_filter)
@@ -740,11 +744,7 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
     # Compute calendar window for the bar interval
     # For 1d, we need 400 days of data; for other intervals, scale accordingly.
     # bars_per_day for 1d = 1, so 400 bars = 400 days.
-    bars_per_day = {
-        "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
-        "60m": 24, "90m": 16, "1h": 24, "1d": 1, "5d": 0.2,
-        "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
-    }.get(interval, 1)
+    bars_per_day = BARS_PER_DAY.get(interval, 1)
 
     bars_needed = 400
     days_needed = calendar_days_for_bars(bars_needed, bars_per_day, "BTC-USD", buffer_days=0)
@@ -2194,14 +2194,14 @@ def _run_stage_auto_body(conn, intervals, backtest_period, asset_class_filter,
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def _group_symbols_from_db(conn, group_id):
+def _group_symbols_from_db(conn, group_id, interval="1d"):
     row = conn.execute(
         "SELECT symbols FROM suggested_groups WHERE group_id = ? "
-        "AND run_id = (SELECT MAX(run_id) FROM suggested_groups) ",
-        (group_id,),
+        "AND run_id = (SELECT MAX(run_id) FROM runs WHERE stage = 'correlation' AND interval = ?)",
+        (group_id, interval),
     ).fetchone()
     if row is None:
-        raise SystemExit(f"No suggested group with group_id={group_id} found. Run --stage correlation first.")
+        raise SystemExit(f"No suggested group with group_id={group_id} found for interval={interval!r}. Run --stage correlation first.")
     return row[0].split(",")
 
 
@@ -2388,7 +2388,7 @@ def main(argv=None):
     elif args.stage == "oracle":
         assets = args.assets
         if args.group_id is not None:
-            assets = _group_symbols_from_db(conn, args.group_id)
+            assets = _group_symbols_from_db(conn, args.group_id, interval=args.interval)
         if not assets:
             raise SystemExit("--stage oracle requires --assets SYM... or --group_id N")
         run_stage_oracle(conn, assets, interval=args.interval,
@@ -2397,7 +2397,7 @@ def main(argv=None):
     elif args.stage in ("base", "finetuned"):
         assets = args.assets
         if args.group_id is not None:
-            assets = _group_symbols_from_db(conn, args.group_id)
+            assets = _group_symbols_from_db(conn, args.group_id, interval=args.interval)
         if not assets:
             raise SystemExit(f"--stage {args.stage} requires --assets SYM... or --group_id N")
         run_stage_model(conn, args.stage, assets, interval=args.interval,

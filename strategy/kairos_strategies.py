@@ -43,7 +43,7 @@ from typing import Callable, List, Optional, Sequence
 import pandas as pd
 
 from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig, print_results
-from kairos_backtest import KairosSettings
+from kairos_backtest import BARS_PER_DAY, bars_per_year, KairosSettings
 from kairos.config import _state
 from kairos_predcache import PredictionCache
 
@@ -170,11 +170,7 @@ def fetch_data_raw(symbol, lookback, pred_len=0, min_bars=None, as_of=None) -> D
 
     from datetime import date, timedelta
     interval = KairosSettings.interval
-    bars_per_day = {
-        "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
-        "60m": 24, "90m": 16, "1h": 24, "1d": 1, "5d": 0.2,
-        "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
-    }.get(interval, 1)
+    bars_per_day = BARS_PER_DAY.get(interval, 1)
     # Yahoo Finance hard limits by interval (days of history available)
     yf_max_days = {
         "1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60,
@@ -619,11 +615,12 @@ def backtest(predicted_close: pd.Series, actual_close: pd.Series,
     return equity_series, trades
 
 
-def compute_metrics(equity: pd.Series, initial_capital: float, trades: list):
+def compute_metrics(equity: pd.Series, initial_capital: float, trades: list, interval: str = "1d"):
     rets = equity.pct_change().dropna()
     total_ret = (equity.iloc[-1] - initial_capital) / initial_capital
-    annual_ret = (1 + total_ret) ** (252 / max(len(rets), 1)) - 1
-    vol = rets.std() * np.sqrt(252)
+    bpy = bars_per_year(interval)
+    annual_ret = (1 + total_ret) ** (bpy / max(len(rets), 1)) - 1
+    vol = rets.std() * np.sqrt(bpy)
     sharpe = (annual_ret - 0.03) / vol if vol > 0 else 0.0
     peak = equity.expanding().max()
     max_dd = ((equity - peak) / peak).min()
@@ -806,11 +803,7 @@ def _period_to_bars(period: str, interval: str) -> int:
     """Convert a human period string (e.g. '6m', '1y') to a bar count."""
     n, unit = _parse_period(period)
     cal_days = {"d": n, "w": n * 7, "m": n * 30, "y": n * 365}[unit]
-    bars_per_day = {
-        "1m": 1440, "2m": 720, "5m": 288, "15m": 96, "30m": 48,
-        "60m": 24, "90m": 16, "1h": 24, "1d": 1, "5d": 0.2,
-        "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
-    }.get(interval, 1)
+    bars_per_day = BARS_PER_DAY.get(interval, 1)
     return max(1, int(cal_days * bars_per_day))
 
 

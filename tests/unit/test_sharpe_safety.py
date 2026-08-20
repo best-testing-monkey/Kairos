@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from kairos_orchestrator import _safe_sharpe, MIN_SIGNALS_FOR_SHARPE, _SHARPE_CLAMP
+from kairos_backtest import bars_per_year, BARS_PER_DAY
 
 
 class TestSafeSharpe:
@@ -49,3 +50,19 @@ class TestSafeSharpe:
         rets = np.array([1.0, 1.0, 1.0 + 1e-12, 1.0 - 1e-12])
         sharpe = _safe_sharpe(rets, np.sqrt(252))
         assert sharpe == pytest.approx(_SHARPE_CLAMP)
+
+
+class TestBarsPerYear:
+    """Guards the interval-aware Sharpe annualization factor: 1d must stay
+    bit-identical to the old hardcoded sqrt(252), and finer intervals must
+    scale up rather than silently reusing 252 (which understated 1h Sharpe
+    ~6x before this was fixed)."""
+
+    def test_1d_matches_legacy_hardcoded_252(self):
+        assert bars_per_year("1d") == 252
+
+    def test_1h_scales_by_bars_per_day(self):
+        assert bars_per_year("1h") == BARS_PER_DAY["1h"] * 252 == 24 * 252
+
+    def test_unknown_interval_falls_back_to_daily(self):
+        assert bars_per_year("bogus") == 252

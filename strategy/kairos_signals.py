@@ -25,6 +25,8 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+from kairos.calendars import _DAILY_OR_COARSER
+
 import numpy as np
 import pandas as pd
 
@@ -158,14 +160,32 @@ def load_accepted_finetuned(conn):
 # Per-strategy signals cache (signals_cache table in db_path)
 # =============================================================================
 
+def _cache_as_of_value(now: datetime, interval: str):
+    """Cache-key granularity for `as_of`, per interval.
+
+    Daily-or-coarser bars: whole calendar date, as before -- fetch_data_raw
+    only ever consumes as_of.date() for these intervals, so two `now`
+    timestamps on the same calendar day fetch identical data and must key
+    identically. Intraday bars: floored to the current bar boundary, so a
+    freshly-closed bar busts the cache instead of an hour's worth of calls
+    all colliding onto one calendar-date key and serving a stale early-day
+    snapshot for the rest of the day.
+    """
+    if interval in _DAILY_OR_COARSER:
+        return now.date()
+    step = _interval_to_timedelta(interval)
+    ref = datetime.min
+    return ref + (now - ref) // step * step
+
+
 def _signals_cache_key(strategy_name, assets_str, interval, as_of_date, lookback,
                         pred_samples, min_ev_pct, model_path, checkpoint_fingerprint) -> str:
     """Canonical cache key for one strategy's rows within one group/pass.
 
-    as_of_date is a date (not a datetime) -- fetch_data_raw only ever
-    consumes as_of.date() (kairos_strategies.py), so two `now` timestamps on
-    the same calendar day fetch identical data and must key identically
-    here too. checkpoint_fingerprint (see
+    as_of_date is whatever _cache_as_of_value(now, interval) returned -- a
+    bare date for daily-or-coarser intervals (preserving the historical "one
+    key per calendar day" behavior), or a bar-floored datetime for intraday
+    ones. checkpoint_fingerprint (see
     kairos_strategies._model_checkpoint_fingerprint) busts the cache when a
     finetuned checkpoint is retrained in place at the same model_path,
     mirroring kairos_predcache.make_key's own key design.
@@ -1029,7 +1049,6 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         lookback = LOOKBACK
     if now is None:
         now = datetime.now()
-    as_of_date = now.date()
 
     conn = _connect_with_retry(db_path)
     try:
@@ -1066,7 +1085,8 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                     model_path=None, model_label="Base",
                     data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
                     conn=conn, use_signal_cache=use_signal_cache,
-                    assets_str=assets_str, as_of_date=as_of_date, lookback=lookback,
+                    assets_str=assets_str, as_of_date=_cache_as_of_value(now, interval),
+                    lookback=lookback,
                     checkpoint_fingerprint="",
                 )
                 if on_group_timing is not None:
@@ -1109,7 +1129,8 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                         model_path=model_path, model_label=model_label,
                         data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
                         conn=conn, use_signal_cache=use_signal_cache,
-                        assets_str=assets_str, as_of_date=as_of_date, lookback=lookback,
+                        assets_str=assets_str, as_of_date=_cache_as_of_value(now, interval),
+                        lookback=lookback,
                         checkpoint_fingerprint=checkpoint_fingerprint,
                     )
                     if on_group_timing is not None:

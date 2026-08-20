@@ -33,6 +33,7 @@ from kairos_signals import (
     _ensure_signals_cache_table,
     _load_cached_group_result,
     _store_cached_group_result,
+    _cache_as_of_value,
 )
 from datetime import timedelta
 import pandas as pd
@@ -2342,6 +2343,35 @@ class TestSignalsCache:
             variant = dict(base)
             variant[field] = other_value
             assert _signals_cache_key(**variant) != key0, f"{field} did not change the key"
+
+    def test_cache_as_of_value_1d_truncates_to_date_like_before(self):
+        # Two `now`s on the same calendar day must key identically for 1d --
+        # this is what makes cross-process cache hits work at all for daily.
+        early = datetime(2026, 7, 10, 1, 0, 0)
+        late = datetime(2026, 7, 10, 23, 59, 0)
+        assert _cache_as_of_value(early, "1d") == _cache_as_of_value(late, "1d") == early.date()
+
+    def test_cache_as_of_value_1h_busts_across_bar_boundary(self):
+        # Two calls within the same hour must collide onto one key; crossing
+        # into the next hour must produce a different key (the bug this
+        # guards: before the fix, both would key on the shared calendar date
+        # and the second call would silently serve the first call's stale
+        # intraday data).
+        same_bar_a = datetime(2026, 7, 10, 9, 5, 0)
+        same_bar_b = datetime(2026, 7, 10, 9, 55, 0)
+        next_bar = datetime(2026, 7, 10, 10, 1, 0)
+        assert _cache_as_of_value(same_bar_a, "1h") == _cache_as_of_value(same_bar_b, "1h")
+        assert _cache_as_of_value(same_bar_a, "1h") != _cache_as_of_value(next_bar, "1h")
+
+    def test_cache_as_of_value_1h_feeds_distinct_signals_cache_keys(self):
+        base = dict(
+            strategy_name="s1", assets_str="BTC-USD", interval="1h",
+            lookback=300, pred_samples=100, min_ev_pct=0.1, model_path=None,
+            checkpoint_fingerprint="",
+        )
+        key_9am = _signals_cache_key(as_of_date=_cache_as_of_value(datetime(2026, 7, 10, 9, 5), "1h"), **base)
+        key_3pm = _signals_cache_key(as_of_date=_cache_as_of_value(datetime(2026, 7, 10, 15, 30), "1h"), **base)
+        assert key_9am != key_3pm
 
     def test_load_store_round_trip(self, tmp_path):
         db_path = os.path.join(tmp_path, "roundtrip.db")
