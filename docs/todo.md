@@ -110,7 +110,7 @@ supervision; everything else is safe for normal cheap-model automation.
 
 ## Epic 15 — Signal generation + selection/allocation for 1h
 
-- [ ] E15-S01 ⚠️ Live-verify kairos_signals.py for 1h + update hourly-signals playbook (docs/tickets/E15-S01-signals-1h-live-verify-and-playbook.md)
+- [x] E15-S01 ⚠️ Live-verify kairos_signals.py for 1h + update hourly-signals playbook (docs/tickets/E15-S01-signals-1h-live-verify-and-playbook.md) — 3 real runs across an hour boundary: cache hit within-hour (byte-identical, 44 rows), cache miss across boundary (88 rows, fresh content); Skipped/Failures footers legitimate, no bugs found
 
 ## Epic 16 — Papertrade/MTM/margin for 1h
 

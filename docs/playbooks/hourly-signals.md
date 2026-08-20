@@ -48,6 +48,30 @@ For the full flag reference (`--min_ev_pct`, `--pred_samples`, `--all`,
 - **This is the strongest case for automation in the whole system:** running
   this by hand every hour is impractical. If you automate one thing first,
   automate this one (see below).
+- **Live-verified cache behavior (E15-S01, 2026-08-20):** ran three times
+  across a real hour boundary against a populated `1h` pipeline (`ZW=F`/
+  `ZEC-USD` finetuned, several base-model groups). Run 1 (fresh):
+  `signals_cache` had 44 `interval='1h'` rows after. Run 2 (same clock hour,
+  ~2 min later): report was byte-identical to run 1 and `signals_cache` row
+  count stayed at 44 — genuine cache hit (`user` CPU time dropped from
+  ~10.5s to ~5.5s; wall-clock `real` time is noisy run-to-run because model
+  weights reload from disk every subprocess invocation regardless of
+  `signals_cache` state, so don't use wall-clock alone to judge a hit).
+  Run 3 (after the real hour boundary): row count grew to 88 and the report
+  content genuinely changed (new EV%/prices per signal, one strategy —
+  `fade_extreme/BCH-USD` — that hadn't cleared the EV floor in runs 1-2
+  showed up fresh). This is the live-conditions confirmation of the E0
+  `_cache_as_of_value` fix (bar-floored cache key for intraday intervals):
+  it correctly reuses within an hour and correctly busts across one.
+- **`## Skipped` and `## Failures` footers read as expected, not broken:**
+  on this same run, `Skipped` entries were legitimate (`zero-size signal
+  dropped (no Kelly edge)`, `ev_pct below threshold`) — no "unknown
+  strategy" mass-skip, so `resolve_disabled_strategies`/strategy registry
+  resolution works correctly for `1h`. `Failures` showed several equities
+  (`CB`, `CRM`, `DE`, `ABT`, `ABBV`, `AAPL`, `BA`, `COST`) failing with
+  `Not enough data ... need 300 bars, got 259` — a real, current data-
+  availability limit for those symbols at `1h` (not a bug in this pipeline),
+  worth knowing before assuming every asset class is equally ready.
 
 ## Automation opportunities
 
