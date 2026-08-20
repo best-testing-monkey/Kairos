@@ -686,14 +686,28 @@ def size_selected(survivors: list[dict], config: AllocationConfig) -> list[dict]
     # =========================================================================
     # Stage 3: GROSS CAP (proportional scale-down if total > gross_cap_pct)
     # =========================================================================
-    survivors_with_status_none = [row for row in result if row["status"] is None]
-    gross_sum = sum(row["alloc"] for row in survivors_with_status_none)
+    # Skipped entirely when leverage is active (max_leverage > 1.0): gross_cap_pct
+    # is a cap on raw notional exposure, calibrated for the cash-only world where
+    # notional == margin used. Once leverage is active, Stage 2.5 already targets
+    # margin_utilization_cap directly -- that's the real portfolio-level risk
+    # constraint. A separate notional cap actively fights it whenever leverage is
+    # uneven across the selected instruments: Stage 2.5 can correctly size toward
+    # e.g. 1000% notional to hit an 80% margin target with a low-leverage
+    # instrument in the mix, and this stage would then scale that back down to
+    # 100% notional -- dragging margin utilization back down by the same factor
+    # (10x in that example: 80% -> 8%), silently defeating the margin target.
+    # Verified against a real run (2026-08-20, IWM 5x + SPY 20x): Stage 2.5 sized
+    # to exactly 80% margin (200%/800% notional), Stage 3 then clobbered it to
+    # 8% margin (20%/80% notional) before this fix.
+    if config.max_leverage <= 1.0:
+        survivors_with_status_none = [row for row in result if row["status"] is None]
+        gross_sum = sum(row["alloc"] for row in survivors_with_status_none)
 
-    if gross_sum > config.gross_cap_pct:
-        scale_factor = config.gross_cap_pct / gross_sum
+        if gross_sum > config.gross_cap_pct:
+            scale_factor = config.gross_cap_pct / gross_sum
 
-        for row in survivors_with_status_none:
-            row["alloc"] *= scale_factor
+            for row in survivors_with_status_none:
+                row["alloc"] *= scale_factor
 
     # =========================================================================
     # Stage 4: DUST FILTER (single-pass, no redistribution)
