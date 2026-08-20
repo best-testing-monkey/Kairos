@@ -548,6 +548,43 @@ data for a range that should be cached, that description is stale; see
 behavior. `kairos_signal_replay.py`'s real-data disqualification rate was the
 symptom that surfaced this bug in this repo.
 
+### price_cache: DST-ambiguous-time crash + crypto tz mislabeling (fixed 2026-08-20, upstream)
+1h-interval fetches spanning a US DST fall-back date (e.g. 2025-11-02) used
+to crash `price_cache.get_price_data()` with `Cannot infer dst time from
+... as there are no repeated times`, and Kairos's own local-fallback fetch
+(`kairos/data.py`'s `fetch_price_data_local_fallback`) had the identical bug
+independently (fixed in this repo directly — see git history around
+"BUG-03"). Root cause on the price_cache side was deeper than the DST edge
+case alone: yfinance returns crypto intraday bars in UTC (unlike equities,
+which come back already in NY time), and price_cache was blindly
+`tz_localize(None)`-ing them — mislabeling every crypto intraday bar by 4-5
+hours, every day, not just at the DST boundary; the DST crash was just the
+one case where the resulting collision was loud enough to raise instead of
+silently mislabeling. Fixed at the source (price_cache commit `72bac58`,
+propagated through `phantom_ledger`'s submodule bump `8f2d087` and this
+repo's `uv.lock`); price_cache's cache schema bumped to v4 to purge
+previously-mislabeled cached sub-daily rows (daily-or-longer cache
+untouched). If a 1h/sub-daily fetch or backtest run from before this date
+looks off by a few hours, or a symbol you know has data mysteriously
+disqualifies, this is why — re-fetch after upgrading.
+
+**Gotcha hit while bumping the dependency**: `uv lock --upgrade-package
+price-cache` alone silently did nothing (no lockfile change, no error) —
+`price-cache` and `phantom-ledger` are two separate `uv` packages sourced
+from the *same* `phantom_ledger.git` repo (one via a `subdirectory=`
+param), and upgrading only one left the other's cached git checkout of that
+shared repo pinned to the old commit; you must pass
+`--upgrade-package price-cache --upgrade-package phantom-ledger` together.
+Separately, this repo's home directory (`~/.cache`) is bind-mounted onto
+the same NTFS/`fuseblk` drive as the repo itself — `uv`'s git checkout
+cache under `~/.cache/uv/git-v0` can get into a state where `uv` fails
+mid-checkout with `failed to remove directory ... Directory not empty (os
+error 39)`, which `rm -rf`-ing that directory does NOT reliably fix (uv
+recreates and hits the same error). Work around it by pointing
+`UV_CACHE_DIR` at a real (non-`fuseblk`) filesystem for the lock/sync
+commands, e.g. `export UV_CACHE_DIR=/tmp/uv-cache-kairos` before
+`uv lock`/`uv sync` when bumping a git-sourced dependency.
+
 ## Test suite
 
 Tests live in `tests/unit/` and require no GPU or model download.
