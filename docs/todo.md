@@ -66,4 +66,55 @@ see that document's §1/§4 for the explicit phase-scope boundary.
 
 ---
 
+# Kairos Multi-Interval Rollout (1d → 1h) — Implementation Todo
+
+Ordered by dependency. Check off an item only in the same commit that completes it.
+Source design: `docs/tickets/DESIGN_DOC_multi_interval_1h.md`. E0 (shared plumbing
+hardening) is already implemented and committed — not re-listed here, see the design
+doc §2 for its detail. Stories marked ⚠️ require a GPU and/or live data and must NOT
+be run via unattended `/run-stories` automation — execute manually or under
+supervision; everything else is safe for normal cheap-model automation.
+
+## Epic 10 — Universe stage for 1h
+
+- [ ] E10-S01 Interval-aware ann_vol annualization in compute_universe_stats (docs/tickets/E10-S01-universe-stats-annualization.md)
+- [ ] E10-S02 Native-interval liquidity fetch in run_stage_universe (docs/tickets/E10-S02-universe-native-interval-fetch.md)
+- [ ] E10-S03 Interval-scaled liquidity thresholds and min_bars (docs/tickets/E10-S03-universe-interval-scaled-thresholds.md)
+- [ ] E10-S04 Real interval_probe_ok gate + hourly-universe-screen playbook (docs/tickets/E10-S04-universe-probe-gate-and-playbook.md)
+
+## Epic 11 — Correlation stage for 1h
+
+- [ ] E11-S01 Interval-scaled min_overlap/roll_window (docs/tickets/E11-S01-correlation-interval-scaled-windows.md)
+- [ ] E11-S02 ⚠️ Live-verify correlation for 1h + playbook (docs/tickets/E11-S02-correlation-live-verify-and-playbook.md)
+
+## Epic 12 — Oracle stage for 1h + OrchestratorConfig calibration
+
+- [ ] E12-S01 Interval-keyed OrchestratorConfig preset mechanism (docs/tickets/E12-S01-orchestrator-config-interval-presets.md)
+- [ ] E12-S02 ⚠️ Live debug_filters=True calibration sweep for 1h (docs/tickets/E12-S02-orchestrator-1h-calibration-sweep.md)
+- [ ] E12-S03 ⚠️ Live-verify oracle stage for 1h + playbook (docs/tickets/E12-S03-oracle-1h-live-verify-and-playbook.md)
+
+## Epic 13 — Base model backtest for 1h
+
+- [ ] E13-S01 ⚠️ Live-verify base stage for 1h + playbook (docs/tickets/E13-S01-base-model-1h-live-verify-and-playbook.md)
+
+## Epic 14 — Finetuning loop for 1h
+
+- [ ] E14-S01 ⚠️ Live-verify finetune_next for 1h + playbook (docs/tickets/E14-S01-finetune-next-1h-live-verify-and-playbook.md)
+
+## Epic 15 — Signal generation + selection/allocation for 1h
+
+- [ ] E15-S01 ⚠️ Live-verify kairos_signals.py for 1h + update hourly-signals playbook (docs/tickets/E15-S01-signals-1h-live-verify-and-playbook.md)
+
+## Epic 16 — Papertrade/MTM/margin for 1h
+
+- [ ] E16-S01 Once-per-calendar-day financing/MTM guard (docs/tickets/E16-S01-papertrade-once-per-day-financing-guard.md)
+- [ ] E16-S02 ⚠️ Live-verify papertrade for 1h + playbook (docs/tickets/E16-S02-papertrade-1h-live-verify-and-playbook.md)
+
+## Epic 17 — Hourly Telegram digest + scheduling
+
+- [ ] E17-S01 New systemd timer for hourly digest (docs/tickets/E17-S01-hourly-digest-systemd-timer.md)
+- [ ] E17-S02 ⚠️ Live-verify digest + hand off timer-enable decision (docs/tickets/E17-S02-hourly-digest-live-verify-and-playbook.md)
+
+---
+
 See `docs/tickets/APPENDIX-A-standards.md` for code style, test conventions, and commit rules that apply to every story.
