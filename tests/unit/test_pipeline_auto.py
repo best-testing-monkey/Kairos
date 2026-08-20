@@ -15,7 +15,7 @@ from kairos_pipeline import (
     run_stage_auto, start_run, dump_csv,
     finetune_model_dir, compute_finetune_periods, select_finetune_candidate,
     compare_finetuned_vs_base, run_stage_finetune_next, acquire_finetune_lock,
-    insert_finetune_registry_row, update_finetune_registry_row,
+    insert_finetune_registry_row, update_finetune_registry_row, compute_universe_stats,
 )
 from kairos.ops import OpsError
 
@@ -3403,3 +3403,87 @@ class TestRunStageFinetuneNextNotifications:
             "SELECT status FROM finetuned_models WHERE id=?", (row_id,)
         ).fetchone()[0]
         assert status == "accepted"
+
+
+class TestComputeUniverseStatsAnnualization:
+    """Test compute_universe_stats annualization with different intervals."""
+
+    def test_default_interval_same_as_explicit_1d(self):
+        """Default interval="1d" should produce same ann_vol as explicit interval="1d"."""
+        # Create synthetic OHLCV data
+        dates = pd.date_range("2024-01-01", periods=100, freq="1D")
+        close_prices = 100.0 + np.cumsum(np.random.randn(100) * 0.5)
+        df = pd.DataFrame({
+            "close": close_prices,
+            "high": close_prices + 1.0,
+            "low": close_prices - 1.0,
+            "open": close_prices,
+            "volume": np.full(100, 1_000_000),
+        }, index=dates)
+
+        # Call with default interval and explicit interval
+        _, _, ann_vol_default, _ = compute_universe_stats(df)
+        _, _, ann_vol_explicit, _ = compute_universe_stats(df, interval="1d")
+
+        # They should be identical
+        assert ann_vol_default is not None
+        assert ann_vol_explicit is not None
+        assert abs(ann_vol_default - ann_vol_explicit) < 1e-9
+
+    def test_1h_interval_differs_from_1d_by_sqrt_24(self):
+        """interval="1h" should produce ann_vol that is larger than "1d" by sqrt(24)."""
+        # Create synthetic OHLCV data
+        dates = pd.date_range("2024-01-01", periods=100, freq="1D")
+        close_prices = 100.0 + np.cumsum(np.random.randn(100) * 0.5)
+        df = pd.DataFrame({
+            "close": close_prices,
+            "high": close_prices + 1.0,
+            "low": close_prices - 1.0,
+            "open": close_prices,
+            "volume": np.full(100, 1_000_000),
+        }, index=dates)
+
+        # Call with "1d" and "1h" intervals
+        _, _, ann_vol_1d, _ = compute_universe_stats(df, interval="1d")
+        _, _, ann_vol_1h, _ = compute_universe_stats(df, interval="1h")
+
+        # Both should be non-None
+        assert ann_vol_1d is not None
+        assert ann_vol_1h is not None
+
+        # ann_vol_1h should be larger than ann_vol_1d by sqrt(24)
+        # Because bars_per_year("1h") / bars_per_year("1d") = 24
+        expected_ratio = np.sqrt(24)
+        actual_ratio = ann_vol_1h / ann_vol_1d
+        assert abs(actual_ratio - expected_ratio) < 1e-9
+
+    def test_insufficient_data_returns_none(self):
+        """Less than 2 bars should return None for ann_vol."""
+        df = pd.DataFrame({
+            "close": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "open": [100.0],
+            "volume": [1_000_000],
+        })
+
+        _, _, ann_vol, _ = compute_universe_stats(df)
+        assert ann_vol is None
+
+    def test_missing_volume_column_allowed(self):
+        """DataFrame without volume column should still compute ann_vol."""
+        dates = pd.date_range("2024-01-01", periods=50, freq="1D")
+        close_prices = 100.0 + np.cumsum(np.random.randn(50) * 0.5)
+        df = pd.DataFrame({
+            "close": close_prices,
+            "high": close_prices + 1.0,
+            "low": close_prices - 1.0,
+            "open": close_prices,
+        }, index=dates)
+
+        _, dollar_volume, ann_vol, _ = compute_universe_stats(df)
+
+        # Without volume column, dollar_volume should be None
+        assert dollar_volume is None
+        # But ann_vol should still be computed
+        assert ann_vol is not None

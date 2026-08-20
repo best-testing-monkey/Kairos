@@ -48,7 +48,7 @@ import numpy as np
 import pandas as pd
 
 import price_cache
-from kairos_strategies import asset_class_for, _period_to_weeks, _parse_period, BARS_PER_DAY
+from kairos_strategies import asset_class_for, _period_to_weeks, _parse_period, BARS_PER_DAY, bars_per_year
 from kairos.ops import (
     DEFAULT_GPU_UTIL_THRESHOLD, GpuLock, OpsError, is_gpu_idle, require_gpu, send_telegram,
 )
@@ -473,7 +473,7 @@ def evaluate_liquidity(symbol: str, asset_class: str, bars: int, dollar_volume,
     return True, None, liquidity_note
 
 
-def compute_universe_stats(df: pd.DataFrame):
+def compute_universe_stats(df: pd.DataFrame, interval: str = "1d"):
     """Compute bars, dollar_volume, ann_vol, atr_pct from a raw OHLCV frame."""
     bars = len(df)
     close = df["close"].astype(float)
@@ -483,7 +483,7 @@ def compute_universe_stats(df: pd.DataFrame):
         dollar_volume = None
 
     log_ret = np.log(close / close.shift(1)).dropna()
-    ann_vol = float(log_ret.std() * np.sqrt(252)) if len(log_ret) > 1 else None
+    ann_vol = float(log_ret.std() * np.sqrt(bars_per_year(interval))) if len(log_ret) > 1 else None
 
     if {"high", "low"}.issubset(df.columns):
         high, low, prev_close = df["high"].astype(float), df["low"].astype(float), close.shift(1)
