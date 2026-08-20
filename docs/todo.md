@@ -105,7 +105,7 @@ supervision; everything else is safe for normal cheap-model automation.
 
 ## Epic 14 — Finetuning loop for 1h
 
-- [ ] E14-S01 ⚠️ Live-verify finetune_next for 1h + playbook (docs/tickets/E14-S01-finetune-next-1h-live-verify-and-playbook.md)
+- [x] E14-S01 ⚠️ Live-verify finetune_next for 1h + playbook (docs/tickets/E14-S01-finetune-next-1h-live-verify-and-playbook.md) — registry id=177, ACCEPTED (base sharpe 7.81 -> ft 18.06), verified against DB+filesystem; found a real bug: select_finetune_candidate's already_registered check is interval-blind (no `interval` filter), permanently hiding candidates whose assets already have a 1d registry row of any status — see docs/playbooks/hourly-finetuning.md's "Known bug" section; not fixed by this story, needs a follow-up ticket
 
 ## Epic 15 — Signal generation + selection/allocation for 1h
 
