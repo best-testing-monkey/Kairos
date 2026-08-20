@@ -329,12 +329,35 @@ class OrchestratorConfig:
 # INTERVAL-SPECIFIC FILTER PRESETS
 # =============================================================================
 
-_FILTER_PRESETS_BY_INTERVAL: dict[str, dict] = {}
+_FILTER_PRESETS_BY_INTERVAL: dict[str, dict] = {
+    # 1h calibration (E12-S02, 2026-08-20): live debug_filters=True sweep,
+    # CL=F/NG=F/SI=F/ZW=F/MKR-USD (the only 1h universe survivors available
+    # at the time -- thin, fx_commodity/single-crypto-skewed sample, not a
+    # broad crypto set; BUG-04's fix landed the same day but $vol=0.0 was
+    # still suppressing most crypto symbols from universe screening, a
+    # separate unfixed issue -- see docs/todo.md), 1m backtest period,
+    # 1060 bars x 5 symbols, n=4579 filter evaluations:
+    #   entropy: min=0.703 p50=2.384 p90=2.642 p95=2.688 p99=2.762 max=2.903
+    #            (never exceeds the ln(20)=~3.0 ceiling, same shape as 1d)
+    #   kurt:    min=-1.739 p50=0.124 p90=1.907 p95=3.244 p99=8.573 max=30.305
+    #            (>10 only 30/4579 = 0.66%, >3 only 255/4579 = 5.6%)
+    # Conclusion: the 1d-calibrated thresholds transfer directly -- entropy/
+    # kurtosis are properties of the model's discrete-token-sampling
+    # distribution shape, not a function of bar interval, at least at 1h.
+    # Set explicitly (not left absent) so it's clear 1h was actually
+    # verified, not just defaulting through by omission. min_volume_percentile
+    # was NOT measured by this sweep (would need real historical volume-
+    # percentile data, thin for this sample) -- kept at the 1d value on the
+    # separate reasoning that a percentile-rank filter is scale-invariant by
+    # construction, unlike entropy/kurtosis. Revisit once BUG-04's residual
+    # $vol=0.0 crypto issue is fixed and a broader/crypto-inclusive sweep is
+    # possible.
+    "1h": {"entropy_threshold": 3.0, "kurtosis_max": 10.0, "min_volume_percentile": 10.0},
+}
 """
 Interval-keyed presets for meta-filter thresholds (entropy_threshold, kurtosis_max,
-min_volume_percentile). Currently empty; calibrated numbers for each interval are
-populated in later stories (e.g., E12-S02 for 1h). Any interval not in this dict
-falls back to OrchestratorConfig's dataclass defaults (1d-calibrated values).
+min_volume_percentile). Any interval not in this dict falls back to
+OrchestratorConfig's dataclass defaults (1d-calibrated values).
 """
 
 

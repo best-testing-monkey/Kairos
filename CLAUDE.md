@@ -607,3 +607,19 @@ Tests live in `tests/unit/` and require no GPU or model download.
 | `kurtosis_action` | `"block"` | Skip high-kurtosis days entirely |
 | `min_volume_percentile` | 10.0 | Model volume predictions are mean-reverting; 30 was too strict |
 | `debug_filters` | `False` | Set True to print entropy/kurtosis per asset per day |
+
+These are the `1d` defaults, read directly off the `OrchestratorConfig`
+dataclass. As of E12-S02 (2026-08-20), `1h` also has an explicit entry in
+`kairos_orchestrator.py`'s `_FILTER_PRESETS_BY_INTERVAL` (consumed via
+`OrchestratorConfig.for_interval(interval, ...)`) — a live `debug_filters=True`
+sweep (n=4579 filter evaluations, CL=F/NG=F/SI=F/ZW=F/MKR-USD, 1h bars) found
+entropy never exceeds ~2.9 (same ln(20)≈3.0 ceiling as 1d) and kurtosis only
+exceeds 10 in 0.66% of samples (p99=8.6) — statistically the same shape as
+1d, so `1h` uses the identical values (`entropy_threshold=3.0`,
+`kurtosis_max=10.0`, `min_volume_percentile=10.0`), verified rather than
+assumed. The sweep sample was thin and fx_commodity/single-crypto-skewed
+(most crypto still fails 1h universe screening on a separate `$vol=0.0`
+issue, see `docs/todo.md`'s BUG-04 entry) — worth re-running once that's
+fixed and a broader crypto sample is available. See
+`kairos_orchestrator.py`'s `_FILTER_PRESETS_BY_INTERVAL["1h"]` comment for
+the full percentile breakdown.
