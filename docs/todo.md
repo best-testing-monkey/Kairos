@@ -115,7 +115,7 @@ supervision; everything else is safe for normal cheap-model automation.
 ## Epic 16 — Papertrade/MTM/margin for 1h
 
 - [x] E16-S01 Once-per-calendar-day financing/MTM guard (docs/tickets/E16-S01-papertrade-once-per-day-financing-guard.md)
-- [ ] E16-S02 ⚠️ Live-verify papertrade for 1h + playbook (docs/tickets/E16-S02-papertrade-1h-live-verify-and-playbook.md)
+- [x] E16-S02 ⚠️ Live-verify papertrade for 1h + playbook (docs/tickets/E16-S02-papertrade-1h-live-verify-and-playbook.md) — 2 runs, guard proven (1 kairos_mtm_daily row per calendar date across 3-4 date windows, not per hourly iteration); financing stayed 0 in both runs (no positions survived to day-close in this thin window) so the nonzero-accrual spot-check couldn't be positively exercised, see playbook for the structural argument covering that gap
 
 ## Epic 17 — Hourly Telegram digest + scheduling
 
