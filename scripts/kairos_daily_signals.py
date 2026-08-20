@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from kairos.ops import GpuLock, OpsError, require_gpu, send_telegram  # noqa: E402
+from kairos.ops import GpuLock, OpsError, require_gpu, send_telegram, send_telegram_document  # noqa: E402
 
 
 STATE_DIR = Path.home() / ".local" / "state" / "kairos"
@@ -74,8 +74,16 @@ def parse_selected_signals(report_text: str) -> tuple[int, int]:
     return 0, 0
 
 
-def parse_allocation_rows(report_text: str, max_rows: int = 5) -> list[str]:
-    """Return a short list of human-readable allocation rows for Telegram."""
+def parse_allocation_rows(report_text: str, max_rows: int = 5) -> list[dict]:
+    """Return structured allocation rows for the Telegram digest.
+
+    Each dict has ticker/direction/entry/stop/target/ev_net/alloc as
+    pass-through strings straight from the report table, plus
+    leverage/margin_pct (also pass-through strings, e.g. "10.0x"/"20.0%")
+    which are empty strings when the report wasn't leverage-sized
+    (max_leverage <= 1.0 -- allocation.write_md_section() leaves those two
+    trailing columns blank in that case).
+    """
     section_match = re.search(
         r"## Portfolio Allocation\n\n.*?(\n\| Ticker[^|]+\|[^\n]+\|\n\|[-\s|]+\|\n.*?)(?=\n\n|\n##|\Z)",
         report_text,
@@ -92,14 +100,65 @@ def parse_allocation_rows(report_text: str, max_rows: int = 5) -> list[str]:
             continue
         parts = [p.strip() for p in line.split("|")]
         # Expected columns: Ticker, Dir, Strategy, Entry, Stop, Target,
-        # EV net, Score, Alloc, Model, ...; skip header/delimiter rows.
+        # EV net, Score, Alloc, Model, [Leverage, Margin %]; skip
+        # header/delimiter rows. Leverage/Margin % are only present when
+        # the report was generated with --max-leverage > 1.0.
         if len(parts) < 10:
             continue
-        ticker, direction, strategy, alloc = parts[1], parts[2], parts[3], parts[9]
-        rows.append(f"{ticker} {direction} ({strategy}) @ {alloc}")
+        rows.append({
+            "ticker": parts[1],
+            "direction": parts[2],
+            "entry": parts[4],
+            "stop": parts[5],
+            "target": parts[6],
+            "ev_net": parts[7],
+            "alloc": parts[9],
+            "leverage": parts[11] if len(parts) > 11 else "",
+            "margin_pct": parts[12] if len(parts) > 12 else "",
+        })
         if len(rows) >= max_rows:
             break
     return rows
+
+
+def _parse_trailing_number(s: str) -> Optional[float]:
+    """Parse '20.0%' or '10.0x' -> 20.0 / 10.0; None if not parseable."""
+    s = s.strip().rstrip("%x")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def format_allocation_row(row: dict) -> str:
+    """Format one allocation row as an actionable Telegram line.
+
+    When leverage sizing is present: shows margin %/leverage actually
+    committed (straight from the report's own Leverage/Margin % columns,
+    unchanged) plus entry/TP/SL and EV expressed as return-on-margin (the
+    underlying EV net % scaled by leverage -- e.g. a 0.5% EV net at 10x
+    leverage is a 5% expected return on the margin actually posted, since
+    that margin is a 1/leverage fraction of the notional exposure).
+
+    Falls back to a plain (unleveraged) line when Leverage/Margin % are
+    blank, e.g. for a report run at the default --max-leverage 1.0.
+    """
+    leverage = _parse_trailing_number(row["leverage"])
+    ev_net = _parse_trailing_number(row["ev_net"])
+
+    if leverage and row["margin_pct"]:
+        ev_str = f"{ev_net * leverage:.0f}%" if ev_net is not None else "n/a"
+        return (
+            f"{row['margin_pct']} margin {row['leverage']} leverage "
+            f"{row['ticker']} {row['direction']} @ {row['entry']} "
+            f"TP {row['target']} SL {row['stop']} (ev {ev_str})"
+        )
+
+    ev_str = row["ev_net"] if row["ev_net"] else "n/a"
+    return (
+        f"{row['ticker']} {row['direction']} @ {row['entry']} "
+        f"TP {row['target']} SL {row['stop']} (ev {ev_str}) -- {row['alloc']} alloc"
+    )
 
 
 def parse_failure_count(report_text: str) -> int:
@@ -126,7 +185,7 @@ def build_success_message(
     ]
     if rows:
         lines.append("Top allocations:")
-        lines.extend(f"- {r}" for r in rows)
+        lines.extend(f"- {format_allocation_row(r)}" for r in rows)
     if failures:
         lines.append(f"⚠️ {failures} fetch/prediction failures — see report.")
     return "\n".join(lines)
@@ -297,11 +356,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     if selected > 0:
         message = build_success_message(report_path.read_text(), report_path, selected, total, failures)
         try:
+            send_telegram_document(report_path)
+        except OpsError as notify_err:
+            # Best-effort: send the actionable text alert below regardless.
+            logger.error("Failed to send Telegram report attachment: %s", notify_err)
+        try:
             send_telegram(message, parse_mode=None)
         except OpsError as notify_err:
             logger.error("Failed to send Telegram: %s", notify_err)
             return 3
     elif args.notify_empty:
+        try:
+            send_telegram_document(report_path)
+        except OpsError as notify_err:
+            logger.error("Failed to send Telegram report attachment: %s", notify_err)
         try:
             send_telegram(
                 f"📊 Kairos daily signals: no actionable signals selected\nReport: `{report_path.name}`",

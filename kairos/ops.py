@@ -19,6 +19,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
+import requests
+
 from kairos.errors import KairosError
 
 
@@ -32,6 +34,7 @@ DEFAULT_GPU_UTIL_THRESHOLD = 10
 DEFAULT_IDLE_SAMPLES = 3
 DEFAULT_IDLE_SAMPLE_INTERVAL_SECONDS = 10.0  # 3 samples * 10s = ~30s idle window
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_DOCUMENT_API_URL = "https://api.telegram.org/bot{token}/sendDocument"
 
 
 class GpuLock:
@@ -222,3 +225,40 @@ def send_telegram(
         raise OpsError(f"Telegram API HTTP error {exc.code}: {exc.read().decode()}") from exc
     except Exception as exc:
         raise OpsError(f"Telegram API call failed: {exc}") from exc
+
+
+def send_telegram_document(
+    file_path: Path | str,
+    bot_token: Optional[str] = None,
+    chat_id: Optional[str] = None,
+) -> None:
+    """Send a file as a Telegram document attachment using the Bot API.
+
+    Reads TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID from the environment unless
+    overridden. Raises OpsError if credentials are missing, the file doesn't
+    exist, or the API call fails. No caption/parse_mode is sent -- keeps
+    this free of the unbalanced-Markdown risk send_telegram() warns about.
+    """
+    bot_token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        raise OpsError(
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set to send Telegram messages"
+        )
+
+    file_path = Path(file_path)
+    if not file_path.is_file():
+        raise OpsError(f"Telegram document attachment not found: {file_path}")
+
+    url = TELEGRAM_DOCUMENT_API_URL.format(token=bot_token)
+    try:
+        with open(file_path, "rb") as f:
+            response = requests.post(
+                url,
+                data={"chat_id": chat_id},
+                files={"document": (file_path.name, f)},
+                timeout=30,
+            )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise OpsError(f"Telegram document upload failed: {exc}") from exc
