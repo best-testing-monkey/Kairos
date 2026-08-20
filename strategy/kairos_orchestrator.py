@@ -298,6 +298,45 @@ class OrchestratorConfig:
         "trend_following", "open_gap",
     })
 
+    @classmethod
+    def for_interval(cls, interval: str, **overrides) -> "OrchestratorConfig":
+        """
+        Construct an OrchestratorConfig with interval-specific preset defaults.
+
+        Looks up _FILTER_PRESETS_BY_INTERVAL.get(interval, {}) to find any
+        interval-specific overrides for meta-filter thresholds (entropy_threshold,
+        kurtosis_max, min_volume_percentile). Merges presets with explicit
+        **overrides (overrides win on conflict) and constructs a new config.
+
+        Any interval not in _FILTER_PRESETS_BY_INTERVAL silently falls back to
+        the class's own dataclass defaults (currently calibrated for 1d). This
+        is intentional: an uncalibrated interval doesn't crash, it just inherits
+        1d's thresholds until someone calibrates it in a later story.
+
+        Args:
+            interval: The timeframe interval (e.g., "1d", "1h").
+            **overrides: Explicit kwargs that override presets on conflict.
+
+        Returns:
+            A new OrchestratorConfig instance.
+        """
+        presets = _FILTER_PRESETS_BY_INTERVAL.get(interval, {})
+        merged = {**presets, **overrides}
+        return cls(**merged)
+
+
+# =============================================================================
+# INTERVAL-SPECIFIC FILTER PRESETS
+# =============================================================================
+
+_FILTER_PRESETS_BY_INTERVAL: dict[str, dict] = {}
+"""
+Interval-keyed presets for meta-filter thresholds (entropy_threshold, kurtosis_max,
+min_volume_percentile). Currently empty; calibrated numbers for each interval are
+populated in later stories (e.g., E12-S02 for 1h). Any interval not in this dict
+falls back to OrchestratorConfig's dataclass defaults (1d-calibrated values).
+"""
+
 
 # =============================================================================
 # STRATEGY REGISTRY
@@ -732,7 +771,7 @@ class KairosOrchestrator:
         self._kwargs = kwargs
         self.predict_fn = predict_fn
         self.assets = assets or ["BTC-USD"]
-        self.config = config or OrchestratorConfig()
+        self.config = config or OrchestratorConfig.for_interval(KairosSettings.interval)
 
         # Sub-components
         self.predictor = KairosPredictor(predict_fn)

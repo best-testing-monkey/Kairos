@@ -1030,7 +1030,8 @@ if __name__ == "__main__":
 
     DEMO_BACKTEST_OVER_N_BARS = _period_to_bars(KairosSettings.backtest_period, KairosSettings.interval)
 
-    config = OrchestratorConfig(
+    config = OrchestratorConfig.for_interval(
+        KairosSettings.interval,
         initial_capital=KairosSettings.initial_capital,
         cross_asset_ranking=True,
         online_weighting=True,

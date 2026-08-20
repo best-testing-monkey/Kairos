@@ -820,7 +820,7 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
     skipped = []
 
     disabled = resolve_disabled_strategies(interval, assets)
-    config = OrchestratorConfig(disabled_strategies=disabled)
+    config = OrchestratorConfig.for_interval(interval, disabled_strategies=disabled)
 
     def _dummy_predict(*a, **kw):
         return []
