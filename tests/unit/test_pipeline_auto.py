@@ -1906,6 +1906,92 @@ class TestCorrelationIntervalThreading:
         assert "BTC-USD" in fetched_symbols
         assert "SOL-USD" not in fetched_symbols
 
+    def test_correlation_min_overlap_roll_window_scale_by_interval(self, temp_db):
+        """min_overlap and roll_window scale by BARS_PER_DAY for different intervals."""
+        from kairos_pipeline import run_stage_correlation, BARS_PER_DAY
+        from unittest.mock import patch
+        import pandas as pd
+
+        # Verify BARS_PER_DAY is what we expect
+        assert BARS_PER_DAY["1d"] == 1
+        assert BARS_PER_DAY["1h"] == 24
+
+        # Pre-populate universe_screen with passing survivors
+        for run_id, ival in [(1, "1h"), (2, "1d")]:
+            temp_db.execute(
+                "INSERT INTO runs (run_id, stage, interval) VALUES (?, 'universe', ?)",
+                (run_id, ival),
+            )
+            for sym, ac in [("BTC-USD", "crypto"), ("ETH-USD", "crypto")]:
+                temp_db.execute(
+                    "INSERT INTO universe_screen (run_id, symbol, asset_class, passed) VALUES (?,?,?,?)",
+                    (run_id, sym, ac, 1),
+                )
+        temp_db.commit()
+
+        # Track compute_pair_correlation calls
+        corr_calls = []
+
+        def mock_get_price_data(symbol, start_date, end_date, interval):
+            # Return enough bars to pass min_overlap for both 1d and 1h
+            if interval == "1d":
+                dates = pd.date_range(start=start_date, end=end_date, freq='D')
+            else:
+                dates = pd.date_range(start=start_date, end=end_date, freq='h')
+            df = pd.DataFrame({
+                "close": [100.0] * len(dates),
+                "volume": [1000000.0] * len(dates),
+            }, index=dates)
+            return df
+
+        original_compute_pair_correlation = None
+
+        def mock_compute_pair_correlation(series_a, series_b, min_overlap=150, roll_window=30):
+            corr_calls.append({
+                "min_overlap": min_overlap,
+                "roll_window": roll_window,
+            })
+            # Call the original function
+            return original_compute_pair_correlation(series_a, series_b, min_overlap, roll_window)
+
+        # Import the original function
+        import kairos_pipeline
+        original_compute_pair_correlation = kairos_pipeline.compute_pair_correlation
+
+        # Test with interval="1h"
+        corr_calls.clear()
+        with patch("price_cache.get_price_data", side_effect=mock_get_price_data), \
+             patch("kairos_pipeline.compute_pair_correlation", side_effect=mock_compute_pair_correlation):
+            run_stage_correlation(temp_db, asset_class_filter=None, interval="1h")
+
+        # Verify that min_overlap=3600 (150*24) and roll_window=720 (30*24) for 1h
+        assert len(corr_calls) >= 1, "Expected at least one compute_pair_correlation call for 1h"
+        for call in corr_calls:
+            assert call["min_overlap"] == 3600, \
+                f"For interval='1h', expected min_overlap=3600, got {call['min_overlap']}"
+            assert call["roll_window"] == 720, \
+                f"For interval='1h', expected roll_window=720, got {call['roll_window']}"
+
+        # Clean up for 1d test
+        temp_db.execute("DELETE FROM runs WHERE stage='correlation'")
+        temp_db.execute("DELETE FROM correlation_pairs")
+        temp_db.execute("DELETE FROM suggested_groups")
+        temp_db.commit()
+
+        # Test with interval="1d"
+        corr_calls.clear()
+        with patch("price_cache.get_price_data", side_effect=mock_get_price_data), \
+             patch("kairos_pipeline.compute_pair_correlation", side_effect=mock_compute_pair_correlation):
+            run_stage_correlation(temp_db, asset_class_filter=None, interval="1d")
+
+        # Verify that min_overlap=150 (150*1) and roll_window=30 (30*1) for 1d
+        assert len(corr_calls) >= 1, "Expected at least one compute_pair_correlation call for 1d"
+        for call in corr_calls:
+            assert call["min_overlap"] == 150, \
+                f"For interval='1d', expected min_overlap=150, got {call['min_overlap']}"
+            assert call["roll_window"] == 30, \
+                f"For interval='1d', expected roll_window=30, got {call['roll_window']}"
+
 
 class TestSingleStageRegression:
     """Test that single-stage invocations remain unchanged."""

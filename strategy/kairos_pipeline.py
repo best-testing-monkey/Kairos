@@ -809,7 +809,11 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
         for j in range(i + 1, len(symbols)):
             a, b = symbols[i], symbols[j]
             pair_class = classes[a] if classes[a] == classes[b] else "cross"
-            full_corr, rolling_median, overlap = compute_pair_correlation(closes[a], closes[b])
+            full_corr, rolling_median, overlap = compute_pair_correlation(
+                closes[a], closes[b],
+                min_overlap=int(150 * BARS_PER_DAY.get(interval, 1)),
+                roll_window=int(30 * BARS_PER_DAY.get(interval, 1))
+            )
             if full_corr is None:
                 continue
             row = {
