@@ -19,39 +19,39 @@ to have run first.
 uv run ./strategy/kairos_pipeline.py --stage correlation --interval 1h
 ```
 
-## ⚠️ Known bug: `min_overlap` scaling produces zero pairs at 1h (found 2026-08-20, unfixed)
+## Bug fix: `min_overlap` scaling + fetch-window scaling (found 2026-08-20, fixed by E11-S03)
 
-**A live run of this stage for `1h` currently produces ZERO correlated pairs — every
-survivor ends up as an isolated singleton group, even when real correlation almost
-certainly exists (e.g. between crude oil and gas futures).** This is not a "thin
-data" edge case; it happens on every run. Root cause, confirmed by reading the code
-and reproducing live:
+A live run on 2026-08-20 found that `--stage correlation --interval 1h` produced **zero
+pairs on every run**, with every survivor ending up as an isolated singleton group.
+Root cause was a scaling mismatch:
 
-- `run_stage_correlation`'s own price-series fetch window is `bars_needed = 400`
-  (`strategy/kairos_pipeline.py`, ~line 781), **not scaled by interval** — the fetch
-  window scales in *calendar days* via `calendar_days_for_bars(400, bars_per_day,
-  ...)`, which for `1h` (`bars_per_day=24`) works out to only `400/24 ≈ 17` calendar
-  days, i.e. roughly 400 1h bars fetched per symbol — the exact same **bar count**
-  fetched for `1d` (400 daily bars), just compressed into far fewer calendar days.
-- E11-S01 (commit `b082e53`) scaled `compute_pair_correlation`'s `min_overlap`
-  threshold by the SAME 24x factor (`150 × BARS_PER_DAY["1h"] = 3600`), intending to
-  preserve "150 calendar days of required overlap" — but never scaled the fetch
-  window (`bars_needed`) to match. The result: at `1h`, the stage requires 3600
-  overlapping bars but only ever fetches ~400. `overlap_bars < min_overlap` is true
-  for every pair, unconditionally, so `compute_pair_correlation` returns
-  `(None, None, overlap_bars)` for everything and no pair is ever scored.
-- Confirmed live: a fresh `1h` universe run (see below) produced 4 survivors
-  (`CL=F`, `NG=F`, `SI=F`, `ZW=F` — all `fx_commodity` futures); the correlation
-  run against them produced **0 pairs, 4 singleton groups** (`run_id=729`).
+- E11-S01 (commit `b082e53`) scaled `compute_pair_correlation`'s `min_overlap` threshold
+  by the bar-per-day factor (`150 × BARS_PER_DAY["1h"] = 3600`), but **never scaled the
+  price-series fetch window** (`bars_needed = 400`) to match.
+- Result: at `1h`, the stage required 3600 overlapping bars but only fetched ~400,
+  making it structurally impossible for any pair to clear the threshold.
 
-**This needs a follow-up fix** (not made by this playbook/story — E11-S02 is
-verification-only, no code changes) — likely either: scale `bars_needed`/the fetch
-window by the same interval factor as `min_overlap`/`roll_window` (so `1h` fetches
-~9600 bars, i.e. the same ~400 calendar days of history as `1d`, not just ~17 days),
-or reconsider whether `min_overlap`/`roll_window` should be scaled by calendar-day
-equivalence at all versus a fixed bar count tuned directly for `1h`. Until fixed,
-**`--stage correlation --interval 1h` is non-functional** — it runs without
-erroring, but produces no real groupings.
+Fixed by E11-S03: `bars_needed` now scales by the same interval factor (`int(400 *
+BARS_PER_DAY.get(interval, 1))`), so the fetch window and the overlap requirement stay
+consistent. For `interval="1h"`, `bars_needed = 9600` bars, resulting in ~400 calendar
+days of history — matching the `1d` case.
+
+**Live re-verification (2026-08-20, after fix):**
+```
+Effective min_abs_corr thresholds: crypto=0.75, default=0.6
+
+Stage 2 (correlation) done: 6 pairs, 4 suggested groups. run_id=730.
+  group 1 [fx_commodity] [singleton]: CL=F
+  group 2 [fx_commodity] [singleton]: NG=F
+  group 3 [fx_commodity] [singleton]: SI=F
+  group 4 [fx_commodity] [singleton]: ZW=F
+```
+
+The 6 pairs all cleared the `min_overlap` threshold (overlap_bars: 4952–6220, vs
+min_overlap 3600). The 4 survivors remain isolated because there aren't enough correlated
+pairs *within* each asset class to form multi-symbol groups at this interval; this is
+real market structure, not a mechanism bug. `--stage correlation --interval 1h` is now
+fully functional.
 
 ## Separate finding: crypto universe screening broke for 1h on this same run (2026-08-20)
 

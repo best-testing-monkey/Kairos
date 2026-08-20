@@ -778,7 +778,7 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
     # bars_per_day for 1d = 1, so 400 bars = 400 days.
     bars_per_day = BARS_PER_DAY.get(interval, 1)
 
-    bars_needed = 400
+    bars_needed = int(400 * BARS_PER_DAY.get(interval, 1))
     days_needed = calendar_days_for_bars(bars_needed, bars_per_day, "BTC-USD", buffer_days=0)
 
     end_dt = date.today()

@@ -86,7 +86,7 @@ supervision; everything else is safe for normal cheap-model automation.
 
 - [x] E11-S01 Interval-scaled min_overlap/roll_window (docs/tickets/E11-S01-correlation-interval-scaled-windows.md)
 - [x] E11-S02 ⚠️ Live-verify correlation for 1h + playbook (docs/tickets/E11-S02-correlation-live-verify-and-playbook.md) — found 2 bugs, see E11-S03/BUG-03
-- [ ] E11-S03 Fix correlation fetch-window scaling (bars_needed) so 1h actually produces pairs (docs/tickets/E11-S03-correlation-fetch-window-scaling.md)
+- [x] E11-S03 Fix correlation fetch-window scaling (bars_needed) so 1h actually produces pairs (docs/tickets/E11-S03-correlation-fetch-window-scaling.md)
 
 ## Bugs found via live verification (not part of the original E10-E17 scope)
 
