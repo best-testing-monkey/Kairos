@@ -2678,6 +2678,51 @@ class TestSelectFinetuneCandidate:
         assert candidate["assets_raw"] == "BTC-USD,ETH-USD"
         assert candidate["viable_count"] == 2
 
+    def test_interval_scoped_already_registered_allows_cross_interval_candidacy(self, temp_db):
+        """E14-S02: Asset with 1d registry row should be a candidate at 1h.
+
+        Prior bug: already_registered pooled assets across all intervals,
+        permanently blocking an asset from candidacy at any OTHER interval if
+        it had a registry row at ANY interval. Fix: check (assets, interval)
+        tuples instead of assets alone.
+        """
+        # Pre-existing 1d finetuned model for ZW=F (status='failed').
+        insert_finetune_registry_row(temp_db, {
+            "assets": "ZW=F", "assets_raw": "ZW=F",
+            "interval": "1d", "backtest_period": "6m", "status": "failed",
+        })
+
+        # Fresh 1h oracle & base results for ZW=F (same asset, different interval).
+        _insert_oracle_strategy(temp_db, "ZW=F", "1h", "6m", "s1", 5.0, 10)
+        _insert_base_strategy(temp_db, "ZW=F", "1h", "6m", "s1", 5.0, 10)
+
+        # ZW=F should be returned as a candidate at 1h, not blocked by the 1d row.
+        candidate = select_finetune_candidate(temp_db)
+        assert candidate is not None
+        assert candidate["assets_raw"] == "ZW=F"
+        assert candidate["interval"] == "1h"
+
+    def test_interval_scoped_already_registered_blocks_same_interval_candidacy(self, temp_db):
+        """E14-S02 regression: Asset with 1h registry row should NOT be candidate at 1h.
+
+        Ensure the interval-scoped fix doesn't over-permissively allow same-interval
+        re-selection: a (ZW=F, 1h) registry row (any status) must still exclude
+        ZW=F from 1h candidacy.
+        """
+        # Pre-existing 1h finetuned model for ZW=F (status='failed').
+        insert_finetune_registry_row(temp_db, {
+            "assets": "ZW=F", "assets_raw": "ZW=F",
+            "interval": "1h", "backtest_period": "6m", "status": "failed",
+        })
+
+        # Fresh 1h oracle & base results for ZW=F.
+        _insert_oracle_strategy(temp_db, "ZW=F", "1h", "6m", "s1", 5.0, 10)
+        _insert_base_strategy(temp_db, "ZW=F", "1h", "6m", "s1", 5.0, 10)
+
+        # ZW=F should NOT be returned as a candidate at 1h (same-interval block).
+        candidate = select_finetune_candidate(temp_db)
+        assert candidate is None
+
 
 class TestCompareFinetunedVsBase:
     """Accept-gate semantics: ft_count > base_count, or tie broken by mean sharpe."""
