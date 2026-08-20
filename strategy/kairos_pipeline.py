@@ -1320,13 +1320,13 @@ def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priorit
         profiles.setdefault(key, []).append((sharpe, signal_count))
 
     already_registered = {
-        r[0] for r in conn.execute("SELECT assets FROM finetuned_models").fetchall()
+        (r[0], r[1]) for r in conn.execute("SELECT assets, interval FROM finetuned_models").fetchall()
     }
 
     candidates = []
     for (assets, interval, backtest_period), strat_rows in profiles.items():
         assets_sorted = ",".join(sorted(assets.split(",")))
-        if assets_sorted in already_registered:
+        if (assets_sorted, interval) in already_registered:
             continue
 
         base_exists = conn.execute(
@@ -1354,7 +1354,7 @@ def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priorit
     if priority_assets:
         for (assets, interval, backtest_period), strat_rows in profiles.items():
             assets_sorted = ",".join(sorted(assets.split(",")))
-            if assets_sorted in already_registered:
+            if (assets_sorted, interval) in already_registered:
                 continue
             if not (set(assets.split(",")) & set(priority_assets)):
                 continue

@@ -6,51 +6,22 @@ mechanics as [model-finetuning.md](model-finetuning.md) (registry, lock,
 GPU-idle check, verdict logic, notifications) — this page covers only what
 differs for `1h`, plus a real bug found while verifying it.
 
-## ⚠️ Known bug: automated candidate selection is interval-blind (found 2026-08-20, unfixed)
+## ✅ Fixed: automated candidate selection is now interval-scoped (E14-S02, 2026-08-20)
 
-`--stage finetune_next --interval 1h` with **no `--assets`** currently finds
-**zero candidates** for almost every asset, even ones with fresh `1h` oracle
-and base results sitting in the DB. Root cause, in
-`select_finetune_candidate` (`strategy/kairos_pipeline.py`, ~line 1322):
+Previously (before E14-S02), `--stage finetune_next --interval 1h` with
+**no `--assets`** would find **zero candidates** for almost every asset, even
+ones with fresh `1h` oracle and base results in the DB. Root cause was in
+`select_finetune_candidate` (`strategy/kairos_pipeline.py`, lines 1322 and
+1357): the `already_registered` check pooled `assets` strings across *all*
+intervals instead of checking per-interval. The table's own `UNIQUE(assets,
+interval)` constraint designed for independent per-interval rows was being
+defeated at the Python-query level.
 
-```python
-already_registered = {
-    r[0] for r in conn.execute("SELECT assets FROM finetuned_models").fetchall()
-}
-```
-
-This query has **no `interval` filter** — it collects every `assets` string
-ever registered in `finetuned_models`, across *all* intervals, and then (line
-1329/1357) excludes a candidate if its `assets_sorted` is anywhere in that
-set. Since `finetuned_models` has a `UNIQUE(assets, interval)` constraint —
-i.e. it's *designed* to hold independent rows per interval for the same asset
-combination — this check defeats that design: once an asset combination has
-**any** `1d` registry row (training/accepted/rejected/failed), it's
-permanently invisible to candidate selection at `1h` (or any other interval),
-forever, with no way to retry short of a manual `--assets` override.
-
-Observed live: `ZW=F` has real `1h` oracle (`run_id=737`) and base
-(`run_id=738`) results, but `--stage finetune_next --interval 1h --dry_run`
-(no `--assets`) printed `[finetune_next] no candidates found` — because
-`ZW=F|1d|failed` already exists in the registry from earlier `1d` work. Given
-how much `1d` finetuning history already exists in this DB, this bug likely
-blocks auto-selection for the *majority* of assets that would otherwise be
-`1h` candidates.
-
-**Workaround used to verify the rest of this story** (also the only way to
-run `1h` finetune_next at all until this is fixed): pass `--assets` explicitly
-to bypass `select_finetune_candidate` entirely — `run_stage_finetune_next`'s
-docstring already documents this as the intended manual-re-queue escape
-hatch (line ~1532: *"Select the top not-yet-finetuned candidate ..., or use
-the explicitly supplied (assets, interval) for a manual re-queue"*), and it
-works correctly — the actual training/registry-write path (unlike the
-selection query) IS properly interval-scoped.
-
-**Not fixed by this story** (verification-only, per its ticket) — needs a
-follow-up: the fix is almost certainly adding `interval = ?` to the
-`already_registered` query (and its `interval` needs threading into the
-query), mirroring the same class of bug already fixed once this session in
-`run_stage_correlation`'s `MAX(run_id)` query (see `docs/tickets/E11-S03-*`).
+**Fixed in E14-S02:** `already_registered` now maintains a set of
+`(assets, interval)` tuples and checks each candidate against its own
+interval, correctly matching the table schema. Auto-selection (no `--assets`)
+now works as intended — an asset combination can be finetuned independently
+at different intervals without one interval's registry row blocking others.
 
 ## Steps (with the workaround)
 
