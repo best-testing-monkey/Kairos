@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Kairos daily signals (exclude_bad_top8, no-crypto) every day at 00:05 UTC
+
+[Timer]
+OnCalendar=*-*-* 00:05:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

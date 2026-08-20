@@ -11,7 +11,7 @@ from odf import opendocument
 from odf.table import Table, TableCell, TableRow
 from odf.text import P
 
-from ..allocation import (
+from allocation import (
     AllocationConfig,
     AllocationResult,
     Candidate,

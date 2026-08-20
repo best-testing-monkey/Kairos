@@ -26,7 +26,7 @@ from kairos_signal_replay import (
     replay,
     _build_arg_parser,
 )
-from ..allocation import AllocationConfig
+from allocation import AllocationConfig
 
 
 def test_ensure_signal_replay_tables_creates_tables():
@@ -1470,7 +1470,7 @@ def test_load_step_candidates_integration_with_fetch_signals():
 
     # Import fetch_signals from allocation
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
-    from ..allocation import fetch_signals
+    from allocation import fetch_signals
 
     # Call fetch_signals with the loaded candidates
     # This is the integration check: if the dict structure is wrong, fetch_signals

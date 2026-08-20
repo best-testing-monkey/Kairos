@@ -4,7 +4,7 @@ Verifies the RFC §6 Markdown "Portfolio Allocation" section renderer produces
 all required lines in the correct order, using a hand-built AllocationResult.
 """
 
-from ..allocation import AllocationResult, AllocationConfig, write_md_section
+from allocation import AllocationResult, AllocationConfig, write_md_section
 from signal_selection import parse_signal_selection
 
 
@@ -219,11 +219,11 @@ Config: n0=100 min_n=50 cost=0.15% kelly_mult=0.35 top_k=12 max_pos=15% max_clus
 
 Selected 3 of 6 signals. Gross exposure: 18.8%. EV total: 0.00%.
 
-| Ticker | Dir   | Strategy        |  Entry |   Stop | Target | EV net | Score | Alloc | Model |
-| ------ | ----- | --------------- | ------ | ------ | ------ | ------ | ----- | ----- | ----- |
-| NG=F   | Long  | close_direction |   2.95 |   2.90 |   3.14 |  0.61% |  1.01 | 13.9% |       |
-| V      | Long  | trend_following | 230.00 | 226.00 | 234.00 |  0.68% |  0.43 |  2.4% |       |
-| REMX   | Short | path_execution  |  79.73 |  84.51 |  73.71 |  2.34% |  0.39 |  2.5% |       |
+| Ticker | Dir   | Strategy        |  Entry |   Stop | Target | EV net | Score | Alloc | Model | Leverage | Margin % |
+| ------ | ----- | --------------- | ------ | ------ | ------ | ------ | ----- | ----- | ----- | -------- | -------- |
+| NG=F   | Long  | close_direction |   2.95 |   2.90 |   3.14 |  0.61% |  1.01 | 13.9% |       |          |          |
+| V      | Long  | trend_following | 230.00 | 226.00 | 234.00 |  0.68% |  0.43 |  2.4% |       |          |          |
+| REMX   | Short | path_execution  |  79.73 |  84.51 |  73.71 |  2.34% |  0.39 |  2.5% |       |          |          |
 
 Cluster exposure: energy_commodities 13.9%, metals_miners 2.5%, healthcare 2.4%
 
@@ -252,6 +252,37 @@ Rejected: 3 total -- BELOW_TOPK 1, LOW_N 1, NEG_EV_NET 1"""
         assert v_line.rstrip("| ").endswith("Finetuned(V)")
         # REMX has no 'model' key -> blank cell, not "None"
         assert "None" not in remx_line
+
+    def test_leverage_and_margin_columns_populated_when_max_leverage_set(self):
+        """Leverage/Margin % render real values when config.max_leverage > 1.0.
+
+        NG=F's 20x ticker ceiling with 13.9% alloc -> margin used =
+        13.9 * (100/20) / 100 = 0.695% of equity.
+        """
+        config = self._make_config()
+        config.max_leverage = 30.0
+        config.ticker_max_leverage = {"NG=F": 20.0}
+        result = self._make_result()
+        output = write_md_section(result, config)
+
+        lines = output.splitlines()
+        assert "| Leverage | Margin % |" in lines[6]
+        ng_line = next(line for line in lines if line.startswith("| NG=F"))
+        assert "20.0x" in ng_line
+        assert "0.7%" in ng_line
+        # V has no entry in ticker_max_leverage -> defaults to 1.0x (no scaling).
+        v_line = next(line for line in lines if line.startswith("| V "))
+        assert "1.0x" in v_line
+
+    def test_leverage_and_margin_columns_blank_when_max_leverage_default(self):
+        """Leverage/Margin % stay blank when max_leverage is left at 1.0 (default)."""
+        config = self._make_config()
+        assert config.max_leverage == 1.0
+        result = self._make_result()
+        output = write_md_section(result, config)
+
+        ng_line = next(line for line in output.splitlines() if line.startswith("| NG=F"))
+        assert "x |" not in ng_line
 
     def test_empty_selected_table_renders_header_only(self):
         """When no rows are selected, the table still has headers and no data rows."""

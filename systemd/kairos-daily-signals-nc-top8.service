@@ -1,0 +1,18 @@
+[Unit]
+Description=Kairos daily signals runner (exclude_bad_top8, no-crypto, margin-target sizing)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/media/baz/MonkeyWorks/PycharmProjects/Kairos
+ExecStart=/home/baz/.local/bin/uv run scripts/kairos_daily_signals.py \
+  --signal-selection "'Cluster' != 'crypto', 'Strategy' != 'path_execution', 'Strategy' != 'tail_asymmetry', 'Strategy' != 'rl_meta_controller', 'Strategy' != 'matrix_profile_anomaly', 'Strategy' != 'multi_factor_rank', 'Strategy' != 'implementation_shortfall', 'Strategy' != 'trend_following', 'Strategy' != 'onchain_flow_filter', 'Strategy' != 'insider_cluster', 'Strategy' != 'gaussian_process', 'Strategy' != 'fractal_dimension', 'Strategy' != 'dark_pool_filter', 'Strategy' != 'cot_positioning_filter', 'Strategy' != 'cds_spread_filter', 'Strategy' != 'atr_bracket', 'n' > 50, ORDER 'EV raw %' DESC, TOP 8" \
+  --cluster_map config/crypto_cluster_map.csv \
+  --max-leverage 30 --margin-utilization 0.8
+EnvironmentFile=-%h/.config/kairos/kairos.env
+
+# GPU recovery may reboot; don't restart automatically.
+Restart=no
+
+[Install]
+WantedBy=default.target

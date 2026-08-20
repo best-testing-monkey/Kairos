@@ -23,8 +23,10 @@ chmod 0644 "$UNIT_DIR"/kairos-*.service "$UNIT_DIR"/kairos-*.timer
 systemctl --user daemon-reload
 systemctl --user enable kairos-daily-signals.timer
 systemctl --user enable kairos-weekly-discovery.timer
+systemctl --user enable kairos-daily-signals-nc-top8.timer
 systemctl --user start kairos-daily-signals.timer
 systemctl --user start kairos-weekly-discovery.timer
+systemctl --user start kairos-daily-signals-nc-top8.timer
 ```
 
 ## Verify
@@ -33,6 +35,7 @@ systemctl --user start kairos-weekly-discovery.timer
 systemctl --user list-timers
 systemctl --user status kairos-daily-signals.timer
 systemctl --user status kairos-weekly-discovery.timer
+systemctl --user status kairos-daily-signals-nc-top8.timer
 ```
 
 ## Run manually
@@ -66,16 +69,29 @@ uv run /media/baz/MonkeyWorks/PycharmProjects/Kairos/strategy/kairos_pipeline.py
 ```bash
 journalctl --user -u kairos-daily-signals.service -f
 journalctl --user -u kairos-weekly-discovery.service -f
+journalctl --user -u kairos-daily-signals-nc-top8.service -f
 ```
 
 Logs are also written to:
 
-- `~/.local/state/kairos/daily_signals.log`
+- `~/.local/state/kairos/daily_signals.log` (shared by both daily-signals
+  units above -- `kairos-daily-signals.service` and
+  `kairos-daily-signals-nc-top8.service` both log here)
 - `~/.local/state/kairos/weekly_discovery.log`
 
 ## Scheduling
 
-- **Daily signals:** every day at 02:00 UTC (`kairos-daily-signals.timer`).
-- **Weekly discovery:** every Sunday at 04:00 UTC (`kairos-weekly-discovery.timer`).
+- **Daily signals:** every day at 02:00 (`kairos-daily-signals.timer`).
+- **Weekly discovery:** every Sunday at 04:00 (`kairos-weekly-discovery.timer`).
+- **Daily signals (exclude_bad_top8, no-crypto, margin-target sizing):**
+  every day at 00:05 UTC (`kairos-daily-signals-nc-top8.timer`) -- a
+  read-only report with per-signal Leverage/Margin % columns, no persistent
+  paper-trading account. Runs before the default job so it isn't waiting on
+  `GpuLock` behind it.
 
-Edit the `OnCalendar=` lines to change times.
+Edit the `OnCalendar=` lines to change times. **Note**: the two `02:00`/
+`04:00` times above have no explicit `UTC` suffix in their `OnCalendar=`
+lines, so despite this doc's historical wording they actually fire at local
+system time (currently CEST, UTC+2) -- only `kairos-daily-signals-nc-top8.timer`
+is pinned to a true UTC instant (`OnCalendar=*-*-* 00:05:00 UTC`). Worth
+fixing the other two the same way if DST drift ever matters for them.

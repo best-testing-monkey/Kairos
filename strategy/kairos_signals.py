@@ -944,7 +944,9 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         include_all=False, predict_fn=None, lookback=None, now=None,
         min_ev_pct=0.10, gsheets=False, xlsx=False, ods=False,
         cluster_map_path=None, base_only=False, return_rows=False,
-        on_group_timing=None, signal_selection=None, use_signal_cache=True):
+        on_group_timing=None, signal_selection=None, use_signal_cache=True,
+        max_leverage=1.0, margin_utilization=0.8,
+        margin_config_path="config/margin_ibkr.yaml"):
     """Run the full signals-report flow. Returns the path to the written report.
 
     now: the moment treated as "now" — stamps output filenames/report
@@ -985,6 +987,11 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         as selection_rule, overriding the default min_n/ev_net gate and
         score-sort/top_k ranking in allocation.select_candidates(). Default
         None preserves the exact old default behavior.
+    max_leverage / margin_utilization / margin_config_path: forwarded into
+        AllocationConfig for Stage 2.5 margin-utilization-target sizing
+        (allocation.py). max_leverage > 1.0 (default 1.0, off) enables it;
+        existing_margin_used_pct is left at its dataclass default (0.0) --
+        this report has no persistent account, always a clean-slate snapshot.
     use_signal_cache: if True (default), cache/reuse each strategy's rows in
         the signals_cache table of db_path, keyed by (strategy, group,
         model+checkpoint, as_of date, lookback, pred_samples, min_ev_pct) --
@@ -1139,7 +1146,24 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     candidates = fetch_signals(stats_rows, advice_rows)
     if candidates:
         cluster_map = load_cluster_map(cluster_map_path) if cluster_map_path else {}
-        allocation_config = AllocationConfig(cluster_map=cluster_map, selection_rule=signal_selection)
+        ticker_max_leverage = {}
+        if max_leverage > 1.0:
+            from kairos_margin import load_margin_config, classify_symbol
+            margin_cfg = load_margin_config(margin_config_path)
+            ticker_max_leverage = {
+                c.ticker: 100.0 / classify_symbol(c.ticker, margin_cfg).initial_margin_pct
+                for c in candidates
+            }
+        allocation_config = AllocationConfig(
+            cluster_map=cluster_map,
+            selection_rule=signal_selection,
+            max_leverage=max_leverage,
+            margin_utilization_cap=margin_utilization,
+            ticker_max_leverage=ticker_max_leverage,
+            # existing_margin_used_pct left at its dataclass default (0.0) --
+            # deliberate: this report never has a real account, always a
+            # clean-slate snapshot.
+        )
         allocation_result = allocate(candidates, allocation_config)
         allocation_section = write_md_section(allocation_result, allocation_config)
 
@@ -1242,6 +1266,17 @@ def main(argv=None):
     parser.add_argument("--cluster_map", default=None,
                         help="Optional path to a CSV file mapping ticker -> "
                              "cluster name for the Allocation sheet/section.")
+    parser.add_argument("--max-leverage", dest="max_leverage", type=float, default=1.0,
+                        help="Maximum leverage for margin-utilization-target sizing "
+                             "(default: 1.0, cash-only -- Stage 2.5 in allocation.py "
+                             "and the report's Leverage/Margin %% columns stay off).")
+    parser.add_argument("--margin-utilization", dest="margin_utilization", type=float, default=0.8,
+                        help="Fraction of equity usable as initial margin, target for "
+                             "Stage 2.5 sizing (default: 0.8). Only used when "
+                             "--max-leverage > 1.0.")
+    parser.add_argument("--margin-config", dest="margin_config", default="config/margin_ibkr.yaml",
+                        help="Path to YAML margin configuration (default: config/margin_ibkr.yaml). "
+                             "Only used when --max-leverage > 1.0.")
     parser.add_argument("--base_only", action="store_true", default=False,
                         help="Skip the accepted-finetuned-model overlay pass "
                              "entirely: every row is labeled 'Base' and no "
@@ -1317,6 +1352,9 @@ def main(argv=None):
             base_only=args.base_only,
             signal_selection=parsed_signal_selection,
             use_signal_cache=args.use_signal_cache,
+            max_leverage=args.max_leverage,
+            margin_utilization=args.margin_utilization,
+            margin_config_path=args.margin_config,
         )
         for p in out_paths:
             print(p)
@@ -1331,6 +1369,9 @@ def main(argv=None):
         base_only=args.base_only,
         signal_selection=parsed_signal_selection,
         use_signal_cache=args.use_signal_cache,
+        max_leverage=args.max_leverage,
+        margin_utilization=args.margin_utilization,
+        margin_config_path=args.margin_config,
     )
     print(out_path)
     return out_path

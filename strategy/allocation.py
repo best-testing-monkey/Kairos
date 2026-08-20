@@ -1821,8 +1821,8 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
     lines.append("")
 
     # Selected-position table via kairos_signals.format_table
-    headers = ["Ticker", "Dir", "Strategy", "Entry", "Stop", "Target", "EV net", "Score", "Alloc", "Model"]
-    align = ["l", "l", "l", "r", "r", "r", "r", "r", "r", "l"]
+    headers = ["Ticker", "Dir", "Strategy", "Entry", "Stop", "Target", "EV net", "Score", "Alloc", "Model", "Leverage", "Margin %"]
+    align = ["l", "l", "l", "r", "r", "r", "r", "r", "r", "l", "r", "r"]
 
     selected_rows = [row for row in result.rows if row.get("status") == "SELECTED"]
     table_rows = []
@@ -1837,6 +1837,12 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
         stop = row.get("stop")
         target = row.get("target")
 
+        # Mirrors Stage 2.5's own _margin_pct_for/_margin_used closures
+        # (allocation.py's size_selected(), ~line 634-645) -- not re-used
+        # directly since those are private to size_selected().
+        leverage = config.ticker_max_leverage.get(row.get("ticker", ""), 1.0)
+        margin_pct_of_equity = alloc * (100.0 / leverage) / 100.0 if leverage > 0 else alloc
+
         table_rows.append({
             "Ticker": row.get("ticker", ""),
             "Dir": direction.capitalize() if isinstance(direction, str) else "",
@@ -1848,6 +1854,8 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
             "Score": f"{score:.2f}" if score is not None else "",
             "Alloc": f"{alloc:.1f}%",
             "Model": row.get("model") or "",
+            "Leverage": f"{leverage:.1f}x" if config.max_leverage > 1.0 else "",
+            "Margin %": f"{margin_pct_of_equity:.1f}%" if config.max_leverage > 1.0 else "",
         })
 
     table_lines = format_table(headers, table_rows, align)

@@ -137,6 +137,10 @@ def run_signals(
     intervals: list[str],
     xlsx: bool,
     ods: bool,
+    signal_selection: Optional[str] = None,
+    cluster_map: Optional[str] = None,
+    max_leverage: Optional[float] = None,
+    margin_utilization: Optional[float] = None,
 ) -> subprocess.CompletedProcess:
     """Run kairos_signals.py as a subprocess and return its result."""
     cmd = [sys.executable, str(REPO_ROOT / "strategy" / "kairos_signals.py")]
@@ -146,6 +150,14 @@ def run_signals(
         cmd.append("--xlsx")
     if ods:
         cmd.append("--ods")
+    if signal_selection:
+        cmd.extend(["--signal-selection", signal_selection])
+    if cluster_map:
+        cmd.extend(["--cluster_map", cluster_map])
+    if max_leverage is not None:
+        cmd.extend(["--max-leverage", str(max_leverage)])
+    if margin_utilization is not None:
+        cmd.extend(["--margin-utilization", str(margin_utilization)])
 
     logger.info("Running: %s", " ".join(cmd))
     return subprocess.run(
@@ -185,6 +197,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Generate .ods allocation sheet",
     )
     parser.add_argument(
+        "--signal-selection",
+        dest="signal_selection",
+        default=None,
+        help="Passed through to kairos_signals.py --signal-selection (rule string).",
+    )
+    parser.add_argument(
+        "--cluster_map",
+        dest="cluster_map",
+        default=None,
+        help="Passed through to kairos_signals.py --cluster_map.",
+    )
+    parser.add_argument(
+        "--max-leverage",
+        dest="max_leverage",
+        type=float,
+        default=None,
+        help="Passed through to kairos_signals.py --max-leverage.",
+    )
+    parser.add_argument(
+        "--margin-utilization",
+        dest="margin_utilization",
+        type=float,
+        default=None,
+        help="Passed through to kairos_signals.py --margin-utilization.",
+    )
+    parser.add_argument(
         "--notify-empty",
         action="store_true",
         default=False,
@@ -214,7 +252,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 allow_recover=not args.no_gpu_recovery,
                 allow_reboot=args.allow_reboot,
             )
-            proc = run_signals(out_dir, args.intervals, args.xlsx, args.ods)
+            proc = run_signals(
+                out_dir, args.intervals, args.xlsx, args.ods,
+                signal_selection=args.signal_selection,
+                cluster_map=args.cluster_map,
+                max_leverage=args.max_leverage,
+                margin_utilization=args.margin_utilization,
+            )
     except OpsError as exc:
         logger.error("GPU/lock error: %s", exc)
         try:
