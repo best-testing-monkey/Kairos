@@ -97,7 +97,7 @@ supervision; everything else is safe for normal cheap-model automation.
 
 - [x] E12-S01 Interval-keyed OrchestratorConfig preset mechanism (docs/tickets/E12-S01-orchestrator-config-interval-presets.md)
 - [x] E12-S02 ⚠️ Live debug_filters=True calibration sweep for 1h (docs/tickets/E12-S02-orchestrator-1h-calibration-sweep.md) — n=4579 samples, 1h thresholds match 1d exactly (data-verified, not copied blindly); sample thin/commodity-skewed pending BUG-04's residual $vol=0.0 fix
-- [ ] E12-S03 ⚠️ Live-verify oracle stage for 1h + playbook (docs/tickets/E12-S03-oracle-1h-live-verify-and-playbook.md)
+- [x] E12-S03 ⚠️ Live-verify oracle stage for 1h + playbook (docs/tickets/E12-S03-oracle-1h-live-verify-and-playbook.md) — run_id=737, group_id=5 (ZW=F), 127 strategies evaluated, 25 disabled for negative shadow Sharpe; disabled_strategies mechanism confirmed live for 1h
 
 ## Epic 13 — Base model backtest for 1h
 
