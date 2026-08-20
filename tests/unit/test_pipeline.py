@@ -339,3 +339,65 @@ def test_cli_min_abs_corr_dict_without_default_gets_default_added():
 def test_cli_rejects_garbage_min_abs_corr():
     with pytest.raises(ValueError):
         kp._parse_min_abs_corr(["not-a-number"])
+
+
+# ============================================================================
+# interval_probe_ok gate
+# ============================================================================
+
+def test_interval_probe_ok_gate_fails_on_probe_failure(tmp_path, monkeypatch):
+    """When probe returns None but main fetch succeeds, the row should fail with
+    fail_reason='interval_probe_failed' even if liquidity checks would have passed."""
+    from datetime import date, timedelta
+
+    # Create a test database
+    db_path = str(tmp_path / "test_probe.db")
+    conn = kp.get_connection(db_path)
+
+    # Mock price_cache.get_price_data to return:
+    # - Good hourly data for the main fetch (long date range, ~400 days @ 24 bars/day)
+    # - None for the probe (short date range, 5 days)
+    def mock_get_price_data(symbol, start_date, end_date, interval):
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+        days_back = (end - start).days
+        # Main fetch is ~400 days; probe is ~5 days. Distinguish by range.
+        if days_back < 50:  # This is the probe call
+            return None  # Probe returns no data
+        else:  # This is the main fetch
+            # Return valid hourly data (1h bars for ~400 days = ~9600 bars).
+            # This ensures min_bars check passes (need 200*24=4800 for 1h interval).
+            freq = "h" if interval == "1h" else "D"
+            dates = pd.date_range(start, end, freq=freq)
+            return pd.DataFrame({
+                "open": [100.0] * len(dates),
+                "high": [101.0] * len(dates),
+                "low": [99.0] * len(dates),
+                "close": [100.5] * len(dates),
+                "volume": [1_000_000] * len(dates),
+            }, index=dates)
+
+    monkeypatch.setattr("kairos_pipeline.price_cache.get_price_data", mock_get_price_data)
+
+    # Run the universe stage with 1h interval
+    kp.run_stage_universe(conn, interval="1h")
+    conn.commit()
+
+    # Fetch all rows
+    rows = conn.execute(
+        "SELECT symbol, passed, fail_reason, interval_probe_ok FROM universe_screen ORDER BY symbol"
+    ).fetchall()
+    conn.close()
+
+    # Should have rows
+    assert len(rows) > 0, "Expected at least one row in universe_screen"
+
+    # All rows should have interval_probe_ok=False (since probe always returns None)
+    # and passed=False with fail_reason='interval_probe_failed'
+    for symbol, passed, fail_reason, interval_probe_ok in rows:
+        assert not interval_probe_ok, \
+            f"Symbol {symbol}: expected interval_probe_ok=False, got {interval_probe_ok}"
+        assert not passed, \
+            f"Symbol {symbol}: expected passed=False, got {passed}"
+        assert fail_reason == "interval_probe_failed", \
+            f"Symbol {symbol}: expected fail_reason='interval_probe_failed', got '{fail_reason}'"

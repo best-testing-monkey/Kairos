@@ -574,6 +574,11 @@ def run_stage_universe(conn, interval="1d"):
                     row["passed"] = passed
                     row["fail_reason"] = fail_reason
                     row["liquidity_note"] = liquidity_note
+
+                    # Override to fail if probe returned no data (for non-1d intervals).
+                    if interval != "1d" and not interval_probe_ok and passed:
+                        row["passed"] = False
+                        row["fail_reason"] = "interval_probe_failed"
             except Exception as exc:
                 row["fail_reason"] = f"fetch_error: {exc}"
                 row["interval_probe_ok"] = False
