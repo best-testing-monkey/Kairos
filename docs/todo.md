@@ -101,7 +101,7 @@ supervision; everything else is safe for normal cheap-model automation.
 
 ## Epic 13 — Base model backtest for 1h
 
-- [ ] E13-S01 ⚠️ Live-verify base stage for 1h + playbook (docs/tickets/E13-S01-base-model-1h-live-verify-and-playbook.md)
+- [x] E13-S01 ⚠️ Live-verify base stage for 1h + playbook (docs/tickets/E13-S01-base-model-1h-live-verify-and-playbook.md) — run_id=738, real GPU inference confirmed, 1d untouched (5592 rows before/after)
 
 ## Epic 14 — Finetuning loop for 1h
 
