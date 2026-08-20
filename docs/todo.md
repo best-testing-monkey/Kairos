@@ -91,6 +91,7 @@ supervision; everything else is safe for normal cheap-model automation.
 ## Bugs found via live verification (not part of the original E10-E17 scope)
 
 - [x] BUG-03 Fix DST-ambiguous-time crash in hourly local-fallback fetch (docs/tickets/BUG-03-dst-ambiguous-time-hourly-fetch.md)
+- [ ] BUG-04 (cross-repo, NOT fixable in Kairos) The SAME DST-ambiguous-time crash exists in the vendored `price_cache` package's own fetch path (the PRIMARY fetch, not Kairos's local fallback that BUG-03 fixed) — confirmed live 2026-08-20: a `--stage universe --interval 1h` re-run after BUG-03 still shows ~150/153 crypto symbols failing with the identical `Cannot infer dst time from 2025-11-02 ...` error, meaning `price_cache.get_price_data()` itself needs the same `ambiguous="infer"` fix. Per project memory, price_cache is a Baz-owned sibling repo — fix at the source there, not by working around it in Kairos. This is currently the main practical blocker to 1h universe screening actually passing a healthy number of symbols; everything downstream (correlation, oracle, etc.) is starved of survivors until it's fixed upstream.
 
 ## Epic 12 — Oracle stage for 1h + OrchestratorConfig calibration
 
