@@ -114,7 +114,7 @@ supervision; everything else is safe for normal cheap-model automation.
 
 ## Epic 16 — Papertrade/MTM/margin for 1h
 
-- [ ] E16-S01 Once-per-calendar-day financing/MTM guard (docs/tickets/E16-S01-papertrade-once-per-day-financing-guard.md)
+- [x] E16-S01 Once-per-calendar-day financing/MTM guard (docs/tickets/E16-S01-papertrade-once-per-day-financing-guard.md)
 - [ ] E16-S02 ⚠️ Live-verify papertrade for 1h + playbook (docs/tickets/E16-S02-papertrade-1h-live-verify-and-playbook.md)
 
 ## Epic 17 — Hourly Telegram digest + scheduling

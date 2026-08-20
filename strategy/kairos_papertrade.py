@@ -2091,6 +2091,7 @@ def main(argv=None):
         phantom_fill_rejected_count = 0
         ruined = False
         last_snapshot = None  # set at end of each iteration; consumed at admission-check time next iteration
+        last_financing_date: date | None = None  # Guard MTM/financing accrual to fire at most once per calendar day
         known_open_ids = set()
         for effective_dt, stats_rows, advice_rows in dated_rows:
             # end must be the START OF THE NEXT DAY, not the same midnight,
@@ -2304,125 +2305,131 @@ def main(argv=None):
                         # same-day-round-trip scan) -- no extra bookkeeping needed here.
                         known_open_ids = current_open_ids
 
-                        # Daily MTM snapshot + financing accrual (DESIGN_DOC_
-                        # mtm_margin_leverage.md Section 4.2/4.5): mark every still-open
-                        # position to today's close, persist one kairos_mtm_daily row.
-                        day_bars = _fetch_day_close_bars(
-                            intraday_provider, [p.ticker for p in current_open], day_start, day_end,
-                        )
-                        mtm_positions = [
-                            OpenPositionView(
-                                ticker=p.ticker, direction=p.direction, entry_price=p.entry_price,
-                                quantity=p.quantity,
-                                entry_costs=(
-                                    p.commission_entry + p.spread_cost
-                                    + p.slippage_cost + p.fx_conversion_cost
-                                ),
+                        # E16-S01: Guard MTM/financing accrual to fire at most once per calendar day.
+                        # For --interval 1d, this is effectively a no-op (one iteration per day).
+                        # For --interval 1h, this ensures daily_financing() is called once per day,
+                        # not 24 times, preventing 24x over-accrual within the same calendar day.
+                        if last_financing_date != day_start.date():
+                            # Daily MTM snapshot + financing accrual (DESIGN_DOC_
+                            # mtm_margin_leverage.md Section 4.2/4.5): mark every still-open
+                            # position to today's close, persist one kairos_mtm_daily row.
+                            day_bars = _fetch_day_close_bars(
+                                intraday_provider, [p.ticker for p in current_open], day_start, day_end,
                             )
-                            for p in current_open if p.ticker in day_bars
-                        ]
-                        financing_day = (
-                            compute_daily_financing_total(mtm_positions, day_bars, margin_config)
-                            if mtm_positions else 0.0
-                        )
-                        corrected_cash -= financing_day
-                        financing_accrued_total += financing_day
-
-                        if mtm_positions:
-                            snapshot = replace(
-                                compute_daily_snapshot(mtm_positions, day_bars, corrected_cash, margin_config),
-                                financing_accrued_day=financing_day,
-                            )
-                        else:
-                            snapshot = DailySnapshot(
-                                date=day_start.date(), cash=corrected_cash, unrealized_pnl=0.0,
-                                equity=corrected_cash, gross_notional=0.0, initial_margin_used=0.0,
-                                maintenance_margin_used=0.0, free_margin=corrected_cash,
-                                margin_utilization=0.0, financing_accrued_day=financing_day,
-                                liquidations=0,
-                            )
-
-                        # E4-S11: evaluate the ESMA close-out rule against THIS
-                        # day's snapshot, before it is persisted -- a liquidation
-                        # must be reflected in the row actually written for today.
-                        tickers_liquidated, _post_equity, ruined_today = liquidation_check(
-                            snapshot, mtm_positions, margin_config,
-                        )
-                        if tickers_liquidated:
-                            pos_by_ticker = {p.ticker: p for p in current_open}
-                            for ticker in tickers_liquidated:
-                                liq_pos = pos_by_ticker.get(ticker)
-                                if liq_pos is None:
-                                    continue
-                                close_price = day_bars[ticker]["close"]
-                                corrected_cash += _liquidate_position(
-                                    client._conn, liq_pos, close_price, day_start,
-                                    margin_config, args.max_leverage,
-                                )
-                                _notify(
-                                    f"⚠️ Kairos papertrade: liquidated {ticker} @ "
-                                    f"{close_price:.4f} on {day_start:%Y-%m-%d} (margin call)",
-                                    enabled=args.notify,
-                                )
-                                known_open_ids.discard(liq_pos.id)
-                            # Recompute the snapshot that actually gets persisted
-                            # from POST-liquidation cash and the remaining
-                            # (non-liquidated) positions -- the pre-liquidation
-                            # `snapshot` above must not be what's written/returned.
-                            remaining_positions = [
-                                p for p in mtm_positions if p.ticker not in tickers_liquidated
-                            ]
-                            snapshot = replace(
-                                compute_daily_snapshot(
-                                    remaining_positions, day_bars, corrected_cash, margin_config,
-                                ),
-                                financing_accrued_day=financing_day,
-                                liquidations=len(tickers_liquidated),
-                            )
-
-                        # BUG-02: fold same-day round trips' entry-side margin usage
-                        # into the snapshot that gets persisted/becomes `last_snapshot`
-                        # -- admission_check() for tomorrow's orders must see capital
-                        # today's (already-closed) round trips actually used. Cash/
-                        # equity are untouched here: cash already reflects their real
-                        # P&L via corrected_cash above, and marking them to today's
-                        # close (like an open position) would double-count that P&L.
-                        if same_day_round_trip_positions:
-                            extra_notional = extra_initial_margin = extra_maintenance_margin = 0.0
-                            for pos in same_day_round_trip_positions:
-                                view = OpenPositionView(
-                                    ticker=pos.ticker, direction=pos.direction,
-                                    entry_price=pos.entry_price, quantity=pos.quantity,
+                            mtm_positions = [
+                                OpenPositionView(
+                                    ticker=p.ticker, direction=p.direction, entry_price=p.entry_price,
+                                    quantity=p.quantity,
                                     entry_costs=(
-                                        pos.commission_entry + pos.spread_cost
-                                        + pos.slippage_cost + pos.fx_conversion_cost
+                                        p.commission_entry + p.spread_cost
+                                        + p.slippage_cost + p.fx_conversion_cost
                                     ),
                                 )
-                                notional, initial_margin, maintenance_margin = position_margin_contribution(
-                                    view, margin_config,
-                                )
-                                extra_notional += notional
-                                extra_initial_margin += initial_margin
-                                extra_maintenance_margin += maintenance_margin
-                            new_initial_margin_used = snapshot.initial_margin_used + extra_initial_margin
-                            snapshot = replace(
-                                snapshot,
-                                gross_notional=snapshot.gross_notional + extra_notional,
-                                initial_margin_used=new_initial_margin_used,
-                                maintenance_margin_used=(
-                                    snapshot.maintenance_margin_used + extra_maintenance_margin
-                                ),
-                                free_margin=snapshot.equity - new_initial_margin_used,
-                                margin_utilization=(
-                                    new_initial_margin_used / snapshot.equity if snapshot.equity > 0 else 0.0
-                                ),
+                                for p in current_open if p.ticker in day_bars
+                            ]
+                            financing_day = (
+                                compute_daily_financing_total(mtm_positions, day_bars, margin_config)
+                                if mtm_positions else 0.0
                             )
+                            corrected_cash -= financing_day
+                            financing_accrued_total += financing_day
 
-                        if ruined_today or snapshot.equity <= 0.0:
-                            ruined = True
+                            if mtm_positions:
+                                snapshot = replace(
+                                    compute_daily_snapshot(mtm_positions, day_bars, corrected_cash, margin_config),
+                                    financing_accrued_day=financing_day,
+                                )
+                            else:
+                                snapshot = DailySnapshot(
+                                    date=day_start.date(), cash=corrected_cash, unrealized_pnl=0.0,
+                                    equity=corrected_cash, gross_notional=0.0, initial_margin_used=0.0,
+                                    maintenance_margin_used=0.0, free_margin=corrected_cash,
+                                    margin_utilization=0.0, financing_accrued_day=financing_day,
+                                    liquidations=0,
+                                )
 
-                        _insert_mtm_daily_row(client._conn, account_name, snapshot, financing_accrued_total)
-                        last_snapshot = snapshot
+                            # E4-S11: evaluate the ESMA close-out rule against THIS
+                            # day's snapshot, before it is persisted -- a liquidation
+                            # must be reflected in the row actually written for today.
+                            tickers_liquidated, _post_equity, ruined_today = liquidation_check(
+                                snapshot, mtm_positions, margin_config,
+                            )
+                            if tickers_liquidated:
+                                pos_by_ticker = {p.ticker: p for p in current_open}
+                                for ticker in tickers_liquidated:
+                                    liq_pos = pos_by_ticker.get(ticker)
+                                    if liq_pos is None:
+                                        continue
+                                    close_price = day_bars[ticker]["close"]
+                                    corrected_cash += _liquidate_position(
+                                        client._conn, liq_pos, close_price, day_start,
+                                        margin_config, args.max_leverage,
+                                    )
+                                    _notify(
+                                        f"⚠️ Kairos papertrade: liquidated {ticker} @ "
+                                        f"{close_price:.4f} on {day_start:%Y-%m-%d} (margin call)",
+                                        enabled=args.notify,
+                                    )
+                                    known_open_ids.discard(liq_pos.id)
+                                # Recompute the snapshot that actually gets persisted
+                                # from POST-liquidation cash and the remaining
+                                # (non-liquidated) positions -- the pre-liquidation
+                                # `snapshot` above must not be what's written/returned.
+                                remaining_positions = [
+                                    p for p in mtm_positions if p.ticker not in tickers_liquidated
+                                ]
+                                snapshot = replace(
+                                    compute_daily_snapshot(
+                                        remaining_positions, day_bars, corrected_cash, margin_config,
+                                    ),
+                                    financing_accrued_day=financing_day,
+                                    liquidations=len(tickers_liquidated),
+                                )
+
+                            # BUG-02: fold same-day round trips' entry-side margin usage
+                            # into the snapshot that gets persisted/becomes `last_snapshot`
+                            # -- admission_check() for tomorrow's orders must see capital
+                            # today's (already-closed) round trips actually used. Cash/
+                            # equity are untouched here: cash already reflects their real
+                            # P&L via corrected_cash above, and marking them to today's
+                            # close (like an open position) would double-count that P&L.
+                            if same_day_round_trip_positions:
+                                extra_notional = extra_initial_margin = extra_maintenance_margin = 0.0
+                                for pos in same_day_round_trip_positions:
+                                    view = OpenPositionView(
+                                        ticker=pos.ticker, direction=pos.direction,
+                                        entry_price=pos.entry_price, quantity=pos.quantity,
+                                        entry_costs=(
+                                            pos.commission_entry + pos.spread_cost
+                                            + pos.slippage_cost + pos.fx_conversion_cost
+                                        ),
+                                    )
+                                    notional, initial_margin, maintenance_margin = position_margin_contribution(
+                                        view, margin_config,
+                                    )
+                                    extra_notional += notional
+                                    extra_initial_margin += initial_margin
+                                    extra_maintenance_margin += maintenance_margin
+                                new_initial_margin_used = snapshot.initial_margin_used + extra_initial_margin
+                                snapshot = replace(
+                                    snapshot,
+                                    gross_notional=snapshot.gross_notional + extra_notional,
+                                    initial_margin_used=new_initial_margin_used,
+                                    maintenance_margin_used=(
+                                        snapshot.maintenance_margin_used + extra_maintenance_margin
+                                    ),
+                                    free_margin=snapshot.equity - new_initial_margin_used,
+                                    margin_utilization=(
+                                        new_initial_margin_used / snapshot.equity if snapshot.equity > 0 else 0.0
+                                    ),
+                                )
+
+                            if ruined_today or snapshot.equity <= 0.0:
+                                ruined = True
+
+                            _insert_mtm_daily_row(client._conn, account_name, snapshot, financing_accrued_total)
+                            last_snapshot = snapshot
+                            last_financing_date = day_start.date()
                     except Exception as e:
                         print(
                             f"WARNING: MTM snapshot / corrected-cash update failed for "
