@@ -90,7 +90,7 @@ supervision; everything else is safe for normal cheap-model automation.
 
 ## Bugs found via live verification (not part of the original E10-E17 scope)
 
-- [ ] BUG-03 Fix DST-ambiguous-time crash in hourly local-fallback fetch (docs/tickets/BUG-03-dst-ambiguous-time-hourly-fetch.md)
+- [x] BUG-03 Fix DST-ambiguous-time crash in hourly local-fallback fetch (docs/tickets/BUG-03-dst-ambiguous-time-hourly-fetch.md)
 
 ## Epic 12 — Oracle stage for 1h + OrchestratorConfig calibration
 

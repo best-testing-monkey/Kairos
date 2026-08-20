@@ -176,6 +176,8 @@ def fetch_price_data_local_fallback(
         rows,
         columns=["Date", "Open", "High", "Low", "Close", "Volume", "Dividends", "Stock Splits", "market_cap"],
     )
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize("America/New_York")
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(
+        "America/New_York", ambiguous="infer", nonexistent="shift_forward"
+    )
     df.set_index("Date", inplace=True)
     return df

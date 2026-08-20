@@ -53,7 +53,7 @@ pairs *within* each asset class to form multi-symbol groups at this interval; th
 real market structure, not a mechanism bug. `--stage correlation --interval 1h` is now
 fully functional.
 
-## Separate finding: crypto universe screening broke for 1h on this same run (2026-08-20)
+## Separate finding: crypto universe screening broke for 1h on this same run (2026-08-20) — FIXED by BUG-03
 
 Not a correlation-stage bug, but it's the reason the correlation run above only had
 4 non-crypto survivors to work with. A fresh `--stage universe --interval 1h` run
@@ -64,15 +64,17 @@ failed on `low_dollar_volume` instead) with:
 fetch_error: Cannot infer dst time from 2025-11-02 01:00:00 as there are no repeated times
 ```
 
-This is a pandas/timezone DST-transition error, not an E10/E11 logic bug — it
-happens because the universe stage's 729-day lookback window (yfinance's 1h history
-cap) now reaches back across the 2025-11-02 US DST fall-back date, and something in
-the fetch/localization path chokes on the ambiguous repeated hour. An older `1h`
-universe run from 2026-07-05 (`run_id=44`, 124 survivors including plenty of crypto)
-predates this — its 729-day window didn't yet reach back across that DST boundary.
-This will keep recurring and get worse as "today" moves further past the DST date
-(the window will cross it for longer). Flagging for a separate follow-up story; not
-fixed here.
+This was a pandas/timezone DST-transition error in kairos/data.py's
+`fetch_price_data_local_fallback` function. The error occurred because the universe
+stage's 729-day lookback window (yfinance's 1h history cap) reaches back across the
+2025-11-02 US DST fall-back date, and pandas' `tz_localize()` by default (`ambiguous="raise"`)
+refused to handle the ambiguous repeated hour. **Fixed by BUG-03 (commit [TBD])**:
+`tz_localize("America/New_York")` now includes `ambiguous="infer", nonexistent="shift_forward"`
+parameters, allowing it to infer the correct offset from the monotonically increasing order
+of the data. An older `1h` universe run from 2026-07-05 (`run_id=44`, 124 survivors including
+plenty of crypto) predated this — its 729-day window didn't yet reach back across that DST
+boundary. Crypto symbols now either pass or fail for legitimate reasons (low ATR%, insufficient bars)
+rather than crashing on the DST error.
 
 ## What a (hypothetically) successful run looks like
 
