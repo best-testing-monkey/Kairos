@@ -85,7 +85,7 @@ supervision; everything else is safe for normal cheap-model automation.
 ## Epic 11 — Correlation stage for 1h
 
 - [x] E11-S01 Interval-scaled min_overlap/roll_window (docs/tickets/E11-S01-correlation-interval-scaled-windows.md)
-- [ ] E11-S02 ⚠️ Live-verify correlation for 1h + playbook (docs/tickets/E11-S02-correlation-live-verify-and-playbook.md)
+- [x] E11-S02 ⚠️ Live-verify correlation for 1h + playbook (docs/tickets/E11-S02-correlation-live-verify-and-playbook.md) — FOUND A BUG, see docs/playbooks/hourly-correlation.md: min_overlap scaling produces 0 pairs at 1h, needs a follow-up fix story
 
 ## Epic 12 — Oracle stage for 1h + OrchestratorConfig calibration
 
