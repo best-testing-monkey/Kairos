@@ -1295,7 +1295,8 @@ def compute_finetune_periods(backtest_period: str, interval: str, now=None) -> d
 FINETUNE_PRIORITY_TICKERS = {"LDO-USD", "AAVE-USD", "FIL-USD", "ATOM-USD", "XTZ-USD", "AXS-USD"}
 
 
-def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priority_min_signals=1):
+def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priority_min_signals=1,
+                               interval=None):
     """
     Select the top-ranked (assets, interval, backtest_period) profile for
     automated finetuning.
@@ -1313,6 +1314,19 @@ def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priorit
         (run_stage_finetune_next with explicit assets/interval) is the only
         way to retry one.
 
+    `interval`, if given, restricts candidates to that interval only. Without
+    it (the default, and the prior behavior before this parameter existed),
+    ranking is global across every interval combined -- since 1d has far more
+    accumulated oracle history than 1h, an unfiltered auto-select on a mixed
+    registry will almost always keep picking 1d profiles even when the caller
+    only wants 1h (confirmed 2026-08-21: the top unfiltered pick was a 1d
+    profile despite `run_stage_finetune_next` having been invoked with
+    `--interval 1h` -- the CLI's --interval flag reached this function's
+    caller but was silently never forwarded here, so it had no effect on
+    auto-select at all). All 1h `finetuned_models` rows registered before this
+    fix were necessarily created via explicit `--assets ... --interval 1h`
+    manual re-queues, not natural auto-select.
+
     `priority_assets`, if given (a set/collection of ticker strings), selects
     among profiles that include any of those tickers using the same
     already_registered/base_exists gates but a more lenient viable-bar of
@@ -1326,6 +1340,8 @@ def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priorit
     Returns a dict {assets_raw, assets_sorted, interval, backtest_period,
     viable_count, mean_sharpe} for the top candidate, or None if none qualify.
     """
+    interval_filter = interval
+
     latest_q = """
         SELECT strategy_name, assets, interval, backtest_period, sharpe, signal_count
         FROM oracle_results
@@ -1352,6 +1368,8 @@ def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priorit
 
     candidates = []
     for (assets, interval, backtest_period), strat_rows in profiles.items():
+        if interval_filter is not None and interval != interval_filter:
+            continue
         assets_sorted = ",".join(sorted(assets.split(",")))
         if (assets_sorted, interval) in already_registered:
             continue
@@ -1380,6 +1398,8 @@ def select_finetune_candidate(conn, min_signals=3, priority_assets=None, priorit
     priority_candidates = []
     if priority_assets:
         for (assets, interval, backtest_period), strat_rows in profiles.items():
+            if interval_filter is not None and interval != interval_filter:
+                continue
             assets_sorted = ",".join(sorted(assets.split(",")))
             if (assets_sorted, interval) in already_registered:
                 continue
@@ -1655,7 +1675,8 @@ def run_stage_finetune_next(conn, assets=None, interval="1d", backtest_period="6
             }
         else:
             candidate = select_finetune_candidate(
-                conn, min_signals=min_signals, priority_assets=FINETUNE_PRIORITY_TICKERS
+                conn, min_signals=min_signals, priority_assets=FINETUNE_PRIORITY_TICKERS,
+                interval=interval,
             )
             if candidate is None:
                 print("[finetune_next] no candidates found (no unregistered profile with "

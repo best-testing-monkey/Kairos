@@ -2723,6 +2723,57 @@ class TestSelectFinetuneCandidate:
         candidate = select_finetune_candidate(temp_db)
         assert candidate is None
 
+    def test_interval_filter_restricts_ranking_to_that_interval(self, temp_db):
+        """Bug found 2026-08-21: unfiltered auto-select always preferred 1d
+        over 1h since 1d has far more accumulated oracle history, and
+        run_stage_finetune_next never forwarded its own `interval` argument
+        into select_finetune_candidate, so `--interval 1h` had zero effect on
+        auto-select. A 1d profile with a much higher score than any 1h
+        profile must NOT be picked when interval='1h' is passed explicitly."""
+        # High-scoring 1d profile (would normally win the unfiltered ranking).
+        _insert_oracle_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 5.0, 10)
+        _insert_base_strategy(temp_db, "BTC-USD,ETH-USD", "1d", "6m", "s1", 5.0, 10)
+
+        # Lower-scoring 1h profile.
+        _insert_oracle_strategy(temp_db, "ZW=F", "1h", "6m", "s1", 1.0, 5)
+        _insert_base_strategy(temp_db, "ZW=F", "1h", "6m", "s1", 1.0, 5)
+
+        # Unfiltered (default) still picks the higher-scoring 1d profile.
+        unfiltered = select_finetune_candidate(temp_db)
+        assert unfiltered["assets_raw"] == "BTC-USD,ETH-USD"
+        assert unfiltered["interval"] == "1d"
+
+        # Filtered to interval='1h' must pick the 1h profile despite its lower score.
+        filtered = select_finetune_candidate(temp_db, interval="1h")
+        assert filtered is not None
+        assert filtered["assets_raw"] == "ZW=F"
+        assert filtered["interval"] == "1h"
+
+    def test_run_stage_finetune_next_forwards_interval_to_candidate_selection(
+        self, temp_db, tmp_path, monkeypatch
+    ):
+        """run_stage_finetune_next's own `interval` argument must reach
+        select_finetune_candidate, not just describe the (unused) manual-requeue
+        path -- this is the actual bug, not just select_finetune_candidate's
+        missing parameter in isolation."""
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+
+        calls = []
+
+        def _capture(*args, **kwargs):
+            calls.append(kwargs)
+            return None
+
+        monkeypatch.setattr(kairos_pipeline, "select_finetune_candidate", _capture)
+
+        run_stage_finetune_next(
+            temp_db, interval="1h", lock_path=str(tmp_path / "finetune_next.lock"),
+        )
+
+        assert len(calls) == 1
+        assert calls[0].get("interval") == "1h"
+
 
 class TestCompareFinetunedVsBase:
     """Accept-gate semantics: ft_count > base_count, or tie broken by mean sharpe."""
