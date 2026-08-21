@@ -26,25 +26,30 @@ swept more than one asset group. A 3-4 day, 5-asset, 100%-stop-loss
 papertrade run (E16-S02) is proof the MTM/financing guard fires correctly —
 it is not, and was never meant to be, a performance verdict.
 
-## Prerequisite: check BUG-04's residual finding first
+## Prerequisite: `$vol=0.0` is fixed — sanity-check it before a big run
 
-`docs/todo.md`'s BUG-04 entry notes that after the upstream price_cache DST
-fix landed, most crypto symbols still report `$vol=0.0` in `1h` universe
-screening despite having real bar/ATR data — flagged as "not yet
-investigated." A full sweep run against the current universe would still be
-crypto-starved if this is actually suppressing real survivors. Before
-committing real GPU time to a sweep:
+BUG-04's residual `$vol=0.0` finding (most crypto symbols reading zero
+dollar volume in `1h` universe screening) is now fixed — see `docs/todo.md`'s
+BUG-05 entry and commit `20bfd0e`. Root cause was two stacked issues in
+`compute_universe_stats`: yfinance omits volume on ~50% of individual 1h
+crypto bars (fixed by resampling to daily buckets and summing before taking
+the median), and yfinance's crypto `volume` column is already
+dollar-denominated rather than share/contract-denominated like equity/fx
+(fixed by skipping the `close *` multiplier for `asset_class="crypto"`).
+Live-verified 2026-08-21: `BTC-USD $vol=8552878080.0` (~$8.5B), universe
+pass count rose 30→41/153 at `--interval 1h`.
+
+Still worth a quick sanity check before committing real GPU time to a sweep,
+since this fix is only a day old:
 
 1. Run `uv run ./strategy/kairos_pipeline.py --stage universe --interval 1h`
-   and check how many symbols pass, and whether crypto specifically is still
-   near-zero.
-2. If it's still thin, spend an hour tracing `$vol=0.0`'s root cause
-   (`compute_universe_stats`'s `dollar_volume` computation, or possibly
-   another price_cache-side gap in the same family as BUG-04) before
-   sinking a multi-hour sweep into a universe that's mostly excluded by a
-   fixable bug.
-3. If crypto now passes at healthy numbers, proceed — the sweep is worth
-   running as-is.
+   and confirm crypto majors (BTC-USD, ETH-USD, etc.) show a plausible `$vol`
+   (billions, not `0.0` and not absurdly large) and pass where expected.
+2. If something looks off, re-read `compute_universe_stats` in
+   `strategy/kairos_pipeline.py` (its docstring documents both fixes and the
+   reasoning) before assuming a new bug — reproduce against raw yfinance
+   output first, the way both prior rounds of this bug were root-caused.
+3. Once it looks right, proceed — the sweep is worth running as-is.
 
 ## What "the sweep" actually is
 
