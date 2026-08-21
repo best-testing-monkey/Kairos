@@ -64,56 +64,17 @@ def test_liquidity_fail_insufficient_bars():
     assert "insufficient_bars" in reason
 
 
-def test_liquidity_crypto_1h_scales_up_to_pass():
-    """At 1h, a per-bar dollar_volume that fails unscaled should pass when scaled to daily."""
-    # BTC crypto threshold is 10M daily. At 1h, 500k per bar scales to 500k * 24 = 12M daily.
-    passed, reason, note = kp.evaluate_liquidity(
-        "BTC-USD", "crypto", bars=250, dollar_volume=500_000, ann_vol=0.5, atr_pct=2.0,
-        interval="1h"
-    )
-    assert passed is True
-    assert reason is None
-
-
-def test_liquidity_1d_unchanged_behavior():
-    """For interval='1d', behavior should be identical to before (BARS_PER_DAY['1d']=1)."""
-    # This case passed before; should still pass.
-    passed, reason, note = kp.evaluate_liquidity(
-        "BTC-USD", "crypto", bars=250, dollar_volume=15_000_000, ann_vol=0.5, atr_pct=2.0,
-        interval="1d"
-    )
-    assert passed is True
-    assert reason is None
-
-    # This case failed before (below 10M threshold); should still fail.
-    passed, reason, note = kp.evaluate_liquidity(
-        "SHIB-USD", "crypto", bars=250, dollar_volume=1_000_000, ann_vol=0.5, atr_pct=2.0,
-        interval="1d"
-    )
-    assert passed is False
-    assert "low_dollar_volume" in reason
-
-
-def test_liquidity_dollar_volume_none_at_1d():
-    """When dollar_volume is None, should fail gracefully without crashing (format as N/A)."""
+def test_liquidity_dollar_volume_none():
+    """dollar_volume=None (e.g. no volume column upstream) should fail gracefully,
+    not crash -- evaluate_liquidity does no interval-based scaling or formatting
+    of dollar_volume itself; that's compute_universe_stats's job now (it always
+    hands evaluate_liquidity an already daily-equivalent figure, see
+    TestComputeUniverseStatsDollarVolume)."""
     passed, reason, note = kp.evaluate_liquidity(
         "BTC-USD", "crypto", bars=250, dollar_volume=None, ann_vol=0.5, atr_pct=2.0,
-        interval="1d"
     )
     assert passed is False
     assert "low_dollar_volume" in reason
-    assert "N/A" in reason
-
-
-def test_liquidity_dollar_volume_none_at_1h():
-    """When dollar_volume is None at 1h, should fail gracefully without crashing."""
-    passed, reason, note = kp.evaluate_liquidity(
-        "BTC-USD", "crypto", bars=250, dollar_volume=None, ann_vol=0.5, atr_pct=2.0,
-        interval="1h"
-    )
-    assert passed is False
-    assert "low_dollar_volume" in reason
-    assert "N/A" in reason
 
 
 # ============================================================================

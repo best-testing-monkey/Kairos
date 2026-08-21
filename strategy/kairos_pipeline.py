@@ -452,16 +452,16 @@ def evaluate_liquidity(
     dollar_volume,
     ann_vol,
     atr_pct,
-    interval: str = "1d",
     min_bars: int = 200,
     atr_min: float = 0.5,
 ):
     """
     Pure logic (no I/O) so it can be unit-tested with synthetic inputs.
 
-    Scales dollar_volume and min_bars to daily-equivalent for comparison against
-    thresholds calibrated for daily bars. For interval="1d", BARS_PER_DAY["1d"]=1,
-    so scaling is a no-op and behavior is unchanged from before.
+    dollar_volume is expected to already be a daily-equivalent figure (see
+    compute_universe_stats's resample-and-sum) -- no interval-based scaling
+    happens here. min_bars is still caller-scaled by interval (a raw bar
+    count, unrelated to the dollar_volume fix).
 
     Returns (passed: bool, fail_reason: str or None, liquidity_note: str or None).
     """
@@ -477,20 +477,8 @@ def evaluate_liquidity(
         liquidity_note = "fx_exempt_from_dollar_volume_filter"
     else:
         threshold = liquidity_threshold(asset_class)
-        # Scale dollar_volume to daily-equivalent for comparison against
-        # threshold (which is calibrated for daily bars).
-        dollar_volume_daily_equiv = (
-            dollar_volume * BARS_PER_DAY.get(interval, 1) if dollar_volume is not None else None
-        )
-        if dollar_volume_daily_equiv is None or dollar_volume_daily_equiv < threshold:
-            daily_equiv_str = (
-                f"{dollar_volume_daily_equiv:.0f}" if dollar_volume_daily_equiv is not None else "N/A"
-            )
-            return (
-                False,
-                f"low_dollar_volume(raw={dollar_volume}, daily_equiv={daily_equiv_str}<{threshold})",
-                liquidity_note,
-            )
+        if dollar_volume is None or dollar_volume < threshold:
+            return False, f"low_dollar_volume({dollar_volume}<{threshold})", liquidity_note
 
     if atr_pct is None or atr_pct < atr_min:
         return False, f"low_atr_pct({atr_pct}<{atr_min})", liquidity_note
@@ -498,12 +486,49 @@ def evaluate_liquidity(
     return True, None, liquidity_note
 
 
-def compute_universe_stats(df: pd.DataFrame, interval: str = "1d"):
-    """Compute bars, dollar_volume, ann_vol, atr_pct from a raw OHLCV frame."""
+def compute_universe_stats(df: pd.DataFrame, interval: str = "1d", asset_class: str | None = None):
+    """Compute bars, dollar_volume, ann_vol, atr_pct from a raw OHLCV frame.
+
+    dollar_volume is always a daily-equivalent figure: the per-bar dollar
+    figure is summed within each calendar day, then the median is taken
+    across days with a nonzero sum. Resampling+summing rather than a flat
+    per-bar median makes this robust to data sources where individual bars
+    under-report volume -- e.g. yfinance's crypto 1h volume, confirmed
+    (2026-08-21, reproduced against raw yfinance output with price_cache
+    entirely out of the path) to report exactly 0 on ~50% of individual
+    hourly bars even for the most liquid instruments (BTC-USD, ETH-USD). A
+    flat per-bar median collapses to 0 in that regime since more than half
+    the sample is zero, even though the real daily total is well above any
+    liquidity threshold. Summing within each day recovers a usable total as
+    long as some bars that day report real volume, which they generally do.
+    For interval="1d" this resample is a no-op (already one bar per day, at
+    most one nonzero value per bucket).
+
+    The per-bar dollar figure itself depends on asset_class: for equity and
+    fx_commodity, yfinance's `volume` column is share/contract-denominated,
+    so `close * volume` is the correct per-bar dollar figure (confirmed
+    2026-08-21 against AAPL, ~$8B/day median, matching real AAPL dollar
+    volume). For crypto, yfinance's `volume` column is already
+    dollar-denominated (confirmed 2026-08-21 by comparing raw yfinance
+    volume against known real-world BTC/ETH/DOGE daily dollar volume at
+    both 1d and 1h granularity -- e.g. BTC-USD daily volume reads in the
+    tens of billions, plausible in USD but impossible in BTC-coin units
+    since only ~19.5M BTC exist). Multiplying by close for crypto squares
+    the price and produces a garbage figure (e.g. BTC-USD read as
+    $734 trillion/day) -- it happened to never matter at 1d because the
+    inflated number always cleared the ($10M) liquidity threshold trivially
+    regardless of correctness, and was separately masked at 1h by the
+    zero-bar collapse above, so this went unnoticed until both were fixed
+    in the same pass.
+    """
     bars = len(df)
     close = df["close"].astype(float)
     if "volume" in df.columns:
-        dollar_volume = float((close * df["volume"].astype(float)).median())
+        volume = df["volume"].astype(float)
+        per_bar_dollar = volume if asset_class == "crypto" else close * volume
+        daily_dollar_volume = per_bar_dollar.resample("1D").sum()
+        daily_dollar_volume = daily_dollar_volume[daily_dollar_volume > 0]
+        dollar_volume = float(daily_dollar_volume.median()) if not daily_dollar_volume.empty else None
     else:
         dollar_volume = None
 
@@ -550,7 +575,9 @@ def run_stage_universe(conn, interval="1d"):
                     idx = pd.to_datetime(df.index)
                     df.index = idx.tz_convert(None) if idx.tz is not None else idx
 
-                    bars, dollar_volume, ann_vol, atr_pct = compute_universe_stats(df, interval=interval)
+                    bars, dollar_volume, ann_vol, atr_pct = compute_universe_stats(
+                        df, interval=interval, asset_class=asset_class,
+                    )
                     row.update(bars=bars, dollar_volume=dollar_volume, ann_vol=ann_vol, atr_pct=atr_pct)
 
                     # Probe the requested --interval separately (may differ from 1d).
@@ -569,7 +596,7 @@ def run_stage_universe(conn, interval="1d"):
 
                     passed, fail_reason, liquidity_note = evaluate_liquidity(
                         symbol, asset_class, bars, dollar_volume, ann_vol, atr_pct,
-                        interval=interval, min_bars=int(200 * BARS_PER_DAY.get(interval, 1))
+                        min_bars=int(200 * BARS_PER_DAY.get(interval, 1))
                     )
                     row["passed"] = passed
                     row["fail_reason"] = fail_reason

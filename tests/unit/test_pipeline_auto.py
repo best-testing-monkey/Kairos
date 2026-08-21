@@ -3637,7 +3637,7 @@ class TestComputeUniverseStatsAnnualization:
             "low": [99.0],
             "open": [100.0],
             "volume": [1_000_000],
-        })
+        }, index=pd.date_range("2024-01-01", periods=1))
 
         _, _, ann_vol, _ = compute_universe_stats(df)
         assert ann_vol is None
@@ -3659,3 +3659,127 @@ class TestComputeUniverseStatsAnnualization:
         assert dollar_volume is None
         # But ann_vol should still be computed
         assert ann_vol is not None
+
+
+class TestComputeUniverseStatsDollarVolume:
+    """dollar_volume regression tests for the resample-and-sum fix (2026-08-21).
+
+    Reproduced live against real yfinance 1h crypto data (bypassing price_cache
+    entirely): ~50% of individual hourly bars report volume=0 for BTC-USD/
+    ETH-USD, even though the instruments are genuinely highly liquid. A flat
+    per-bar median collapses to exactly 0 once more than half the sample is
+    zero. compute_universe_stats now sums dollar volume within each calendar
+    day first, then takes the median across days -- robust to the same
+    sparse-reporting pattern, and numerically identical to the old per-bar
+    median for 1d data (one bar per day already).
+    """
+
+    def test_sparse_hourly_volume_recovers_nonzero_daily_total(self):
+        """Synthetic 1h data mimicking the real crypto pattern: 13/24 bars per
+        day report volume=0 (>50%, matching the real ~50.7% observed for
+        ETH-USD), the rest report real volume. The old flat per-bar median
+        would be exactly 0 here; the fix must recover the real daily total."""
+        n_days = 10
+        dates = pd.date_range("2024-01-01", periods=n_days * 24, freq="1h")
+        # Per day: hours 0-10 (11 bars) have real volume, hours 11-23 (13 bars) are zero.
+        volume = np.tile([1000.0] * 11 + [0.0] * 13, n_days)
+        close = np.full(n_days * 24, 100.0)
+        df = pd.DataFrame({
+            "close": close, "high": close + 1, "low": close - 1, "open": close,
+            "volume": volume,
+        }, index=dates)
+
+        # Sanity-check the premise: the old flat per-bar median really is 0
+        # for this data (more than half the bars are zero).
+        old_style_median = pd.Series(close * volume).median()
+        assert old_style_median == 0.0
+
+        _, dollar_volume, _, _ = compute_universe_stats(df)
+
+        # New behavior: each day sums to 11 * (100 * 1000) = 1,100,000,
+        # constant across all 10 days, so the median across days is exact.
+        assert dollar_volume == pytest.approx(1_100_000.0)
+
+    def test_1d_cadence_unchanged_vs_old_per_bar_median(self):
+        """For interval='1d'-shaped data (one bar per day, no missing bars),
+        the new resample-and-sum-then-median-across-days must be numerically
+        identical to the old flat per-bar median -- 1d behavior must not
+        change."""
+        dates = pd.date_range("2024-01-01", periods=100, freq="1D")
+        rng = np.random.default_rng(7)
+        close = 100.0 + np.cumsum(rng.normal(0, 0.5, 100))
+        volume = rng.integers(500_000, 2_000_000, 100).astype(float)
+        df = pd.DataFrame({
+            "close": close, "high": close + 1, "low": close - 1, "open": close,
+            "volume": volume,
+        }, index=dates)
+
+        old_style_median = float(pd.Series(close * volume, index=dates).median())
+        _, dollar_volume, _, _ = compute_universe_stats(df, interval="1d")
+
+        assert dollar_volume == pytest.approx(old_style_median)
+
+    def test_fully_zero_volume_day_excluded_from_median(self):
+        """A calendar day with zero total volume (e.g. an exchange outage)
+        must not count as a real '$0 dollar volume' trading day pulling the
+        median down -- it should be excluded, not included as a 0."""
+        # 4 days with real volume, 1 day fully zero.
+        dates = pd.date_range("2024-01-01", periods=5, freq="1D")
+        close = np.full(5, 100.0)
+        volume = np.array([1000.0, 1000.0, 0.0, 1000.0, 1000.0])
+        df = pd.DataFrame({
+            "close": close, "high": close + 1, "low": close - 1, "open": close,
+            "volume": volume,
+        }, index=dates)
+
+        _, dollar_volume, _, _ = compute_universe_stats(df)
+
+        # All 4 nonzero days have the same dollar volume (100 * 1000), so the
+        # median across the 4 real days is exactly that value, not dragged
+        # toward 0 by the excluded zero day.
+        assert dollar_volume == pytest.approx(100_000.0)
+
+
+class TestComputeUniverseStatsCryptoVolumeUnits:
+    """asset_class='crypto' regression tests (2026-08-21): yfinance's `volume`
+    column for crypto tickers is already dollar-denominated, unlike equity/fx
+    where it's share/contract-denominated. Confirmed live against raw yfinance
+    output (bypassing price_cache): BTC-USD daily volume reads in the tens of
+    billions -- plausible in USD, impossible in BTC-coin units (only ~19.5M
+    BTC exist total). Multiplying by close for crypto squares the price,
+    producing e.g. BTC-USD $vol=734 trillion instead of ~$6-8B. This was
+    invisible at 1d (the inflated number always cleared the $10M crypto
+    liquidity threshold trivially) and separately masked at 1h by the
+    zero-bar median collapse (see TestComputeUniverseStatsDollarVolume) --
+    only surfaced once both were fixed in the same session."""
+
+    def test_crypto_uses_volume_directly_not_close_times_volume(self):
+        dates = pd.date_range("2024-01-01", periods=5, freq="1D")
+        close = np.full(5, 70_000.0)  # BTC-like price
+        volume = np.full(5, 20_000_000_000.0)  # already-dollar volume, BTC-like
+        df = pd.DataFrame({
+            "close": close, "high": close + 1, "low": close - 1, "open": close,
+            "volume": volume,
+        }, index=dates)
+
+        _, dollar_volume, _, _ = compute_universe_stats(df, asset_class="crypto")
+
+        assert dollar_volume == pytest.approx(20_000_000_000.0)
+
+    def test_equity_still_uses_close_times_volume(self):
+        """Non-crypto (including the default asset_class=None) must keep the
+        close*volume behavior -- confirmed correct for equity via AAPL's real
+        ~$8B/day median matching close*share-volume."""
+        dates = pd.date_range("2024-01-01", periods=5, freq="1D")
+        close = np.full(5, 200.0)
+        volume = np.full(5, 40_000_000.0)  # share count
+        df = pd.DataFrame({
+            "close": close, "high": close + 1, "low": close - 1, "open": close,
+            "volume": volume,
+        }, index=dates)
+
+        _, dollar_volume_equity, _, _ = compute_universe_stats(df, asset_class="equity")
+        _, dollar_volume_default, _, _ = compute_universe_stats(df)
+
+        assert dollar_volume_equity == pytest.approx(200.0 * 40_000_000.0)
+        assert dollar_volume_default == pytest.approx(200.0 * 40_000_000.0)
