@@ -1809,7 +1809,7 @@ def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
             _notify(
                 f"〰️ backtesting finetuned model: assets={assets_list} interval={interval} "
                 f"backtest_period={backtest_period}",
-                enabled=True
+                enabled=notify
             )
 
             ft_run_id = run_stage_model(
