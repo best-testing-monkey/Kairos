@@ -53,6 +53,65 @@ best not-yet-finetuned profile, trains and backtests a group-specific
 checkpoint, and accepts/rejects it against the existing base result - see
 "Stage: `finetune_next`" below).
 
+### The candidate universe: current scope and how to expand it
+
+`CANDIDATE_UNIVERSE` (`strategy/kairos_pipeline.py`) is a **hand-typed
+Python dict** of 153 tickers total as of 2026-08-21 (crypto 62, equity 57,
+fx_commodity 34) — it is not derived from any exchange, index, or broker
+listing. It grew once before by manual edit (commit `cfd3c68`, "Expand
+candidate universe to 144 tickers") and has been edited by hand ever since.
+There is currently no code anywhere in this repo that pulls a ticker list
+from an external source.
+
+**Why it's small on purpose, not a bug**: real-world instrument counts run
+into the hundreds of thousands (stocks, ETFs, futures, indices, mutual
+funds, FX pairs combined), but most of that is not appropriate input here
+regardless of universe size:
+- **Indices aren't directly tradeable** — you trade an instrument that
+  *tracks* one (an ETF, a future), not the index number itself.
+- **Mutual funds price once/day at NAV** — there's no intraday quote at
+  all, so this system's 1h/intraday backtesting is meaningless for them.
+- Every survivor of the `universe` screening stage goes on to real Kronos
+  model inference in `oracle`/`base`/`finetuned` — that's GPU-expensive per
+  instrument (see "Storage" below for scale), so the practical ceiling on
+  *how many candidates are worth screening* is set by GPU budget, not by
+  how many tickers exist in the world.
+
+**The `universe` stage itself is cheap, though** — it's just a price-history
+fetch plus dollar-volume/ATR computation, no model inference (see
+"Screening criteria" above for the exact liquidity/volatility bar every
+candidate must clear). That means the tractable way to widen coverage is to
+feed a **much larger candidate list into `CANDIDATE_UNIVERSE`** and let the
+existing liquidity/ATR/bar-count filters do the narrowing before anything
+GPU-expensive runs — not to try to screen "everything" through the full
+pipeline.
+
+**To change the list**: edit the `CANDIDATE_UNIVERSE` dict directly in
+`strategy/kairos_pipeline.py` — it's a plain `{"crypto": [...], "equity":
+[...], "fx_commodity": [...]}` literal, one ticker string per entry, in
+whatever `price_cache`/yfinance calling convention the rest of the codebase
+already uses for that asset class (e.g. `"-USD"` suffix for crypto, `"=X"`
+for FX, `"=F"` for futures/commodities, plain ticker for equities/ETFs —
+see `FX_SUFFIX`, `is_fx()`, and `kairos_strategies.is_24_7_crypto_symbol()`/
+`is_limited_hours_equity_symbol()` for how these suffixes are matched
+elsewhere in the pipeline). There is no dedicated `--asset_class`-specific
+file or config to edit instead — it's this one dict.
+
+**Sourcing a broader list from Interactive Brokers (IBKR)**: as of
+2026-08-21 there is no IBKR API integration in this repo at all — no
+`ib_insync`/`ibapi` dependency, no TWS/Gateway connection code. The only
+existing IBKR-related artifacts are `config/margin_ibkr.yaml` (margin *rate*
+modeling for `kairos_mtm.py`, unrelated to instrument discovery) and a
+vendored `phantom/profiles/ibkr.json` broker profile. Getting an
+IBKR-tradeable ticker list means either (a) standing up a live TWS/Gateway
+connection with real account credentials and querying IBKR's contract
+search API, or (b) using IBKR's own published, downloadable per-exchange
+product listings (no account needed for those). Neither is wired up yet —
+whoever picks this up next should start by deciding which of those two
+paths fits, then filter the result down to the security types this system
+actually models (stocks/ETFs, futures, FX pairs — not options, bonds, or
+mutual funds) before merging it into `CANDIDATE_UNIVERSE`.
+
 ## 2. Storage
 
 ### SQLite: `data/pipeline_results.db`
