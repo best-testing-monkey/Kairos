@@ -27,6 +27,7 @@ Usage:
 """
 import sys
 import os
+import shutil
 
 # strategy/ has no __init__.py - it is not a package. Scripts and tests add it
 # to sys.path explicitly (see tests/conftest.py and kairos_strategies.py).
@@ -1830,15 +1831,26 @@ def _run_finetune_next_body(conn, candidate, manual, interval, backtest_period,
             base_mean_sharpe=comparison["base_mean"], ft_mean_sharpe=comparison["ft_mean"],
         )
 
+        metadata_model_path = best_model_path
+        if not comparison["accepted"]:
+            # A rejected checkpoint is never used again -- select_finetune_candidate
+            # permanently excludes rejected/failed profiles from auto-select, and a
+            # manual re-queue trains a fresh checkpoint from scratch rather than
+            # reusing this one. Reclaim the disk space (~780MB/checkpoint observed)
+            # rather than leaving it to accumulate forever; keep model_dir itself
+            # plus metadata.json + the REJECTED marker for post-mortem.
+            for subdir in ("best_model", "final_model"):
+                shutil.rmtree(os.path.join(model_dir, subdir), ignore_errors=True)
+            update_finetune_registry_row(conn, row_id, model_path=None)
+            metadata_model_path = None
+            open(os.path.join(model_dir, "REJECTED"), "w").close()
+
         _write_metadata({
-            "status": status, "model_path": best_model_path,
+            "status": status, "model_path": metadata_model_path,
             "base_run_id": comparison["base_run_id"], "finetuned_run_id": ft_run_id,
             "base_viable_count": comparison["base_count"], "ft_viable_count": comparison["ft_count"],
             "base_mean_sharpe": comparison["base_mean"], "ft_mean_sharpe": comparison["ft_mean"],
         })
-
-        if not comparison["accepted"]:
-            open(os.path.join(model_dir, "REJECTED"), "w").close()
 
         print(f"\n[finetune_next] VERDICT: {status.upper()}")
         print(f"  assets={assets_raw} interval={interval} backtest_period={backtest_period}")

@@ -2986,6 +2986,58 @@ class TestRunStageFinetuneNextOrchestrator:
             meta = json.load(f)
         assert meta["status"] == "rejected"
 
+    def test_rejected_flow_deletes_checkpoint_weights(self, temp_db, tmp_path, monkeypatch):
+        """A rejected checkpoint is never reused (auto-select permanently excludes
+        rejected/failed profiles, and manual re-queue trains fresh from scratch) --
+        deleting the ~hundreds-of-MB best_model/final_model weight directories on
+        rejection reclaims real disk space (confirmed live 2026-08-21: 23
+        accumulated rejected checkpoints, ~780MB each, ~18GB total, previously never
+        cleaned up). model_dir itself, metadata.json, and the REJECTED marker must
+        survive for post-mortem; only the weight subdirectories are removed."""
+        import kairos_pipeline
+        monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
+        self._seed_candidate_profile(temp_db)
+
+        model_dir = finetune_model_dir("1d", "BTC-USD,ETH-USD")
+        os.makedirs(os.path.join(model_dir, "best_model"), exist_ok=True)
+        os.makedirs(os.path.join(model_dir, "final_model"), exist_ok=True)
+        with open(os.path.join(model_dir, "best_model", "weights.bin"), "w") as f:
+            f.write("fake checkpoint weights")
+        with open(os.path.join(model_dir, "final_model", "weights.bin"), "w") as f:
+            f.write("fake checkpoint weights")
+
+        def fake_run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
+                                  pred_samples=100, model_path=None, **kwargs):
+            run_id = start_run(conn, stage, interval, {})
+            # 0 viable strategies -> fewer than base's 1 -> rejected.
+            _insert_base_strategy(conn, ",".join(assets), interval, backtest_period, "s1",
+                                   -1.0, 10, run_id=run_id, stage=stage, model_path=model_path)
+            return run_id
+
+        with patch("kairos_pipeline.subprocess.run",
+                   return_value=self._mock_subprocess(returncode=0)), \
+             patch("kairos_pipeline.run_stage_model", side_effect=fake_run_stage_model):
+            row_id = run_stage_finetune_next(
+                temp_db, ft_epochs=1, ft_batch_size=4,
+                lock_path=str(tmp_path / "finetune_next.lock"),
+            )
+
+        # Weight directories are gone.
+        assert not os.path.exists(os.path.join(model_dir, "best_model"))
+        assert not os.path.exists(os.path.join(model_dir, "final_model"))
+        # But model_dir, the marker, and metadata survive.
+        assert os.path.exists(model_dir)
+        assert os.path.exists(os.path.join(model_dir, "REJECTED"))
+        with open(os.path.join(model_dir, "metadata.json")) as f:
+            meta = json.load(f)
+        assert meta["status"] == "rejected"
+        assert meta["model_path"] is None
+
+        db_model_path = temp_db.execute(
+            "SELECT model_path FROM finetuned_models WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert db_model_path is None
+
     def test_manual_requeue_deletes_existing_row_and_reruns(self, temp_db, tmp_path, monkeypatch):
         import kairos_pipeline
         monkeypatch.setattr(kairos_pipeline, "MODELS_DIR", str(tmp_path))
