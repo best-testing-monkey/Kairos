@@ -150,6 +150,21 @@ def is_24_7_crypto_symbol(symbol: str) -> bool:
     return symbol.endswith("-USD")
 
 
+EQUITY_TRADING_HOURS_PER_DAY = 6.5  # NYSE regular session, 9:30am-4:00pm ET
+
+
+def is_limited_hours_equity_symbol(symbol: str) -> bool:
+    """True for plain-ticker equities/ETFs (no -USD/=X/=F suffix).
+
+    These trade only within a limited daily session (NYSE: 9:30am-4:00pm ET,
+    6.5 hours) -- unlike FX/futures ("=X"/"=F" suffix), which trade nearly
+    continuously through the weekday session, close enough to 24h/day that
+    calendar_days_for_bars's weekend-only correction is accurate for them
+    without a separate hours-per-day adjustment.
+    """
+    return not (symbol.endswith("-USD") or symbol.endswith(("=X", "=F")))
+
+
 def calendar_days_for_bars(bars_needed: float, bars_per_day: float, symbol: str, buffer_days: int = 30) -> int:
     """Convert a bar count into a calendar-day window, padding for non-24/7 markets.
 
@@ -158,7 +173,23 @@ def calendar_days_for_bars(bars_needed: float, bars_per_day: float, symbol: str,
     We multiply by 7/5 for those symbols (plus a small flat cushion) before adding
     the existing flat buffer_days, so the window still contains enough trading days.
     Crypto symbols (24/7) are left unpadded to preserve existing behavior.
+
+    For limited-hours equities/ETFs specifically, the weekday-only correction
+    alone is NOT enough at intraday granularity (bars_per_day > 1): `bars_per_day`
+    is computed from BARS_PER_DAY, which assumes 24 hours of trading per day
+    (correct for crypto, a reasonable approximation for near-continuous
+    FX/futures) -- but an equity trading day is only ~6.5 hours (NYSE), not 24.
+    Confirmed live (2026-08-21): fetch_data_raw raised "Not enough data for
+    CB: need 300 bars, got 252" under the weekday-only correction alone (52
+    calendar days requested, ~37 trading days x ~7 bars/day =~ 259, undershooting
+    300) -- every 1h equity signal in a live kairos_signals.run() sweep silently
+    failed and got swallowed by run()'s per-group exception handling, so this
+    went unnoticed until traced through a report file's Failures section.
+    Rescale bars_per_day itself to the real ~6.5 bars/day for these symbols
+    before applying the weekend padding.
     """
+    if bars_per_day > 1 and is_limited_hours_equity_symbol(symbol):
+        bars_per_day = bars_per_day * (EQUITY_TRADING_HOURS_PER_DAY / 24.0)
     raw_days = bars_needed / bars_per_day
     if not is_24_7_crypto_symbol(symbol):
         raw_days = raw_days * (7 / 5) + 5

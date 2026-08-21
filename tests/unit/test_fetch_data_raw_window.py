@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy
 import pandas as pd
 
 from kairos_strategies import (
-    is_24_7_crypto_symbol, calendar_days_for_bars, fetch_data_raw, KairosSettings,
+    is_24_7_crypto_symbol, is_limited_hours_equity_symbol, calendar_days_for_bars,
+    fetch_data_raw, KairosSettings, EQUITY_TRADING_HOURS_PER_DAY,
 )
 
 
@@ -73,6 +74,63 @@ def test_padding_covers_previously_failing_case():
     days_equity = calendar_days_for_bars(bars_needed=300, bars_per_day=1, symbol="SPY", buffer_days=30)
     approx_trading_days = days_equity * (5 / 7)
     assert approx_trading_days >= 300
+
+
+def test_limited_hours_equity_symbol_classification():
+    assert is_limited_hours_equity_symbol("SPY")
+    assert is_limited_hours_equity_symbol("AAPL")
+    assert not is_limited_hours_equity_symbol("BTC-USD")
+    assert not is_limited_hours_equity_symbol("EURUSD=X")
+    assert not is_limited_hours_equity_symbol("ES=F")
+
+
+def test_equity_intraday_gets_hours_per_day_correction():
+    """Residual bug found 2026-08-21, live: the 7/5 weekend-only correction
+    (from the earlier "need 300 bars, got 287" fix) is not enough at intraday
+    granularity for equities specifically -- bars_per_day=24 (from
+    BARS_PER_DAY["1h"]) assumes 24 HOURS of trading per day, which is only
+    true for crypto (and a fair approximation for near-continuous FX/futures).
+    An NYSE equity day only covers ~6.5 hours, not 24. Confirmed live:
+    fetch_data_raw raised "Not enough data for CB: need 300 bars, got 252"
+    under the weekend-only correction alone. Equity's requested calendar-day
+    window must now be meaningfully larger than the naive (pre-fix) window at
+    bars_per_day=24, to actually cover 300 real bars once trading-hours
+    sparsity is accounted for."""
+    naive_days = int(300 / 24 * (7 / 5) + 5) + 30  # the old (incomplete) formula
+    fixed_days = calendar_days_for_bars(bars_needed=300, bars_per_day=24, symbol="CB", buffer_days=30)
+    assert fixed_days > naive_days
+
+    # Real bars covered by the fixed window: ~5/7 trading days/week x
+    # ~6.5 bars/day (not 24) must clear the 300 bars requested.
+    approx_trading_days = (fixed_days - 30) * (5 / 7)
+    approx_real_bars = approx_trading_days * EQUITY_TRADING_HOURS_PER_DAY
+    assert approx_real_bars >= 300
+
+
+def test_fx_futures_intraday_unaffected_by_equity_hours_correction():
+    """FX/futures trade near-continuously through the weekday session, so they
+    should NOT get the equity-specific hours-per-day rescaling -- only the
+    existing weekend-only correction, same as before this fix."""
+    days_fx = calendar_days_for_bars(bars_needed=300, bars_per_day=24, symbol="EURUSD=X", buffer_days=30)
+    days_futures = calendar_days_for_bars(bars_needed=300, bars_per_day=24, symbol="ES=F", buffer_days=30)
+    expected = int(300 / 24 * (7 / 5) + 5) + 30
+    assert days_fx == expected
+    assert days_futures == expected
+
+
+def test_crypto_intraday_unaffected_by_equity_hours_correction():
+    """Crypto is 24/7 -- must stay completely unpadded, exactly as before."""
+    days = calendar_days_for_bars(bars_needed=300, bars_per_day=24, symbol="BTC-USD", buffer_days=30)
+    assert days == int(300 / 24) + 30
+
+
+def test_equity_daily_interval_unaffected_by_hours_correction():
+    """At bars_per_day=1 (daily interval), the hours-per-day correction must
+    not kick in -- 1 bar/trading-day is already correct for equities at daily
+    granularity, matching all the bars_per_day=1 tests above (unchanged)."""
+    days_before_this_fix = int(300 * (7 / 5) + 5) + 30
+    days_now = calendar_days_for_bars(bars_needed=300, bars_per_day=1, symbol="SPY", buffer_days=30)
+    assert days_now == days_before_this_fix
 
 
 def test_as_of_caps_fetch_window_end_date(monkeypatch):
