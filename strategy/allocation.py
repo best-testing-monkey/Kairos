@@ -14,7 +14,7 @@ from typing import Optional
 from openpyxl.styles import Protection
 
 from kairos_signals import _ev_pct_value, format_table
-from signal_selection import SignalSelectionRule, evaluate_condition, resolve_column
+from signal_selection import SignalSelectionRule, evaluate_condition, resolve_column, rule_matches
 
 
 @dataclass
@@ -390,18 +390,18 @@ def select_candidates(candidates: list[Candidate], config: AllocationConfig, ena
 
         if config.selection_rule is not None:
             # A --signal-selection rule fully REPLACES the LOW_N/NEG_EV_NET
-            # gate below (not additive) — evaluate the rule's conditions in
-            # order, rejecting on the first one that fails.
-            rejected = False
-            for cond in config.selection_rule.conditions:
-                if not evaluate_condition(cond, c, derived, config.cluster_map):
-                    row["status"] = "RULE_FILTERED"
+            # gate below (not additive). rule_matches() handles both a plain
+            # AND-only rule and an OR-of-AND-groups rule (semicolon-separated
+            # groups, added 2026-08-22 for exact-whitelist filtering, e.g.
+            # matching one of N explicit (Strategy, Ticker, Model) triples)
+            # uniformly.
+            matched, failing_cond = rule_matches(config.selection_rule, c, derived, config.cluster_map)
+            if not matched:
+                row["status"] = "RULE_FILTERED"
+                if failing_cond is not None:
                     row["flags"].append(
-                        f"failed: '{cond.column}' {cond.op} {cond.value}"
+                        f"failed: '{failing_cond.column}' {failing_cond.op} {failing_cond.value}"
                     )
-                    rejected = True
-                    break
-            if rejected:
                 continue
             # Survived gating
             row["status"] = None
