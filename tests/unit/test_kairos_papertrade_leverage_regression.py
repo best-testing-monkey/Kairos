@@ -703,6 +703,131 @@ def test_same_day_round_trip_mixed_with_multiday_position(monkeypatch, tmp_path)
 
 
 # =============================================================================
+# Test 4b: BUG-11 -- same-day round trip must not be re-counted across the
+# multiple hourly day-loop iterations --interval 1h shares per calendar day
+# =============================================================================
+
+CAPITAL_6 = 10000.0
+
+
+def test_same_day_round_trip_not_recounted_across_hourly_iterations(monkeypatch, tmp_path):
+    """BUG-11 regression: the same-day-round-trip scan (see
+    `_fill_cash_delta`/`_close_cash_delta` callers in kairos_papertrade.py's
+    main() day loop) re-lists EVERY closed position each iteration and keeps
+    any that closed "today" -- with `--interval 1d` there is only ever one
+    iteration per calendar day, so this is harmless. With `--interval 1h`
+    (or, as reproduced here, several dated_rows sharing one calendar date),
+    the SAME round-trip position matches this "closed today" filter again on
+    every later iteration of that same day, re-applying its fill+close cash
+    delta each time -- silently multiplying its P&L's contribution to
+    `corrected_cash` by however many same-day iterations follow.
+
+    Identical scenario to test_same_day_round_trip_mixed_with_multiday_position
+    (TICKA same-day round trip + TICKB ordinary multi-day hold, same bars,
+    same capital) EXCEPT day1 is split into four hourly iterations
+    (day1_h0..h3) instead of one daily iteration. TICKB stays open through
+    all four, so `tickers` is non-empty on h1/h2/h3 too (see kairos_papertrade
+    .py's `if tickers:` gate) -- meaning the buggy scan actually runs on
+    those extra iterations, unlike a naive same-ticker-only reproduction
+    where an empty `tickers` set would skip the block entirely and hide the
+    bug. Pre-fix, h1/h2/h3 each re-add TICKA's already-counted 594.70 fill+
+    close delta to `corrected_cash`; post-fix (and in the sibling daily-
+    interval test), every downstream number must be IDENTICAL to that
+    sibling test's pinned values, since de-duping same-day round trips must
+    not depend on how many hourly iterations happen to share a calendar day.
+    """
+    day0 = datetime(2024, 1, 1)
+    day1_h0 = datetime(2024, 1, 2, 0)
+    day1_h1 = datetime(2024, 1, 2, 1)
+    day1_h2 = datetime(2024, 1, 2, 2)
+    day1_h3 = datetime(2024, 1, 2, 3)
+    day2 = datetime(2024, 1, 3)
+    day3 = datetime(2024, 1, 4)
+
+    dated_rows = _dated_rows([
+        (day0, [_candidate("TICKA", 100.0, 90.0, 140.0), _candidate("TICKB", 50.0, 45.0, 65.0)]),
+        (day1_h0, []),
+        (day1_h1, []),
+        (day1_h2, []),
+        (day1_h3, []),
+        (day2, []),
+        (day3, []),
+    ])
+
+    bars_by_ticker = {
+        "TICKA": {
+            # Open=100 fills the entry; High=145 >= target(140) triggers a
+            # take-profit close on THIS SAME bar/day. day1_h0..h3 all query
+            # this same day1 bar (day_start/day_end are derived from the
+            # calendar date alone), but TICKA is already closed after h0, so
+            # h1/h2/h3 are no-op fills/closes for phantom itself -- the bug
+            # is entirely in Kairos-side corrected_cash bookkeeping
+            # re-scanning an already-processed closed position, not in
+            # phantom's own state.
+            day1_h0.date(): (100.0, 145.0, 95.0, 130.0, 1000.0),
+        },
+        "TICKB": {
+            # Fills day1 (Open=50, no touch) and stays open through h0-h3 --
+            # this is what keeps `tickers` non-empty on h1/h2/h3 so the
+            # buggy scan actually executes on them (see docstring).
+            day1_h0.date(): (50.0, 50.5, 49.5, 50.2, 1000.0),
+            day2.date(): (50.0, 50.5, 49.5, 50.2, 1000.0),
+            day3.date(): (48.0, 49.0, 44.0, 44.5, 1000.0),  # Low<=45 -> sl @ 45 exactly
+        },
+    }
+
+    metrics, meta, client = _run_main(
+        monkeypatch, tmp_path, dated_rows, bars_by_ticker,
+        argv_extra=[
+            "--capital", str(CAPITAL_6), "--top-n", "3",
+            "--max-leverage", "1.0", "--margin-utilization", "0.8",
+        ],
+        account_name="same_day_round_trip_hourly",
+    )
+    try:
+        closed = {
+            p.ticker: p for p in client.positions.list(
+                account_name="same_day_round_trip_hourly", status="closed",
+            )
+        }
+        assert set(closed) == {"TICKA", "TICKB"}
+
+        # Identical to EXPECTED_METRICS_LEVERAGE_OFF / test 4's totals --
+        # splitting day1 into four hourly iterations must not change the
+        # real, phantom-tracked outcome at all.
+        for key, expected in EXPECTED_METRICS_LEVERAGE_OFF.items():
+            assert metrics[key] == pytest.approx(expected, rel=1e-9), key
+
+        rows = {
+            r[0]: r for r in client._conn.execute(
+                "SELECT date, cash, equity, financing_accrued_day FROM kairos_mtm_daily "
+                "WHERE account_name = ? ORDER BY date",
+                ("same_day_round_trip_hourly",),
+            ).fetchall()
+        }
+        assert set(rows) == {"2024-01-02", "2024-01-03", "2024-01-04"}
+
+        # THE bug: pre-fix, h1/h2/h3 each re-add TICKA's 594.70 round-trip
+        # delta to corrected_cash on top of day1's own (already-persisted,
+        # correct) row -- so day2's row, persisted from the carried-forward
+        # corrected_cash, would read ~9052.545 + 3*594.70 instead of exactly
+        # matching test 4's pinned day2/day3 values below.
+        assert rows["2024-01-02"][1] == pytest.approx(9071.9975, rel=1e-9)
+        assert rows["2024-01-03"][1] == pytest.approx(9052.545, rel=1e-9)
+        assert rows["2024-01-04"][1] == pytest.approx(10400.87, rel=1e-9)
+        assert rows["2024-01-04"][2] == pytest.approx(10400.87, rel=1e-9)
+        # NOTE: unlike the pure-round-trip test above, mtm_total_return_pct is
+        # NOT expected to equal pct_profit here -- TICKB's overnight financing
+        # is an intentional, orthogonal cash/equity divergence (see test
+        # test_same_day_round_trip_mixed_with_multiday_position's docstring),
+        # not something this test is checking. The three row assertions above,
+        # matching that sibling daily-interval test's pinned values exactly,
+        # are what prove hourly splitting doesn't change the outcome.
+    finally:
+        client._conn.close()
+
+
+# =============================================================================
 # Test 5: RESEARCH-01 -- stale stop/target bracket rejected before order placement
 # =============================================================================
 

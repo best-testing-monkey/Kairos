@@ -2093,6 +2093,11 @@ def main(argv=None):
         last_snapshot = None  # set at end of each iteration; consumed at admission-check time next iteration
         last_financing_date: date | None = None  # Guard MTM/financing accrual to fire at most once per calendar day
         known_open_ids = set()
+        # BUG-11: dedupe same-day round-trip cash credits (see below) across the
+        # many --interval 1h iterations that share one calendar day -- reset
+        # whenever the calendar day advances.
+        same_day_round_trip_seen_date: date | None = None
+        same_day_round_trip_seen_ids = set()
         for effective_dt, stats_rows, advice_rows in dated_rows:
             # end must be the START OF THE NEXT DAY, not the same midnight,
             # or the daily bar (timestamped ~04-05h UTC) gets filtered out
@@ -2288,12 +2293,29 @@ def main(argv=None):
                         # tomorrow's admission_check() sees) never reflects capital an
                         # account dominated by same-day round trips actually used, and
                         # the margin_utilization_cap admission gate is defeated.
+                        if same_day_round_trip_seen_date != day_start.date():
+                            same_day_round_trip_seen_date = day_start.date()
+                            same_day_round_trip_seen_ids = set()
                         same_day_round_trip_positions = []
                         for pos in client.positions.list(account_name=account_name, status="closed"):
                             if pos.id in known_open_ids or pos.id in current_open_ids:
                                 continue  # already handled above
                             if pos.exit_datetime is None or pos.exit_datetime.date() != day_start.date():
                                 continue  # closed on a different day; not this iteration's concern
+                            if pos.id in same_day_round_trip_seen_ids:
+                                # BUG-11: this scan re-lists EVERY closed position
+                                # each hourly iteration and filters only by "closed
+                                # today" -- without this guard, a position that
+                                # closed intraday gets its fill+close cash delta
+                                # (and, further down, its margin usage) re-applied
+                                # on every remaining hourly iteration of the same
+                                # calendar day, not just once. With --interval 1h
+                                # this can double/triple/N-count realized_pnl for
+                                # every same-day round trip, silently corrupting
+                                # corrected_cash far below (or above) phantom's
+                                # actual, correctly-tracked cash.
+                                continue
+                            same_day_round_trip_seen_ids.add(pos.id)
                             include_notional = _use_full_notional(pos.ticker, margin_config, args.max_leverage)
                             corrected_cash += _fill_cash_delta(pos, include_notional=include_notional)
                             corrected_cash += _close_cash_delta(pos, include_notional=include_notional)
