@@ -37,6 +37,7 @@ sys.path.append("..")
 import argparse
 import csv
 import fcntl
+import glob
 import json
 import sqlite3
 import subprocess
@@ -49,7 +50,10 @@ import numpy as np
 import pandas as pd
 
 import price_cache
-from kairos_strategies import asset_class_for, _period_to_weeks, _parse_period, BARS_PER_DAY, bars_per_year
+from kairos_strategies import (
+    asset_class_for, _period_to_weeks, _parse_period, BARS_PER_DAY, bars_per_year,
+    KairosSettings, calendar_days_for_bars,
+)
 from kairos.ops import (
     DEFAULT_GPU_UTIL_THRESHOLD, GpuLock, OpsError, is_gpu_idle, require_gpu, send_telegram,
 )
@@ -99,6 +103,30 @@ CANDIDATE_UNIVERSE = {
         "PDBC", "CPER", "COPX", "REMX",
     ],
 }
+
+
+def _load_scraped_ibkr_equity_symbols() -> list[str]:
+    """yf_symbol column from data/ibkr_shortable/ibkr_*.csv (see docs/handoff for provenance).
+
+    Those CSVs are gitignored (data/) and scraped separately -- absent on a
+    fresh checkout, in which case this just contributes nothing and
+    CANDIDATE_UNIVERSE falls back to the hand-curated list alone.
+    """
+    pattern = os.path.join(REPO_ROOT, "data", "ibkr_shortable", "ibkr_*.csv")
+    symbols: list[str] = []
+    for path in sorted(glob.glob(pattern)):
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                sym = row.get("yf_symbol", "").strip()
+                if sym:
+                    symbols.append(sym)
+    return symbols
+
+
+# Merge scraped international-equity symbols into the hand-curated list. Kept
+# as a runtime merge (not pasted in as a literal) -- ~39k scraped tickers as
+# inline source would dwarf and bury the hand-curated list.
+CANDIDATE_UNIVERSE["equity"] = sorted(set(CANDIDATE_UNIVERSE["equity"]) | set(_load_scraped_ibkr_equity_symbols()))
 
 FX_SUFFIX = "=X"
 
@@ -446,6 +474,83 @@ def liquidity_threshold(asset_class: str) -> float:
     return 0.0  # fx / commodities handled separately (ETFs like GLD still use equity-style vol)
 
 
+# ── Non-USD equity currency handling ─────────────────────────────────────────
+# The scraped IBKR international-equity symbols (see docs/handoff for how they
+# were sourced) use yfinance's country-suffix convention. liquidity_threshold()
+# is a flat USD figure, so a non-USD symbol's dollar_volume must be converted
+# to USD before comparison -- otherwise a JPY-denominated stock's volume reads
+# ~150x too large (JPY notional >> USD) and a GBP-denominated LSE stock reads
+# ~100x too small, because yfinance quotes LSE stocks in pence (GBp), not
+# pounds. Both are confirmed empirically (2026-08-25): SHEL.L close=3380.0 is
+# pence (real price ~33.80 GBP); fast_info['currency'] for LSE tickers reports
+# "GBp" specifically, not "GBP".
+_SUFFIX_CURRENCY: dict[str, tuple[str, bool]] = {
+    # suffix -> (currency, is_pence_quoted)
+    ".TO": ("CAD", False),
+    ".MX": ("MXN", False),
+    ".DE": ("EUR", False),
+    ".L": ("GBP", True),
+    ".AS": ("EUR", False),
+    ".SW": ("CHF", False),
+    ".BR": ("EUR", False),
+    ".ST": ("SEK", False),
+    ".MC": ("EUR", False),
+    ".VI": ("EUR", False),
+    ".MI": ("EUR", False),
+    ".AX": ("AUD", False),
+    ".T": ("JPY", False),
+    ".HK": ("HKD", False),
+}
+
+_FX_PAIR_TO_USD = {
+    "EUR": "EURUSD=X", "GBP": "GBPUSD=X", "CAD": "CADUSD=X",
+    "CHF": "CHFUSD=X", "JPY": "JPYUSD=X", "SEK": "SEKUSD=X",
+    "MXN": "MXNUSD=X", "HKD": "HKDUSD=X", "AUD": "AUDUSD=X",
+}
+
+_fx_rate_cache: dict[str, float | None] = {}
+
+
+def symbol_currency_info(symbol: str) -> tuple[str, bool]:
+    """(currency, is_pence_quoted) inferred from the yfinance ticker suffix. USD/no suffix -> ("USD", False)."""
+    for suffix, info in _SUFFIX_CURRENCY.items():
+        if symbol.endswith(suffix):
+            return info
+    return "USD", False
+
+
+def fx_rate_to_usd(currency: str, as_of: date) -> float | None:
+    """Multiply-by-this-to-get-USD rate for `currency`, cached per process. None if unavailable."""
+    if currency == "USD":
+        return 1.0
+    if currency in _fx_rate_cache:
+        return _fx_rate_cache[currency]
+    pair = _FX_PAIR_TO_USD.get(currency)
+    rate = None
+    if pair:
+        try:
+            df = price_cache.get_price_data(
+                pair, start_date=(as_of - timedelta(days=10)).isoformat(),
+                end_date=as_of.isoformat(), interval="1d",
+            )
+            if df is not None and not df.empty:
+                close_col = "Close" if "Close" in df.columns else "close"
+                rate = float(df.sort_index()[close_col].iloc[-1])
+        except Exception:
+            rate = None
+    _fx_rate_cache[currency] = rate
+    return rate
+
+
+def usd_conversion_factor(symbol: str, as_of: date) -> float | None:
+    """Combined pence + FX correction to turn this symbol's local dollar_volume into USD. None if FX rate unavailable."""
+    currency, is_pence = symbol_currency_info(symbol)
+    rate = fx_rate_to_usd(currency, as_of)
+    if rate is None:
+        return None
+    return rate * (0.01 if is_pence else 1.0)
+
+
 def evaluate_liquidity(
     symbol: str,
     asset_class: str,
@@ -487,7 +592,10 @@ def evaluate_liquidity(
     return True, None, liquidity_note
 
 
-def compute_universe_stats(df: pd.DataFrame, interval: str = "1d", asset_class: str | None = None):
+def compute_universe_stats(
+    df: pd.DataFrame, interval: str = "1d", asset_class: str | None = None,
+    usd_factor: float = 1.0,
+):
     """Compute bars, dollar_volume, ann_vol, atr_pct from a raw OHLCV frame.
 
     dollar_volume is always a daily-equivalent figure: the per-bar dollar
@@ -521,6 +629,13 @@ def compute_universe_stats(df: pd.DataFrame, interval: str = "1d", asset_class: 
     regardless of correctness, and was separately masked at 1h by the
     zero-bar collapse above, so this went unnoticed until both were fixed
     in the same pass.
+
+    `usd_factor` converts the local-currency dollar_volume figure to USD
+    before it's returned (multiply-to-USD FX rate, times 0.01 for pence-quoted
+    LSE symbols) -- see usd_conversion_factor() / symbol_currency_info().
+    Defaults to 1.0 (USD, no-op) for backward compatibility. Only applied to
+    dollar_volume: ann_vol and atr_pct are dimensionless ratios of same-currency
+    figures, so currency cancels out and they need no conversion.
     """
     bars = len(df)
     close = df["close"].astype(float)
@@ -529,7 +644,10 @@ def compute_universe_stats(df: pd.DataFrame, interval: str = "1d", asset_class: 
         per_bar_dollar = volume if asset_class == "crypto" else close * volume
         daily_dollar_volume = per_bar_dollar.resample("1D").sum()
         daily_dollar_volume = daily_dollar_volume[daily_dollar_volume > 0]
-        dollar_volume = float(daily_dollar_volume.median()) if not daily_dollar_volume.empty else None
+        dollar_volume = (
+            float(daily_dollar_volume.median()) * usd_factor
+            if not daily_dollar_volume.empty else None
+        )
     else:
         dollar_volume = None
 
@@ -551,18 +669,51 @@ def compute_universe_stats(df: pd.DataFrame, interval: str = "1d", asset_class: 
     return bars, dollar_volume, ann_vol, atr_pct
 
 
+_UNIVERSE_COMMIT_EVERY = 200
+
+
 def run_stage_universe(conn, interval="1d"):
     price_cache.configure(remote=False)
-    run_id = start_run(conn, "universe", interval, {"interval": interval})
     end_dt = date.today()
-    max_days = _YF_MAX_DAYS.get(interval, 400)
-    start_dt = end_dt - timedelta(days=min(400, max_days))
+    max_days = _YF_MAX_DAYS.get(interval, _YF_MAX_DAYS_DEFAULT)
+    min_bars = KairosSettings.lookback
 
-    inserted_rows = []
+    all_pairs = [(ac, s) for ac, syms in CANDIDATE_UNIVERSE.items() for s in syms]
+
+    # Resume the latest incomplete run for this interval (crash/kill recovery) rather
+    # than re-screening symbols already committed to universe_screen -- a full run over
+    # ~38k scraped symbols takes hours, so losing all progress on a crash is expensive.
+    prior = conn.execute(
+        "SELECT run_id FROM runs WHERE stage='universe' AND interval=? ORDER BY run_id DESC LIMIT 1",
+        (interval,),
+    ).fetchone()
+    already_done: set[tuple[str, str]] = set()
+    if prior is not None:
+        done_rows = conn.execute(
+            "SELECT asset_class, symbol FROM universe_screen WHERE run_id=?", (prior[0],)
+        ).fetchall()
+        if 0 < len(done_rows) < len(all_pairs):
+            run_id = prior[0]
+            already_done = {(ac, s) for ac, s in done_rows}
+            print(f"Resuming universe run_id={run_id}: {len(already_done)}/{len(all_pairs)} already screened.")
+    if not already_done:
+        run_id = start_run(conn, "universe", interval, {"interval": interval})
+
+    since_commit = 0
     for asset_class, symbols in CANDIDATE_UNIVERSE.items():
         for symbol in symbols:
+            if (asset_class, symbol) in already_done:
+                continue
             row = {"symbol": symbol, "asset_class": asset_class, "passed": False}
             try:
+                # Bar-count -> calendar-day window, padded for weekends/limited trading
+                # hours per symbol (see calendar_days_for_bars's BUG-10 history) --
+                # a flat day count undershoots real bar count for non-24/7 markets.
+                days_needed = min(
+                    calendar_days_for_bars(min_bars, BARS_PER_DAY.get(interval, 1), symbol),
+                    max_days,
+                )
+                start_dt = end_dt - timedelta(days=days_needed)
                 df = price_cache.get_price_data(
                     symbol, start_date=start_dt.isoformat(), end_date=end_dt.isoformat(),
                     interval=interval,
@@ -571,13 +722,25 @@ def run_stage_universe(conn, interval="1d"):
                     row["fail_reason"] = "no_data_returned"
                     row["interval_probe_ok"] = False
                 else:
+                    factor = usd_conversion_factor(symbol, end_dt)
+                    if factor is None:
+                        row["fail_reason"] = "fx_rate_unavailable"
+                        row["interval_probe_ok"] = False
+                        insert_universe_row(conn, run_id, row)
+                        since_commit += 1
+                        if since_commit >= _UNIVERSE_COMMIT_EVERY:
+                            conn.commit()
+                            since_commit = 0
+                        print(f"  [{asset_class:>13}] {symbol:<10} fail  reason=fx_rate_unavailable")
+                        continue
+
                     df = df.sort_index().copy()
                     df.columns = [c.lower() for c in df.columns]
                     idx = pd.to_datetime(df.index)
                     df.index = idx.tz_convert(None) if idx.tz is not None else idx
 
                     bars, dollar_volume, ann_vol, atr_pct = compute_universe_stats(
-                        df, interval=interval, asset_class=asset_class,
+                        df, interval=interval, asset_class=asset_class, usd_factor=factor,
                     )
                     row.update(bars=bars, dollar_volume=dollar_volume, ann_vol=ann_vol, atr_pct=atr_pct)
 
@@ -597,7 +760,7 @@ def run_stage_universe(conn, interval="1d"):
 
                     passed, fail_reason, liquidity_note = evaluate_liquidity(
                         symbol, asset_class, bars, dollar_volume, ann_vol, atr_pct,
-                        min_bars=int(200 * BARS_PER_DAY.get(interval, 1))
+                        min_bars=min_bars
                     )
                     row["passed"] = passed
                     row["fail_reason"] = fail_reason
@@ -612,16 +775,27 @@ def run_stage_universe(conn, interval="1d"):
                 row["interval_probe_ok"] = False
 
             insert_universe_row(conn, run_id, row)
-            inserted_rows.append({"run_id": run_id, **row})
+            since_commit += 1
+            if since_commit >= _UNIVERSE_COMMIT_EVERY:
+                conn.commit()
+                since_commit = 0
             status = "PASS" if row.get("passed") else "fail"
             print(f"  [{asset_class:>13}] {symbol:<10} {status:5} "
                   f"bars={row.get('bars')} $vol={row.get('dollar_volume')} "
                   f"atr%={row.get('atr_pct')} reason={row.get('fail_reason')}")
 
     conn.commit()
-    csv_path = dump_csv("universe_screen", inserted_rows, "universe")
-    n_pass = sum(1 for r in inserted_rows if r.get("passed"))
-    print(f"\nStage 1 (universe) done: {n_pass}/{len(inserted_rows)} passed. "
+    # Re-read the full run from DB (not just this invocation's rows) so a resumed
+    # run's CSV/summary covers symbols committed before an earlier crash too.
+    cols = ["symbol", "asset_class", "bars", "dollar_volume", "ann_vol", "atr_pct",
+            "interval_probe_ok", "liquidity_note", "passed", "fail_reason"]
+    all_rows = [
+        {"run_id": run_id, **dict(zip(cols, r))}
+        for r in conn.execute(f"SELECT {','.join(cols)} FROM universe_screen WHERE run_id=?", (run_id,))
+    ]
+    csv_path = dump_csv("universe_screen", all_rows, "universe")
+    n_pass = sum(1 for r in all_rows if r.get("passed"))
+    print(f"\nStage 1 (universe) done: {n_pass}/{len(all_rows)} passed. "
           f"run_id={run_id}. CSV: {csv_path}")
     return run_id
 
@@ -774,30 +948,30 @@ def greedy_group_pairs(pairs: list, min_abs_corr=0.6, max_group_size=4):
     return result
 
 
-def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_corr=None):
-    run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
+_CORRELATION_COMMIT_EVERY = 5000
 
+
+def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_corr=None):
     # Latest passing universe survivors for this interval (most recent
     # universe run *at this interval*, not just the most recent overall --
     # a 1h universe run must not silently pick up a later 1d run's rows).
-    q = """
-        SELECT symbol, asset_class FROM universe_screen
-        WHERE passed = 1 AND run_id = (
-            SELECT MAX(run_id) FROM runs WHERE stage = 'universe' AND interval = ?
-        )
-    """
-    params = [interval]
+    universe_run_row = conn.execute(
+        "SELECT MAX(run_id) FROM runs WHERE stage = 'universe' AND interval = ?", (interval,)
+    ).fetchone()
+    universe_run_id = universe_run_row[0] if universe_run_row else None
+
+    q = "SELECT symbol, asset_class FROM universe_screen WHERE passed = 1 AND run_id = ?"
+    params = [universe_run_id]
     if asset_class_filter:
         q += " AND asset_class = ?"
         params.append(asset_class_filter)
     survivors = conn.execute(q, params).fetchall()
 
     if not survivors:
+        run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
         print("Stage 2 (correlation): no passing universe survivors found. Run --stage universe first.")
         conn.commit()
         return run_id
-
-    from kairos_strategies import calendar_days_for_bars
 
     price_cache.configure(remote=False)
 
@@ -807,15 +981,19 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
     bars_per_day = BARS_PER_DAY.get(interval, 1)
 
     bars_needed = int(400 * BARS_PER_DAY.get(interval, 1))
-    days_needed = calendar_days_for_bars(bars_needed, bars_per_day, "BTC-USD", buffer_days=0)
-
     end_dt = date.today()
-    start_dt = end_dt - timedelta(days=days_needed)
 
     closes = {}
     classes = {}
     for symbol, ac in survivors:
         try:
+            # Per-symbol window: calendar_days_for_bars pads for weekends/limited
+            # trading hours based on the actual symbol (crypto is 24/7, equities
+            # aren't) -- a single shared window from one proxy symbol undersizes
+            # every non-24/7 symbol's fetch (same class of bug as universe stage's
+            # min_bars/window mismatch, see docs/handoff for that fix).
+            days_needed = calendar_days_for_bars(bars_needed, bars_per_day, symbol, buffer_days=0)
+            start_dt = end_dt - timedelta(days=days_needed)
             df = price_cache.get_price_data(
                 symbol, start_date=start_dt.isoformat(), end_date=end_dt.isoformat(), interval=interval
             )
@@ -831,11 +1009,58 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
             print(f"  [warn] correlation fetch failed for {symbol}: {exc}")
 
     symbols = sorted(closes.keys())
+    total_pairs = len(symbols) * (len(symbols) - 1) // 2
+
+    # Resume the latest incomplete run for this interval (crash/kill recovery) --
+    # ~1.7M pairs at this scale takes the better part of an hour, so losing all
+    # progress on a crash is expensive. Already-computed pairs are skipped but
+    # still fed into pairs_for_grouping (reconstructed from the DB + the classes
+    # dict, which is always rebuilt fresh) so clustering sees the complete pair
+    # set even when resuming mid-run.
+    #
+    # Require run_id > universe_run_id: run_ids are monotonically increasing, so
+    # this guarantees the candidate correlation run was started against the SAME
+    # universe survivor set we just queried -- without it, a much older, already
+    # -complete-for-its-own-smaller-scope correlation run (e.g. from back when
+    # the universe was ~150 hand-curated symbols) can satisfy "done < total_pairs"
+    # purely because today's total_pairs is now huge, and get wrongly "resumed"
+    # against a completely different, incompatible survivor set.
+    prior = conn.execute(
+        "SELECT run_id FROM runs WHERE stage='correlation' AND interval=? AND run_id > ? "
+        "ORDER BY run_id DESC LIMIT 1",
+        (interval, universe_run_id),
+    ).fetchone()
+    already_done: dict[tuple[str, str], dict] = {}
+    if prior is not None:
+        done_rows = conn.execute(
+            "SELECT symbol_a, symbol_b, asset_class, full_corr, rolling_corr_median, overlap_bars "
+            "FROM correlation_pairs WHERE run_id=?", (prior[0],)
+        ).fetchall()
+        if 0 < len(done_rows) < total_pairs:
+            run_id = prior[0]
+            already_done = {
+                (sa, sb): {
+                    "asset_class": ac, "full_corr": fc,
+                    "rolling_corr_median": rc, "overlap_bars": ov,
+                }
+                for sa, sb, ac, fc, rc, ov in done_rows
+            }
+            print(f"Resuming correlation run_id={run_id}: {len(already_done)}/{total_pairs} pairs already computed.")
+    if not already_done:
+        run_id = start_run(conn, "correlation", interval, {"asset_class_filter": asset_class_filter})
+
     inserted_pairs = []
     pairs_for_grouping = []
+    since_commit = 0
     for i in range(len(symbols)):
         for j in range(i + 1, len(symbols)):
             a, b = symbols[i], symbols[j]
+            cached = already_done.get((a, b))
+            if cached is not None:
+                row = {"symbol_a": a, "symbol_b": b, **cached}
+                inserted_pairs.append({"run_id": run_id, **row})
+                pairs_for_grouping.append({**row, "class_a": classes[a], "class_b": classes[b]})
+                continue
             pair_class = classes[a] if classes[a] == classes[b] else "cross"
             full_corr, rolling_median, overlap = compute_pair_correlation(
                 closes[a], closes[b],
@@ -850,6 +1075,10 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
                 "overlap_bars": overlap,
             }
             insert_correlation_row(conn, run_id, row)
+            since_commit += 1
+            if since_commit >= _CORRELATION_COMMIT_EVERY:
+                conn.commit()
+                since_commit = 0
             inserted_pairs.append({"run_id": run_id, **row})
             # class_a/class_b carry the two symbols' own classes so
             # greedy_group_pairs can resolve a per-pair threshold even for
@@ -1001,6 +1230,49 @@ def _rows_from_export(payload: dict, assets, interval, backtest_period, stage: s
             "backtest_period": backtest_period,
         })
     return rows
+
+
+def select_deduped_groups(conn, correlation_run_id):
+    """Minimal group set covering every survivor symbol at least once.
+
+    greedy_group_pairs (stage 2) emits massively overlapping candidate groups at
+    scraped-universe scale -- e.g. a single popular symbol can appear in dozens of
+    near-duplicate 4-symbol combinations. Running oracle/base/finetuned once per
+    raw suggested_groups row re-tests the same symbols redundantly and multiplies
+    runtime by an order of magnitude for no extra coverage (confirmed 2026-08-26:
+    13,472 raw groups reduced to 961 via this greedy set-cover, with 0 symbols left
+    uncovered). Singletons already cover exactly one symbol each and pass through
+    unchanged; multi-symbol candidates are reduced via greedy set cover (repeatedly
+    pick the group covering the most not-yet-covered symbols).
+
+    Returns a list of (group_id, symbols_list) tuples.
+    """
+    rows = conn.execute(
+        "SELECT group_id, symbols FROM suggested_groups WHERE run_id=?", (correlation_run_id,)
+    ).fetchall()
+    singletons = [(gid, s.split(",")) for gid, s in rows if "," not in s]
+    multi = [(gid, s.split(",")) for gid, s in rows if "," in s]
+
+    uncovered = set()
+    for _, syms in multi:
+        uncovered.update(syms)
+
+    remaining = list(multi)
+    selected = []
+    while uncovered and remaining:
+        best_gid, best_syms, best_gain = None, None, -1
+        for gid, syms in remaining:
+            gain = len(uncovered.intersection(syms))
+            if gain > best_gain:
+                best_gain = gain
+                best_gid, best_syms = gid, syms
+        if best_gain <= 0:
+            break
+        selected.append((best_gid, best_syms))
+        uncovered -= set(best_syms)
+        remaining = [(gid, syms) for gid, syms in remaining if gid != best_gid]
+
+    return singletons + selected
 
 
 def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_samples=100,

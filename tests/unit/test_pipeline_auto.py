@@ -2042,7 +2042,7 @@ class TestSingleStageRegression:
 
     def test_run_stage_universe_uses_native_interval(self, temp_db):
         """run_stage_universe fetches and computes stats for native interval."""
-        from kairos_pipeline import run_stage_universe, CANDIDATE_UNIVERSE
+        from kairos_pipeline import run_stage_universe
         from kairos.data import price_cache
 
         # Create mock DataFrame to return for all price_cache calls
@@ -2059,7 +2059,8 @@ class TestSingleStageRegression:
              patch("kairos_pipeline.evaluate_liquidity") as mock_eval, \
              patch("kairos_pipeline.insert_universe_row"), \
              patch("kairos_pipeline.dump_csv"), \
-             patch("kairos_pipeline.start_run", return_value=1):
+             patch("kairos_pipeline.start_run", return_value=1), \
+             patch("kairos_pipeline.CANDIDATE_UNIVERSE", {"equity": ["AAPL", "MSFT"]}):
 
             mock_get.return_value = mock_df
             mock_stats.return_value = (3, 101500.0, 0.015, 0.02)

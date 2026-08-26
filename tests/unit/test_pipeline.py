@@ -339,6 +339,10 @@ def test_interval_probe_ok_gate_fails_on_probe_failure(tmp_path, monkeypatch):
             }, index=dates)
 
     monkeypatch.setattr("kairos_pipeline.price_cache.get_price_data", mock_get_price_data)
+    # Isolate from the real (scraped, ~38k-symbol) CANDIDATE_UNIVERSE -- iterating that
+    # for real here is both slow and drags in symbol-specific FX-lookup edge cases
+    # (non-USD suffixes) unrelated to what this test is checking.
+    monkeypatch.setattr(kp, "CANDIDATE_UNIVERSE", {"equity": ["AAPL", "MSFT"]})
 
     # Run the universe stage with 1h interval
     kp.run_stage_universe(conn, interval="1h")
