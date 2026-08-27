@@ -585,6 +585,66 @@ recreates and hits the same error). Work around it by pointing
 commands, e.g. `export UV_CACHE_DIR=/tmp/uv-cache-kairos` before
 `uv lock`/`uv sync` when bumping a git-sourced dependency.
 
+### Oracle vs. naive-baseline modes, and the parallel dedup sweep (2026-08-27)
+`kairos_strategies.py` has three prediction modes, not two:
+- **Model** (default): real Kronos forecast via `predict_fn`/`multi_predictor`.
+- **Oracle** (`--no-prediction`): replaces the model's distribution with the
+  *actual next-bar* OHLCV (`_make_realized_predictions()` in
+  `kairos_orchestrator.py`, `config.no_prediction=True`,
+  `config.use_current_bar=False`) — a perfect-foresight **ceiling**. This is
+  what the `--stage oracle` pipeline stage runs; it also drives the
+  production `disabled_strategies` gate via `refresh_disabled_strategies()`.
+- **Naive baseline** (`--naive-baseline`, implies `--no-prediction`):
+  replaces the model's distribution with the *current/last-known* bar
+  instead (`config.use_current_bar=True`) — real, already-available data,
+  no model, no future peek. A **floor**: measures how much of a strategy's
+  edge depends on prediction quality at all. Do NOT confuse this with
+  oracle — "no prediction" alone is ambiguous between the two; oracle still
+  cheats by reading the future, naive baseline does not.
+
+`run_stage_naive()` in `kairos_pipeline.py` mirrors `run_stage_oracle()` but
+writes `stage='naive'` rows to the same `oracle_results` table (it already
+has a `stage` column) and **deliberately never calls
+`refresh_disabled_strategies()`** — mixing naive-baseline Sharpe into the
+production disable gate would incorrectly disable strategies that work fine
+with real predictions but (expectedly) go quiet or lose money once
+prediction is stripped out entirely. Naive-baseline results are for
+analysis only.
+
+**The oracle dedup sweep is now a parallel process pool, not sequential.**
+`scripts/run_oracle_dedup.py` (committed; supersedes an original sequential
+scratchpad script of the same name from 2026-08-26) runs
+`select_deduped_groups()` through a `ProcessPoolExecutor` instead of one
+`subprocess.run()` at a time. Root cause of the old script's idle cores
+(observed live: one core pegged, others 5-40%, hopping across cores every
+few seconds): the per-day/per-strategy backtest loop is mostly
+single-threaded, GIL-bound Python, not BLAS matrix math — the occasional
+`ps` reading of ~4 cores' worth of cumulative CPU was brief vectorized
+bursts blended into the average, not sustained parallelism. Real
+multiprocessing (separate OS processes, separate GILs) was the fix. Each
+worker subprocess is pinned to 1 BLAS thread
+(`OMP_NUM_THREADS`/`OPENBLAS_NUM_THREADS`/`MKL_NUM_THREADS`/
+`NUMEXPR_NUM_THREADS=1`) so N workers approximate N busy cores instead of
+oversubscribing. Measured on this box (8 physical / 16 logical cores): 4
+workers gave a 3.78x speedup over sequential on matched 4-asset groups,
+close to linear — `--workers` defaults to 8 (physical core count; SMT
+doesn't reliably double GIL-bound throughput). Supports `--stage
+oracle|naive` (default `oracle`) to sweep either mode across the same
+deduped group list; same resume/skip semantics as before (checks
+`oracle_results` for an existing `(assets, interval, backtest_period,
+stage)` row before running a group).
+
+**Multi-session caution**: this box regularly runs more than one Claude
+Code session at once (see `docs/handoff-*.md` for the current cast). A
+`kairos_strategies.py` subprocess spawned by *your* test can look
+identical in `ps` to one spawned by a sibling session's live sweep — same
+command shape, same args style, no attribution. Before killing anything
+that looks like an orphan, verify it's actually yours (e.g. by asset list
+match against what you just launched, or timestamp), not just "looks like
+a leftover." A live sweep's own group was killed by mistake this way on
+2026-08-27 — the sweep's per-group error handling absorbed it as a `[FAIL]`
+and moved on, but the group still needed a manual one-off re-run to backfill.
+
 ## Test suite
 
 Tests live in `tests/unit/` and require no GPU or model download.

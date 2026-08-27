@@ -1040,6 +1040,10 @@ if __name__ == "__main__":
                         help=f"Initial capital (default {INITIAL_CAPITAL})")
     parser.add_argument("--no-prediction", dest="no_prediction", action="store_true", default=False,
                         help="Replace model predictions with actual next-bar OHLCV (oracle baseline)")
+    parser.add_argument("--naive-baseline", dest="use_current_bar", action="store_true", default=False,
+                        help="Like --no-prediction but uses the current/last-known bar instead of "
+                             "peeking at the future bar -- a real no-model floor (implies --no-prediction), "
+                             "as opposed to oracle's perfect-foresight ceiling")
     parser.add_argument("--export_json", metavar="PATH", default=None, dest="export_json",
                         help="Additionally dump summary/strategy_rankings/shadow_performance to this JSON path")
     parser.add_argument("--no_disabled_filter", dest="no_disabled_filter", action="store_true", default=False,
@@ -1047,6 +1051,8 @@ if __name__ == "__main__":
                              "(used by the oracle pipeline stage)")
 
     args = parser.parse_args()
+    if args.use_current_bar:
+        args.no_prediction = True
     KairosSettings.configure(args)
 
     assets = KairosSettings.assets or _DEFAULT_ASSETS
@@ -1069,6 +1075,7 @@ if __name__ == "__main__":
         partial_exits=True,
         max_horizon=3,
         no_prediction=KairosSettings.no_prediction,
+        use_current_bar=KairosSettings.use_current_bar,
         disabled_strategies=disabled,
     )
 

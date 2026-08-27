@@ -287,6 +287,11 @@ class OrchestratorConfig:
 
     # Baseline mode
     no_prediction: bool = False
+    # Only meaningful when no_prediction=True: use the current (already-known)
+    # bar instead of peeking at the future bar. Oracle (default) = perfect
+    # foresight ceiling; this = naive "no model, no peek" floor, still built
+    # from real observed data (not None, not synthetic noise).
+    use_current_bar: bool = False
 
     # Disabled strategies (shadow-tested and found unprofitable even with perfect predictions)
     disabled_strategies: Set[str] = field(default_factory=lambda: {
@@ -871,13 +876,22 @@ class KairosOrchestrator:
 
     def _make_realized_predictions(self, date: pd.Timestamp,
                                     histories: Dict[str, pd.DataFrame]) -> Dict:
-        """Oracle baseline: build AssetPrediction from the actual next bar."""
+        """Build AssetPrediction from real data only, no model call.
+
+        Oracle mode (default, use_current_bar=False): bar = the actual next
+        bar (future peek) -- a perfect-foresight ceiling.
+        Naive mode (use_current_bar=True): bar = the current/last-known bar
+        -- a "no model, no peek" floor built from real observed data.
+        """
         result = {}
         for symbol, history in histories.items():
-            full_df = self._data_dict.get(symbol)
-            future = full_df[full_df.index > date] if full_df is not None else pd.DataFrame()
-            bar = future.iloc[0] if not future.empty else history.iloc[-1]
             current_price = float(history.iloc[-1]["close"])
+            if self.config.use_current_bar:
+                bar = history.iloc[-1]
+            else:
+                full_df = self._data_dict.get(symbol)
+                future = full_df[full_df.index > date] if full_df is not None else pd.DataFrame()
+                bar = future.iloc[0] if not future.empty else history.iloc[-1]
             dist = KairosDistribution.from_bar(
                 bar, n_samples=KairosSettings.pred_samples, center=current_price
             )
@@ -1493,6 +1507,7 @@ class KairosOrchestrator:
             "shadow_performance": shadow_perf,
             "daily_logs": self.daily_logs,
             "no_prediction": self.config.no_prediction,
+            "use_current_bar": self.config.use_current_bar,
             "strategy_build_stats": dict(StrategyRegistry.LAST_BUILD_STATS),
             "signal_firing_count": len(shadow_ranked),
         }
@@ -1574,7 +1589,10 @@ def print_results(results: Dict, top_strategy_results: Optional[List[Dict]] = No
     print("=" * W)
     print("KAIROS BACKTEST RESULTS")
     if results.get("no_prediction"):
-        print("  Mode: NO-PREDICTION  (oracle - actual next-bar OHLCV)")
+        if results.get("use_current_bar"):
+            print("  Mode: NO-PREDICTION  (naive baseline - current/last-known bar, no model, no peek)")
+        else:
+            print("  Mode: NO-PREDICTION  (oracle - actual next-bar OHLCV)")
     print("=" * W)
     print(f"  Total Return:     {_fmt(s['total_return']*100)}%")
     print(f"  Sharpe Ratio:     {_fmt(s['sharpe'])}")

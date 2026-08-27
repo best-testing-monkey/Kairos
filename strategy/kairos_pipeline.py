@@ -1143,7 +1143,7 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
 
 def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
                              no_prediction=False, model_path=None, pred_samples=100,
-                             extra_env=None, no_disabled_filter=False):
+                             extra_env=None, no_disabled_filter=False, naive_baseline=False):
     """
     Invoke strategy/kairos_strategies.py as a subprocess and return the parsed
     JSON export (summary, strategy_rankings, shadow_performance).
@@ -1160,6 +1160,12 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
     still be evaluated by the oracle so they can be re-enabled once their
     numbers improve; base/finetuned (stages 4/5) never do, since they should
     keep skipping strategies that are already known to be disabled.
+
+    `naive_baseline=True` appends `--naive-baseline` (see run_stage_naive) --
+    real current-bar data, no model, no future peek. kairos_strategies.py
+    already forces --no-prediction internally when this is set, but we still
+    pass no_prediction=True explicitly from run_stage_naive to match how
+    run_stage_oracle documents its own mode in the cmd line.
     """
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         tmp_path = tmp.name
@@ -1174,6 +1180,8 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
     ]
     if no_prediction:
         cmd.append("--no-prediction")
+    if naive_baseline:
+        cmd.append("--naive-baseline")
     if model_path:
         cmd.extend(["--model", model_path])
     if no_disabled_filter:
@@ -1328,6 +1336,44 @@ def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_sam
         ).fetchall()
     ]
     dump_csv("disabled_strategies", current_rows, "oracle_disabled_strategies")
+    return run_id
+
+
+def run_stage_naive(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+    """Naive baseline: real current-bar data, no model, no future peek.
+
+    Deliberately does NOT call refresh_disabled_strategies, unlike
+    run_stage_oracle. The naive baseline measures how much a strategy
+    depends on prediction quality at all -- a different question than
+    oracle's perfect-foresight ceiling, which is what actually calibrates
+    the production disable gate. Feeding naive results into that gate would
+    incorrectly disable strategies that do fine with real predictions but
+    (expectedly) go quiet or lose money once prediction is stripped out.
+    """
+    run_id = start_run(conn, "naive", interval, {
+        "assets": assets, "backtest_period": backtest_period, "pred_samples": pred_samples,
+    })
+    payload = run_backtest_subprocess(
+        assets, interval=interval, backtest_period=backtest_period,
+        no_prediction=True, naive_baseline=True, model_path=None, pred_samples=pred_samples,
+        no_disabled_filter=True,
+    )
+    rows = _rows_from_export(payload, assets, interval, backtest_period, stage="naive")
+    for row in rows:
+        insert_oracle_row(conn, run_id, row)
+    conn.commit()
+
+    csv_path = dump_csv("oracle_results", [{"run_id": run_id, **r} for r in rows], "naive")
+    build_stats = payload.get("strategy_build_stats") or {}
+    if build_stats:
+        print(
+            f"\nStage naive done: built {build_stats.get('total_constructed', '?')}, "
+            f"disabled {build_stats.get('disabled_removed', '?')}, "
+            f"evaluating {build_stats.get('evaluated', '?')} strategies "
+            f"({len(rows)} fired at least one signal). run_id={run_id}. CSV: {csv_path}"
+        )
+    else:
+        print(f"\nStage naive done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
     return run_id
 
 

@@ -117,6 +117,7 @@ class KairosSettings:
     model: Optional[str] = None
     tokenizer: Optional[str] = None
     no_prediction: bool = False
+    use_current_bar: bool = False  # naive baseline: real last-known bar, not model or future peek
     interval: str = "1d"
     assets: list = None   # None → caller falls back to default asset list
     backtest_period: str = "6m"
@@ -125,7 +126,7 @@ class KairosSettings:
     def configure(cls, args) -> None:
         for attr in ("symbol", "lookback", "pred_len", "pred_samples",
                      "initial_capital", "output_dir", "model", "tokenizer",
-                     "no_prediction", "interval", "assets", "backtest_period"):
+                     "no_prediction", "use_current_bar", "interval", "assets", "backtest_period"):
             if hasattr(args, attr) and getattr(args, attr) is not None:
                 setattr(cls, attr, getattr(args, attr))
 
