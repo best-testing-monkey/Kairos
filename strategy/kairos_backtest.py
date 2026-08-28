@@ -2311,19 +2311,38 @@ class OvernightExposureFilter(Strategy):
     """
     Wrapper that returns FLAT if next-day predicted range doesn't favor the current position.
     Useful for avoiding hold-through-news trades.
+
+    Tracks its own shadow position per symbol (direction + entry price, from
+    this chain's own most recent non-FLAT signal) instead of reading the real
+    portfolio's active_positions. Even before this change, a FLAT signal from
+    this filter never actually closed a real position -- FLAT signals are
+    filtered out before reaching competitive selection/_enter_position, so
+    real positions only ever closed via stop/target/hold-expiry, independent
+    of anything this filter said. So real active_positions was tracking
+    whichever *other* strategy won real capital allocation for the symbol,
+    not this chain's own decisions -- a self-contained shadow position is
+    actually a more coherent signal for this filter's own purpose than that
+    was. ponytail: doesn't model a stop/target hit closing the shadow
+    position early (there's no real engine here to hit one against) -- it
+    only closes via this filter's own overnight check. Upgrade if that gap
+    ever matters.
     """
     name = "overnight_filter"
 
     def __init__(self, base_strategy: Strategy):
         self.base_strategy = base_strategy
+        self._shadow_position: Dict[str, Dict] = {}
 
     def generate_signal(self, dist: KairosDistribution, current_price: float,
                         history: pd.DataFrame, context: Dict, **kwargs) -> Optional[Signal]:
-        current_pos = context.get("current_position")
+        symbol = context.get("current_symbol")
+        current_pos = self._shadow_position.get(symbol)
 
         if current_pos is None:
-            # No existing position, pass through
-            return self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+            sig = self.base_strategy.generate_signal(dist, current_price, history, context, **kwargs)
+            if sig and sig.direction != Direction.FLAT:
+                self._shadow_position[symbol] = {"direction": sig.direction, "entry_price": sig.entry}
+            return sig
 
         pred_high = dist.stats.get("high", {}).get("mean", dist.stats["close"]["pct_90"])
         pred_low = dist.stats.get("low", {}).get("mean", dist.stats["close"]["pct_10"])
@@ -2332,6 +2351,7 @@ class OvernightExposureFilter(Strategy):
         pos_direction = current_pos.get("direction")
 
         if pos_direction == Direction.LONG and pred_high < entry_price:
+            self._shadow_position.pop(symbol, None)
             return Signal(
                 direction=Direction.FLAT, size=0.0, entry=current_price,
                 stop=0.0, target=0.0, strategy_name=self.name,
@@ -2339,6 +2359,7 @@ class OvernightExposureFilter(Strategy):
                 metadata={"action": "close_overnight", "reason": "range_below_entry"}
             )
         elif pos_direction == Direction.SHORT and pred_low > entry_price:
+            self._shadow_position.pop(symbol, None)
             return Signal(
                 direction=Direction.FLAT, size=0.0, entry=current_price,
                 stop=0.0, target=0.0, strategy_name=self.name,

@@ -221,44 +221,70 @@ class TestModelDecayMonitorStrategy:
 # ============================================================================
 
 class TestOvernightExposureFilter:
+    """OvernightExposureFilter now tracks its own shadow position per symbol
+    (set from the base strategy's own first non-FLAT signal) instead of
+    reading context["current_position"] from a real portfolio -- so these
+    tests drive it through two calls (entry day, then the overnight-check
+    day) rather than injecting a fake position directly into context."""
+
     def test_overnight_filter_long_range_below(self):
         """Test: returns FLAT when pred_high < entry_price for LONG position"""
-        dist = make_dist([95.0] * 50 + [96.0] * 50)  # max ~96
         stub = StubStrategy(Direction.LONG, size=0.5)
         strat = OvernightExposureFilter(stub)
-        current_pos = {"direction": Direction.LONG, "entry_price": 100.0}
-        sig = strat.generate_signal(dist, 98.0, make_history(), {"current_position": current_pos})
+        entry_dist = make_dist([100.0] * 100)
+        strat.generate_signal(entry_dist, 100.0, make_history(), {"current_symbol": "TEST"})
+
+        overnight_dist = make_dist([95.0] * 50 + [96.0] * 50)  # max ~96 < entry 100
+        sig = strat.generate_signal(overnight_dist, 98.0, make_history(), {"current_symbol": "TEST"})
         assert sig is not None
         assert sig.direction == Direction.FLAT
 
     def test_overnight_filter_short_range_above(self):
         """Test: returns FLAT when pred_low > entry_price for SHORT position"""
-        dist = make_dist([104.0] * 50 + [105.0] * 50)  # min ~104
         stub = StubStrategy(Direction.SHORT, size=0.5)
         strat = OvernightExposureFilter(stub)
-        current_pos = {"direction": Direction.SHORT, "entry_price": 100.0}
-        sig = strat.generate_signal(dist, 102.0, make_history(), {"current_position": current_pos})
+        entry_dist = make_dist([100.0] * 100)
+        strat.generate_signal(entry_dist, 100.0, make_history(), {"current_symbol": "TEST"})
+
+        overnight_dist = make_dist([104.0] * 50 + [105.0] * 50)  # min ~104 > entry 100
+        sig = strat.generate_signal(overnight_dist, 102.0, make_history(), {"current_symbol": "TEST"})
         assert sig is not None
         assert sig.direction == Direction.FLAT
 
     def test_overnight_filter_no_position(self):
-        """Test: delegates to base when no position"""
+        """Test: delegates to base when no shadow position yet"""
         dist = make_dist([110.0] * 100)
         stub = StubStrategy(Direction.LONG, size=0.5)
         strat = OvernightExposureFilter(stub)
-        sig = strat.generate_signal(dist, 100.0, make_history(), {})
+        sig = strat.generate_signal(dist, 100.0, make_history(), {"current_symbol": "TEST"})
         assert sig is not None
         assert sig.direction == Direction.LONG
 
     def test_overnight_filter_favorable_range(self):
         """Test: delegates to base when range is favorable"""
-        dist = make_dist([105.0] * 100)
         stub = StubStrategy(Direction.LONG, size=0.5)
         strat = OvernightExposureFilter(stub)
-        current_pos = {"direction": Direction.LONG, "entry_price": 100.0}
-        sig = strat.generate_signal(dist, 102.0, make_history(), {"current_position": current_pos})
+        entry_dist = make_dist([100.0] * 100)
+        strat.generate_signal(entry_dist, 100.0, make_history(), {"current_symbol": "TEST"})
+
+        favorable_dist = make_dist([105.0] * 100)  # pred_high > entry 100
+        sig = strat.generate_signal(favorable_dist, 102.0, make_history(), {"current_symbol": "TEST"})
         # Should delegate to stub since pred_high > entry_price
         assert sig is not None
+
+    def test_overnight_filter_tracks_shadow_position_independent_of_context(self):
+        """Shadow position must persist across calls without any real
+        portfolio/context input -- this is the whole point of the change."""
+        stub = StubStrategy(Direction.LONG, size=0.5)
+        strat = OvernightExposureFilter(stub)
+        entry_dist = make_dist([100.0] * 100)
+        strat.generate_signal(entry_dist, 100.0, make_history(), {"current_symbol": "AAA"})
+        assert strat._shadow_position.get("AAA") == {"direction": Direction.LONG, "entry_price": 100.0}
+
+        overnight_dist = make_dist([95.0] * 100)
+        sig = strat.generate_signal(overnight_dist, 98.0, make_history(), {"current_symbol": "AAA"})
+        assert sig.direction == Direction.FLAT
+        assert "AAA" not in strat._shadow_position  # closed, shadow position cleared
 
 
 # ============================================================================

@@ -761,12 +761,10 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
     return {
         "date": history.index[-1],
         "current_price": current_price,
-        "capital": orchestrator.capital,
         "multi_asset_predictions": multi_preds,
         "current_symbol": symbol,
         "predict_fn": lambda *a, **kw: [],
         "prev_dist": None,
-        "current_position": None,
         "bar_index": len(history) - 1,
         "returns_window": returns_window,
         "realized_vol": realized_vol,

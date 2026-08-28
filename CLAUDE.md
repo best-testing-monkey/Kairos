@@ -653,41 +653,89 @@ analysis only.
 adding a seventh or assuming "the backtest engine" means one specific thing:
 1. `_compute_shadow_performance()` — 1 bar only, feeds `oracle_results`/`model_results`.
 2. `_compute_shadow_performance_naive()` — multi-bar, correct, naive-only.
-3. `KairosOrchestrator._manage_positions()` — the real trade engine (every
-   mode: oracle/naive/base/finetuned), walks forward day-by-day correctly.
+3. ~~`KairosOrchestrator._manage_positions()`~~ — **removed entirely
+   2026-08-28**, see below. Historical only.
 4. `BacktestEngine._check_exit`/`_calculate_pnl` (`kairos_backtest.py`) —
    used only by `kairos_signal_replay.py`; multi-bar, no phantom dependency.
 5. `MultiHorizonBacktestEngine._check_exit` (`kairos_horizon.py`) —
    **dead code**, imported into `kairos_orchestrator.py` but never
    instantiated anywhere.
 6. `PartialExitBacktestEngine`/`_check_leg_exit` (`kairos_execution.py`) —
-   **also dead code**; `UnifiedSignal.execution_plan` (which would route
-   here) is captured from signal metadata but never read anywhere.
+   **also dead code**; the `execution_plan` metadata that would route here
+   was captured from signal metadata but never read anywhere (still true;
+   `UnifiedSignal` itself no longer exists, see below).
 7. phantom_ledger's `PositionManager.determine_close` — the actual live
    papertrade fill engine (`kairos_papertrade.py`), external submodule,
    unrelated to any of the above.
 
-**`_manage_positions()`'s `hold_days` cap was silently ~2 days for almost
-every strategy (fixed 2026-08-28).** `UnifiedSignal.hold_days` used to
-default to `1` whenever a strategy's `Signal.metadata` didn't set
-`"hold_days"` explicitly — only 3 of ~141 strategy classes ever did
-(`kairos_horizon.py`, `kairos_stocks.py`, `kairos_universal.py`). Tracing
-the countdown: a position with the default survives at most 2 real trading
-days before being force-closed as `"hold_expired"`, regardless of whether
-stop/target ever triggers — for ~138 strategies, in practice. Fixed by
-making the default `None` instead of `1` (`UnifiedSignal.hold_days: Optional[int]`,
-`_create_unified_signal`'s `sig.metadata.get("hold_days")` with no
-fallback) — `_manage_positions()` now only applies the countdown when
-`hold_days_remaining is not None`, so an unset `hold_days` means "hold
-until stop/target triggers or the backtest window ends" (the existing
-`_close_all_positions()` end-of-data safety net already handles that case
-correctly). Strategies that explicitly set `hold_days` are unaffected.
-**Verified this does not touch any persisted `oracle_results`/`model_results`
-row** — those come entirely from `shadow_performance`
-(`_compute_shadow_performance`/`_naive`), which never touches
-`_manage_positions`; the only consumer of `_manage_positions`'s output
-(`results["summary"]`, `actual_trade_rankings`) is `print_results()`'s own
-CLI banner — nothing else in the codebase reads either field.
+**The real portfolio simulation was removed entirely (2026-08-28), same day
+it was found and fixed for `hold_days` above.** Once `hold_days` was fixed,
+Baz asked directly: since nothing persisted reads `_manage_positions`'s
+output, why run it at all? Answer, after a full input/output dependency
+trace: almost everything was safe to remove, except one real coupling —
+`OvernightExposureFilter` (`kairos_backtest.py`) read `context["current_position"]`,
+sourced from `self.active_positions`, which **is** shadow-persisted (it's a
+registered strategy, unconditionally active). Fixed by giving that one
+filter its own self-contained shadow position tracker
+(`self._shadow_position: Dict[str, Dict]`, keyed by symbol, set from its
+own wrapped strategy's signals) instead of reading real portfolio state —
+decoupled from capital/exposure/competitive-selection entirely. Deliberate
+simplification: it doesn't model a stop/target hit closing the shadow
+position early (there's no real engine left to hit one against) — it only
+closes via its own overnight check.
+
+With that one blocker resolved, **removed**: `_manage_positions()`,
+`_enter_position()`, `_close_all_positions()`, `_create_unified_signal()`,
+the `UnifiedSignal` dataclass, `get_live_signal()` (confirmed zero callers
+anywhere — dead before this change too), `export_results()` (also zero
+callers, and would have crashed anyway since it referenced keys this change
+removes), `self.tracker`/`StrategyPerformanceTracker` instance (its
+`get_weight`/`record_trade` calls had no remaining caller once
+`_manage_positions` and `get_live_signal` were gone), and the portfolio
+allocator / cross-asset-ranking / per-asset "best signal" selection steps in
+`_run_day()` (they only ever fed the now-removed entry step; shadow
+recording already happens earlier and is untouched by any of them).
+`self.capital`/`self.active_positions`/`self.all_trades`/`self.daily_logs`/
+`self.all_signals` are gone; `self.equity_curve` survives as a plain list of
+dates (day-count only, for the "signals/week" stat in reports — nothing
+needs the capital values it used to hold).
+
+**`results["summary"]` (Total Return, Sharpe, Max Drawdown, Win Rate, etc. —
+the CLI banner) is now built from `shadow_performance` instead**, via a new
+shared helper `_compound_equity_stats()` (module-level in
+`kairos_orchestrator.py`) extracted from `backtest_top_strategies()`'s
+pre-existing per-strategy pattern (compound each pnl_pct at 10% of capital
+per signal). The summary pools **every strategy's every shadow signal**
+into one combined list — an approximation that assumes every signal could
+have been taken independently with equal sizing, explicitly not a claim
+about a single capital-constrained account. `best_strategy`/`worst_strategy`
+now come from `shadow_ranked` (same source as `strategy_rankings`) instead
+of a real-trade ranking that no longer exists. One cosmetic side effect:
+`max_drawdown`'s sign convention now matches `backtest_top_strategies`'s
+existing (negative) convention throughout, rather than the old top-level
+banner's separate positive-sign convention — purely cosmetic, nothing
+persisted or parsed depends on the sign.
+
+**Real, separate blind spot found and fixed during this change**:
+`kairos_signals.py`'s own `_build_context()` — a third, independent
+context-building function (used by the real live-signal-generation
+pipeline, not `run_backtest()`) — read `orchestrator.capital` as a live
+attribute. Removing `self.capital` broke it (silently, inside a try/except,
+producing wrong cache/predict behavior rather than a clean crash — caught by
+20 `test_signals_report.py` failures). Fixed the same way as everywhere
+else: removed the dead `"capital"`/`"current_position"` context keys from
+`_build_context()` too. Lesson: `context["capital"]`/`context["current_position"]`
+had **three** independent producers across the codebase
+(`_run_day()`, `get_live_signal()`, `kairos_signals._build_context()`) —
+grepping only inside `kairos_orchestrator.py` and the strategy files misses
+call sites like this one; grep the whole repo for `orchestrator\.<attr>`
+patterns too when removing orchestrator state.
+
+**Verified nothing persisted was affected**: full test suite green (1718
+passed) after the fix above; a fresh `run_stage_oracle()` call post-refactor
+produced byte-identical Sharpe/win_rate/signal_count values to the same
+group's pre-refactor numbers (`_compute_shadow_performance()` itself was
+never touched — only what happens downstream of it).
 
 **`oracle_results.version` column (added 2026-08-28).** Purely
 administrative — `kairos_pipeline.git_commit_hash()` (short hash, cached
