@@ -1,4 +1,4 @@
-"""_compute_shadow_performance_lagged: re-anchor entry, walk forward until a
+"""_compute_shadow_performance_naive: re-anchor entry, walk forward until a
 genuine stop/target trigger, exclude signals that never resolve."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
@@ -34,7 +34,7 @@ def test_target_hit_after_holding_two_bars_uses_reanchored_entry():
     )
 
     fake_self = _fake_self([signal], {"TEST": df})
-    result = KairosOrchestrator._compute_shadow_performance_lagged(fake_self)
+    result = KairosOrchestrator._compute_shadow_performance_naive(fake_self)
 
     assert result["test_strat"]["signal_count"] == 1
     pnl = result["test_strat"]["pnl_list"][0]
@@ -57,7 +57,7 @@ def test_never_resolves_is_excluded_not_force_closed():
     )
 
     fake_self = _fake_self([signal], {"TEST": df})
-    result = KairosOrchestrator._compute_shadow_performance_lagged(fake_self)
+    result = KairosOrchestrator._compute_shadow_performance_naive(fake_self)
 
     assert "test_strat" not in result  # excluded entirely, no fake close-out
 
@@ -76,7 +76,7 @@ def test_open_gap_triggers_immediately():
     )
 
     fake_self = _fake_self([signal], {"TEST": df})
-    result = KairosOrchestrator._compute_shadow_performance_lagged(fake_self)
+    result = KairosOrchestrator._compute_shadow_performance_naive(fake_self)
 
     pnl = result["test_strat"]["pnl_list"][0]
     # gap-open exit at 120, not the nominal target price of 114.4

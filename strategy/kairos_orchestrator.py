@@ -287,18 +287,16 @@ class OrchestratorConfig:
 
     # Baseline mode
     no_prediction: bool = False
-    # Only meaningful when no_prediction=True: use the current (already-known)
-    # bar instead of peeking at the future bar. Oracle (default) = perfect
-    # foresight ceiling; this = naive "no model, no peek" floor, still built
-    # from real observed data (not None, not synthetic noise).
-    use_current_bar: bool = False
-    # Only meaningful when no_prediction=True and use_current_bar=False:
-    # keep oracle's real decision (direction + relative stop/target %, from
-    # its future-peeking distribution) unchanged, but re-anchor entry to the
-    # real bar oracle peeked at (no longer a peek once it's the entry bar)
-    # and resolve the trade against genuinely later real bars only -- see
-    # KairosOrchestrator._compute_shadow_performance_lagged.
-    lagged_oracle: bool = False
+    # Only meaningful when no_prediction=True: keep oracle's real decision
+    # (direction + relative stop/target %, from its future-peeking
+    # distribution) unchanged, but re-anchor entry to the real bar oracle
+    # peeked at (no longer a peek once it's the entry bar) and resolve the
+    # trade against genuinely later real bars only -- see
+    # KairosOrchestrator._compute_shadow_performance_naive. Measures how
+    # much of a strategy's edge depends on prediction quality at all,
+    # without ever touching a bar that wasn't genuinely knowable at the
+    # point the trade could exist.
+    naive_baseline: bool = False
 
     # Disabled strategies (shadow-tested and found unprofitable even with perfect predictions)
     disabled_strategies: Set[str] = field(default_factory=lambda: {
@@ -883,22 +881,20 @@ class KairosOrchestrator:
 
     def _make_realized_predictions(self, date: pd.Timestamp,
                                     histories: Dict[str, pd.DataFrame]) -> Dict:
-        """Build AssetPrediction from real data only, no model call.
+        """Oracle baseline: build AssetPrediction from the actual next bar.
 
-        Oracle mode (default, use_current_bar=False): bar = the actual next
-        bar (future peek) -- a perfect-foresight ceiling.
-        Naive mode (use_current_bar=True): bar = the current/last-known bar
-        -- a "no model, no peek" floor built from real observed data.
+        Always a future peek (perfect-foresight ceiling) -- this is the
+        decision-making step, shared unchanged by both oracle and naive
+        modes. naive_baseline doesn't change how the decision is made; it
+        only changes how the resulting signal is scored afterward (see
+        KairosOrchestrator._compute_shadow_performance_naive).
         """
         result = {}
         for symbol, history in histories.items():
             current_price = float(history.iloc[-1]["close"])
-            if self.config.use_current_bar:
-                bar = history.iloc[-1]
-            else:
-                full_df = self._data_dict.get(symbol)
-                future = full_df[full_df.index > date] if full_df is not None else pd.DataFrame()
-                bar = future.iloc[0] if not future.empty else history.iloc[-1]
+            full_df = self._data_dict.get(symbol)
+            future = full_df[full_df.index > date] if full_df is not None else pd.DataFrame()
+            bar = future.iloc[0] if not future.empty else history.iloc[-1]
             dist = KairosDistribution.from_bar(
                 bar, n_samples=KairosSettings.pred_samples, center=current_price
             )
@@ -1424,7 +1420,7 @@ class KairosOrchestrator:
             result[sname] = {"pnl_list": pnl_list, "sharpe": sharpe, "signal_count": n}
         return result
 
-    def _compute_shadow_performance_lagged(self) -> Dict[str, Dict]:
+    def _compute_shadow_performance_naive(self) -> Dict[str, Dict]:
         """Evaluate oracle's real shadow signals with no future peek at all.
 
         Oracle's decision (direction + relative stop/target %) is kept
@@ -1567,8 +1563,8 @@ class KairosOrchestrator:
         # Shadow rankings: all strategies that generated at least one signal,
         # evaluated against actual next-bar OHLCV independent of competition.
         shadow_perf = (
-            self._compute_shadow_performance_lagged()
-            if self.config.lagged_oracle
+            self._compute_shadow_performance_naive()
+            if self.config.naive_baseline
             else self._compute_shadow_performance()
         )
         shadow_ranked = sorted(
@@ -1601,8 +1597,7 @@ class KairosOrchestrator:
             "shadow_performance": shadow_perf,
             "daily_logs": self.daily_logs,
             "no_prediction": self.config.no_prediction,
-            "use_current_bar": self.config.use_current_bar,
-            "lagged_oracle": self.config.lagged_oracle,
+            "naive_baseline": self.config.naive_baseline,
             "strategy_build_stats": dict(StrategyRegistry.LAST_BUILD_STATS),
             "signal_firing_count": len(shadow_ranked),
         }
@@ -1684,10 +1679,8 @@ def print_results(results: Dict, top_strategy_results: Optional[List[Dict]] = No
     print("=" * W)
     print("KAIROS BACKTEST RESULTS")
     if results.get("no_prediction"):
-        if results.get("lagged_oracle"):
-            print("  Mode: NO-PREDICTION  (lagged oracle - real decision, no-peek accounting)")
-        elif results.get("use_current_bar"):
-            print("  Mode: NO-PREDICTION  (naive baseline - current/last-known bar, no model, no peek)")
+        if results.get("naive_baseline"):
+            print("  Mode: NO-PREDICTION  (naive baseline - real decision, no-peek accounting)")
         else:
             print("  Mode: NO-PREDICTION  (oracle - actual next-bar OHLCV)")
     print("=" * W)

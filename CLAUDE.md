@@ -585,22 +585,59 @@ recreates and hits the same error). Work around it by pointing
 commands, e.g. `export UV_CACHE_DIR=/tmp/uv-cache-kairos` before
 `uv lock`/`uv sync` when bumping a git-sourced dependency.
 
-### Oracle vs. naive-baseline modes, and the parallel dedup sweep (2026-08-27)
+### Oracle vs. naive-baseline modes, and the parallel dedup sweep (2026-08-27/28)
 `kairos_strategies.py` has three prediction modes, not two:
 - **Model** (default): real Kronos forecast via `predict_fn`/`multi_predictor`.
 - **Oracle** (`--no-prediction`): replaces the model's distribution with the
   *actual next-bar* OHLCV (`_make_realized_predictions()` in
-  `kairos_orchestrator.py`, `config.no_prediction=True`,
-  `config.use_current_bar=False`) — a perfect-foresight **ceiling**. This is
-  what the `--stage oracle` pipeline stage runs; it also drives the
-  production `disabled_strategies` gate via `refresh_disabled_strategies()`.
-- **Naive baseline** (`--naive-baseline`, implies `--no-prediction`):
-  replaces the model's distribution with the *current/last-known* bar
-  instead (`config.use_current_bar=True`) — real, already-available data,
-  no model, no future peek. A **floor**: measures how much of a strategy's
-  edge depends on prediction quality at all. Do NOT confuse this with
-  oracle — "no prediction" alone is ambiguous between the two; oracle still
-  cheats by reading the future, naive baseline does not.
+  `kairos_orchestrator.py`, `config.no_prediction=True`) — a
+  perfect-foresight **ceiling**. This is what the `--stage oracle` pipeline
+  stage runs; it also drives the production `disabled_strategies` gate via
+  `refresh_disabled_strategies()`.
+- **Naive baseline** (`--naive-baseline`, implies `--no-prediction`,
+  `config.naive_baseline=True`): keeps oracle's real decision (direction +
+  relative stop/target %, from its genuine future-peeking distribution)
+  completely unchanged — the *decision* is not recomputed. What changes is
+  the accounting: entry is re-anchored to the real bar oracle peeked at (by
+  the time this trade could exist, that bar has closed for real — it's no
+  longer a peek), stop/target recomputed from the same relative offsets
+  against that new entry, and the trade resolved only against genuinely
+  later bars, walking forward until a real stop/target trigger — or
+  excluding the signal if data runs out first, never force-closing it at an
+  arbitrary point. Implemented in
+  `KairosOrchestrator._compute_shadow_performance_naive()`, mirroring the
+  exact terminal-exit-reason contract `kairos_signal_replay.py` already
+  established for `BacktestEngine._check_exit` (open-gap-then-intrabar,
+  "close" means keep holding not force-exit) — reimplemented as a plain
+  pandas loop, no `BacktestEngine`/phantom_trader dependency. A **floor**:
+  measures how much of a strategy's edge depends on prediction quality at
+  all, with zero future peek anywhere in the decision.
+
+  **This mode went through a real methodology correction on 2026-08-28,
+  worth knowing before touching it again.** An earlier implementation
+  (`config.use_current_bar`, since removed) tried to answer the same
+  question by feeding the distribution-construction step the *current*
+  bar as if it were the forecast basis (same bar for both center and
+  shape) — this doesn't produce a neutral no-information test, it bakes in
+  an active "assume zero drift" assumption that handicaps every directional
+  strategy by construction, since the distribution ends up centered exactly
+  at the entry price. A full 961-group sweep was run on this flawed version
+  before the flaw was caught; that DB data (`stage='naive'` at the time) was
+  deleted outright rather than kept as a labeled-flawed artifact. The
+  corrected version above (originally prototyped under the name
+  "lagged oracle" mid-session, then renamed to take over the `naive`
+  identity once confirmed correct) reuses oracle's real decision instead of
+  re-deriving one from a self-referential bar, which avoids the same trap.
+
+  Also surfaced while fixing this: `_compute_shadow_performance()` (oracle's
+  own evaluator, and the one every `oracle_results` Sharpe/win-rate number
+  in this table has ever come from) only checks **one bar ahead**, then
+  force-closes at that bar's close if neither stop nor target triggered —
+  it does not walk forward multiple bars. Don't assume "the current
+  mechanism already handles multi-bar TP/SL" without checking which
+  evaluator you mean; the genuinely multi-bar-capable one is
+  `BacktestEngine._check_exit`/`kairos_signal_replay.py`'s usage of it, not
+  this one.
 
 `run_stage_naive()` in `kairos_pipeline.py` mirrors `run_stage_oracle()` but
 writes `stage='naive'` rows to the same `oracle_results` table (it already

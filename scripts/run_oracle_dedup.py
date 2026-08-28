@@ -16,10 +16,11 @@ confirmed via a controlled 4-vs-4-group benchmark: 4 parallel workers gave a
 subprocess is pinned to 1 BLAS thread so N workers approximate N busy cores
 instead of oversubscribing.
 
-`--stage naive` runs the same groups through the naive baseline (real
-current-bar data, no model, no future peek) instead of oracle's
-perfect-foresight peek -- see run_stage_naive's docstring for why its results
-deliberately don't feed the disabled_strategies gate the way oracle's do.
+`--stage naive` runs the same groups through the naive baseline (oracle's
+real decision, re-anchored to a genuinely no-peek entry and resolved only
+against later real bars) instead of oracle's perfect-foresight peek -- see
+run_stage_naive's docstring for why its results deliberately don't feed the
+disabled_strategies gate the way oracle's do.
 
 Box has 8 physical / 16 logical cores; default --workers=8 keeps to physical
 cores since SMT doesn't reliably double throughput for GIL-bound work like
@@ -85,11 +86,6 @@ def _run_one(group_id, assets, stage):
                 conn, assets, interval=INTERVAL, backtest_period=BACKTEST_PERIOD,
                 pred_samples=PRED_SAMPLES,
             )
-        elif stage == "lagged":
-            run_id = kp.run_stage_lagged(
-                conn, assets, interval=INTERVAL, backtest_period=BACKTEST_PERIOD,
-                pred_samples=PRED_SAMPLES,
-            )
         else:
             run_id = kp.run_stage_oracle(
                 conn, assets, interval=INTERVAL, backtest_period=BACKTEST_PERIOD,
@@ -105,7 +101,7 @@ def _run_one(group_id, assets, stage):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("correlation_run_id", type=int)
-    parser.add_argument("--stage", choices=["oracle", "naive", "lagged"], default="oracle",
+    parser.add_argument("--stage", choices=["oracle", "naive"], default="oracle",
                          help="Which no-model mode to sweep (default: oracle)")
     parser.add_argument("--workers", type=int, default=8,
                          help="Parallel subprocess workers (default: 8)")
