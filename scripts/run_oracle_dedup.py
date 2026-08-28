@@ -85,6 +85,11 @@ def _run_one(group_id, assets, stage):
                 conn, assets, interval=INTERVAL, backtest_period=BACKTEST_PERIOD,
                 pred_samples=PRED_SAMPLES,
             )
+        elif stage == "lagged":
+            run_id = kp.run_stage_lagged(
+                conn, assets, interval=INTERVAL, backtest_period=BACKTEST_PERIOD,
+                pred_samples=PRED_SAMPLES,
+            )
         else:
             run_id = kp.run_stage_oracle(
                 conn, assets, interval=INTERVAL, backtest_period=BACKTEST_PERIOD,
@@ -100,7 +105,7 @@ def _run_one(group_id, assets, stage):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("correlation_run_id", type=int)
-    parser.add_argument("--stage", choices=["oracle", "naive"], default="oracle",
+    parser.add_argument("--stage", choices=["oracle", "naive", "lagged"], default="oracle",
                          help="Which no-model mode to sweep (default: oracle)")
     parser.add_argument("--workers", type=int, default=8,
                          help="Parallel subprocess workers (default: 8)")

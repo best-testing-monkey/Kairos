@@ -1044,6 +1044,11 @@ if __name__ == "__main__":
                         help="Like --no-prediction but uses the current/last-known bar instead of "
                              "peeking at the future bar -- a real no-model floor (implies --no-prediction), "
                              "as opposed to oracle's perfect-foresight ceiling")
+    parser.add_argument("--lagged-oracle", dest="lagged_oracle", action="store_true", default=False,
+                        help="Like --no-prediction but keeps oracle's real decision (direction + "
+                             "relative stop/target %%) and only fixes the accounting: entry re-anchored "
+                             "to the real bar oracle peeked at, resolved only against genuinely later "
+                             "bars (implies --no-prediction)")
     parser.add_argument("--export_json", metavar="PATH", default=None, dest="export_json",
                         help="Additionally dump summary/strategy_rankings/shadow_performance to this JSON path")
     parser.add_argument("--no_disabled_filter", dest="no_disabled_filter", action="store_true", default=False,
@@ -1051,7 +1056,9 @@ if __name__ == "__main__":
                              "(used by the oracle pipeline stage)")
 
     args = parser.parse_args()
-    if args.use_current_bar:
+    if args.use_current_bar and args.lagged_oracle:
+        parser.error("--naive-baseline and --lagged-oracle are mutually exclusive")
+    if args.use_current_bar or args.lagged_oracle:
         args.no_prediction = True
     KairosSettings.configure(args)
 
@@ -1076,6 +1083,7 @@ if __name__ == "__main__":
         max_horizon=3,
         no_prediction=KairosSettings.no_prediction,
         use_current_bar=KairosSettings.use_current_bar,
+        lagged_oracle=KairosSettings.lagged_oracle,
         disabled_strategies=disabled,
     )
 

@@ -292,6 +292,13 @@ class OrchestratorConfig:
     # foresight ceiling; this = naive "no model, no peek" floor, still built
     # from real observed data (not None, not synthetic noise).
     use_current_bar: bool = False
+    # Only meaningful when no_prediction=True and use_current_bar=False:
+    # keep oracle's real decision (direction + relative stop/target %, from
+    # its future-peeking distribution) unchanged, but re-anchor entry to the
+    # real bar oracle peeked at (no longer a peek once it's the entry bar)
+    # and resolve the trade against genuinely later real bars only -- see
+    # KairosOrchestrator._compute_shadow_performance_lagged.
+    lagged_oracle: bool = False
 
     # Disabled strategies (shadow-tested and found unprofitable even with perfect predictions)
     disabled_strategies: Set[str] = field(default_factory=lambda: {
@@ -1417,6 +1424,89 @@ class KairosOrchestrator:
             result[sname] = {"pnl_list": pnl_list, "sharpe": sharpe, "signal_count": n}
         return result
 
+    def _compute_shadow_performance_lagged(self) -> Dict[str, Dict]:
+        """Evaluate oracle's real shadow signals with no future peek at all.
+
+        Oracle's decision (direction + relative stop/target %) is kept
+        exactly as computed -- it was derived from oracle's real
+        future-peeking distribution and that's not being redone here. What
+        changes is the accounting: entry is re-anchored to the real bar
+        oracle peeked at (by the time this trade could actually be placed,
+        that bar has closed for real -- it's no longer a peek), stop/target
+        are recomputed from the same relative offsets against that new
+        entry, and the trade is then resolved against genuinely later bars
+        only, walking forward one bar at a time exactly like
+        BacktestEngine._check_exit / kairos_signal_replay.py's
+        _resolve_closure_for_signal: a bar where neither stop nor target
+        triggers just means "keep holding," not "force-close" (unlike
+        _compute_shadow_performance above, which only ever checks one bar).
+        A signal that never resolves before real data runs out is excluded
+        rather than force-closed at an arbitrary point -- same choice
+        kairos_signal_replay.py already made for the same reason.
+        """
+        by_strategy: Dict[str, List[float]] = defaultdict(list)
+        for record in self._shadow_signals:
+            if len(record) == 7:
+                date, symbol, sname, direction, stop, target, sig_entry = record
+            else:
+                continue  # pre-entry-tracking records can't be re-anchored
+
+            full_df = self._data_dict.get(symbol)
+            if full_df is None:
+                continue
+            future = full_df[full_df.index > date]
+            if future.empty:
+                continue
+            entry_bar = future.iloc[0]
+            new_entry = float(entry_bar["close"])
+            if new_entry <= 0:
+                continue
+
+            ref = float(sig_entry) if sig_entry and sig_entry > 0 else new_entry
+            stop_price = new_entry * (1.0 + (stop - ref) / ref)
+            target_price = new_entry * (1.0 + (target - ref) / ref)
+
+            exit_p = None
+            for _, bar in future.iloc[1:].iterrows():
+                o, h, l = float(bar["open"]), float(bar["high"]), float(bar["low"])
+                if direction == Direction.LONG:
+                    if o <= stop_price:
+                        exit_p = o
+                    elif o >= target_price:
+                        exit_p = o
+                    elif l <= stop_price:
+                        exit_p = stop_price
+                    elif h >= target_price:
+                        exit_p = target_price
+                else:
+                    if o >= stop_price:
+                        exit_p = o
+                    elif o <= target_price:
+                        exit_p = o
+                    elif h >= stop_price:
+                        exit_p = stop_price
+                    elif l <= target_price:
+                        exit_p = target_price
+                if exit_p is not None:
+                    break
+
+            if exit_p is None:
+                continue  # ran out of real data before a genuine trigger -- excluded
+
+            if direction == Direction.LONG:
+                pnl_pct = (exit_p - new_entry) / new_entry
+            else:
+                pnl_pct = (new_entry - exit_p) / new_entry
+            by_strategy[sname].append(pnl_pct)
+
+        result = {}
+        ann_factor = np.sqrt(bars_per_year(KairosSettings.interval))
+        for sname, pnl_list in by_strategy.items():
+            n = len(pnl_list)
+            sharpe = _safe_sharpe(np.array(pnl_list), ann_factor)
+            result[sname] = {"pnl_list": pnl_list, "sharpe": sharpe, "signal_count": n}
+        return result
+
     def _build_results(self) -> Dict:
         """Compile all results into a comprehensive dict."""
         # Basic metrics
@@ -1476,7 +1566,11 @@ class KairosOrchestrator:
 
         # Shadow rankings: all strategies that generated at least one signal,
         # evaluated against actual next-bar OHLCV independent of competition.
-        shadow_perf = self._compute_shadow_performance()
+        shadow_perf = (
+            self._compute_shadow_performance_lagged()
+            if self.config.lagged_oracle
+            else self._compute_shadow_performance()
+        )
         shadow_ranked = sorted(
             [(sname, d["sharpe"]) for sname, d in shadow_perf.items()],
             key=lambda x: x[1], reverse=True,
@@ -1508,6 +1602,7 @@ class KairosOrchestrator:
             "daily_logs": self.daily_logs,
             "no_prediction": self.config.no_prediction,
             "use_current_bar": self.config.use_current_bar,
+            "lagged_oracle": self.config.lagged_oracle,
             "strategy_build_stats": dict(StrategyRegistry.LAST_BUILD_STATS),
             "signal_firing_count": len(shadow_ranked),
         }
@@ -1589,7 +1684,9 @@ def print_results(results: Dict, top_strategy_results: Optional[List[Dict]] = No
     print("=" * W)
     print("KAIROS BACKTEST RESULTS")
     if results.get("no_prediction"):
-        if results.get("use_current_bar"):
+        if results.get("lagged_oracle"):
+            print("  Mode: NO-PREDICTION  (lagged oracle - real decision, no-peek accounting)")
+        elif results.get("use_current_bar"):
             print("  Mode: NO-PREDICTION  (naive baseline - current/last-known bar, no model, no peek)")
         else:
             print("  Mode: NO-PREDICTION  (oracle - actual next-bar OHLCV)")

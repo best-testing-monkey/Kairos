@@ -1143,7 +1143,8 @@ def run_stage_correlation(conn, asset_class_filter=None, interval="1d", min_abs_
 
 def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
                              no_prediction=False, model_path=None, pred_samples=100,
-                             extra_env=None, no_disabled_filter=False, naive_baseline=False):
+                             extra_env=None, no_disabled_filter=False, naive_baseline=False,
+                             lagged_oracle=False):
     """
     Invoke strategy/kairos_strategies.py as a subprocess and return the parsed
     JSON export (summary, strategy_rankings, shadow_performance).
@@ -1182,6 +1183,8 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
         cmd.append("--no-prediction")
     if naive_baseline:
         cmd.append("--naive-baseline")
+    if lagged_oracle:
+        cmd.append("--lagged-oracle")
     if model_path:
         cmd.extend(["--model", model_path])
     if no_disabled_filter:
@@ -1374,6 +1377,50 @@ def run_stage_naive(conn, assets, interval="1d", backtest_period="6m", pred_samp
         )
     else:
         print(f"\nStage naive done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
+    return run_id
+
+
+def run_stage_lagged(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
+    """Lagged oracle: oracle's real decision, no-peek accounting.
+
+    Keeps oracle's real distribution-driven decision (direction + relative
+    stop/target %) exactly as computed -- it was derived from oracle's real
+    future-peeking distribution, and that's not being redone here. What
+    changes is entry/exit accounting: entry is re-anchored to the real bar
+    oracle peeked at (by the time this trade could exist, that bar has
+    closed for real -- no longer a peek), and the trade is then resolved
+    only against genuinely later bars, walking forward until stop/target
+    triggers or real data runs out. See
+    KairosOrchestrator._compute_shadow_performance_lagged for the mechanics.
+
+    Like run_stage_naive, deliberately does NOT call
+    refresh_disabled_strategies -- this measures something different from
+    oracle's ceiling and shouldn't feed the production disable gate.
+    """
+    run_id = start_run(conn, "lagged", interval, {
+        "assets": assets, "backtest_period": backtest_period, "pred_samples": pred_samples,
+    })
+    payload = run_backtest_subprocess(
+        assets, interval=interval, backtest_period=backtest_period,
+        no_prediction=True, lagged_oracle=True, model_path=None, pred_samples=pred_samples,
+        no_disabled_filter=True,
+    )
+    rows = _rows_from_export(payload, assets, interval, backtest_period, stage="lagged")
+    for row in rows:
+        insert_oracle_row(conn, run_id, row)
+    conn.commit()
+
+    csv_path = dump_csv("oracle_results", [{"run_id": run_id, **r} for r in rows], "lagged")
+    build_stats = payload.get("strategy_build_stats") or {}
+    if build_stats:
+        print(
+            f"\nStage lagged done: built {build_stats.get('total_constructed', '?')}, "
+            f"disabled {build_stats.get('disabled_removed', '?')}, "
+            f"evaluating {build_stats.get('evaluated', '?')} strategies "
+            f"({len(rows)} fired at least one signal). run_id={run_id}. CSV: {csv_path}"
+        )
+    else:
+        print(f"\nStage lagged done: {len(rows)} strategies. run_id={run_id}. CSV: {csv_path}")
     return run_id
 
 
