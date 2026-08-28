@@ -183,7 +183,8 @@ CREATE TABLE IF NOT EXISTS oracle_results (
     avg_pnl_per_trade REAL,
     assets TEXT,
     interval TEXT,
-    backtest_period TEXT
+    backtest_period TEXT,
+    version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS model_results (
@@ -253,10 +254,19 @@ CREATE TABLE IF NOT EXISTS finetuned_models (
 """
 
 
+def _migrate_add_column(conn, table, column, coltype):
+    """Idempotent ADD COLUMN for a table that may predate this column."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
 def get_connection(db_path=DB_PATH):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    _migrate_add_column(conn, "oracle_results", "version", "TEXT")
+    conn.commit()
     return conn
 
 
@@ -302,15 +312,35 @@ def insert_group_row(conn, run_id, row: dict):
     )
 
 
+_GIT_COMMIT_HASH = None  # cached: same for every row inserted in one process
+
+
+def git_commit_hash() -> str:
+    """Short git commit hash of the running code, for administrative
+    provenance on oracle_results rows -- not used in any query/filter logic.
+    Cached per-process since it can't change mid-run."""
+    global _GIT_COMMIT_HASH
+    if _GIT_COMMIT_HASH is None:
+        try:
+            _GIT_COMMIT_HASH = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except Exception:
+            _GIT_COMMIT_HASH = "unknown"
+    return _GIT_COMMIT_HASH
+
+
 def insert_oracle_row(conn, run_id, row: dict):
     conn.execute(
         """INSERT INTO oracle_results
            (run_id, stage, strategy_name, sharpe, signal_count, win_rate, avg_pnl_per_trade,
-            assets, interval, backtest_period)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            assets, interval, backtest_period, version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         (run_id, row.get("stage", "oracle"), row["strategy_name"], row.get("sharpe"),
          row.get("signal_count"), row.get("win_rate"), row.get("avg_pnl_per_trade"),
-         row.get("assets"), row.get("interval"), row.get("backtest_period")),
+         row.get("assets"), row.get("interval"), row.get("backtest_period"),
+         row.get("version", git_commit_hash())),
     )
 
 
@@ -2226,7 +2256,7 @@ def _get_metric_columns(conn, table_name):
     """
     cursor = conn.execute(f"PRAGMA table_info({table_name})")
     all_cols = [row[1] for row in cursor.fetchall()]  # row[1] is the column name
-    identifying = {"run_id", "stage", "strategy_name", "assets", "interval", "backtest_period"}
+    identifying = {"run_id", "stage", "strategy_name", "assets", "interval", "backtest_period", "version"}
     metrics = [c for c in all_cols if c not in identifying]
     # Standard naming: signal_count → signals in the report
     report_names = [c.replace("signal_count", "signals") if c == "signal_count" else c for c in metrics]

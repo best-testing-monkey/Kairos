@@ -648,6 +648,57 @@ with real predictions but (expectedly) go quiet or lose money once
 prediction is stripped out entirely. Naive-baseline results are for
 analysis only.
 
+**Six independent TP/SL-checking implementations exist in this codebase**
+(found while investigating the one-bar issue above) — worth knowing before
+adding a seventh or assuming "the backtest engine" means one specific thing:
+1. `_compute_shadow_performance()` — 1 bar only, feeds `oracle_results`/`model_results`.
+2. `_compute_shadow_performance_naive()` — multi-bar, correct, naive-only.
+3. `KairosOrchestrator._manage_positions()` — the real trade engine (every
+   mode: oracle/naive/base/finetuned), walks forward day-by-day correctly.
+4. `BacktestEngine._check_exit`/`_calculate_pnl` (`kairos_backtest.py`) —
+   used only by `kairos_signal_replay.py`; multi-bar, no phantom dependency.
+5. `MultiHorizonBacktestEngine._check_exit` (`kairos_horizon.py`) —
+   **dead code**, imported into `kairos_orchestrator.py` but never
+   instantiated anywhere.
+6. `PartialExitBacktestEngine`/`_check_leg_exit` (`kairos_execution.py`) —
+   **also dead code**; `UnifiedSignal.execution_plan` (which would route
+   here) is captured from signal metadata but never read anywhere.
+7. phantom_ledger's `PositionManager.determine_close` — the actual live
+   papertrade fill engine (`kairos_papertrade.py`), external submodule,
+   unrelated to any of the above.
+
+**`_manage_positions()`'s `hold_days` cap was silently ~2 days for almost
+every strategy (fixed 2026-08-28).** `UnifiedSignal.hold_days` used to
+default to `1` whenever a strategy's `Signal.metadata` didn't set
+`"hold_days"` explicitly — only 3 of ~141 strategy classes ever did
+(`kairos_horizon.py`, `kairos_stocks.py`, `kairos_universal.py`). Tracing
+the countdown: a position with the default survives at most 2 real trading
+days before being force-closed as `"hold_expired"`, regardless of whether
+stop/target ever triggers — for ~138 strategies, in practice. Fixed by
+making the default `None` instead of `1` (`UnifiedSignal.hold_days: Optional[int]`,
+`_create_unified_signal`'s `sig.metadata.get("hold_days")` with no
+fallback) — `_manage_positions()` now only applies the countdown when
+`hold_days_remaining is not None`, so an unset `hold_days` means "hold
+until stop/target triggers or the backtest window ends" (the existing
+`_close_all_positions()` end-of-data safety net already handles that case
+correctly). Strategies that explicitly set `hold_days` are unaffected.
+**Verified this does not touch any persisted `oracle_results`/`model_results`
+row** — those come entirely from `shadow_performance`
+(`_compute_shadow_performance`/`_naive`), which never touches
+`_manage_positions`; the only consumer of `_manage_positions`'s output
+(`results["summary"]`, `actual_trade_rankings`) is `print_results()`'s own
+CLI banner — nothing else in the codebase reads either field.
+
+**`oracle_results.version` column (added 2026-08-28).** Purely
+administrative — `kairos_pipeline.git_commit_hash()` (short hash, cached
+per-process) is written on every `insert_oracle_row()` call, so a future
+session can tell which code version produced a given row without guessing
+from timestamps. Existing rows predating this column are `NULL` (no
+retroactive backfill — genuinely unknown). Excluded from
+`_get_metric_columns()`'s auto-discovered metric list (it's not a metric).
+`model_results` doesn't have this column yet — same rationale would apply
+if it's ever wanted there.
+
 **The oracle dedup sweep is now a parallel process pool, not sequential.**
 `scripts/run_oracle_dedup.py` (committed; supersedes an original sequential
 scratchpad script of the same name from 2026-08-26) runs

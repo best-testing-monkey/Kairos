@@ -714,7 +714,7 @@ class UnifiedSignal:
     strategy_name: str
     confidence: float
     expected_value: float
-    hold_days: int = 1
+    hold_days: Optional[int] = None  # None = no time-based cap, hold until stop/target/end-of-data
     execution_plan: Optional[Any] = None
     metadata: Dict = field(default_factory=dict)
     is_hedge: bool = False
@@ -1171,8 +1171,10 @@ class KairosOrchestrator:
                     exit_price = close
                     exit_reason = "time_stop"
 
-            # Check hold expiry
-            if exit_price is None and pos.get("hold_days_remaining", 1) <= 0:
+            # Check hold expiry -- None means the strategy never set hold_days,
+            # so there's no time-based cap; hold until stop/target/end-of-data.
+            hold_days_remaining = pos.get("hold_days_remaining")
+            if exit_price is None and hold_days_remaining is not None and hold_days_remaining <= 0:
                 exit_price = close
                 exit_reason = "hold_expired"
 
@@ -1199,7 +1201,8 @@ class KairosOrchestrator:
                     exit_price=exit_price
                 )
             else:
-                pos["hold_days_remaining"] = pos.get("hold_days_remaining", 1) - 1
+                if pos.get("hold_days_remaining") is not None:
+                    pos["hold_days_remaining"] -= 1
                 remaining.append(pos)
 
         self.active_positions = remaining
@@ -1237,7 +1240,7 @@ class KairosOrchestrator:
     def _create_unified_signal(self, date: pd.Timestamp, symbol: str,
                                 sig: Signal, pred: AssetPrediction) -> Optional[UnifiedSignal]:
         """Convert a strategy signal to a unified signal."""
-        hold_days = sig.metadata.get("hold_days", 1) if hasattr(sig, "metadata") else 1
+        hold_days = sig.metadata.get("hold_days") if hasattr(sig, "metadata") else None
         exec_plan = sig.metadata.get("execution_plan") if hasattr(sig, "metadata") else None
 
         return UnifiedSignal(
