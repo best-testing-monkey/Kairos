@@ -63,6 +63,7 @@ try:
         KairosDistribution, KairosPredictor, Direction,
         Signal, Strategy, BacktestEngine,
         DecisionTreeRouter, KairosSettings, bars_per_year,
+        asset_class_of_symbol,
         PercentileEntryStrategy, DynamicBracketStrategy, SkewStrategy,
         RangeTradingStrategy, TrendFollowingStrategy, VolatilityArbStrategy,
         HighLowStrategy, OpenGapStrategy, FadeExtremeStrategy,
@@ -233,6 +234,35 @@ def _safe_sharpe(returns: np.ndarray, annualization_factor: float, min_n: int = 
     std_r = max(std_r, _SHARPE_STD_EPSILON)
     sharpe = float(np.mean(returns) / std_r * annualization_factor)
     return float(np.clip(sharpe, -_SHARPE_CLAMP, _SHARPE_CLAMP))
+
+
+def _summarize_pnl(pnl_list: List[float], ann_factor: float) -> Dict:
+    """One strategy's (or one strategy-and-class's) pnl list -> stats dict."""
+    return {
+        "pnl_list": pnl_list,
+        "sharpe": _safe_sharpe(np.array(pnl_list), ann_factor),
+        "signal_count": len(pnl_list),
+    }
+
+
+def _summarize_by_class(by_class: Dict[str, Dict[str, List[float]]],
+                        ann_factor: float) -> Dict[str, Dict[str, Dict]]:
+    """Nested {strategy: {asset_class: stats}} from per-class pnl lists.
+
+    Module-level, not a method, so the shadow evaluators stay callable as
+    unbound methods against a bare stand-in object (which is how
+    tests/unit/test_shadow_performance_naive.py drives them).
+
+    Sharpe here is computed from each class's OWN pooled pnl list, so it is
+    exact per class. It is NOT a decomposition of the corpus Sharpe -- Sharpe
+    is a ratio and does not recombine across classes. Never sum or
+    signal-count-weight these back into a corpus figure; read the corpus
+    number from the corpus row instead.
+    """
+    return {
+        sname: {cls: _summarize_pnl(pnls, ann_factor) for cls, pnls in per_class.items()}
+        for sname, per_class in by_class.items()
+    }
 
 
 def _compound_equity_stats(pnl_list: List[float], initial_capital: float,
@@ -846,6 +876,9 @@ class KairosOrchestrator:
         # Shadow tracking: (date, symbol, strategy_name, direction, stop, target)
         self._shadow_signals: List[Tuple] = []
         self._shadow_seen: set = set()
+        # {strategy: {asset_class: stats}} — populated as a side effect of the
+        # shadow evaluators, see _summarize_by_class.
+        self._shadow_performance_by_class: Dict[str, Dict[str, Dict]] = {}
 
     def run_backtest(self,
                      data_dict: Dict[str, pd.DataFrame],
@@ -1131,8 +1164,12 @@ class KairosOrchestrator:
         Returns a dict keyed by strategy_name with:
           pnl_list  – list of per-signal pnl_pct values
           sharpe    – annualised Sharpe across all signals
+
+        Also populates `self._shadow_performance_by_class` as a side effect
+        (see `_store_by_class`); the return value is unchanged.
         """
         by_strategy: Dict[str, List[float]] = defaultdict(list)
+        by_class: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
         for record in self._shadow_signals:
             # Unpack with backward compat: entry field added later
             if len(record) == 7:
@@ -1181,14 +1218,12 @@ class KairosOrchestrator:
                 pnl_pct = (entry - exit_p) / entry
 
             by_strategy[sname].append(pnl_pct)
+            by_class[sname][asset_class_of_symbol(symbol)].append(pnl_pct)
 
-        result = {}
         ann_factor = np.sqrt(bars_per_year(KairosSettings.interval))
-        for sname, pnl_list in by_strategy.items():
-            n = len(pnl_list)
-            sharpe = _safe_sharpe(np.array(pnl_list), ann_factor)
-            result[sname] = {"pnl_list": pnl_list, "sharpe": sharpe, "signal_count": n}
-        return result
+        self._shadow_performance_by_class = _summarize_by_class(by_class, ann_factor)
+        return {sname: _summarize_pnl(pnl_list, ann_factor)
+                for sname, pnl_list in by_strategy.items()}
 
     def _compute_shadow_performance_naive(self) -> Dict[str, Dict]:
         """Evaluate oracle's real shadow signals with no future peek at all.
@@ -1211,6 +1246,7 @@ class KairosOrchestrator:
         kairos_signal_replay.py already made for the same reason.
         """
         by_strategy: Dict[str, List[float]] = defaultdict(list)
+        by_class: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
         for record in self._shadow_signals:
             if len(record) == 7:
                 date, symbol, sname, direction, stop, target, sig_entry = record
@@ -1264,14 +1300,12 @@ class KairosOrchestrator:
             else:
                 pnl_pct = (new_entry - exit_p) / new_entry
             by_strategy[sname].append(pnl_pct)
+            by_class[sname][asset_class_of_symbol(symbol)].append(pnl_pct)
 
-        result = {}
         ann_factor = np.sqrt(bars_per_year(KairosSettings.interval))
-        for sname, pnl_list in by_strategy.items():
-            n = len(pnl_list)
-            sharpe = _safe_sharpe(np.array(pnl_list), ann_factor)
-            result[sname] = {"pnl_list": pnl_list, "sharpe": sharpe, "signal_count": n}
-        return result
+        self._shadow_performance_by_class = _summarize_by_class(by_class, ann_factor)
+        return {sname: _summarize_pnl(pnl_list, ann_factor)
+                for sname, pnl_list in by_strategy.items()}
 
     def _build_results(self) -> Dict:
         """Compile all results into a comprehensive dict.
@@ -1328,6 +1362,10 @@ class KairosOrchestrator:
             "worst_strategy": worst_strategy,
             "strategy_rankings": shadow_ranked,   # all strategies with signals
             "shadow_performance": shadow_perf,
+            # Same signals as shadow_performance, split by the asset class of
+            # the symbol each signal came from. Populated by whichever shadow
+            # evaluator just ran, so it always matches shadow_performance.
+            "shadow_performance_by_class": self._shadow_performance_by_class,
             "no_prediction": self.config.no_prediction,
             "naive_baseline": self.config.naive_baseline,
             "strategy_build_stats": dict(StrategyRegistry.LAST_BUILD_STATS),

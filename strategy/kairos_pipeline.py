@@ -201,6 +201,41 @@ CREATE TABLE IF NOT EXISTS model_results (
     model_path TEXT
 );
 
+-- Per-(model, instrument class) strategy stats. Deliberately a SEPARATE table
+-- rather than an asset_class column on oracle_results/model_results: those two
+-- are keyed one row per (run, strategy) and seven consumers rely on that grain
+-- (refresh_disabled_strategies would raise IntegrityError outright; viability
+-- report / rebuild_disabled / finetune selection+acceptance would silently pick
+-- one arbitrary class per strategy). Keeping them untouched makes this purely
+-- additive, and preserves their `sharpe` as the exact pooled-corpus figure.
+--
+-- `sharpe` here is exact WITHIN a class (computed from that class's own pooled
+-- pnl list). It is NOT a decomposition of the corpus Sharpe -- a ratio does not
+-- recombine across classes. Never weight these back into a corpus number; read
+-- the corpus number from oracle_results/model_results.
+--
+-- `asset_class` is free text (equity|crypto|fx_commodity today, plus 'mixed'
+-- for backfilled rows that could not be split) so a later split -- FX out of
+-- fx_commodity, or venue/sector -- is a data migration, not a schema change.
+-- `model_path` distinguishes base from each finetuned checkpoint; oracle and
+-- naive write NULL.
+CREATE TABLE IF NOT EXISTS strategy_class_stats (
+    run_id INTEGER,
+    stage TEXT,
+    model_path TEXT,
+    strategy_name TEXT,
+    asset_class TEXT,
+    sharpe REAL,
+    signal_count INTEGER,
+    win_rate REAL,
+    avg_pnl_per_trade REAL,
+    assets TEXT,
+    interval TEXT,
+    backtest_period TEXT,
+    version TEXT,
+    PRIMARY KEY (run_id, strategy_name, asset_class)
+);
+
 CREATE TABLE IF NOT EXISTS disabled_strategies (
     interval TEXT NOT NULL,
     assets TEXT NOT NULL,           -- sorted CSV, normalized
@@ -353,6 +388,25 @@ def insert_model_row(conn, run_id, row: dict):
         (run_id, row["stage"], row["strategy_name"], row.get("sharpe"),
          row.get("signal_count"), row.get("win_rate"), row.get("avg_pnl_per_trade"),
          row.get("assets"), row.get("interval"), row.get("backtest_period"), row.get("model_path")),
+    )
+
+
+def insert_class_stat_row(conn, run_id, row: dict):
+    """Write one per-(strategy, asset class) row.
+
+    INSERT OR REPLACE on the natural key so re-running a group or re-running
+    the backfill is idempotent rather than duplicating.
+    """
+    conn.execute(
+        """INSERT OR REPLACE INTO strategy_class_stats
+           (run_id, stage, model_path, strategy_name, asset_class, sharpe, signal_count,
+            win_rate, avg_pnl_per_trade, assets, interval, backtest_period, version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (run_id, row.get("stage"), row.get("model_path"), row["strategy_name"],
+         row.get("asset_class"), row.get("sharpe"), row.get("signal_count"),
+         row.get("win_rate"), row.get("avg_pnl_per_trade"), row.get("assets"),
+         row.get("interval"), row.get("backtest_period"),
+         row.get("version", git_commit_hash())),
     )
 
 
@@ -1248,28 +1302,141 @@ def run_backtest_subprocess(assets, interval="1d", backtest_period="6m",
     return payload
 
 
+def _pnl_stats(sdata: dict, fallback_sharpe=None) -> dict:
+    """win_rate / avg_pnl_per_trade / signal_count / sharpe from one pnl list."""
+    pnl_list = sdata.get("pnl_list", [])
+    wins = sum(1 for p in pnl_list if p > 0)
+    return {
+        "sharpe": sdata.get("sharpe", fallback_sharpe),
+        "signal_count": sdata.get("signal_count", len(pnl_list)),
+        "win_rate": wins / len(pnl_list) if pnl_list else 0.0,
+        "avg_pnl_per_trade": float(np.mean(pnl_list)) if pnl_list else 0.0,
+    }
+
+
 def _rows_from_export(payload: dict, assets, interval, backtest_period, stage: str):
     """Flatten export_json payload into one row per strategy."""
     shadow = payload.get("shadow_performance", {})
     rankings = dict(payload.get("strategy_rankings", []))
     rows = []
     for sname, sdata in shadow.items():
-        pnl_list = sdata.get("pnl_list", [])
-        wins = sum(1 for p in pnl_list if p > 0)
-        win_rate = wins / len(pnl_list) if pnl_list else 0.0
-        avg_pnl = float(np.mean(pnl_list)) if pnl_list else 0.0
         rows.append({
             "stage": stage,
             "strategy_name": sname,
-            "sharpe": sdata.get("sharpe", rankings.get(sname)),
-            "signal_count": sdata.get("signal_count", len(pnl_list)),
-            "win_rate": win_rate,
-            "avg_pnl_per_trade": avg_pnl,
+            **_pnl_stats(sdata, rankings.get(sname)),
             "assets": ",".join(assets),
             "interval": interval,
             "backtest_period": backtest_period,
         })
     return rows
+
+
+def _class_rows_from_export(payload: dict, assets, interval, backtest_period,
+                            stage: str, model_path=None):
+    """Flatten export_json into one row per (strategy, asset class).
+
+    Returns [] when the payload predates `shadow_performance_by_class` (older
+    exports, hand-built test payloads) -- callers then simply write nothing to
+    strategy_class_stats, leaving the corpus tables as the only record.
+    """
+    by_class = payload.get("shadow_performance_by_class", {})
+    rows = []
+    for sname, per_class in by_class.items():
+        for cls, sdata in per_class.items():
+            rows.append({
+                "stage": stage,
+                "model_path": model_path,
+                "strategy_name": sname,
+                "asset_class": cls,
+                **_pnl_stats(sdata),
+                "assets": ",".join(assets),
+                "interval": interval,
+                "backtest_period": backtest_period,
+            })
+    return rows
+
+
+CLASS_STATS_MIN_SIGNALS = 30
+"""Minimum signals before a (model, class) cell is trusted over the corpus.
+
+Starting default, NOT calibrated -- there is no per-class history to tune it
+against yet. For scale: AllocationConfig.min_n is 50 and n0 is 100, while
+refresh_disabled_strategies uses 5 and the viability report 3. Phase 2 should
+revisit this against real per-class volume.
+"""
+
+
+def strategy_class_stats(conn, *, stage, asset_class=None, model_path=None,
+                         interval="1d", backtest_period="6m",
+                         min_signals=CLASS_STATS_MIN_SIGNALS,
+                         fallback_to_corpus=True):
+    """Signal-count-weighted per-strategy stats for one (model, class).
+
+    Returns {strategy_name: {sharpe, win_rate, avg_pnl_per_trade, signal_count,
+    n_groups, source}} where `source` is "class" or "corpus".
+
+    `asset_class=None` returns the corpus figure, read from
+    oracle_results/model_results -- NOT reconstructed from per-class rows.
+    Sharpe is a ratio: weighting per-class Sharpes back together is not the
+    corpus Sharpe and must never be used as one. win_rate and
+    avg_pnl_per_trade are per-trade means and would recombine exactly, but
+    they are read from the same place for consistency.
+
+    With `fallback_to_corpus`, any strategy whose class cell has fewer than
+    `min_signals` signals falls back to that model's corpus stat, so a caller
+    never has to handle a missing entry.
+    """
+    corpus_table = "model_results" if stage in ("base", "finetuned") else "oracle_results"
+
+    def _weighted(sql, params):
+        out = {}
+        for r in conn.execute(sql, params):
+            name, n_groups, signals, sharpe, win, pnl = r
+            if not signals:
+                continue
+            out[name] = {"sharpe": sharpe, "win_rate": win, "avg_pnl_per_trade": pnl,
+                         "signal_count": signals, "n_groups": n_groups}
+        return out
+
+    agg = ("SELECT strategy_name, COUNT(DISTINCT run_id), SUM(signal_count),"
+           " SUM(sharpe*signal_count)*1.0/SUM(signal_count),"
+           " SUM(win_rate*signal_count)*1.0/SUM(signal_count),"
+           " SUM(avg_pnl_per_trade*signal_count)*1.0/SUM(signal_count) ")
+
+    corpus_sql = (agg + f"FROM {corpus_table} WHERE stage=? AND interval=? AND backtest_period=?"
+                        " AND signal_count>0")
+    corpus_params = [stage, interval, backtest_period]
+    if model_path is not None and corpus_table == "model_results":
+        corpus_sql += " AND model_path=?"
+        corpus_params.append(model_path)
+    corpus_sql += " GROUP BY strategy_name"
+    corpus = _weighted(corpus_sql, corpus_params)
+    for v in corpus.values():
+        v["source"] = "corpus"
+
+    if asset_class is None:
+        return corpus
+
+    cls_sql = (agg + "FROM strategy_class_stats WHERE stage=? AND asset_class=? AND interval=?"
+                     " AND backtest_period=? AND signal_count>0")
+    cls_params = [stage, asset_class, interval, backtest_period]
+    if model_path is not None:
+        cls_sql += " AND model_path=?"
+        cls_params.append(model_path)
+    cls_sql += " GROUP BY strategy_name"
+    per_class = _weighted(cls_sql, cls_params)
+
+    result = {}
+    for name, v in per_class.items():
+        if v["signal_count"] >= min_signals:
+            v["source"] = "class"
+            result[name] = v
+        elif fallback_to_corpus and name in corpus:
+            result[name] = corpus[name]
+    if fallback_to_corpus:
+        for name, v in corpus.items():
+            result.setdefault(name, v)
+    return result
 
 
 def select_deduped_groups(conn, correlation_run_id):
@@ -1328,6 +1495,12 @@ def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_sam
     rows = _rows_from_export(payload, assets, interval, backtest_period, stage="oracle")
     for row in rows:
         insert_oracle_row(conn, run_id, row)
+    # Additive: per-class rows alongside the corpus rows above. refresh_disabled_
+    # strategies() below still receives `rows` (corpus only), so the live gate is
+    # untouched by this.
+    for crow in _class_rows_from_export(payload, assets, interval, backtest_period,
+                                        stage="oracle"):
+        insert_class_stat_row(conn, run_id, crow)
     conn.commit()
 
     csv_path = dump_csv("oracle_results", [{"run_id": run_id, **r} for r in rows], "oracle")
@@ -1403,6 +1576,9 @@ def run_stage_naive(conn, assets, interval="1d", backtest_period="6m", pred_samp
     rows = _rows_from_export(payload, assets, interval, backtest_period, stage="naive")
     for row in rows:
         insert_oracle_row(conn, run_id, row)
+    for crow in _class_rows_from_export(payload, assets, interval, backtest_period,
+                                        stage="naive"):
+        insert_class_stat_row(conn, run_id, crow)
     conn.commit()
 
     csv_path = dump_csv("oracle_results", [{"run_id": run_id, **r} for r in rows], "naive")
@@ -1445,6 +1621,9 @@ def run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
     for row in rows:
         row["model_path"] = model_path
         insert_model_row(conn, run_id, row)
+    for crow in _class_rows_from_export(payload, assets, interval, backtest_period,
+                                        stage=stage, model_path=model_path):
+        insert_class_stat_row(conn, run_id, crow)
     conn.commit()
 
     csv_path = dump_csv("model_results", [{"run_id": run_id, **r} for r in rows], stage)

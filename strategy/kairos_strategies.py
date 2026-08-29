@@ -43,7 +43,7 @@ from typing import Callable, List, Optional, Sequence
 import pandas as pd
 
 from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig, print_results
-from kairos_backtest import BARS_PER_DAY, bars_per_year, KairosSettings
+from kairos_backtest import BARS_PER_DAY, bars_per_year, KairosSettings, COMMODITY_ETFS
 from kairos.config import _state
 from kairos_predcache import PredictionCache
 
@@ -856,7 +856,9 @@ def _period_to_weeks(period: str) -> float:
     return cal_days / 7
 
 
-_COMMODITY_ETFS = {"GLD", "SLV", "USO", "UNG", "DBC", "PDBC", "CPER", "COPX", "GDX"}
+# Single source of truth lives in kairos_backtest (also used by the per-symbol
+# stats classifier); aliased here so asset_class_for's body is unchanged.
+_COMMODITY_ETFS = COMMODITY_ETFS
 
 
 def asset_class_for(assets) -> str:
@@ -1117,6 +1119,12 @@ if __name__ == "__main__":
             "summary": _jsonable(results.get("summary", {})),
             "strategy_rankings": _jsonable(results.get("strategy_rankings", [])),
             "shadow_performance": _jsonable(results.get("shadow_performance", {})),
+            # {strategy: {asset_class: stats}} — the same signals as
+            # shadow_performance, split by the class of the symbol each came
+            # from. Consumers must read this with .get(): older exports and
+            # hand-built test payloads do not carry it.
+            "shadow_performance_by_class": _jsonable(
+                results.get("shadow_performance_by_class", {})),
             "strategy_build_stats": _jsonable(results.get("strategy_build_stats", {})),
             "signal_firing_count": _jsonable(results.get("signal_firing_count", 0)),
         }

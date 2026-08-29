@@ -835,6 +835,78 @@ contributes fewer signals rather than failing loudly, so a lower-than-expected
 for that before concluding a strategy went quiet. Tests in
 `tests/unit/test_realized_predictions_nonfinite.py`.
 
+### Per-(model, instrument class) stats: `strategy_class_stats`
+
+Sweeps record per-strategy stats **twice**: the long-standing corpus row (one per
+strategy per group, in `oracle_results`/`model_results`) and, since 2026-08-29, a
+per-(strategy, asset class) row in `strategy_class_stats`. Motivation is in
+`docs/papers/where_strategies_travel.html` — strategy quality is strongly
+class-dependent (oracle median +2.40 on equities vs −4.78 on crypto, and some
+strategies reverse sign between classes), so one corpus number averages away the
+thing you would select on.
+
+**It is a separate table on purpose.** Adding an `asset_class` column to the
+results tables would change their grain to (run, strategy, class), and seven
+consumers rely on one row per (run, strategy) — `refresh_disabled_strategies()`
+would raise `IntegrityError` outright (plain INSERT, PK `(interval, assets,
+strategy_name)`), while `run_stage_rebuild_disabled`, `build_viability_report`,
+`select_finetune_candidate`, `compare_finetuned_vs_base`, `_get_metric_columns`
+and `docs/papers/*.py` would each silently pick one arbitrary class per strategy.
+Keeping the results tables untouched makes this purely additive.
+
+**Never reconstruct a corpus figure from per-class rows.** Sharpe is a ratio and
+does not recombine across classes — `signal_count` sums and `win_rate` /
+`avg_pnl_per_trade` are per-trade means that would recombine exactly, but Sharpe
+would not, and it is the number everything reads. The corpus Sharpe stays what it
+always was: a true value over the group's pooled `pnl_list` in the results tables.
+Within a class, Sharpe is likewise exact, computed from that class's own pooled
+list. Read one or the other, never a weighted blend of the per-class rows.
+`kairos_pipeline.strategy_class_stats(conn, stage=..., asset_class=...)` enforces
+this — `asset_class=None` reads the corpus table, and a class cell below
+`CLASS_STATS_MIN_SIGNALS` (30, uncalibrated) falls back to corpus with
+`source="corpus"` on the returned dict.
+
+**Attribution is exact for new sweeps, approximate for backfilled rows.**
+`_compute_shadow_performance{,_naive}` attribute each signal to its own symbol's
+class (the symbol is in `_shadow_signals`; it used to be discarded), so a mixed
+group splits correctly. `scripts/backfill_class_stats.py` could not do that for
+the 111,657 historical rows — the per-symbol breakdown was gone before they were
+persisted — so it derives class from group composition and marks genuinely mixed
+groups `'mixed'` (1,503 rows, 1.3%), invisible to per-class reads.
+
+**The invariant that catches attribution bugs:** per-class `signal_count`s must sum
+to the corpus `signal_count` for the same (run, strategy). Sharpe will not match
+and must never be asserted to.
+
+**Nothing consumes these yet** — that is deliberate. See
+`docs/tickets/per-class-stats-wiring.md` for what phase 2 must wire, with call
+sites traced.
+
+### Four classifiers, none interchangeable
+
+Do not unify these and do not join on `asset_class` across tables:
+
+| Function | Taxonomy | Grain | Used for |
+|---|---|---|---|
+| `kairos_backtest.asset_class_of_symbol()` | 3-way `equity｜crypto｜fx_commodity`, suffix-based | symbol | `strategy_class_stats` only |
+| `kairos_strategies.asset_class_for()` | 5-way — `fx` and `commodity` **separate**, plus `mixed` | group, majority vote | live `_DISABLED_BY_CLASS` fallback |
+| `kairos_pipeline.asset_class_of()` | 3-way, membership lookup in `CANDIDATE_UNIVERSE` | symbol | universe screening |
+| `kairos_margin.classify_symbol()` | 7-way margin schedule (`config/margin_ibkr.yaml`) | symbol | leverage/margin math |
+
+The suffix classifier exists because the membership one returns `unknown` for
+anything unscreened — which is why 17 real FX-pair groups were unclassifiable in
+the market-segmentation analysis.
+
+**`asset_class_for()` is load-bearing and was deliberately left alone.**
+`_DISABLED_BY_CLASS` (`kairos_strategies.py:906`) is keyed `("1d","fx")` and
+`("1d","commodity")` separately, and `resolve_disabled_strategies()` consults it
+for any group with no oracle-tested DB profile — the live path
+(`kairos_signals.py:820`). Collapsing fx+commodity into `fx_commodity` there would
+make every one of those keys miss, silently returning an **empty disabled set** and
+letting strategies as bad as `volume_fade` (−150 mean Sharpe on crypto) run
+unfiltered. If you ever do reconcile the taxonomies, update those keys in the same
+commit.
+
 ### Research papers live in `docs/papers/`
 
 Two published research documents, each generated from the DB rather than

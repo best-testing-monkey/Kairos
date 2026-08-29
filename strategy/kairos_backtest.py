@@ -91,6 +91,44 @@ BARS_PER_DAY = {
     "1wk": 1 / 7, "1mo": 1 / 30, "3mo": 1 / 90,
 }
 
+# Known commodity ETFs — tickers with no suffix that are nonetheless commodity
+# exposure. Single source of truth; kairos_strategies.asset_class_for() imports
+# this rather than keeping its own copy.
+COMMODITY_ETFS = {"GLD", "SLV", "USO", "UNG", "DBC", "PDBC", "CPER", "COPX", "GDX"}
+
+
+def asset_class_of_symbol(symbol: str) -> str:
+    """Classify ONE ticker into the 3-way strategy-stats taxonomy.
+
+    Returns "crypto" | "fx_commodity" | "equity".
+
+    This is the canonical classifier **for per-strategy statistics only**
+    (`strategy_class_stats`). Do not confuse it with the three other
+    classifiers in this codebase, which disagree deliberately:
+
+      - `kairos_strategies.asset_class_for(assets)` — 5-way (adds a separate
+        "fx" vs "commodity" split, plus "mixed"), operates on a whole GROUP by
+        majority vote, and is load-bearing for the live `_DISABLED_BY_CLASS`
+        safety net. Not interchangeable with this function.
+      - `kairos_pipeline.asset_class_of(symbol)` — 3-way but membership-based
+        (looks the symbol up in CANDIDATE_UNIVERSE), so it returns "unknown"
+        for anything unscreened. That is why real FX pairs were unclassifiable
+        in earlier analysis; this function classifies them by suffix instead.
+      - `kairos_margin.classify_symbol(symbol, cfg)` — 7-way margin schedule
+        from config/margin_ibkr.yaml, for leverage math only.
+
+    Suffix rules mirror `asset_class_for`'s per-symbol half, with fx and
+    commodity merged into one bucket. The return value is free-text by design:
+    splitting fx back out, or adding venue/sector, is a data migration rather
+    than a schema change.
+    """
+    s = symbol.strip()
+    if s.endswith("-USD"):
+        return "crypto"
+    if s.endswith("=X") or s.endswith("=F") or s in COMMODITY_ETFS:
+        return "fx_commodity"
+    return "equity"
+
 
 def bars_per_year(interval: str) -> float:
     """Approximate annualization base for Sharpe/vol math at a given bar interval.
