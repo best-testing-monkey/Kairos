@@ -781,6 +781,90 @@ a leftover." A live sweep's own group was killed by mistake this way on
 2026-08-27 — the sweep's per-group error handling absorbed it as a `[FAIL]`
 and moved on, but the group still needed a manual one-off re-run to backfill.
 
+### Eight strategy names are the same strategy (found 2026-08-29)
+
+`trend_following` plus seven "filter" strategies — `cds_spread_filter`,
+`cot_positioning_filter`, `dark_pool_filter`, `fractal_dimension`,
+`gaussian_process`, `insider_cluster`, `onchain_flow_filter` — all produce
+**byte-identical** results. Each of the seven wraps `TrendFollowingStrategy()`
+(registered that way in `kairos_orchestrator.py`) and gates on a context key
+the pipeline never supplies (`cds_spread_change`, `dark_pool_sentiment`,
+`cot_net_position`, …). Every `context.get(key, 0.0)` returns the `0.0`
+default, so every gate condition is false and each filter degrades to an
+unmodified pass-through, differing only in the name stamped on the signal.
+Confirmed in code, not inferred from the numbers.
+
+**Consequence for any corpus-wide statistic: one behaviour votes eight
+times.** Collapsing the aliases moved the whitepaper's oracle median from
++0.32 to +2.20, because seven redundant copies of an unprofitable strategy
+sat near the middle of the distribution. Counts of *profitable* strategies
+were unaffected (all eight are negative in every regime), but medians,
+quartiles and denominators all were. Any new per-strategy aggregation should
+collapse these to `trend_following` alone — see `docs/papers/build_paper.py`'s
+`ALIAS` set and `analyze_by_market3.py` for the pattern.
+
+Four further pairs coincide on most-but-not-all groups and are **not** exact
+aliases, so they are deliberately left uncollapsed — but check them before
+trusting a fine-grained count: `expected_value`/`vol_target_sizer` (445
+groups), `range_trading`/`rqa_determinism` (302),
+`dynamic_bracket`/`inverse_variance` (262), `amount_flow`/`predicted_vwap`
+(70). Detect aliasing generally by grouping strategies on their full vector
+of per-group `(sharpe, signal_count)` and looking for exact duplicates.
+
+### Non-finite bars are skipped, not fatal (fixed 2026-08-29)
+
+`KairosDistribution.from_bar()` seeds its RNG with
+`int(abs(actual_close) * 1000)`, so a NaN close raised
+`ValueError: cannot convert float NaN to integer` and aborted the **entire
+group's** backtest. Previous handoffs described this as an
+"international-symbol bug" — **that diagnosis was wrong**. A single missing
+bar anywhere in any one symbol's history is enough; the case that finally
+pinned it was `P`, with exactly one NaN close in 484 bars. It was
+deterministic (the bad bar is the "next bar" for exactly one date), which is
+why the same groups failed every sweep.
+
+`_make_realized_predictions()` now skips that symbol for that date. The guard
+lives there rather than in `from_bar()` because that is `from_bar`'s only
+caller and skipping is the caller's decision; it also covers `current_price`
+(whose non-finite case is quieter and worse — it poisons every sampled close
+into NaN rather than raising) and `inf` (which overflows the same cast).
+**Behavioural consequence:** a symbol with gappy data now silently
+contributes fewer signals rather than failing loudly, so a lower-than-expected
+`signal_count` may mean skipped bars. It warns once per symbol
+(`[warn] <SYM>: non-finite OHLC bar, skipping affected dates`) — grep run logs
+for that before concluding a strategy went quiet. Tests in
+`tests/unit/test_realized_predictions_nonfinite.py`.
+
+### Research papers live in `docs/papers/`
+
+Two published research documents, each generated from the DB rather than
+hand-written, with their generators and input data checked in beside them:
+
+| File | What |
+|------|------|
+| `prediction_premium.html` | *The Prediction Premium* — naive vs base vs oracle, paired on a matched group set |
+| `where_strategies_travel.html` | *Where Strategies Travel* — same regimes segmented by asset class and listing venue |
+| `build_paper.py` / `paper_table.json` | generator + data for the first |
+| `build_market_report.py` / `market_analysis3.json` | generator + data for the second |
+| `analyze_by_market3.py` | regenerates `market_analysis3.json` from `pipeline_results.db` |
+| `audit_paper.py` | re-derives the first paper's figures straight from the DB and cross-checks the published HTML |
+
+Both generators read every figure from JSON instead of transcribed constants,
+specifically so a page cannot drift from the data — earlier hand-kept
+constants printed a median of `+0.160` where the data said `+0.159`. Re-run
+the analysis and the pages regenerate.
+
+**Two flavours, one source.** Run a generator **from `docs/papers/`** and it
+writes a standalone doctype'd file there (for opening from disk — `file://`
+has no Content-Type header, so without `<meta charset>` the em-dashes and ρ
+garble). Run it **from a scratchpad** and it writes a head-less
+artifact-publish source there *and* refreshes the repo copy. Publish the
+scratchpad copy — the Artifact tool rejects a page carrying its own doctype.
+
+The §8 "Data provenance" section of each paper records the exact tables,
+columns, run ids and SQL behind every figure; that is the reference for
+"where does the data for phase X live," not this file.
+
 ## Test suite
 
 Tests live in `tests/unit/` and require no GPU or model download.
