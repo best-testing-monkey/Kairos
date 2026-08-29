@@ -740,6 +740,45 @@ path_high_low_exec    +6.62 -> +5.13      high_low          +7.73 -> +7.04
 
 One sign flip (`support_confluence`), mean delta −0.029.
 
+### ⚠ 14 oracle groups have an ambiguous ruler (open, as of 2026-08-29)
+
+**Do not regenerate `docs/papers/analyze_by_market3.py` or
+`build_market_report.py` until this is resolved.** The corpus is not uniform.
+
+A sibling session's re-sweep of the 14 `'mixed'`-class groups (run_ids
+4206–4233) ran *while the exit-rule change above sat uncommitted in the working
+tree*. Subprocesses import whatever is on disk, so the sweep straddles the edit:
+
+| run_ids | started | rule | how known |
+|---|---|---|---|
+| 4206–4213 (8 groups) | 20:45:39, together | **old** | 4206 measured 39/39; rest started same second (inference) |
+| 4214–4218 (5 groups) | 20:50:59–20:51:58 | **unknown** | edit boundary falls in here |
+| 4219 (1 group) | 20:52:03 | **new** | measured 39/39 |
+| 4220–4233 (naive) | 20:57–21:04 | n/a | naive behaviour unchanged by the refactor — unaffected |
+
+So 1–6 oracle groups out of ~961 sit on a different ruler from the rest, and the
+differences are large enough to move per-class medians (`support_confluence`
++10.09 vs +10.23, `high_low` +5.54 vs +3.39 on one group; on another,
++6.45 → +0.36).
+
+**`oracle_results.version` reads `539ba54` for all 14 and is wrong for at least
+one of them.** `git_commit_hash()` returns HEAD, which was `539ba54` both before
+and after the edit — it records what was *committed*, never what *executed*.
+Treat the column as trustworthy only for rows produced from a clean tree, and
+launch sweeps from a committed tree so it stays meaningful.
+
+Resolution is deferred pending a decision on whether the corpus moves to the new
+rule (then re-sweep ~947 oracle + ~559 base groups, and both papers' exit-rule
+limitation retires) or stays on the old one (then re-sweep these groups back
+from a clean tree at `539ba54`). **Re-sweep all 14 uniformly either way** —
+cheaper than establishing the exact boundary, and it also retires the
+inference in the table above. Base sweeps are frozen meanwhile.
+
+To re-check any single group: `uv run scripts/ab_exit_rule.py "<assets>"`
+computes both rules on one run's identical shadow signals; oracle is
+deterministic, so whichever column matches the stored row is the rule that
+produced it.
+
 **Do not generalise this to base.** Base was not measured (it needs the GPU) and
 is where the change should bite hardest: a model's predicted brackets are not
 derived from the realised bar, so they miss on bar 1 far more often than
