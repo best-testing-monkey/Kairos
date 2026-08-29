@@ -77,6 +77,7 @@ _TEXT_COLUMNS = {
     "Strategy": lambda c, derived, cluster_map: c.strategy,
     "Dir": lambda c, derived, cluster_map: c.direction,
     "Model": lambda c, derived, cluster_map: c.model or "",
+    "Asset Class": lambda c, derived, cluster_map: c.asset_class or "",
 }
 
 _NUMERIC_COLUMNS = {

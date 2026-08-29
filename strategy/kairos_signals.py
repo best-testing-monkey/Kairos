@@ -382,7 +382,7 @@ STATS_COLUMNS = [
     "strategy", "symbol", "interval", "backtest_period", "direction", "size",
     "entry", "stop", "target", "expected_value", "ev_pct",
     "oracle_sharpe", "base_sharpe", "oracle_win_rate", "base_win_rate",
-    "signals_per_week", "model",
+    "signals_per_week", "model", "asset_class",
 ]
 
 
@@ -771,6 +771,48 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
     }
 
 
+def _class_prior_win_rate(interval, assets, model_path, db_path=DB_PATH):
+    """Signal-count-weighted mean win rate across ALL strategies in this
+    (model, asset class) cell, or None.
+
+    This is the empirical prior `allocation.compute_derived()` shrinks a thin
+    strategy toward, instead of a flat 0.5. Returning None (no data, mixed
+    group, or any DB problem) restores the previous shrink-toward-0.5
+    behaviour exactly, so this can only ever refine sizing, never break it.
+
+    Mixed-class groups return None deliberately: one class's base rate cannot
+    stand in for a basket spanning several. Uses plain sqlite3 rather than
+    importing kairos_pipeline, matching resolve_disabled_strategies' reasoning
+    about the module import cycle.
+    """
+    from kairos_backtest import asset_class_of_symbol
+
+    classes = {asset_class_of_symbol(a) for a in assets}
+    if len(classes) != 1:
+        return None
+    stage = "finetuned" if model_path else "base"
+    clause = "model_path IS NULL" if model_path is None else "model_path = ?"
+    params = [interval, next(iter(classes)), stage]
+    if model_path is not None:
+        params.append(model_path)
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT SUM(win_rate * signal_count) * 1.0 / SUM(signal_count) "
+            "FROM strategy_class_stats "
+            f"WHERE interval=? AND asset_class=? AND stage=? AND {clause} "
+            "AND signal_count > 0",
+            params,
+        ).fetchone()
+        return row[0] if row and row[0] is not None else None
+    except sqlite3.Error:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label,
                data, pred_samples, min_ev_pct, conn=None, use_signal_cache=True,
                assets_str=None, as_of_date=None, lookback=None,
@@ -817,7 +859,8 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
     advice_rows = []
     skipped = []
 
-    disabled = resolve_disabled_strategies(interval, assets)
+    disabled = resolve_disabled_strategies(interval, assets, model_path=model_path)
+    class_prior = _class_prior_win_rate(interval, assets, model_path)
     config = OrchestratorConfig.for_interval(interval, disabled_strategies=disabled)
 
     def _dummy_predict(*a, **kw):
@@ -934,6 +977,8 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
                 "base_win_rate": row.get("base_win_rate"),
                 "signals_per_week": row.get("signals_per_week"),
                 "model": model_label,
+                "asset_class": row.get("asset_class"),
+                "class_prior_win_rate": class_prior,
             })
             strat_advice.append({
                 "expected_value": sig.expected_value,

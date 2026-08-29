@@ -2013,7 +2013,8 @@ class TestFinetunedOverlay:
         assert (sheets["strategies"]["model"] == "Base").all()
 
     def test_model_column_appended_to_stats_and_signals_columns(self):
-        assert STATS_COLUMNS[-1] == "model"
+        assert "model" in STATS_COLUMNS
+        assert STATS_COLUMNS[-1] == "asset_class"
         assert SIGNALS_COLUMNS[-1] == "model"
         assert SIGNALS_ALIGN[-1] == "l"
         assert len(SIGNALS_ALIGN) == len(SIGNALS_COLUMNS)
@@ -2235,7 +2236,7 @@ class TestSignalsCache:
         import kairos_strategies
         monkeypatch.setattr(
             kairos_strategies, "resolve_disabled_strategies",
-            lambda interval, assets: {"strat_a"},
+            lambda interval, assets, model_path=None: {"strat_a"},
         )
         out2, stats2, advice2 = self._run(tmp_path, monkeypatch, db_path, strategies, predict_calls)
 

@@ -18,16 +18,10 @@ ALIAS = {"onchain_flow_filter", "insider_cluster", "gaussian_process", "fractal_
          "dark_pool_filter", "cot_positioning_filter", "cds_spread_filter"}  # drop; keep trend_following
 
 conn = sqlite3.connect(DB); conn.row_factory = sqlite3.Row
-CLS = {s: a for s, a in conn.execute(
-    "SELECT symbol, asset_class FROM universe_screen WHERE passed=1 AND run_id=759")}
 SUFFIX = re.compile(r"\.([A-Z]+)$")
 VENUE = {"US": "United States", "L": "London", "HK": "Hong Kong", "DE": "Germany",
          "ST": "Stockholm", "AX": "Australia", "SW": "Switzerland", "PA": "Paris",
          "T": "Tokyo", "TO": "Toronto", "MI": "Milan", "AS": "Amsterdam", "MX": "Mexico"}
-
-def gclass(a):
-    ks = {CLS.get(s) for s in a.split(",")}
-    return "unknown" if None in ks else (ks.pop() if len(ks) == 1 else "mixed")
 
 def gvenue(a):
     vs = {(SUFFIX.search(s).group(1) if SUFFIX.search(s) else "US") for s in a.split(",")}
@@ -38,7 +32,7 @@ def weighted(rows, keyfn):
     for r in rows:
         if r["strategy_name"] in ALIAS:      # collapse
             continue
-        b = keyfn(r["assets"])
+        b = keyfn(r)
         if b is None: continue
         d = agg[b][r["strategy_name"]]; n = r["signal_count"]
         d["g"] += 1; d["s"] += n
@@ -57,14 +51,15 @@ def spearman(a,b,keys):
     return 1-6*sum((ra[k]-rb[k])**2 for k in keys)/(n*(n*n-1))
 
 CLASSES=("equity","crypto","fx_commodity")
-STAGES=[("oracle_results","oracle"),("oracle_results","naive"),("model_results","base")]
+STAGES=["oracle","naive","base"]
 report={"alias_collapsed":sorted(ALIAS),"by_class":{},"by_venue":{},"rank":{},
         "divergence":{},"summary":{},"venue_summary":{}}
 
-for tbl,stage in STAGES:
-    rows=conn.execute(f"""SELECT strategy_name,sharpe,signal_count,win_rate,avg_pnl_per_trade,assets
-                          FROM {tbl} WHERE stage=? AND signal_count>=?""",(stage,MIN_SIGNALS)).fetchall()
-    byc=weighted(rows, lambda a:(lambda g: g if g in CLASSES else None)(gclass(a)))
+for stage in STAGES:
+    rows=conn.execute(f"""SELECT strategy_name,sharpe,signal_count,win_rate,avg_pnl_per_trade,assets,asset_class
+                          FROM strategy_class_stats WHERE stage=? AND asset_class!='mixed' AND signal_count>=?""",
+                      (stage,MIN_SIGNALS)).fetchall()
+    byc=weighted(rows, lambda r:(r["asset_class"] if r["asset_class"] in CLASSES else None))
     have=[c for c in CLASSES if byc.get(c)]
     common=sorted(set.intersection(*[set(byc[c]) for c in have])) if have else []
     report["by_class"][stage]={c:byc[c] for c in have}
@@ -98,8 +93,8 @@ for tbl,stage in STAGES:
             print(f"    {k:28s} " + "  ".join(f"{c[:6]:>6s} {byc[c][k]['sharpe']:+8.2f}" for c in have))
 
     # venue, equities only
-    eqrows=[r for r in rows if gclass(r["assets"])=="equity"]
-    byv=weighted(eqrows, lambda a:(lambda v: v if v!="mixed" else None)(gvenue(a)))
+    eqrows=[r for r in rows if r["asset_class"]=="equity"]
+    byv=weighted(eqrows, lambda r:(lambda v: v if v!="mixed" else None)(gvenue(r["assets"])))
     byv={v:d for v,d in byv.items() if len(d)>=10}
     report["by_venue"][stage]=byv
     if byv:

@@ -40,6 +40,12 @@ class Candidate:
     avg_loss_pct: Optional[float] = None
     avg_holding_days: Optional[float] = None
     model: Optional[str] = None
+    asset_class: Optional[str] = None
+    # Signal-count-weighted mean win rate of ALL strategies in this
+    # (model, asset class) cell -- the empirical prior compute_derived shrinks
+    # toward when this strategy's own evidence is thin. None -> shrink toward
+    # 0.5 exactly as before. See compute_derived().
+    class_prior_win_rate: Optional[float] = None
 
 
 @dataclass
@@ -152,7 +158,15 @@ def compute_derived(c: Candidate, config: AllocationConfig) -> dict:
     ev_shrunk = c.ev_pct * shrink
     ev_net = ev_shrunk - config.round_trip_cost_pct
 
-    p_shrunk = 0.5 + (c.base_win_rate - 0.5) * shrink
+    # Shrink toward the (model, asset class) base rate when we know it, else
+    # toward 0.5 exactly as before. A strategy with thin evidence should
+    # regress to how strategies actually behave in ITS market, not to a coin
+    # flip -- crypto and equities have materially different base rates (see
+    # docs/papers/where_strategies_travel.html). With no class prior available
+    # this is arithmetically identical to the previous behaviour, so the
+    # default path is unchanged.
+    prior = c.class_prior_win_rate if c.class_prior_win_rate is not None else 0.5
+    p_shrunk = prior + (c.base_win_rate - prior) * shrink
     kelly_raw = p_shrunk - (1 - p_shrunk) / b
     kelly_frac = max(kelly_raw, 0) * config.kelly_mult
 
@@ -299,6 +313,8 @@ def fetch_signals(stats_rows, advice_rows):
             avg_loss_pct=None,  # Not present in current data; v1 nullable
             avg_holding_days=None,  # Not present in current data; v1 nullable
             model=stats_row.get("model", ""),
+            asset_class=stats_row.get("asset_class", ""),
+            class_prior_win_rate=stats_row.get("class_prior_win_rate"),
         )
 
         candidates.append(candidate)

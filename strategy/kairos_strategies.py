@@ -43,7 +43,7 @@ from typing import Callable, List, Optional, Sequence
 import pandas as pd
 
 from kairos_orchestrator import KairosOrchestrator, OrchestratorConfig, print_results
-from kairos_backtest import BARS_PER_DAY, bars_per_year, KairosSettings, COMMODITY_ETFS
+from kairos_backtest import BARS_PER_DAY, bars_per_year, KairosSettings, COMMODITY_ETFS, asset_class_of_symbol
 from kairos.config import _state
 from kairos_predcache import PredictionCache
 
@@ -963,7 +963,14 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(REPO_ROOT, "data", "pipeline_results.db")
 
 
-def resolve_disabled_strategies(interval: str, assets, db_path: str = None) -> set:
+_CLASS_STATS_MIN_SIGNALS = 30
+"""Mirrors kairos_pipeline.CLASS_STATS_MIN_SIGNALS. Duplicated (not imported)
+because this module must not import kairos_pipeline - see the module-cycle
+note in resolve_disabled_strategies()'s docstring. Keep in sync by hand."""
+
+
+def resolve_disabled_strategies(interval: str, assets, db_path: str = None,
+                                 model_path: str = None) -> set:
     """Resolve the set of disabled strategy names for a run.
 
     Resolution order:
@@ -972,16 +979,35 @@ def resolve_disabled_strategies(interval: str, assets, db_path: str = None) -> s
          has been oracle-tested - return the (possibly empty) set of
          strategy names found in that DB's disabled_strategies table for the
          same profile. An empty result here is meaningful ("tested and
-         clean") and does NOT fall through to the class fallback.
-      2. Otherwise (profile never oracle-tested, DB missing, or any sqlite3
-         error), fall back to (interval, asset_class) in _DISABLED_BY_CLASS,
-         where asset_class is computed via asset_class_for(assets).
-      3. Empty set if neither matches.
+         clean") and does NOT fall through to anything below.
+      2. Otherwise, a per-(model, class) gate read from strategy_class_stats
+         (see docs/tickets/per-class-stats-wiring.md). `asset_class_of_symbol()`
+         (3-way: crypto/fx_commodity/equity) is applied to every symbol; if
+         the group spans more than one such class, this step is skipped
+         entirely (falls to step 3) since one class's stats cannot be
+         applied to a mixed basket. `stage` is "finetuned" when `model_path`
+         is truthy, else "base". Signal-count-weighted avg_pnl_per_trade and
+         summed signal_count are aggregated across every matching row for
+         that (interval, asset_class, stage, model_path) cell (matching
+         `model_path IS NULL` when it is None). A strategy is disabled if
+         that weighted avg_pnl_per_trade is negative AND the summed
+         signal_count is >= _CLASS_STATS_MIN_SIGNALS - mirroring
+         kairos_pipeline.refresh_disabled_strategies()'s criterion. The cell
+         is only treated as authoritative if at least one strategy clears
+         that signal threshold; a cell that is missing entirely OR swept but
+         too thin falls through to step 3, so a sparse class can never
+         silently produce an empty disabled set and drop step 3's safety net.
+      3. Fall back to (interval, asset_class) in _DISABLED_BY_CLASS, where
+         asset_class is computed via asset_class_for(assets) - a DIFFERENT,
+         5-way, per-GROUP classifier from step 2's 3-way per-symbol one (see
+         asset_class_of_symbol()'s docstring). Do not conflate the two keys.
+      4. Empty set if nothing matches.
 
     `db_path` defaults to None, resolving to DEFAULT_DB_PATH at call time
     (not baked in at import time) so tests can point at a temp DB. Never
     imports kairos_pipeline (would create an import cycle) - plain sqlite3
-    only, opened/closed per call.
+    only, opened/closed per call. Any sqlite3.Error anywhere in this
+    function falls back to the step-3 class fallback, same as today.
 
     Note: this assumes oracle_results.assets was written with a consistently
     sorted CSV for a given profile going forward (run_stage_oracle /
@@ -1003,13 +1029,46 @@ def resolve_disabled_strategies(interval: str, assets, db_path: str = None) -> s
             "SELECT 1 FROM oracle_results WHERE interval=? AND assets=? LIMIT 1",
             (interval, assets_key),
         ).fetchone()
-        if tested is None:
-            return class_fallback
-        rows = conn.execute(
-            "SELECT strategy_name FROM disabled_strategies WHERE interval=? AND assets=?",
-            (interval, assets_key),
-        ).fetchall()
-        return {r[0] for r in rows}
+        if tested is not None:
+            rows = conn.execute(
+                "SELECT strategy_name FROM disabled_strategies WHERE interval=? AND assets=?",
+                (interval, assets_key),
+            ).fetchall()
+            return {r[0] for r in rows}
+
+        # Step 2: per-(model, class) gate. Only applicable to a pure-class
+        # group - a mixed group has no single class's stats to apply.
+        symbol_classes = {asset_class_of_symbol(a) for a in assets}
+        if len(symbol_classes) == 1:
+            stats_class = next(iter(symbol_classes))
+            stage = "finetuned" if model_path else "base"
+            model_clause = "model_path IS NULL" if model_path is None else "model_path = ?"
+            params = [interval, stats_class, stage]
+            if model_path is not None:
+                params.append(model_path)
+            db_rows = conn.execute(
+                "SELECT strategy_name, "
+                "SUM(avg_pnl_per_trade * signal_count) * 1.0 / SUM(signal_count), "
+                "SUM(signal_count) "
+                "FROM strategy_class_stats "
+                f"WHERE interval=? AND asset_class=? AND stage=? AND {model_clause} "
+                "AND signal_count > 0 "
+                "GROUP BY strategy_name",
+                params,
+            ).fetchall()
+            # The cell is only authoritative if it actually has enough data to
+            # judge on -- at least one strategy clearing the signal threshold.
+            # A swept-but-thin cell (rows exist, none thick enough) must fall
+            # through to step 3, NOT return an empty set: returning empty would
+            # mean "nothing is disabled here" and silently drop the hand-curated
+            # safety net for that class, which is the failure mode this whole
+            # gate is meant to avoid.
+            thick = [(name, pnl) for name, pnl, n in db_rows
+                     if n >= _CLASS_STATS_MIN_SIGNALS]
+            if thick:
+                return {name for name, pnl in thick if pnl is not None and pnl < 0}
+
+        return class_fallback
     except sqlite3.Error:
         return class_fallback
     finally:

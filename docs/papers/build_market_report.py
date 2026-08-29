@@ -263,20 +263,20 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   <h2>Abstract</h2>
   <p>The companion paper treated the 127-strategy corpus as one population. It is not. Segmenting results
   by asset class shows large, systematic differences in <em>level</em>: under perfect foresight the median
-  strategy reaches +2.40 Sharpe on equities but &minus;4.78 on crypto, a gap far wider than the difference
+  strategy reaches +2.40 Sharpe on equities but &minus;4.32 on crypto, a gap far wider than the difference
   between prediction regimes.</p>
   <p>The more useful finding concerns <em>portability</em>. Ranking strategies within each asset class and
-  correlating those rankings, the no-forecast regime averages <strong>&rho;&nbsp;=&nbsp;+0.40</strong> across
+  correlating those rankings, the no-forecast regime averages <strong>&rho;&nbsp;=&nbsp;+0.32</strong> across
   the three class pairs &mdash; a weak, partly-shared ordering. Add a forecast and agreement rises to
-  <strong>+0.72</strong> with the real model and <strong>+0.80</strong> with a perfect one. Forecast
+  <strong>+0.71</strong> with the real model and <strong>+0.79</strong> with a perfect one. Forecast
   information is a large part of what makes strategy quality a property of the strategy rather than of the
   market it happened to be tested on.</p>
   <p>Listing venue matters much less than asset class. Across six exchanges, strategy rankings agree with the
   US ordering at &rho;&nbsp;=&nbsp;+0.91 to +0.97 under oracle. A Hong Kong or German listing is, for these
   strategies, far more like a US listing than any equity is like a crypto pair.</p>
   <p>One class breaks the companion paper&rsquo;s pattern outright: <strong>FX and commodities are the only
-  segment profitable without any forecast at all</strong>, at a naive median of +0.50 with 25 of 38 strategies
-  above zero, against &minus;0.49 on equities and &minus;1.83 on crypto.</p>
+  segment profitable without any forecast at all</strong>, at a naive median of +1.34 with 27 of 38 strategies
+  above zero, against &minus;0.49 on equities and &minus;1.80 on crypto.</p>
   <p>The segmentation also surfaced a defect: <strong>eight strategy names in the corpus are the same
   strategy</strong>, and correcting for it moves the companion paper&rsquo;s oracle median from +0.32 to +2.30.</p>
 </div>
@@ -304,12 +304,12 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   comparisons are not: it does not care that crypto and equity groups contain different assets over
   different sessions, only whether the two markets <em>order the strategies the same way</em>.</p>
   <p>Without a forecast, agreement is weak. The three class pairs average
-  <strong>&rho;&nbsp;=&nbsp;+0.40</strong> (+0.37 equity&ndash;crypto, +0.48 equity&ndash;FX, +0.34
+  <strong>&rho;&nbsp;=&nbsp;+0.32</strong> (+0.37 equity&ndash;crypto, +0.36 equity&ndash;FX, +0.22
   crypto&ndash;FX). Some ordering does survive &mdash; a strategy that is catastrophic on one class tends to
   be poor on another &mdash; but it is far too loose to select on. Roughly speaking, a strategy&rsquo;s naive
   standing on equities explains about a sixth of its variance in standing on crypto.</p>
-  <p>With a forecast, agreement roughly doubles. Base reaches <strong>+0.70 to +0.76</strong> across all
-  three pairs (mean +0.72) and oracle <strong>+0.70 to +0.90</strong> (mean +0.80), and both are consistent
+  <p>With a forecast, agreement roughly doubles. Base reaches <strong>+0.69 to +0.74</strong> across all
+  three pairs (mean +0.71) and oracle <strong>+0.70 to +0.90</strong> (mean +0.79), and both are consistent
   across pairs rather than driven by one. The forecast supplies a common signal that each strategy transforms
   in its own characteristic way, so merit becomes a property of the transformation rather than of the market.
   That is the finding worth carrying forward: <strong>prediction is a large part of what makes strategy
@@ -331,7 +331,7 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
 <div class="wrap">
 <section>
   <p>Under perfect foresight the spread is dramatic: a median of <strong>+2.40 on equities against
-  &minus;4.78 on crypto</strong>, with FX and commodities between them at &minus;1.91. The corpus extracts far
+  &minus;4.32 on crypto</strong>, with FX and commodities between them at &minus;1.91. The corpus extracts far
   more from a perfectly forecast equity bar than from a perfectly forecast crypto bar. The likely mechanism
   is bracket geometry rather than direction: crypto&rsquo;s intrabar range is wide relative to a
   strategy&rsquo;s stop distance, so a position that is directionally right is still stopped out on the way,
@@ -349,16 +349,17 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   <p>The naive row carries the one result that contradicts the companion paper&rsquo;s headline. That paper
   concluded that the corpus does not work without forecast information &mdash; 43 of 51 strategies losing
   money, median well below zero. Segmented, that conclusion holds for equities (median &minus;0.49, 9 of 38
-  strategies positive) and holds harder for crypto (&minus;1.83, 10 of 38). It fails for FX and commodities,
-  where the naive median is <strong>+0.50 with 25 of 38 strategies positive</strong> &mdash; the only
+  strategies positive) and holds harder for crypto (&minus;1.80, 10 of 38). It fails for FX and commodities,
+  where the naive median is <strong>+1.34 with 27 of 38 strategies positive</strong> &mdash; the only
   regime-and-class cell in this study that is broadly profitable with no forward information whatsoever.</p>
   <p>The plausible reading is that these instruments are the corpus&rsquo;s best fit for
   <em>structural</em> rather than directional edge. The companion paper found that the strategies surviving
   the naive regime were those trading bracket geometry and win-rate asymmetry rather than direction; range-bound,
   mean-reverting commodity and currency series are exactly where that kind of edge should persist. It is also
-  the thinnest cell in the study &mdash; 64,858 signals, against 2.7 million for naive equities &mdash; and
-  the class as sampled here skews to commodities rather than currencies (&sect;6). Treat it as a lead worth
-  testing directly, not a settled result.</p>
+  the thinnest cell in the study &mdash; 128,327 signals, against 2.7 million for naive equities &mdash; and
+  still the thinnest class in the study. It no longer skews to commodities, though: FX pairs that earlier
+  versions of this note had to discard as unclassifiable are now attributed correctly (&sect;6), which both
+  roughly doubled this class&rsquo;s coverage and strengthened the result rather than diluting it.</p>
 
   <h3>3.2 &mdash; Which strategies are most class-dependent</h3>
 </section>
@@ -455,13 +456,14 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
     under 3,000 signals each; their &rho;-versus-US figures (+0.11, +0.22) are too small a sample to
     distinguish from the oracle regime&rsquo;s much higher agreement. The venue conclusion rests mainly on the
     oracle row.</li>
-    <li><strong>&ldquo;FX &amp; commodities&rdquo; skews to commodities.</strong> Class comes from the universe
-    screen&rsquo;s <code>asset_class</code> for run 759. Seventeen genuine FX-pair groups
-    (<code>EURUSD=X</code>, <code>CADJPY=X</code>, &hellip;) carry symbols absent from that run&rsquo;s
-    survivor list, so they classify as unknown and are dropped. What this note calls FX and commodities is
-    therefore mostly commodities and commodity ETFs (<code>NG=F</code>, <code>UNG</code>, <code>DBC</code>,
-    <code>CPER</code>). This bears directly on &sect;3.1: the no-forecast profitability found there is
-    primarily a commodity result, and should not be read as a currency result.</li>
+    <li><strong>Superseded: the FX/commodity sample is no longer commodity-only.</strong> An earlier
+    version of this note warned that seventeen genuine FX-pair groups (<code>EURUSD=X</code>,
+    <code>CADJPY=X</code>, &hellip;) classified as unknown and were dropped, because class was derived from
+    the universe screen&rsquo;s membership list and those symbols were never screened. Class now comes from
+    per-signal attribution recorded at sweep time, which classifies by ticker suffix and so places them
+    correctly &mdash; recovering 222,342 previously-discarded oracle signals and roughly doubling this
+    class&rsquo;s coverage. &sect;3.1 now reflects both currencies and commodities. It remains the thinnest
+    class in the study.</li>
     <li><strong>Venue is a listing suffix, not an economy.</strong> Groups are classified by yfinance symbol
     suffix, which identifies where a security is listed &mdash; not where the company earns, nor its sector.
     No sector or country-of-revenue data exists in the pipeline, so &ldquo;the market the company is in&rdquo;
@@ -513,9 +515,9 @@ WHERE  stage = ?  AND signal_count &gt;= 3;</pre>
   spread under perfect foresight is wider than the gap between having a forecast and not having one. Listing
   venue produces almost none: a London or Hong Kong equity ranks strategies essentially as a US equity does.</p>
   <p>The finding with the most practical weight is that portability is substantially improved by prediction.
-  With no forecast, per-class rankings agree only weakly (mean &rho;&nbsp;=&nbsp;+0.40) and a strategy
+  With no forecast, per-class rankings agree only weakly (mean &rho;&nbsp;=&nbsp;+0.32) and a strategy
   selected on one market would largely have to be re-selected on the next. With a forecast, agreement roughly
-  doubles (+0.72 base, +0.80 oracle) and selection made on one class carries much better to another. That
+  doubles (+0.71 base, +0.79 oracle) and selection made on one class carries much better to another. That
   extends the companion paper&rsquo;s conclusion: the model does not only lift performance, it makes
   performance mean more nearly the same thing in different markets.</p>
   <p>One class dissents. FX and commodities are profitable with no forecast at all, the only such cell here,
