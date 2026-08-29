@@ -740,14 +740,12 @@ path_high_low_exec    +6.62 -> +5.13      high_low          +7.73 -> +7.04
 
 One sign flip (`support_confluence`), mean delta −0.029.
 
-### ⚠ 14 oracle groups have an ambiguous ruler (open, as of 2026-08-29)
-
-**Do not regenerate `docs/papers/analyze_by_market3.py` or
-`build_market_report.py` until this is resolved.** The corpus is not uniform.
+### 14 oracle groups were deleted for an ambiguous ruler (2026-08-29)
 
 A sibling session's re-sweep of the 14 `'mixed'`-class groups (run_ids
 4206–4233) ran *while the exit-rule change above sat uncommitted in the working
-tree*. Subprocesses import whatever is on disk, so the sweep straddles the edit:
+tree*. Subprocesses import whatever is on disk, so the sweep straddled the edit
+and produced rows on two different rulers:
 
 | run_ids | started | rule | how known |
 |---|---|---|---|
@@ -756,25 +754,40 @@ tree*. Subprocesses import whatever is on disk, so the sweep straddles the edit:
 | 4219 (1 group) | 20:52:03 | **new** | measured 39/39 |
 | 4220–4233 (naive) | 20:57–21:04 | n/a | naive behaviour unchanged by the refactor — unaffected |
 
-So 1–6 oracle groups out of ~961 sit on a different ruler from the rest, and the
-differences are large enough to move per-class medians (`support_confluence`
-+10.09 vs +10.23, `high_low` +5.54 vs +3.39 on one group; on another,
-+6.45 → +0.36).
+**`oracle_results.version` read `539ba54` for all 14 and was wrong for at least
+one.** `git_commit_hash()` returns HEAD, which was `539ba54` both before and
+after the edit — it records what was *committed*, never what *executed*. Treat
+the column as trustworthy only for rows produced from a clean tree, and launch
+sweeps from a committed tree so it stays meaningful. This is the durable lesson
+here; the data problem below is already fixed.
 
-**`oracle_results.version` reads `539ba54` for all 14 and is wrong for at least
-one of them.** `git_commit_hash()` returns HEAD, which was `539ba54` both before
-and after the edit — it records what was *committed*, never what *executed*.
-Treat the column as trustworthy only for rows produced from a clean tree, and
-launch sweeps from a committed tree so it stays meaningful.
+**Resolved by deletion** (backup: `data/pipeline_results.db.bak-20260829-preruledelete`):
 
-Resolution is deferred pending a decision on whether the corpus moves to the new
-rule (then re-sweep ~947 oracle + ~559 base groups, and both papers' exit-rule
-limitation retires) or stays on the old one (then re-sweep these groups back
-from a clean tree at `539ba54`). **Re-sweep all 14 uniformly either way** —
-cheaper than establishing the exact boundary, and it also retires the
-inference in the table above. Base sweeps are frozen meanwhile.
+- `oracle_results` −585 rows, `strategy_class_stats` −1089, `runs` −14, for
+  run_ids 4206–4219. All 14 deleted uniformly rather than only the 6 suspect
+  ones — cheaper than establishing the exact boundary, and it also retires the
+  same-second inference covering 4206–4213.
+- The 14 **naive** runs (4220–4233) were kept. Naive's behaviour is unchanged by
+  the refactor, so those rows are valid and comparable to every other naive row.
+- Those 14 groups now have **no oracle row at all** and are simply absent from
+  the corpus until re-swept. `asset_class='mixed'` is still 0 — the original
+  mixed-attribution problem did not come back; these groups are pending, not
+  mis-attributed.
 
-To re-check any single group: `uv run scripts/ab_exit_rule.py "<assets>"`
+**The 151 `disabled_strategies` rows those runs wrote were deliberately KEPT.**
+That table is the live gate (`resolve_disabled_strategies()` in
+`kairos_signals.py`), and those 14 groups have no prior rows to fall back to.
+Six of them — `BOIL,KOLD,NG=F,UNG`, `CL=F,USO,XLE,XOM`, `CPER,DFIV,HG=F,SCCO`,
+`DBC,PDBC,XLE,XOM`, `ETH-USD,SBET`, `GLD,HMY,SI=F,UGL` — classify as `mixed`
+under `asset_class_for()`, and `_DISABLED_BY_CLASS` has **no `mixed` key**, so
+deleting their rows would have returned an empty disabled set and let every
+strategy run unfiltered on the live path. That is exactly the foot-gun the
+"Four classifiers" section warns about, reached by a different route. The rows
+are now orphaned (their `source_run_id` points at a deleted run) but functional,
+and a disable decision made on the *new* rule is if anything better founded than
+one made on the old.
+
+To re-check any single group's ruler: `uv run scripts/ab_exit_rule.py "<assets>"`
 computes both rules on one run's identical shadow signals; oracle is
 deterministic, so whichever column matches the stored row is the rule that
 produced it.
