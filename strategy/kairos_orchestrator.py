@@ -841,6 +841,8 @@ class KairosOrchestrator:
         # bar_index-style context and the "signals/week" stat in reports.
         self.equity_curve: List[pd.Timestamp] = []
         self._prev_dist: Dict[str, KairosDistribution] = {}
+        # Symbols already warned about a non-finite bar (warn once, not per date).
+        self._nonfinite_bar_warned: set = set()
         # Shadow tracking: (date, symbol, strategy_name, direction, stop, target)
         self._shadow_signals: List[Tuple] = []
         self._shadow_seen: set = set()
@@ -900,6 +902,24 @@ class KairosOrchestrator:
             full_df = self._data_dict.get(symbol)
             future = full_df[full_df.index > date] if full_df is not None else pd.DataFrame()
             bar = future.iloc[0] if not future.empty else history.iloc[-1]
+
+            # A bar with a missing or infinite OHLC value carries no information.
+            # Skip this symbol for this date instead of letting it through:
+            # from_bar() seeds its RNG with int(abs(close) * 1000), so a NaN close
+            # raises ValueError and takes down the whole group's backtest -- a
+            # single missing bar anywhere in one symbol's history was enough to
+            # fail every sweep that group appeared in, deterministically (the bar
+            # is "next" for exactly one date). A non-finite center is just as bad
+            # and quieter: it poisons every sampled close into NaN rather than
+            # raising. Guarding here rather than in from_bar() because this is
+            # its only caller, and skipping the symbol is the caller's decision.
+            probe = [current_price, *(bar.get(c) for c in ("open", "high", "low", "close"))]
+            if not all(v is not None and np.isfinite(v) for v in probe):
+                if symbol not in self._nonfinite_bar_warned:
+                    self._nonfinite_bar_warned.add(symbol)
+                    print(f"  [warn] {symbol}: non-finite OHLC bar, skipping affected dates")
+                continue
+
             dist = KairosDistribution.from_bar(
                 bar, n_samples=KairosSettings.pred_samples, center=current_price
             )
