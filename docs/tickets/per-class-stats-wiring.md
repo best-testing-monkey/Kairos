@@ -1,8 +1,12 @@
 # Phase 2: wiring per-(model, class) stats into selection, allocation and margin
 
-Phase 1 (done) records the stats. **Nothing consumes them yet.** This document is
-the deliverable that says exactly what must change to make them matter, with call
-sites already traced so the next session doesn't have to re-derive them.
+Phase 1 records the stats; phase 2 wires them in. **Both are now complete**
+(phase 1 `ddaffb8`, phase 2 `d78c250`). Items 1-5 and 7 were implemented; item 6
+was decided against and closed. This document is kept as the record of what was
+done and, for item 6, what was deliberately not done and why.
+
+Two things below differ from what the tickets originally specified, both
+deliberately — see item 5's note on shrink targets, and item 6's decision.
 
 ## What phase 1 built
 
@@ -40,7 +44,7 @@ kp.strategy_class_stats(conn, stage="base", asset_class="crypto",
 
 ## The work
 
-### 1. Make the disabled-strategy gate model-aware
+### 1. Make the disabled-strategy gate model-aware — DONE
 
 `resolve_disabled_strategies(interval, assets)` — `strategy/kairos_strategies.py:964`,
 called from `strategy/kairos_signals.py:811,820`.
@@ -51,7 +55,7 @@ for a group is disabled under every model — even though phase 1's own data sho
 which strategies work differs by model. Add `model_path` and consult
 `strategy_class_stats` for that model.
 
-### 2. Replace the hand-curated class fallback
+### 2. Replace the hand-curated class fallback — DONE (layered, not replaced)
 
 `_DISABLED_BY_CLASS` — `strategy/kairos_strategies.py:906-952`. A dict hand-derived
 from a single 2026-07-05 sweep, and today the *only* class-level gate in the live
@@ -65,21 +69,28 @@ returns an empty disabled set, letting strategies as bad as `volume_fade`
 (−150 mean Sharpe on crypto) run unfiltered. That is a live safety regression, and
 it is why phase 1 left `asset_class_for()` alone.
 
-### 3. Stop discarding the class at signal time
+**As implemented:** the DB gate was inserted *above* the hand-curated dict rather
+than replacing it, so `_DISABLED_BY_CLASS` remains the final fallback and the worst
+case degrades to today's behaviour instead of to no filtering. A class cell is only
+treated as authoritative when at least one strategy in it clears the 30-signal
+threshold — a swept-but-thin cell falls through rather than returning an empty
+disabled set, which would have dropped the safety net by a different route.
+
+### 3. Stop discarding the class at signal time — DONE
 
 `viability_report.asset_class` is already computed and stored
 (`kairos_pipeline.py:2358`) but is **not** in `STATS_COLUMNS`
 (`kairos_signals.py:381-386`), so it is dropped before reaching `stats_row`
 (`:920-946`) and never reaches `Candidate` (`allocation.py:224`). Thread it through.
 
-### 4. Let selection rules filter on class
+### 4. Let selection rules filter on class — DONE
 
 `strategy/signal_selection.py:74-99` — the DSL column registry has no
 `Asset Class`. Add it to `_TEXT_COLUMNS` so rules like
 `"'Asset Class' == 'crypto', 'Sharpe' > 1.0, TOP 3"` become expressible. Depends
 on item 3.
 
-### 5. Source allocation priors per (model, class)
+### 5. Source allocation priors per (model, class) — DONE (differently, see below)
 
 `strategy/allocation.py` `compute_derived()` (`:121`) shrinks toward a no-edge prior
 using `n` and `base_win_rate`, which arrive from `viability_report` per GROUP.
@@ -88,14 +99,43 @@ contaminated by its equity record. `AllocationConfig.n0=100` / `min_n=50` are
 global constants — consider whether they should vary by class, given per-class
 signal volume differs by an order of magnitude.
 
-### 6. Decide whether margin should care
+**As implemented — deliberately not what this item asked for.** Sourcing `n` and
+`base_win_rate` per class would be a *downgrade*: the group's own backtest is more
+specific evidence than a class-wide average, so replacing group data with class
+data loses information wherever the group has any.
 
-`admission_check()` (`kairos_mtm.py:252`) takes ticker, notional and account state.
-**Nothing per-strategy feeds in today.** If class-aware strategy quality should
-influence sizing, this is where it goes — but it is a genuine product decision,
-not a mechanical wiring job, and needs its own thinking.
+What class data genuinely adds is a better **shrink target**. `compute_derived()`
+shrank toward a flat 0.5 — a coin flip — so a thin strategy regressed to "no edge"
+regardless of market. It now shrinks toward the (model, class) base win rate:
+`p_shrunk = prior + (base_win_rate - prior) * shrink`, where `prior` is the
+signal-count-weighted mean win rate of all strategies in that cell. A thin strategy
+regresses to how strategies actually behave in *its* market instead.
 
-### 7. Point the analysis scripts at the table
+With no class prior available `prior` is 0.5 and the arithmetic is identical to
+before, so the default path is unchanged. The prior is computed by
+`kairos_signals._class_prior_win_rate()` and returns None for mixed-class groups
+(one class's base rate cannot stand in for a mixed basket).
+
+`n0`/`min_n` were left global — varying them by class is still open.
+
+### 6. Should margin care about strategy quality? — DECIDED: no (2026-08-29)
+
+**Closed, will not implement.** How much margin a position gets is decided at
+*allocation*, not at the admission gate. `admission_check()` (`kairos_mtm.py:252`)
+stays a pure risk constraint — "can the account survive this position" — keyed on
+ticker, notional and account state, with no notion of strategy quality.
+
+Rationale: `allocate()` already scales exposure by edge through Kelly sizing. If a
+strategy's historical edge also widened its margin headroom, the same signal would
+be applied twice, and it would mean backtested statistics increasing real leverage
+against live capital. Keeping the two concerns separate is deliberate, not an
+oversight or a data limitation — the per-class stats needed to do it exist and are
+being left unused here on purpose.
+
+Do not reopen this by wiring class stats into `admission_check()`. If margin
+behaviour should vary by class, change it at allocation.
+
+### 7. Point the analysis scripts at the table — DONE
 
 `docs/papers/analyze_by_market3.py:22,28,60` reimplements per-class stats as a
 read-time group-majority heuristic with the same 3-way taxonomy — it is the prior
