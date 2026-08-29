@@ -265,6 +265,48 @@ def _summarize_by_class(by_class: Dict[str, Dict[str, List[float]]],
     }
 
 
+def _resolve_exit(bars: pd.DataFrame, direction, stop_price: float, target_price: float,
+                  *, gap_check_first_bar: bool = True) -> Optional[float]:
+    """Walk forward bar by bar until stop or target genuinely triggers.
+
+    Returns the exit price, or None if no trigger happened before the data
+    ran out -- "neither hit" means keep holding, never force-close. Callers
+    decide what an unresolved signal means (both current callers exclude it).
+
+    Mirrors BacktestEngine._check_exit's precedence exactly -- stop before
+    target, open-gap before intrabar -- minus its "close" fallback, which is
+    the force-exit this function deliberately does not do. Shared by both
+    shadow evaluators so oracle/base and naive are scored with one ruler; see
+    KairosOrchestrator._compute_shadow_performance.
+
+    `gap_check_first_bar=False` for a caller that entered at the first bar's
+    OWN open: there is no gap to check against a price you already filled at,
+    so that bar gets the intrabar test only.
+    """
+    for i, (_, bar) in enumerate(bars.iterrows()):
+        o, h, l = float(bar["open"]), float(bar["high"]), float(bar["low"])
+        gap = gap_check_first_bar or i > 0
+        if direction == Direction.LONG:
+            if gap and o <= stop_price:
+                return o
+            if gap and o >= target_price:
+                return o
+            if l <= stop_price:
+                return stop_price
+            if h >= target_price:
+                return target_price
+        else:
+            if gap and o >= stop_price:
+                return o
+            if gap and o <= target_price:
+                return o
+            if h >= stop_price:
+                return stop_price
+            if l <= target_price:
+                return target_price
+    return None
+
+
 def _compound_equity_stats(pnl_list: List[float], initial_capital: float,
                             per_signal_fraction: float = 0.1) -> Dict:
     """Compound a pnl_pct list into an equity curve, each signal allocated a
@@ -1158,15 +1200,39 @@ class KairosOrchestrator:
 
         return top_results
 
-    def _compute_shadow_performance(self) -> Dict[str, Dict]:
-        """Evaluate every recorded signal against actual next-bar OHLCV.
+    def _compute_shadow_performance(self, naive: bool = False) -> Dict[str, Dict]:
+        """Evaluate every recorded signal by walking forward to a real exit.
 
         Returns a dict keyed by strategy_name with:
           pnl_list  – list of per-signal pnl_pct values
           sharpe    – annualised Sharpe across all signals
 
-        Also populates `self._shadow_performance_by_class` as a side effect
-        (see `_store_by_class`); the return value is unchanged.
+        Also populates `self._shadow_performance_by_class` as a side effect;
+        the return value is unchanged.
+
+        Both modes resolve a signal with the SAME exit rule (`_resolve_exit`):
+        walk forward one bar at a time, open-gap then intrabar, stop before
+        target, and a bar where neither triggers means "keep holding" rather
+        than "force-close". A signal that never resolves before the data runs
+        out is excluded rather than closed at an arbitrary point -- the same
+        choice kairos_signal_replay.py makes, for the same reason.
+
+        Changed 2026-08-29: this used to check exactly ONE bar and force-close
+        at that bar's close, while the naive path below walked forward. Floor
+        and ceiling were therefore measured with different rulers, which was
+        the biggest methodological caveat in both docs/papers/ documents. They
+        now differ only in ENTRY anchoring, which is the one difference that
+        is supposed to exist:
+
+          - model/oracle (`naive=False`): the signal is decided on `date`, so
+            the trade fills at the next bar's OPEN. That bar is then part of
+            the holding period -- intrabar only, since there is no gap to
+            check against a price you just filled at.
+          - naive (`naive=True`): oracle peeked at the next bar to decide, so
+            this trade cannot exist until that bar has CLOSED for real. Entry
+            re-anchors to that close and only genuinely later bars can resolve
+            it. The decision itself (direction, relative stop/target %) is
+            oracle's and is not recomputed -- only the accounting changes.
         """
         by_strategy: Dict[str, List[float]] = defaultdict(list)
         by_class: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
@@ -1174,6 +1240,8 @@ class KairosOrchestrator:
             # Unpack with backward compat: entry field added later
             if len(record) == 7:
                 date, symbol, sname, direction, stop, target, sig_entry = record
+            elif naive:
+                continue  # pre-entry-tracking records can't be re-anchored
             else:
                 date, symbol, sname, direction, stop, target = record
                 sig_entry = None
@@ -1184,37 +1252,32 @@ class KairosOrchestrator:
             future = full_df[full_df.index > date]
             if future.empty:
                 continue
-            nb = future.iloc[0]
-            entry = float(nb["open"])
-            high = float(nb["high"])
-            low = float(nb["low"])
-            close = float(nb["close"])
+            entry_bar = future.iloc[0]
+            entry = float(entry_bar["close"] if naive else entry_bar["open"])
             if entry <= 0:
                 continue
 
             # Convert stop/target from absolute prices to % offsets relative to
-            # sig_entry, then re-anchor to the actual next-bar open.  This keeps
+            # sig_entry, then re-anchor to this mode's entry price. This keeps
             # the evaluation correct even when a strategy (e.g. cross_asset_rank)
             # sets stop/target in a different asset's price units.
             ref = float(sig_entry) if sig_entry and sig_entry > 0 else entry
-            stop_price  = entry * (1.0 + (stop  - ref) / ref)
+            stop_price = entry * (1.0 + (stop - ref) / ref)
             target_price = entry * (1.0 + (target - ref) / ref)
 
+            # naive entered at bar 0's close, so bar 0 is spent; model/oracle
+            # entered at bar 0's open, so bar 0 counts but has no gap to check.
+            exit_p = _resolve_exit(
+                future.iloc[1:] if naive else future,
+                direction, stop_price, target_price,
+                gap_check_first_bar=naive,
+            )
+            if exit_p is None:
+                continue  # ran out of real data before a genuine trigger -- excluded
+
             if direction == Direction.LONG:
-                if low <= stop_price:
-                    exit_p = stop_price
-                elif high >= target_price:
-                    exit_p = target_price
-                else:
-                    exit_p = close
                 pnl_pct = (exit_p - entry) / entry
             else:
-                if high >= stop_price:
-                    exit_p = stop_price
-                elif low <= target_price:
-                    exit_p = target_price
-                else:
-                    exit_p = close
                 pnl_pct = (entry - exit_p) / entry
 
             by_strategy[sname].append(pnl_pct)
@@ -1226,86 +1289,8 @@ class KairosOrchestrator:
                 for sname, pnl_list in by_strategy.items()}
 
     def _compute_shadow_performance_naive(self) -> Dict[str, Dict]:
-        """Evaluate oracle's real shadow signals with no future peek at all.
-
-        Oracle's decision (direction + relative stop/target %) is kept
-        exactly as computed -- it was derived from oracle's real
-        future-peeking distribution and that's not being redone here. What
-        changes is the accounting: entry is re-anchored to the real bar
-        oracle peeked at (by the time this trade could actually be placed,
-        that bar has closed for real -- it's no longer a peek), stop/target
-        are recomputed from the same relative offsets against that new
-        entry, and the trade is then resolved against genuinely later bars
-        only, walking forward one bar at a time exactly like
-        BacktestEngine._check_exit / kairos_signal_replay.py's
-        _resolve_closure_for_signal: a bar where neither stop nor target
-        triggers just means "keep holding," not "force-close" (unlike
-        _compute_shadow_performance above, which only ever checks one bar).
-        A signal that never resolves before real data runs out is excluded
-        rather than force-closed at an arbitrary point -- same choice
-        kairos_signal_replay.py already made for the same reason.
-        """
-        by_strategy: Dict[str, List[float]] = defaultdict(list)
-        by_class: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
-        for record in self._shadow_signals:
-            if len(record) == 7:
-                date, symbol, sname, direction, stop, target, sig_entry = record
-            else:
-                continue  # pre-entry-tracking records can't be re-anchored
-
-            full_df = self._data_dict.get(symbol)
-            if full_df is None:
-                continue
-            future = full_df[full_df.index > date]
-            if future.empty:
-                continue
-            entry_bar = future.iloc[0]
-            new_entry = float(entry_bar["close"])
-            if new_entry <= 0:
-                continue
-
-            ref = float(sig_entry) if sig_entry and sig_entry > 0 else new_entry
-            stop_price = new_entry * (1.0 + (stop - ref) / ref)
-            target_price = new_entry * (1.0 + (target - ref) / ref)
-
-            exit_p = None
-            for _, bar in future.iloc[1:].iterrows():
-                o, h, l = float(bar["open"]), float(bar["high"]), float(bar["low"])
-                if direction == Direction.LONG:
-                    if o <= stop_price:
-                        exit_p = o
-                    elif o >= target_price:
-                        exit_p = o
-                    elif l <= stop_price:
-                        exit_p = stop_price
-                    elif h >= target_price:
-                        exit_p = target_price
-                else:
-                    if o >= stop_price:
-                        exit_p = o
-                    elif o <= target_price:
-                        exit_p = o
-                    elif h >= stop_price:
-                        exit_p = stop_price
-                    elif l <= target_price:
-                        exit_p = target_price
-                if exit_p is not None:
-                    break
-
-            if exit_p is None:
-                continue  # ran out of real data before a genuine trigger -- excluded
-
-            if direction == Direction.LONG:
-                pnl_pct = (exit_p - new_entry) / new_entry
-            else:
-                pnl_pct = (new_entry - exit_p) / new_entry
-            by_strategy[sname].append(pnl_pct)
-            by_class[sname][asset_class_of_symbol(symbol)].append(pnl_pct)
-
-        ann_factor = np.sqrt(bars_per_year(KairosSettings.interval))
-        self._shadow_performance_by_class = _summarize_by_class(by_class, ann_factor)
-        return {sname: _summarize_pnl(pnl_list, ann_factor)
-                for sname, pnl_list in by_strategy.items()}
+        """Naive-baseline evaluation. See `_compute_shadow_performance`."""
+        return KairosOrchestrator._compute_shadow_performance(self, naive=True)
 
     def _build_results(self) -> Dict:
         """Compile all results into a comprehensive dict.
@@ -1321,12 +1306,10 @@ class KairosOrchestrator:
         single constrained real account.
         """
         # Shadow rankings: all strategies that generated at least one signal,
-        # evaluated against actual next-bar OHLCV independent of competition.
-        shadow_perf = (
-            self._compute_shadow_performance_naive()
-            if self.config.naive_baseline
-            else self._compute_shadow_performance()
-        )
+        # each walked forward to a real stop/target exit, independent of
+        # competition. Signals that never resolve are excluded, so a strategy's
+        # signal_count here can be lower than the number of signals it fired.
+        shadow_perf = self._compute_shadow_performance(naive=self.config.naive_baseline)
         shadow_ranked = sorted(
             [(sname, d["sharpe"]) for sname, d in shadow_perf.items()],
             key=lambda x: x[1], reverse=True,

@@ -631,13 +631,10 @@ commands, e.g. `export UV_CACHE_DIR=/tmp/uv-cache-kairos` before
 
   Also surfaced while fixing this: `_compute_shadow_performance()` (oracle's
   own evaluator, and the one every `oracle_results` Sharpe/win-rate number
-  in this table has ever come from) only checks **one bar ahead**, then
-  force-closes at that bar's close if neither stop nor target triggered —
-  it does not walk forward multiple bars. Don't assume "the current
-  mechanism already handles multi-bar TP/SL" without checking which
-  evaluator you mean; the genuinely multi-bar-capable one is
-  `BacktestEngine._check_exit`/`kairos_signal_replay.py`'s usage of it, not
-  this one.
+  in this table has ever come from) only checked **one bar ahead**, then
+  force-closed at that bar's close if neither stop nor target triggered —
+  it did not walk forward multiple bars, so oracle/base and naive were scored
+  with different rulers. **Fixed 2026-08-29 — see "One exit rule" below.**
 
 `run_stage_naive()` in `kairos_pipeline.py` mirrors `run_stage_oracle()` but
 writes `stage='naive'` rows to the same `oracle_results` table (it already
@@ -648,11 +645,85 @@ with real predictions but (expectedly) go quiet or lose money once
 prediction is stripped out entirely. Naive-baseline results are for
 analysis only.
 
+### One exit rule for oracle, base and naive (changed 2026-08-29)
+
+Until this date the three stages were scored with **different rulers**, which
+was the biggest methodological caveat in both `docs/papers/` documents: oracle
+and base checked exactly one bar and force-closed at that bar's close, while
+naive walked forward until a genuine stop/target trigger. A ceiling measured
+by one rule and a floor measured by another are not comparable, and the gap
+between them was partly an artefact of the rule difference rather than of
+prediction quality.
+
+`_compute_shadow_performance()` now takes a `naive: bool` flag and both modes
+share one walk-forward routine, module-level `_resolve_exit()`:
+
+- walk forward one bar at a time; **open-gap before intrabar, stop before
+  target** — the same precedence as `BacktestEngine._check_exit`, which it
+  deliberately mirrors, minus that function's `"close"` fallback;
+- a bar where neither triggers means **keep holding**, never force-close;
+- a signal that never resolves before the data runs out is **excluded**, not
+  closed at an arbitrary price — the same choice `kairos_signal_replay.py`
+  already made, for the same reason.
+
+`_compute_shadow_performance_naive()` survives only as a one-line alias
+(tests and several docstrings name it). It calls the shared method as an
+**unbound** method — `KairosOrchestrator._compute_shadow_performance(self, ...)`
+— because both evaluators are driven in tests against a bare `SimpleNamespace`
+stand-in that has no methods of its own. Don't "simplify" it to `self.…`.
+
+**The only remaining difference between the modes is entry anchoring, and that
+difference is deliberate:**
+
+| | entry | first bar of the walk |
+|---|---|---|
+| oracle / base (`naive=False`) | next bar's **open** — the signal was decided on `date`, so it fills at the next open | that same bar, **intrabar only** (no gap to check against a price you just filled at) |
+| naive (`naive=True`) | next bar's **close** — oracle peeked at that bar to decide, so the trade cannot exist until it has closed for real | the bar **after** it, full gap+intrabar |
+
+For a well-formed signal (`stop < ref < target` for a long) the entry bar's
+gap check is unreachable anyway, since stop/target are derived from that same
+open — so `gap_check_first_bar=False` is defensive, not behaviour-changing.
+
+**Consequences to expect when re-sweeping:**
+
+- **Every existing `oracle_results` / `model_results` row predates this and is
+  not comparable to a new one.** `stage='naive'` rows are unaffected — naive's
+  behaviour did not change. Rows carry a `version` column (short git hash) for
+  exactly this kind of question; rows older than the fix are the ones to
+  distrust in a mixed comparison.
+- **`signal_count` drops** for oracle/base — unresolved signals are now
+  excluded rather than force-closed into the pnl list. A lower count is
+  expected, not a bug (cf. the non-finite-bar skip, which has the same
+  symptom for a different reason).
+- **`refresh_disabled_strategies()` uses `min_signals=5` against oracle
+  counts**, so a strategy that drops below 5 resolved signals changes the live
+  disabled set. This is the one place the change reaches production behaviour,
+  and only once oracle is re-run for that group.
+- Both papers need regenerating once oracle/base are re-swept;
+  `docs/papers/audit_paper.py` will flag the staleness. Their "exit-rule
+  asymmetry" limitation (§ limitations in both) is what this change retires —
+  mark it superseded rather than editing it, the way the FX-classification
+  limitation was handled.
+
+**The caveat this fix introduces**, and it is a real one: excluding unresolved
+signals is mild survivorship selection. A trade that drifts for the rest of the
+window without touching either barrier is dropped rather than counted as the
+roughly-flat outcome it was. Naive and `kairos_signal_replay.py` have always
+had this; the fix spreads it to oracle/base rather than creating it. The
+alternative — force-closing at the last available bar — was rejected because it
+reintroduces exactly the arbitrary exit the change removes. Worth revisiting
+only with a measured exclusion rate per stage in hand.
+
 **Six independent TP/SL-checking implementations exist in this codebase**
 (found while investigating the one-bar issue above) — worth knowing before
 adding a seventh or assuming "the backtest engine" means one specific thing:
-1. `_compute_shadow_performance()` — 1 bar only, feeds `oracle_results`/`model_results`.
-2. `_compute_shadow_performance_naive()` — multi-bar, correct, naive-only.
+1. `_compute_shadow_performance(naive=...)` — multi-bar since 2026-08-29,
+   feeds `oracle_results`/`model_results` **and** the naive rows. Items 1 and
+   2 used to be separate implementations; they are now one function sharing
+   `_resolve_exit`, differing only in entry anchoring.
+2. ~~`_compute_shadow_performance_naive()`~~ — now a one-line alias for
+   `_compute_shadow_performance(naive=True)`, kept because tests and docs
+   name it. Not a separate implementation any more.
 3. ~~`KairosOrchestrator._manage_positions()`~~ — **removed entirely
    2026-08-28**, see below. Historical only.
 4. `BacktestEngine._check_exit`/`_calculate_pnl` (`kairos_backtest.py`) —
