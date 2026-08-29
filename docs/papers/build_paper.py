@@ -9,14 +9,26 @@ rows = data["rows"]
 STAGES = ("naive", "base", "oracle")
 
 # --- box-plot geometry -------------------------------------------------------
-BOX = {
-    "naive":  dict(mn=-12.79, q1=-1.39, med=-0.72, q3=0.14, mx=5.53,
-                   n=1014688, pos=13, win=46.11, pnl=-0.0616),
-    "base":   dict(mn=-8.17,  q1=-0.22, med=0.16,  q3=0.72, mx=12.14,
-                   n=834561, pos=29, win=47.34, pnl=0.0429),
-    "oracle": dict(mn=-33.52, q1=-4.00, med=2.20,  q3=9.96, mx=49.29,
-                   n=964776, pos=27, win=57.46, pnl=0.3527),
-}
+# Derived from the same rows the full table renders, never transcribed: hand-kept
+# constants previously carried 2dp values into 3dp table cells, printing a median
+# of +0.160 where the data said +0.159.
+def _median(v):
+    v = sorted(v); n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2
+
+def _box(stage):
+    sh = sorted(r["sh"][stage] for r in rows)
+    tot = sum(r["n"][stage] for r in rows)
+    return dict(
+        mn=sh[0], q1=sh[len(sh) // 4], med=_median(sh),
+        q3=sh[3 * len(sh) // 4], mx=sh[-1],
+        n=tot,
+        pos=sum(1 for v in sh if v > 0),
+        win=sum(r["win"][stage] * r["n"][stage] for r in rows) / tot * 100,
+        pnl=_median([r["pnl"][stage] for r in rows]) * 100,
+    )
+
+BOX = {s: _box(s) for s in STAGES}
 AX_LO, AX_HI = -6.0, 10.0
 def pct(v):
     return max(0.0, min(100.0, (v - AX_LO) / (AX_HI - AX_LO) * 100.0))
