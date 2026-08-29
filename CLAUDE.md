@@ -705,14 +705,47 @@ open — so `gap_check_first_bar=False` is defensive, not behaviour-changing.
   mark it superseded rather than editing it, the way the FX-classification
   limitation was handled.
 
-**The caveat this fix introduces**, and it is a real one: excluding unresolved
-signals is mild survivorship selection. A trade that drifts for the rest of the
-window without touching either barrier is dropped rather than counted as the
-roughly-flat outcome it was. Naive and `kairos_signal_replay.py` have always
-had this; the fix spreads it to oracle/base rather than creating it. The
-alternative — force-closing at the last available bar — was rejected because it
-reintroduces exactly the arbitrary exit the change removes. Worth revisiting
-only with a measured exclusion rate per stage in hand.
+**The caveat this fix introduces**: excluding unresolved signals is mild
+survivorship selection — a trade that drifts to the end of the window without
+touching either barrier is dropped rather than counted as the roughly-flat
+outcome it was. Naive and `kairos_signal_replay.py` have always had this; the
+fix spreads it to oracle/base rather than creating it. Force-closing at the
+last bar was rejected as the alternative: it reintroduces exactly the arbitrary
+exit this change removes.
+
+**Measured on one oracle group** (AAPL/MSFT/NVDA/AMD, 1d/6m, both rules scored
+on one run's identical shadow signals — `_resolve_exit` vs. a local
+reimplementation of the old rule):
+
+| | old | new |
+|---|---|---|
+| signals | 3,658 | 3,657 (**1** never resolved) |
+| strategies firing | 39 | 39 |
+| median Sharpe | +3.795 | +3.795 |
+
+So for **oracle** the survivorship concern is ~0.03% and the aggregate effect is
+nil — expected in hindsight, since oracle brackets the very bar it peeked at, so
+almost every signal resolves on bar 1 and multi-bar walking changes nothing.
+**33 of 39 strategies were byte-identical.**
+
+The 6 that moved, moved hard — these are the strategies whose stop/target don't
+come from the peeked bar's own geometry, so the force-close was materially
+distorting them:
+
+```
+cross_asset_spread    -7.83 -> -3.05      martingale_floor  +7.53 -> +4.05
+support_confluence    +1.86 -> -1.07 (!)  funding_rate_pred -10.00 -> -7.34
+path_high_low_exec    +6.62 -> +5.13      high_low          +7.73 -> +7.04
+```
+
+One sign flip (`support_confluence`), mean delta −0.029.
+
+**Do not generalise this to base.** Base was not measured (it needs the GPU) and
+is where the change should bite hardest: a model's predicted brackets are not
+derived from the realised bar, so they miss on bar 1 far more often than
+oracle's do, which is exactly the case the old rule force-closed. One equity
+group is also not a corpus claim — crypto's wider ranges will resolve
+differently.
 
 **Six independent TP/SL-checking implementations exist in this codebase**
 (found while investigating the one-bar issue above) — worth knowing before
