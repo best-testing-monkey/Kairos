@@ -100,7 +100,12 @@ def _run_one(group_id, assets, stage):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("correlation_run_id", type=int)
+    parser.add_argument("correlation_run_id", type=int, nargs="?", default=None)
+    parser.add_argument("--assets-file",
+                         help="File of comma-joined asset lists, one group per line. Bypasses "
+                              "select_deduped_groups entirely -- for backfilling a targeted set "
+                              "(e.g. groups another stage already ran that this one hasn't). "
+                              "Mutually exclusive with correlation_run_id.")
     parser.add_argument("--stage", choices=["oracle", "naive"], default="oracle",
                          help="Which no-model mode to sweep (default: oracle)")
     parser.add_argument("--workers", type=int, default=8,
@@ -109,9 +114,17 @@ def main():
                          help="Only process the first N groups (quick wiring test)")
     args = parser.parse_args()
 
+    if (args.correlation_run_id is None) == (args.assets_file is None):
+        parser.error("give exactly one of correlation_run_id or --assets-file")
+
     import kairos_pipeline as kp
     conn = _connect()
-    groups = kp.select_deduped_groups(conn, args.correlation_run_id)
+    if args.assets_file:
+        with open(args.assets_file) as fh:
+            groups = [(f"file:{i}", line.strip().split(","))
+                      for i, line in enumerate(fh, 1) if line.strip()]
+    else:
+        groups = kp.select_deduped_groups(conn, args.correlation_run_id)
     conn.close()
     if args.limit:
         groups = groups[: args.limit]
