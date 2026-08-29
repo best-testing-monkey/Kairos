@@ -1,1177 +1,1039 @@
 {
-"matched_groups": 343,
+"matched_groups": 451,
 "rows": [
 {
 "name": "bollinger_validation",
 "n": {
-"naive": 343,
-"base": 111,
-"oracle": 343
+"oracle": 369,
+"naive": 379,
+"base": 256
 },
 "sh": {
-"naive": 5.199,
-"base": 10.355,
-"oracle": 49.437
+"oracle": 49.285,
+"naive": 5.528,
+"base": 12.144
 },
 "win": {
-"naive": 0.6181,
-"base": 0.6486,
-"oracle": 0.9971
+"oracle": 0.9973,
+"naive": 0.6174,
+"base": 0.6836
 },
 "pnl": {
-"naive": 0.007036,
-"base": 0.140084,
-"oracle": 0.026916
+"oracle": 0.025914,
+"naive": 0.00652,
+"base": 0.092666
 }
 },
 {
 "name": "open_gap",
 "n": {
-"naive": 26370,
-"base": 17059,
-"oracle": 26421
+"oracle": 30820,
+"naive": 31347,
+"base": 29389
 },
 "sh": {
-"naive": -0.8,
-"base": 3.757,
-"oracle": 1.455
+"oracle": 2.202,
+"naive": -0.82,
+"base": 5.317
 },
 "win": {
-"naive": 0.4224,
-"base": 0.5675,
-"oracle": 0.4051
+"oracle": 0.4263,
+"naive": 0.4272,
+"base": 0.6128
 },
 "pnl": {
-"naive": -0.001101,
-"base": 0.009479,
-"oracle": 0.002314
-}
-},
-{
-"name": "path_high_low_sequence",
-"n": {
-"naive": 10236,
-"base": 469,
-"oracle": 10278
-},
-"sh": {
-"naive": 0.011,
-"base": 2.04,
-"oracle": 21.029
-},
-"win": {
-"naive": 0.6383,
-"base": 0.5139,
-"oracle": 1.0
-},
-"pnl": {
-"naive": -0.000324,
-"base": 0.036385,
-"oracle": 0.008671
+"oracle": 0.002607,
+"naive": -0.001071,
+"base": 0.012328
 }
 },
 {
 "name": "high_low",
 "n": {
-"naive": 28688,
-"base": 21650,
-"oracle": 29046
+"oracle": 43433,
+"naive": 42179,
+"base": 34241
 },
 "sh": {
-"naive": -0.818,
-"base": 1.888,
-"oracle": 8.196
+"oracle": 9.144,
+"naive": -0.68,
+"base": 3.269
 },
 "win": {
-"naive": 0.528,
-"base": 0.5211,
-"oracle": 0.7323
+"oracle": 0.7494,
+"naive": 0.5375,
+"base": 0.5498
 },
 "pnl": {
-"naive": -0.000798,
-"base": 0.007462,
-"oracle": 0.006172
-}
-},
-{
-"name": "funding_rate_prediction",
-"n": {
-"naive": 31090,
-"base": 85,
-"oracle": 30865
-},
-"sh": {
-"naive": -0.503,
-"base": 1.661,
-"oracle": -10.566
-},
-"win": {
-"naive": 0.7163,
-"base": 0.6706,
-"oracle": 0.3579
-},
-"pnl": {
-"naive": -0.001065,
-"base": -0.004396,
-"oracle": -0.019324
+"oracle": 0.007153,
+"naive": -0.000616,
+"base": 0.008434
 }
 },
 {
 "name": "support_confluence",
 "n": {
-"naive": 5982,
-"base": 5984,
-"oracle": 6054
+"oracle": 9470,
+"naive": 9135,
+"base": 10154
 },
 "sh": {
-"naive": 1.07,
-"base": 1.48,
-"oracle": 8.514
+"oracle": 9.997,
+"naive": 1.559,
+"base": 2.959
 },
 "win": {
-"naive": 0.7372,
-"base": 0.5881,
-"oracle": 0.7868
+"oracle": 0.8155,
+"naive": 0.7563,
+"base": 0.6012
 },
 "pnl": {
-"naive": -0.000244,
-"base": 0.001298,
-"oracle": 0.005135
-}
-},
-{
-"name": "fade_extreme",
-"n": {
-"naive": 20826,
-"base": 328,
-"oracle": 20869
-},
-"sh": {
-"naive": 0.161,
-"base": 1.397,
-"oracle": 15.544
-},
-"win": {
-"naive": 0.4914,
-"base": 0.5274,
-"oracle": 1.0
-},
-"pnl": {
-"naive": 0.000289,
-"base": 0.007681,
-"oracle": 0.012944
-}
-},
-{
-"name": "conditional_path",
-"n": {
-"naive": 43304,
-"base": 57503,
-"oracle": 42741
-},
-"sh": {
-"naive": -1.421,
-"base": 1.297,
-"oracle": -0.569
-},
-"win": {
-"naive": 0.3677,
-"base": 0.4606,
-"oracle": 0.3713
-},
-"pnl": {
-"naive": -0.001618,
-"base": 0.003471,
-"oracle": -0.000469
-}
-},
-{
-"name": "volume_confirmation",
-"n": {
-"naive": 9329,
-"base": 1037,
-"oracle": 9214
-},
-"sh": {
-"naive": -0.522,
-"base": 0.96,
-"oracle": -9.78
-},
-"win": {
-"naive": 0.6057,
-"base": 0.5063,
-"oracle": 0.427
-},
-"pnl": {
-"naive": -0.001119,
-"base": 0.004717,
-"oracle": -0.011385
-}
-},
-{
-"name": "close_direction",
-"n": {
-"naive": 53997,
-"base": 36494,
-"oracle": 53867
-},
-"sh": {
-"naive": -0.738,
-"base": 0.82,
-"oracle": 2.668
-},
-"win": {
-"naive": 0.409,
-"base": 0.422,
-"oracle": 0.4948
-},
-"pnl": {
-"naive": -0.000802,
-"base": 0.005485,
-"oracle": 0.001759
-}
-},
-{
-"name": "pca_residual_reversal",
-"n": {
-"naive": 996,
-"base": 652,
-"oracle": 1001
-},
-"sh": {
-"naive": -2.968,
-"base": 0.763,
-"oracle": -6.598
-},
-"win": {
-"naive": 0.3384,
-"base": 0.3727,
-"oracle": 0.2438
-},
-"pnl": {
-"naive": -0.001152,
-"base": 0.00121,
-"oracle": -0.002197
-}
-},
-{
-"name": "cross_asset_rank",
-"n": {
-"naive": 66,
-"base": 18337,
-"oracle": 66
-},
-"sh": {
-"naive": -16.541,
-"base": 0.726,
-"oracle": 16.901
-},
-"win": {
-"naive": 0.3788,
-"base": 0.4512,
-"oracle": 0.5758
-},
-"pnl": {
-"naive": -0.003633,
-"base": 0.002945,
-"oracle": 0.004604
-}
-},
-{
-"name": "multi_factor_rank",
-"n": {
-"naive": 28249,
-"base": 2003,
-"oracle": 28587
-},
-"sh": {
-"naive": -1.717,
-"base": 0.695,
-"oracle": -4.026
-},
-"win": {
-"naive": 0.3277,
-"base": 0.348,
-"oracle": 0.229
-},
-"pnl": {
-"naive": -0.001845,
-"base": 0.001537,
-"oracle": -0.002306
-}
-},
-{
-"name": "rsi_divergence",
-"n": {
-"naive": 4315,
-"base": 3345,
-"oracle": 4318
-},
-"sh": {
-"naive": -1.451,
-"base": 0.637,
-"oracle": 4.699
-},
-"win": {
-"naive": 0.3979,
-"base": 0.4532,
-"oracle": 0.5767
-},
-"pnl": {
-"naive": -0.000941,
-"base": 0.006348,
-"oracle": 0.00451
+"oracle": 0.005695,
+"naive": 0.000336,
+"base": 0.001569
 }
 },
 {
 "name": "martingale_floor",
 "n": {
-"naive": 32140,
-"base": 4654,
-"oracle": 32546
+"oracle": 47566,
+"naive": 45985,
+"base": 8614
 },
 "sh": {
-"naive": 0.706,
-"base": 0.56,
-"oracle": 11.423
+"oracle": 12.257,
+"naive": 0.806,
+"base": 2.865
 },
 "win": {
-"naive": 0.7019,
-"base": 0.6347,
-"oracle": 0.8376
+"oracle": 0.8542,
+"naive": 0.7028,
+"base": 0.6629
 },
 "pnl": {
-"naive": 5e-06,
-"base": 0.00027,
-"oracle": 0.009008
+"oracle": 0.009934,
+"naive": 0.000283,
+"base": 0.00042
 }
 },
 {
-"name": "dynamic_bracket",
+"name": "fade_extreme",
 "n": {
-"naive": 39951,
-"base": 32750,
-"oracle": 39840
+"oracle": 26319,
+"naive": 27345,
+"base": 573
 },
 "sh": {
-"naive": -0.639,
-"base": 0.546,
-"oracle": 2.32
+"oracle": 15.577,
+"naive": 0.698,
+"base": 2.767
 },
 "win": {
-"naive": 0.4133,
-"base": 0.4409,
-"oracle": 0.5072
+"oracle": 1.0,
+"naive": 0.5052,
+"base": 0.5497
 },
 "pnl": {
-"naive": -0.000683,
-"base": 0.002621,
-"oracle": 0.002589
+"oracle": 0.011744,
+"naive": 0.000482,
+"base": 0.010434
+}
+},
+{
+"name": "path_high_low_sequence",
+"n": {
+"oracle": 12641,
+"naive": 12511,
+"base": 639
+},
+"sh": {
+"oracle": 20.987,
+"naive": 0.775,
+"base": 1.851
+},
+"win": {
+"oracle": 1.0,
+"naive": 0.6506,
+"base": 0.507
+},
+"pnl": {
+"oracle": 0.007871,
+"naive": 0.000106,
+"base": 0.033597
+}
+},
+{
+"name": "conditional_path",
+"n": {
+"oracle": 48409,
+"naive": 59897,
+"base": 65991
+},
+"sh": {
+"oracle": -0.905,
+"naive": -1.369,
+"base": 1.483
+},
+"win": {
+"oracle": 0.3578,
+"naive": 0.3589,
+"base": 0.4645
+},
+"pnl": {
+"oracle": -0.000795,
+"naive": -0.00155,
+"base": 0.003874
+}
+},
+{
+"name": "safe_haven_rotation",
+"n": {
+"oracle": 593,
+"naive": 592,
+"base": 220
+},
+"sh": {
+"oracle": -1.109,
+"naive": -0.597,
+"base": 0.932
+},
+"win": {
+"oracle": 0.4604,
+"naive": 0.473,
+"base": 0.5364
+},
+"pnl": {
+"oracle": -0.000214,
+"naive": -0.000192,
+"base": 0.000155
 }
 },
 {
 "name": "cross_asset_spread",
 "n": {
-"naive": 2960,
-"base": 9283,
-"oracle": 2989
+"oracle": 3619,
+"naive": 4130,
+"base": 12022
 },
 "sh": {
-"naive": 0.231,
-"base": 0.529,
-"oracle": -5.823
+"oracle": -6.681,
+"naive": 0.71,
+"base": 0.767
 },
 "win": {
-"naive": 0.5747,
-"base": 0.4705,
-"oracle": 0.3921
+"oracle": 0.3783,
+"naive": 0.578,
+"base": 0.4781
 },
 "pnl": {
-"naive": 0.000255,
-"base": 0.00131,
-"oracle": -0.006297
+"oracle": -0.006675,
+"naive": 0.000516,
+"base": 0.001275
 }
 },
 {
-"name": "tail_asymmetry",
+"name": "close_direction",
 "n": {
-"naive": 3750,
-"base": 15537,
-"oracle": 3793
+"oracle": 67694,
+"naive": 71972,
+"base": 44488
 },
 "sh": {
-"naive": -1.926,
-"base": 0.526,
-"oracle": 0.321
+"oracle": 2.535,
+"naive": -0.74,
+"base": 0.757
 },
 "win": {
-"naive": 0.2341,
-"base": 0.4377,
-"oracle": 0.1766
+"oracle": 0.4921,
+"naive": 0.4006,
+"base": 0.4197
 },
 "pnl": {
-"naive": -0.000356,
-"base": 0.00084,
-"oracle": 0.00234
+"oracle": 0.001449,
+"naive": -0.000794,
+"base": 0.004583
+}
+},
+{
+"name": "cross_asset_rank",
+"n": {
+"oracle": 80,
+"naive": 84,
+"base": 25587
+},
+"sh": {
+"oracle": 13.79,
+"naive": -12.794,
+"base": 0.717
+},
+"win": {
+"oracle": 0.5875,
+"naive": 0.4048,
+"base": 0.4374
+},
+"pnl": {
+"oracle": 0.003218,
+"naive": -0.002859,
+"base": 0.003336
+}
+},
+{
+"name": "volume_confirmation",
+"n": {
+"oracle": 10493,
+"naive": 13819,
+"base": 1650
+},
+"sh": {
+"oracle": -12.92,
+"naive": -1.215,
+"base": 0.486
+},
+"win": {
+"oracle": 0.3802,
+"naive": 0.618,
+"base": 0.5139
+},
+"pnl": {
+"oracle": -0.014424,
+"naive": -0.002029,
+"base": 0.003075
+}
+},
+{
+"name": "dynamic_bracket",
+"n": {
+"oracle": 50816,
+"naive": 54536,
+"base": 40557
+},
+"sh": {
+"oracle": 2.396,
+"naive": -0.605,
+"base": 0.438
+},
+"win": {
+"oracle": 0.5062,
+"naive": 0.4057,
+"base": 0.4372
+},
+"pnl": {
+"oracle": 0.002234,
+"naive": -0.00073,
+"base": 0.002152
 }
 },
 {
 "name": "particle_filter",
 "n": {
-"naive": 49469,
-"base": 37506,
-"oracle": 49373
+"oracle": 63006,
+"naive": 66864,
+"base": 45358
 },
 "sh": {
-"naive": -0.552,
-"base": 0.499,
-"oracle": 3.953
+"oracle": 4.028,
+"naive": -0.486,
+"base": 0.415
 },
 "win": {
-"naive": 0.4274,
-"base": 0.4389,
-"oracle": 0.5833
+"oracle": 0.5837,
+"naive": 0.4228,
+"base": 0.4359
 },
 "pnl": {
-"naive": -0.000658,
-"base": 0.002,
-"oracle": 0.003866
-}
-},
-{
-"name": "inverse_variance",
-"n": {
-"naive": 36692,
-"base": 22101,
-"oracle": 36583
-},
-"sh": {
-"naive": -0.696,
-"base": 0.498,
-"oracle": -0.037
-},
-"win": {
-"naive": 0.4073,
-"base": 0.4418,
-"oracle": 0.4633
-},
-"pnl": {
-"naive": -0.000778,
-"base": 0.002179,
-"oracle": -5.2e-05
+"oracle": 0.003379,
+"naive": -0.000675,
+"base": 0.00169
 }
 },
 {
 "name": "hmm_regime",
 "n": {
-"naive": 4920,
-"base": 650,
-"oracle": 4948
+"oracle": 5652,
+"naive": 7855,
+"base": 961
 },
 "sh": {
+"oracle": -7.027,
 "naive": -0.723,
-"base": 0.481,
-"oracle": -7.319
+"base": 0.399
 },
 "win": {
-"naive": 0.5081,
-"base": 0.7138,
-"oracle": 0.4228
+"oracle": 0.4315,
+"naive": 0.5055,
+"base": 0.6524
 },
 "pnl": {
-"naive": -0.000213,
-"base": -0.002976,
-"oracle": -0.001857
-}
-},
-{
-"name": "rsi_filter",
-"n": {
-"naive": 1951,
-"base": 3031,
-"oracle": 1937
-},
-"sh": {
-"naive": -1.758,
-"base": 0.351,
-"oracle": -5.422
-},
-"win": {
-"naive": 0.3409,
-"base": 0.4144,
-"oracle": 0.255
-},
-"pnl": {
-"naive": -0.000576,
-"base": 0.000947,
-"oracle": -0.001776
-}
-},
-{
-"name": "vol_target_sizer",
-"n": {
-"naive": 7670,
-"base": 28687,
-"oracle": 7741
-},
-"sh": {
-"naive": 0.637,
-"base": 0.35,
-"oracle": 16.278
-},
-"win": {
-"naive": 0.4407,
-"base": 0.471,
-"oracle": 0.7819
-},
-"pnl": {
-"naive": 0.001092,
-"base": 0.000538,
-"oracle": 0.019102
-}
-},
-{
-"name": "expected_value",
-"n": {
-"naive": 7670,
-"base": 29234,
-"oracle": 7741
-},
-"sh": {
-"naive": 0.637,
-"base": 0.33,
-"oracle": 16.278
-},
-"win": {
-"naive": 0.4407,
-"base": 0.4702,
-"oracle": 0.7819
-},
-"pnl": {
-"naive": 0.001092,
-"base": 0.00051,
-"oracle": 0.019102
-}
-},
-{
-"name": "path_high_low_execution",
-"n": {
-"naive": 55826,
-"base": 50088,
-"oracle": 56450
-},
-"sh": {
-"naive": -0.093,
-"base": 0.299,
-"oracle": 8.098
-},
-"win": {
-"naive": 0.5537,
-"base": 0.4922,
-"oracle": 0.7429
-},
-"pnl": {
-"naive": -0.000769,
-"base": 0.000706,
-"oracle": 0.010042
-}
-},
-{
-"name": "bsts_decomposition",
-"n": {
-"naive": 23215,
-"base": 16697,
-"oracle": 23133
-},
-"sh": {
-"naive": -0.758,
-"base": 0.283,
-"oracle": 4.316
-},
-"win": {
-"naive": 0.4214,
-"base": 0.4342,
-"oracle": 0.5895
-},
-"pnl": {
-"naive": -0.000818,
-"base": 0.00153,
-"oracle": 0.003883
-}
-},
-{
-"name": "path_execution",
-"n": {
-"naive": 36240,
-"base": 83587,
-"oracle": 36635
-},
-"sh": {
-"naive": -1.045,
-"base": 0.133,
-"oracle": 2.285
-},
-"win": {
-"naive": 0.3253,
-"base": 0.4718,
-"oracle": 0.374
-},
-"pnl": {
-"naive": -0.001493,
-"base": 0.000539,
-"oracle": 0.003388
-}
-},
-{
-"name": "path_v_shape",
-"n": {
-"naive": 24288,
-"base": 35858,
-"oracle": 24216
-},
-"sh": {
-"naive": -0.585,
-"base": 0.09,
-"oracle": 16.107
-},
-"win": {
-"naive": 0.5701,
-"base": 0.6272,
-"oracle": 0.9003
-},
-"pnl": {
-"naive": -0.000581,
-"base": 0.000178,
-"oracle": 0.004404
+"oracle": -0.001679,
+"naive": -0.000161,
+"base": -0.001962
 }
 },
 {
 "name": "range_trading",
 "n": {
-"naive": 27742,
-"base": 14875,
-"oracle": 27883
+"oracle": 38336,
+"naive": 38248,
+"base": 21785
 },
 "sh": {
-"naive": -0.264,
-"base": 0.04,
-"oracle": 10.721
+"oracle": 9.962,
+"naive": 0.152,
+"base": 0.385
 },
 "win": {
-"naive": 0.488,
-"base": 0.5013,
-"oracle": 0.8691
+"oracle": 0.8462,
+"naive": 0.4945,
+"base": 0.5184
 },
 "pnl": {
-"naive": -0.000146,
-"base": 0.000301,
-"oracle": 0.009845
+"oracle": 0.008379,
+"naive": 8.3e-05,
+"base": 0.000447
 }
 },
 {
-"name": "skew",
+"name": "inverse_variance",
 "n": {
-"naive": 10412,
-"base": 4561,
-"oracle": 10465
+"oracle": 45947,
+"naive": 49305,
+"base": 29574
 },
 "sh": {
-"naive": -1.108,
-"base": 0.022,
-"oracle": 0.495
+"oracle": -0.348,
+"naive": -0.755,
+"base": 0.375
 },
 "win": {
-"naive": 0.3129,
-"base": 0.4058,
-"oracle": 0.2567
+"oracle": 0.4539,
+"naive": 0.395,
+"base": 0.4368
 },
 "pnl": {
-"naive": -0.000951,
-"base": 0.000427,
-"oracle": 0.000705
+"oracle": -0.000321,
+"naive": -0.000875,
+"base": 0.00168
 }
 },
 {
 "name": "rqa_determinism",
 "n": {
-"naive": 22730,
-"base": 14799,
-"oracle": 22872
+"oracle": 31538,
+"naive": 31000,
+"base": 21687
 },
 "sh": {
-"naive": -0.223,
-"base": 0.003,
-"oracle": 10.031
+"oracle": 8.711,
+"naive": 0.144,
+"base": 0.357
 },
 "win": {
-"naive": 0.4907,
-"base": 0.5014,
-"oracle": 0.8404
+"oracle": 0.813,
+"naive": 0.4951,
+"base": 0.5186
 },
 "pnl": {
-"naive": -0.00016,
-"base": 0.000231,
-"oracle": 0.005787
+"oracle": 0.004835,
+"naive": 5.9e-05,
+"base": 0.0004
 }
 },
 {
-"name": "cvd_divergence",
+"name": "rsi_divergence",
 "n": {
-"naive": 5531,
-"base": 13966,
-"oracle": 5575
+"oracle": 5463,
+"naive": 5939,
+"base": 4192
 },
 "sh": {
-"naive": -2.494,
-"base": 0.0,
-"oracle": 3.199
+"oracle": 4.851,
+"naive": -1.242,
+"base": 0.317
 },
 "win": {
-"naive": 0.2927,
-"base": 0.4406,
-"oracle": 0.3995
+"oracle": 0.5837,
+"naive": 0.3991,
+"base": 0.4478
 },
 "pnl": {
-"naive": -0.002729,
-"base": 0.000477,
-"oracle": 0.004485
+"oracle": 0.0038,
+"naive": -0.000868,
+"base": 0.005165
 }
 },
 {
-"name": "distribution_overlap",
+"name": "path_high_low_execution",
 "n": {
-"naive": 16989,
-"base": 1284,
-"oracle": 16744
+"oracle": 77610,
+"naive": 75959,
+"base": 66592
 },
 "sh": {
-"naive": -0.755,
-"base": -0.05,
-"oracle": -3.85
+"oracle": 9.54,
+"naive": 0.032,
+"base": 0.269
 },
 "win": {
-"naive": 0.365,
-"base": 0.4252,
-"oracle": 0.2321
+"oracle": 0.7713,
+"naive": 0.5633,
+"base": 0.4847
 },
 "pnl": {
-"naive": -0.000876,
-"base": 0.000108,
-"oracle": -0.002483
+"oracle": 0.011486,
+"naive": -0.000495,
+"base": 0.000468
+}
+},
+{
+"name": "bsts_decomposition",
+"n": {
+"oracle": 29547,
+"naive": 31266,
+"base": 20325
+},
+"sh": {
+"oracle": 4.49,
+"naive": -0.658,
+"base": 0.187
+},
+"win": {
+"oracle": 0.592,
+"naive": 0.4183,
+"base": 0.4311
+},
+"pnl": {
+"oracle": 0.00353,
+"naive": -0.00079,
+"base": 0.001253
+}
+},
+{
+"name": "path_v_shape",
+"n": {
+"oracle": 30211,
+"naive": 32455,
+"base": 43510
+},
+"sh": {
+"oracle": 15.724,
+"naive": -0.258,
+"base": 0.159
+},
+"win": {
+"oracle": 0.8815,
+"naive": 0.5527,
+"base": 0.6298
+},
+"pnl": {
+"oracle": 0.003648,
+"naive": -0.000538,
+"base": 0.000155
+}
+},
+{
+"name": "path_execution",
+"n": {
+"oracle": 52194,
+"naive": 49458,
+"base": 110722
+},
+"sh": {
+"oracle": 2.001,
+"naive": -0.826,
+"base": 0.082
+},
+"win": {
+"oracle": 0.3526,
+"naive": 0.3215,
+"base": 0.4701
+},
+"pnl": {
+"oracle": 0.002863,
+"naive": -0.001149,
+"base": 0.000636
+}
+},
+{
+"name": "vol_target_sizer",
+"n": {
+"oracle": 10450,
+"naive": 11410,
+"base": 42072
+},
+"sh": {
+"oracle": 18.089,
+"naive": 0.644,
+"base": 0.077
+},
+"win": {
+"oracle": 0.802,
+"naive": 0.4447,
+"base": 0.4604
+},
+"pnl": {
+"oracle": 0.020697,
+"naive": 0.000706,
+"base": 0.000118
+}
+},
+{
+"name": "tail_asymmetry",
+"n": {
+"oracle": 5794,
+"naive": 6172,
+"base": 21421
+},
+"sh": {
+"oracle": 2.004,
+"naive": -0.553,
+"base": 0.075
+},
+"win": {
+"oracle": 0.2009,
+"naive": 0.2132,
+"base": 0.4187
+},
+"pnl": {
+"oracle": 0.003527,
+"naive": 0.000409,
+"base": 3.3e-05
+}
+},
+{
+"name": "expected_value",
+"n": {
+"oracle": 11160,
+"naive": 11410,
+"base": 43077
+},
+"sh": {
+"oracle": 18.132,
+"naive": 0.644,
+"base": 0.061
+},
+"win": {
+"oracle": 0.8023,
+"naive": 0.4447,
+"base": 0.4599
+},
+"pnl": {
+"oracle": 0.020694,
+"naive": 0.000706,
+"base": 0.000106
 }
 },
 {
 "name": "rl_meta_controller",
 "n": {
-"naive": 9912,
-"base": 6528,
-"oracle": 10126
+"oracle": 13799,
+"naive": 14003,
+"base": 9273
 },
 "sh": {
-"naive": -0.692,
-"base": -0.104,
-"oracle": 8.149
+"oracle": 6.834,
+"naive": -0.328,
+"base": 0.026
 },
 "win": {
-"naive": 0.4368,
-"base": 0.4422,
-"oracle": 0.7013
+"oracle": 0.6623,
+"naive": 0.4306,
+"base": 0.4549
 },
 "pnl": {
-"naive": -0.000552,
-"base": 0.000501,
-"oracle": 0.007554
+"oracle": 0.005992,
+"naive": -0.000271,
+"base": 0.000429
+}
+},
+{
+"name": "cvd_divergence",
+"n": {
+"oracle": 6863,
+"naive": 7213,
+"base": 17869
+},
+"sh": {
+"oracle": 2.664,
+"naive": -2.773,
+"base": 0.008
+},
+"win": {
+"oracle": 0.3835,
+"naive": 0.2796,
+"base": 0.4446
+},
+"pnl": {
+"oracle": 0.003912,
+"naive": -0.002927,
+"base": 0.000523
+}
+},
+{
+"name": "pca_residual_reversal",
+"n": {
+"oracle": 1498,
+"naive": 1496,
+"base": 1226
+},
+"sh": {
+"oracle": -6.835,
+"naive": -3.072,
+"base": -0.019
+},
+"win": {
+"oracle": 0.2377,
+"naive": 0.3235,
+"base": 0.3695
+},
+"pnl": {
+"oracle": -0.003209,
+"naive": -0.001396,
+"base": 0.000565
 }
 },
 {
 "name": "dfa_persistence",
 "n": {
-"naive": 14507,
-"base": 7115,
-"oracle": 14576
+"oracle": 20258,
+"naive": 20454,
+"base": 10308
 },
 "sh": {
-"naive": -0.394,
-"base": -0.593,
-"oracle": 12.65
+"oracle": 11.9,
+"naive": 0.166,
+"base": -0.037
 },
 "win": {
-"naive": 0.4882,
-"base": 0.4694,
-"oracle": 0.888
+"oracle": 0.8651,
+"naive": 0.495,
+"base": 0.4929
 },
 "pnl": {
-"naive": -9.2e-05,
-"base": 0.000407,
-"oracle": 0.01331
+"oracle": 0.011276,
+"naive": 0.00028,
+"base": 0.000551
 }
 },
 {
-"name": "variance_risk_premium",
+"name": "funding_rate_prediction",
 "n": {
-"naive": 27021,
-"base": 347,
-"oracle": 27258
+"oracle": 33043,
+"naive": 40827,
+"base": 552
 },
 "sh": {
-"naive": -0.711,
-"base": -0.668,
-"oracle": -7.209
+"oracle": -11.298,
+"naive": -0.929,
+"base": -0.04
 },
 "win": {
-"naive": 0.3683,
-"base": 0.2853,
-"oracle": 0.1623
+"oracle": 0.3401,
+"naive": 0.7088,
+"base": 0.6196
 },
 "pnl": {
-"naive": -0.000728,
-"base": 0.0003,
-"oracle": -0.002351
+"oracle": -0.02117,
+"naive": -0.001905,
+"base": -0.000929
 }
 },
 {
-"name": "matrix_profile_anomaly",
+"name": "multi_factor_rank",
 "n": {
-"naive": 2403,
-"base": 1023,
-"oracle": 2425
+"oracle": 35733,
+"naive": 36142,
+"base": 11072
 },
 "sh": {
-"naive": -2.914,
-"base": -1.52,
-"oracle": -8.122
+"oracle": -3.963,
+"naive": -1.645,
+"base": -0.205
 },
 "win": {
-"naive": 0.3571,
-"base": 0.3978,
-"oracle": 0.2144
+"oracle": 0.2278,
+"naive": 0.3259,
+"base": 0.341
 },
 "pnl": {
-"naive": -0.001158,
-"base": 0.001199,
-"oracle": -0.00245
+"oracle": -0.00224,
+"naive": -0.001711,
+"base": 0.000364
+}
+},
+{
+"name": "distribution_overlap",
+"n": {
+"oracle": 18533,
+"naive": 23774,
+"base": 1509
+},
+"sh": {
+"oracle": -4.0,
+"naive": -0.681,
+"base": -0.22
+},
+"win": {
+"oracle": 0.2262,
+"naive": 0.3512,
+"base": 0.4228
+},
+"pnl": {
+"oracle": -0.002685,
+"naive": -0.000819,
+"base": -4.7e-05
+}
+},
+{
+"name": "skew",
+"n": {
+"oracle": 14642,
+"naive": 15285,
+"base": 6594
+},
+"sh": {
+"oracle": 0.411,
+"naive": -0.817,
+"base": -0.536
+},
+"win": {
+"oracle": 0.2504,
+"naive": 0.291,
+"base": 0.3899
+},
+"pnl": {
+"oracle": 0.000658,
+"naive": -0.000689,
+"base": -0.000523
+}
+},
+{
+"name": "rsi_filter",
+"n": {
+"oracle": 2909,
+"naive": 2906,
+"base": 4461
+},
+"sh": {
+"oracle": -5.922,
+"naive": -1.393,
+"base": -1.038
+},
+"win": {
+"oracle": 0.2231,
+"naive": 0.3262,
+"base": 0.3815
+},
+"pnl": {
+"oracle": -0.003433,
+"naive": -0.000494,
+"base": -0.001338
 }
 },
 {
 "name": "hurst_regime_switch",
 "n": {
-"naive": 9581,
-"base": 4451,
-"oracle": 9636
+"oracle": 13495,
+"naive": 13782,
+"base": 6285
 },
 "sh": {
-"naive": -0.376,
-"base": -1.541,
-"oracle": 15.31
+"oracle": 14.693,
+"naive": 0.154,
+"base": -1.153
 },
 "win": {
-"naive": 0.4839,
-"base": 0.4006,
-"oracle": 0.9099
+"oracle": 0.8879,
+"naive": 0.4909,
+"base": 0.4234
 },
 "pnl": {
-"naive": -4.8e-05,
-"base": 0.000472,
-"oracle": 0.016689
+"oracle": 0.014267,
+"naive": 0.000198,
+"base": 0.000397
+}
+},
+{
+"name": "variance_risk_premium",
+"n": {
+"oracle": 35691,
+"naive": 37304,
+"base": 5599
+},
+"sh": {
+"oracle": -7.161,
+"naive": -0.939,
+"base": -1.411
+},
+"win": {
+"oracle": 0.1602,
+"naive": 0.35,
+"base": 0.2709
+},
+"pnl": {
+"oracle": -0.002323,
+"naive": -0.000809,
+"base": -0.00103
 }
 },
 {
 "name": "volume_fade",
 "n": {
-"naive": 1821,
-"base": 1709,
-"oracle": 1810
+"oracle": 2194,
+"naive": 3114,
+"base": 1747
 },
 "sh": {
-"naive": -0.719,
-"base": -1.562,
-"oracle": -29.671
+"oracle": -33.516,
+"naive": -2.138,
+"base": -1.556
 },
 "win": {
-"naive": 0.6183,
-"base": 0.6109,
-"oracle": 0.0707
+"oracle": 0.0583,
+"naive": 0.657,
+"base": 0.6119
 },
 "pnl": {
-"naive": -0.002721,
-"base": -0.003565,
-"oracle": -0.030859
+"oracle": -0.037468,
+"naive": -0.004942,
+"base": -0.003533
+}
+},
+{
+"name": "matrix_profile_anomaly",
+"n": {
+"oracle": 3144,
+"naive": 3191,
+"base": 1954
+},
+"sh": {
+"oracle": -8.29,
+"naive": -2.561,
+"base": -2.043
+},
+"win": {
+"oracle": 0.2061,
+"naive": 0.351,
+"base": 0.3552
+},
+"pnl": {
+"oracle": -0.002748,
+"naive": -0.001309,
+"base": -0.000601
 }
 },
 {
 "name": "gbm_direction",
 "n": {
-"naive": 1895,
-"base": 1049,
-"oracle": 1863
+"oracle": 2335,
+"naive": 2589,
+"base": 1686
 },
 "sh": {
-"naive": -1.995,
-"base": -2.428,
-"oracle": -6.905
+"oracle": -6.554,
+"naive": -3.031,
+"base": -2.671
 },
 "win": {
-"naive": 0.3805,
-"base": 0.3527,
-"oracle": 0.2179
+"oracle": 0.221,
+"naive": 0.3476,
+"base": 0.3446
 },
 "pnl": {
-"naive": -0.000937,
-"base": -0.000656,
-"oracle": -0.002322
+"oracle": -0.002202,
+"naive": -0.001304,
+"base": -0.000715
 }
 },
 {
 "name": "trend_following",
 "n": {
-"naive": 137,
-"base": 2035,
-"oracle": 155
+"oracle": 424,
+"naive": 388,
+"base": 2497
 },
 "sh": {
-"naive": -5.818,
-"base": -5.89,
-"oracle": -1.846
+"oracle": -1.891,
+"naive": -2.82,
+"base": -5.632
 },
 "win": {
-"naive": 0.0803,
-"base": 0.1204,
-"oracle": 0.1484
+"oracle": 0.1557,
+"naive": 0.1211,
+"base": 0.1233
 },
 "pnl": {
-"naive": -0.00234,
-"base": 0.000331,
-"oracle": 0.005845
-}
-},
-{
-"name": "cds_spread_filter",
-"n": {
-"naive": 137,
-"base": 2021,
-"oracle": 155
-},
-"sh": {
-"naive": -5.818,
-"base": -5.928,
-"oracle": -1.846
-},
-"win": {
-"naive": 0.0803,
-"base": 0.1202,
-"oracle": 0.1484
-},
-"pnl": {
-"naive": -0.00234,
-"base": 0.000334,
-"oracle": 0.005845
-}
-},
-{
-"name": "cot_positioning_filter",
-"n": {
-"naive": 137,
-"base": 2021,
-"oracle": 155
-},
-"sh": {
-"naive": -5.818,
-"base": -5.928,
-"oracle": -1.846
-},
-"win": {
-"naive": 0.0803,
-"base": 0.1202,
-"oracle": 0.1484
-},
-"pnl": {
-"naive": -0.00234,
-"base": 0.000334,
-"oracle": 0.005845
-}
-},
-{
-"name": "dark_pool_filter",
-"n": {
-"naive": 137,
-"base": 2021,
-"oracle": 155
-},
-"sh": {
-"naive": -5.818,
-"base": -5.928,
-"oracle": -1.846
-},
-"win": {
-"naive": 0.0803,
-"base": 0.1202,
-"oracle": 0.1484
-},
-"pnl": {
-"naive": -0.00234,
-"base": 0.000334,
-"oracle": 0.005845
-}
-},
-{
-"name": "fractal_dimension",
-"n": {
-"naive": 137,
-"base": 2021,
-"oracle": 155
-},
-"sh": {
-"naive": -5.818,
-"base": -5.928,
-"oracle": -1.846
-},
-"win": {
-"naive": 0.0803,
-"base": 0.1202,
-"oracle": 0.1484
-},
-"pnl": {
-"naive": -0.00234,
-"base": 0.000334,
-"oracle": 0.005845
-}
-},
-{
-"name": "gaussian_process",
-"n": {
-"naive": 137,
-"base": 2021,
-"oracle": 155
-},
-"sh": {
-"naive": -5.818,
-"base": -5.928,
-"oracle": -1.846
-},
-"win": {
-"naive": 0.0803,
-"base": 0.1202,
-"oracle": 0.1484
-},
-"pnl": {
-"naive": -0.00234,
-"base": 0.000334,
-"oracle": 0.005845
-}
-},
-{
-"name": "insider_cluster",
-"n": {
-"naive": 137,
-"base": 2021,
-"oracle": 155
-},
-"sh": {
-"naive": -5.818,
-"base": -5.928,
-"oracle": -1.846
-},
-"win": {
-"naive": 0.0803,
-"base": 0.1202,
-"oracle": 0.1484
-},
-"pnl": {
-"naive": -0.00234,
-"base": 0.000334,
-"oracle": 0.005845
-}
-},
-{
-"name": "onchain_flow_filter",
-"n": {
-"naive": 137,
-"base": 2021,
-"oracle": 155
-},
-"sh": {
-"naive": -5.818,
-"base": -5.928,
-"oracle": -1.846
-},
-"win": {
-"naive": 0.0803,
-"base": 0.1202,
-"oracle": 0.1484
-},
-"pnl": {
-"naive": -0.00234,
-"base": 0.000334,
-"oracle": 0.005845
+"oracle": 0.00669,
+"naive": 0.00122,
+"base": 0.000244
 }
 },
 {
 "name": "atr_bracket",
 "n": {
-"naive": 137,
-"base": 2014,
-"oracle": 155
+"oracle": 373,
+"naive": 388,
+"base": 2410
 },
 "sh": {
-"naive": -5.818,
-"base": -5.974,
-"oracle": -1.846
+"oracle": -2.939,
+"naive": -2.82,
+"base": -5.655
 },
 "win": {
-"naive": 0.0803,
-"base": 0.1197,
-"oracle": 0.1484
+"oracle": 0.1501,
+"naive": 0.1211,
+"base": 0.1228
 },
 "pnl": {
-"naive": -0.00234,
-"base": 0.000286,
-"oracle": 0.005845
+"oracle": 0.006373,
+"naive": 0.00122,
+"base": 0.00027
 }
 },
 {
 "name": "implementation_shortfall",
 "n": {
-"naive": 137,
-"base": 2014,
-"oracle": 155
+"oracle": 373,
+"naive": 388,
+"base": 2435
 },
 "sh": {
-"naive": -5.819,
-"base": -5.976,
-"oracle": -0.907
+"oracle": 1.478,
+"naive": -2.82,
+"base": -5.675
 },
 "win": {
-"naive": 0.0803,
-"base": 0.1197,
-"oracle": 0.1806
+"oracle": 0.2038,
+"naive": 0.1211,
+"base": 0.1228
 },
 "pnl": {
-"naive": -0.00234,
-"base": 0.000285,
-"oracle": 0.007897
+"oracle": 0.009966,
+"naive": 0.00122,
+"base": 0.000228
 }
 },
 {
 "name": "trend_following+arima_agree",
 "n": {
-"naive": 67,
-"base": 1138,
-"oracle": 87
+"oracle": 239,
+"naive": 192,
+"base": 1427
 },
 "sh": {
-"naive": -16.229,
-"base": -7.758,
-"oracle": -6.819
+"oracle": -6.778,
+"naive": -7.219,
+"base": -8.17
 },
 "win": {
-"naive": 0.0448,
-"base": 0.1239,
-"oracle": 0.1149
+"oracle": 0.1213,
+"naive": 0.099,
+"base": 0.1191
 },
 "pnl": {
-"naive": -0.00841,
-"base": 0.000621,
-"oracle": 0.00321
+"oracle": 0.004789,
+"naive": -0.002183,
+"base": 0.000188
 }
 }
 ]

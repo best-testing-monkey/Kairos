@@ -10,12 +10,12 @@ STAGES = ("naive", "base", "oracle")
 
 # --- box-plot geometry -------------------------------------------------------
 BOX = {
-    "naive":  dict(mn=-16.54, q1=-2.97, med=-0.758, q3=-0.39, mx=5.20,
-                   n=742514, pos=8, win=37.78, pnl=-0.0876),
-    "base":   dict(mn=-7.76,  q1=-1.56, med=0.283, q3=0.70,  mx=10.35,
-                   n=627775, pos=32, win=40.33, pnl=0.0510),
-    "oracle": dict(mn=-29.67, q1=-3.85, med=0.321, q3=8.51,  mx=49.44,
-                   n=744465, pos=26, win=45.88, pnl=0.4510),
+    "naive":  dict(mn=-12.79, q1=-1.39, med=-0.72, q3=0.14, mx=5.53,
+                   n=1014688, pos=13, win=46.11, pnl=-0.0616),
+    "base":   dict(mn=-8.17,  q1=-0.22, med=0.16,  q3=0.72, mx=12.14,
+                   n=834561, pos=29, win=47.34, pnl=0.0429),
+    "oracle": dict(mn=-33.52, q1=-4.00, med=2.20,  q3=9.96, mx=49.29,
+                   n=964776, pos=27, win=57.46, pnl=0.3527),
 }
 AX_LO, AX_HI = -6.0, 10.0
 def pct(v):
@@ -55,10 +55,11 @@ def figure():
     {"".join(rowhtml)}
     <div class="bp-axis"><div class="bp-label"></div><div class="bp-track">{tick_html}</div><div class="bp-med"></div></div>
   </div>
-  <figcaption><b>Figure 1.</b> Distribution of per-strategy signal-weighted Sharpe across the 51 strategies
+  <figcaption><b>Figure 1.</b> Distribution of per-strategy signal-weighted Sharpe across the 45 distinct strategies
   evaluated in all three regimes. Boxes span the first to third quartile; the vertical rule is the median;
-  whiskers are clipped at the axis bounds with the true extremes printed at each end. The naive box lies
-  entirely left of zero. The base model's median crosses it. Oracle's third quartile runs off the scale.</figcaption>
+  whiskers are clipped at the axis bounds with the true extremes printed at each end. The naive box sits
+  almost entirely left of zero, clearing it only at the third quartile. The base model's median crosses it.
+  Oracle's box extends to +9.96, filling the scale.</figcaption>
 </figure>'''
 
 def summary_table():
@@ -68,7 +69,7 @@ def summary_table():
         cells.append(f'''<tr data-stage="{s}">
       <th scope="row"><span class="swatch"></span>{LABEL[s]}</th>
       <td class="num">{b["n"]:,}</td>
-      <td class="num">{b["pos"]} / 51</td>
+      <td class="num">{b["pos"]} / 45</td>
       <td class="num">{b["med"]:+.3f}</td>
       <td class="num">{b["q1"]:+.2f}</td>
       <td class="num">{b["q3"]:+.2f}</td>
@@ -341,7 +342,7 @@ footer {{
   <div class="byline">
     <span>Kairos Project</span>
     <span>1d bars &middot; 6-month window</span>
-    <span>127 strategies &middot; 343 matched asset groups</span>
+    <span>127 strategies &middot; 451 matched asset groups</span>
     <span>commit 2db63e4</span>
   </div>
 </header>
@@ -353,13 +354,13 @@ footer {{
   over the same assets and the same period under three prediction regimes &mdash; a <strong>naive</strong> floor
   with no forecast information, an <strong>oracle</strong> ceiling with perfect foresight of the next bar, and the
   <strong>base</strong> regime driven by the pretrained Kronos forecasting model.</p>
-  <p>On a matched sample of 343 asset groups and the 51 strategies that produced signals in all three
-  regimes, the results separate cleanly. Stripped of forecast information, only 8 of 51 strategies hold a
-  positive signal-weighted Sharpe and the median strategy sits at &minus;0.76. Given perfect foresight, the
-  median crosses into profit at +0.32 and the upper quartile reaches +8.51 &mdash; but half the corpus still
-  loses money even knowing the future. The base model recovers most of the <em>breadth</em> of that
-  improvement, lifting 32 of 51 strategies above zero and moving the median to +0.28, while capturing only
-  a small fraction of its <em>magnitude</em>.</p>
+  <p>On a matched sample of 451 asset groups and the 45 distinct strategies that produced signals in all
+  three regimes, the results separate cleanly. Stripped of forecast information, only 13 of 45 strategies
+  hold a positive signal-weighted Sharpe and the median strategy sits at &minus;0.72. Given perfect
+  foresight, the median rises to +2.20 and the upper quartile to +9.96 &mdash; but 18 of 45 still lose money
+  knowing the future. The base model recovers the <em>breadth</em> of that improvement, lifting 29 of 45
+  strategies above zero &mdash; more than the oracle&rsquo;s own 27 &mdash; while its median of +0.16 and
+  upper quartile of +0.72 capture only a small fraction of the <em>magnitude</em>.</p>
   <p>We conclude that forecast quality is the dominant term in this corpus&rsquo;s measured performance, that
   a substantial subset of strategies is unsalvageable by any forecast, and that the pretrained model
   supplies real, measurable directional information &mdash; without yet supplying conviction.</p>
@@ -475,9 +476,17 @@ footer {{
   <p><strong>Matched sample.</strong> The three sweeps have unequal coverage &mdash; the oracle sweep has run
   over 1,180 groups, naive over 959, and the base sweep is still in progress at 558. Comparing regimes on
   their full, unequal footprints would confound regime with asset mix. Every figure in this note is
-  therefore computed on the <strong>343 groups present in all three sweeps</strong>, restricted further to the
-  <strong>51 strategies that fired signals in all three regimes</strong>. This is the paper&rsquo;s central
-  methodological commitment: all comparisons are paired.</p>
+  therefore computed on the <strong>451 groups present in all three sweeps</strong> (matched on assets, interval and backtest
+  period), restricted further to the <strong>45 distinct strategies that fired signals in all three
+  regimes</strong>. This is the paper&rsquo;s central methodological commitment: all comparisons are
+  paired.</p>
+  <p><strong>Aliased strategies are collapsed.</strong> Eight strategy names in the corpus are the same
+  strategy: <code>trend_following</code> and seven filters that wrap it
+  (<code>cds_spread_filter</code>, <code>cot_positioning_filter</code>, <code>dark_pool_filter</code>,
+  <code>fractal_dimension</code>, <code>gaussian_process</code>, <code>insider_cluster</code>,
+  <code>onchain_flow_filter</code>) and gate on context keys the pipeline never supplies, so every gate
+  defaults false and each is an unmodified pass-through. Counted separately they would contribute seven
+  redundant copies of one behaviour to every median. Only <code>trend_following</code> is retained.</p>
   <h3>3.4 &mdash; Aggregation and evaluation</h3>
   <p><strong>Aggregation.</strong> Per-strategy figures are signal-count-weighted means across groups, so a
   group contributing 900 signals counts nine times a group contributing 100. Group-level rows with fewer
@@ -495,62 +504,64 @@ footer {{
   {summary_table()}
 
   <h3>4.1 &mdash; Without prediction, the corpus does not work</h3>
-  <p>The naive regime is unambiguous. Across 742,514 signals, <strong>8 of 51 strategies</strong> hold a
-  positive signal-weighted Sharpe. The median strategy sits at <strong>&minus;0.758</strong>, the mean win rate
-  at 37.8%, and the median return per trade at <strong>&minus;0.088%</strong>. The entire interquartile range
-  lies below zero: the third quartile is &minus;0.39, meaning three-quarters of the corpus is losing money
-  before the best quarter even begins.</p>
-  <p>Nor are the eight survivors a reprieve. The strongest, <code>bollinger_validation</code>, posts +5.20 &mdash;
-  but on 616 signals across 149 groups, roughly a hundredth of the signal volume that the mainstream
-  strategies generate. The two thickest positives, <code>martingale_floor</code> and
-  <code>support_confluence</code>, are structural rather than directional: both derive their edge from
-  bracket geometry and win-rate asymmetry (72.6% and 75.8% win rates respectively) rather than from calling
-  direction. Strip out the forecast and what remains profitable is mostly not a forecast-shaped thing.</p>
+  <p>The naive regime is the weakest of the three. Across 1,014,688 signals, <strong>13 of 45
+  strategies</strong> hold a positive signal-weighted Sharpe, the median strategy sits at
+  <strong>&minus;0.72</strong>, mean win rate at 46.1%, and the median return per trade is negative at
+  <strong>&minus;0.062%</strong>. Nearly three-quarters of the corpus loses money with no forward
+  information, and the third quartile only barely clears zero at +0.14.</p>
+  <p>The survivors are mostly not forecast-shaped. The strongest, <code>bollinger_validation</code>, posts
+  +5.53 &mdash; but on 379 signals, a fraction of a percent of the volume the mainstream strategies
+  generate. The two thickest positives, <code>support_confluence</code> (+1.56) and
+  <code>martingale_floor</code> (+0.81), are structural rather than directional: both derive their edge from
+  bracket geometry and win-rate asymmetry rather than from calling direction. Strip out the forecast and
+  what remains profitable is largely what never depended on direction in the first place.</p>
   <p>This includes implementations of families that have been standard teaching material in quantitative
   finance for decades &mdash; RSI filters, trend following, ATR bracketing, range trading, Bollinger
   validation, gap trading. In this corpus, given no forward-looking information, they are marginal at best
   and unprofitable in the majority.</p>
 
   <h3>4.2 &mdash; Prediction is the difference, but it does not rescue everything</h3>
-  <p>Handed a perfect one-step forecast, the corpus moves decisively. The median Sharpe crosses into
-  profit at <strong>+0.321</strong>, mean win rate rises to <strong>45.9%</strong>, and median return per
-  trade rises more than fivefold to <strong>+0.451%</strong>. The oracle beats the naive floor on
-  <strong>39 of 51 strategies</strong>. The upper tail is where the effect is most visible: oracle&rsquo;s
-  third quartile is <strong>+8.51</strong> against naive&rsquo;s &minus;0.39, and its best performer reaches
-  +49.44. Whatever these strategies are for, forecast quality is the input that makes them work.</p>
-  <p>And yet <strong>25 of 51 strategies remain unprofitable with perfect foresight.</strong> Oracle&rsquo;s
-  worst result, <code>volume_fade</code> at &minus;29.67, is far worse than its own naive result of &minus;0.72
-  &mdash; perfect information made it decisively worse, because a strategy that acts confidently on a
-  correct forecast in the wrong direction loses faster than one that barely acts at all. Oracle&rsquo;s
-  distribution is the widest of the three in both directions. This is the finding that resists a
-  comfortable reading: for half the corpus, no improvement in forecasting will help, because the
-  decision rule sitting on top of the forecast is itself broken.</p>
+  <p>Handed a perfect one-step forecast, the corpus moves decisively. The median Sharpe rises to
+  <strong>+2.20</strong>, mean win rate to <strong>57.5%</strong>, and median return per trade to
+  <strong>+0.353%</strong> &mdash; roughly eight times the base model&rsquo;s. The oracle beats the naive
+  floor on <strong>31 of 45 strategies</strong>. The upper tail is where the effect is most visible:
+  oracle&rsquo;s third quartile is <strong>+9.96</strong> against naive&rsquo;s +0.14, and its best performer
+  reaches +49.28. Whatever these strategies are for, forecast quality is the input that makes them work.</p>
+  <p>And yet <strong>18 of 45 strategies remain unprofitable with perfect foresight.</strong>
+  Oracle&rsquo;s worst result, <code>volume_fade</code> at &minus;33.52, is far worse than its own naive
+  result of &minus;2.14 &mdash; perfect information made it decisively worse, because a strategy that acts
+  confidently on a correct forecast in the wrong direction loses faster than one that barely acts at all.
+  Oracle&rsquo;s distribution is by far the widest of the three in both directions, spanning &minus;33.52 to
+  +49.28. This is the finding that resists a comfortable reading: for two-fifths of the corpus, no
+  improvement in forecasting will help, because the decision rule sitting on top of the forecast is itself
+  broken.</p>
 
   <h3>4.3 &mdash; The base model supplies real information</h3>
-  <p>The pretrained Kronos model, with no fine-tuning, moves the corpus most of the way from floor to
-  profitability by breadth. It lifts <strong>32 of 51 strategies</strong> above zero &mdash; four times the
-  naive count, and <em>more</em> than the oracle&rsquo;s 26 &mdash; and beats the naive floor head-to-head on
-  <strong>34 of 51</strong>. The median Sharpe reaches <strong>+0.283</strong>, within 0.04 of the perfect-foresight
-  median, and median return per trade turns positive at +0.051%.</p>
+  <p>The pretrained Kronos model, with no fine-tuning, moves the corpus decisively on breadth. It lifts
+  <strong>29 of 45 strategies</strong> above zero &mdash; more than double the naive count of 13, and
+  <em>more</em> than the oracle&rsquo;s own 27 &mdash; and beats the naive floor head-to-head on
+  <strong>36 of 45</strong>, its strongest head-to-head margin. The median Sharpe turns positive at
+  <strong>+0.16</strong> and median return per trade at <strong>+0.043%</strong>.</p>
   <p>The individual movements are large where they matter. <code>cross_asset_rank</code> goes from
-  &minus;16.54 to +0.73; <code>open_gap</code> from &minus;0.80 to +3.76; <code>high_low</code> from &minus;0.82 to
-  +1.89; <code>conditional_path</code> from &minus;1.42 to +1.30. These are strategies that do not work at all
-  without a forecast and do work with this one. The model is not decorative.</p>
+  &minus;12.79 to +0.72; <code>open_gap</code> from &minus;0.82 to +5.32; <code>high_low</code> from
+  &minus;0.68 to +3.27; <code>conditional_path</code> from &minus;1.37 to +1.48. These are strategies that do
+  not work at all without a forecast and do work with this one. The model is not decorative.</p>
 
   <div class="callout">
     <h4>The qualification this result carries</h4>
-    <p>The base model captures the <em>breadth</em> of the oracle&rsquo;s benefit but little of its
-    <em>magnitude</em>. Base&rsquo;s third quartile is +0.70 against oracle&rsquo;s +8.51 &mdash; a twelvefold gap
-    &mdash; and its best strategy reaches +10.35 against oracle&rsquo;s +49.44. The model finds the direction;
-    it does not yet find the conviction.</p>
-    <p>A second measurement sharpens this. Ranking the 51 strategies by Sharpe within each regime and
-    correlating those rankings, the base ordering resembles the <em>naive</em> ordering
-    (Spearman <span class="mono">&rho;&nbsp;=&nbsp;+0.561</span>) more closely than it resembles the
-    <em>oracle</em> ordering (<span class="mono">&rho;&nbsp;=&nbsp;+0.338</span>). The base model shifts
-    performance levels upward across the board, but which strategies it favours is still governed largely
-    by the same structural factors that operate with no forecast at all. Reading this result as
-    &ldquo;the base model approaches perfect foresight&rdquo; would be wrong; it clears the floor
-    convincingly and has not started up the wall.</p>
+    <p>The base model matches the oracle on <em>breadth</em> and captures little of its
+    <em>magnitude</em>. It puts more strategies above zero than perfect foresight does (29 against 27), but
+    its median is +0.16 against oracle&rsquo;s +2.20, its third quartile +0.72 against +9.96 &mdash; a
+    fourteenfold gap &mdash; and its best strategy reaches +12.14 against +49.28. The model finds the
+    direction; it does not yet find the conviction.</p>
+    <p>A second measurement sharpens this. Ranking the 45 strategies by Sharpe within each regime and
+    correlating those rankings, the base ordering still resembles the <em>naive</em> ordering
+    (Spearman <span class="mono">&rho;&nbsp;=&nbsp;+0.569</span>) more closely than it resembles the
+    <em>oracle</em> ordering (<span class="mono">&rho;&nbsp;=&nbsp;+0.467</span>). The base model shifts
+    performance levels upward across the board, but which strategies it favours is still governed
+    substantially by the same structural factors that operate with no forecast at all. Reading this result
+    as &ldquo;the base model approaches perfect foresight&rdquo; would be wrong; it clears the floor
+    convincingly and has barely started up the wall.</p>
   </div>
 </section>
 
@@ -561,17 +572,18 @@ footer {{
   forecasting rather than to itself &mdash; and for this corpus, that width is most of the number.</p>
   <p>Three groups fall out of the paired comparison. <strong>Forecast-dependent strategies</strong>
   (<code>cross_asset_rank</code>, <code>open_gap</code>, <code>high_low</code>, <code>conditional_path</code>)
-  are unprofitable at the floor, profitable with the base model, and strongly profitable at the ceiling.
-  These are the corpus&rsquo;s real assets, and their performance is a direct claim about forecast quality.
-  <strong>Structurally profitable strategies</strong> (<code>martingale_floor</code>,
-  <code>support_confluence</code>) clear zero even at the floor; their edge is bracket geometry and does not
-  depend on knowing direction. <strong>Irreparable strategies</strong> (<code>volume_fade</code>,
-  <code>gbm_direction</code>, <code>trend_following+arima_agree</code>, <code>atr_bracket</code>) lose money in
-  all three regimes, several of them losing <em>more</em> as information improves.</p>
+  are unprofitable at the floor and profitable with the base model. These are the corpus&rsquo;s real
+  assets, and their performance is a direct claim about forecast quality.
+  <strong>Structurally profitable strategies</strong> (<code>support_confluence</code>,
+  <code>martingale_floor</code>, <code>fade_extreme</code>) clear zero even at the floor; their edge is
+  bracket geometry and does not depend on knowing direction. <strong>Irreparable strategies</strong>
+  (<code>volume_fade</code>, <code>gbm_direction</code>, <code>trend_following+arima_agree</code>,
+  <code>atr_bracket</code>) lose money in all three regimes, several of them losing <em>more</em> as
+  information improves.</p>
   <p>That third group is the most actionable output here. A strategy that loses money with perfect
   foresight cannot be fixed by a better model, more training data, or a longer fine-tune. It should be
   repaired at the decision rule or removed from the corpus, and the resources currently spent evaluating
-  it across every sweep should go elsewhere. Roughly half the corpus is in this position.</p>
+  it across every sweep should go elsewhere. Two-fifths of the corpus is in this position.</p>
   <p>For the strategies that are not, the gap between the base column and the oracle column is the
   remaining headroom, and it is large. The pretrained model has demonstrated that the coupling works. What
   it has not yet demonstrated is that the coupling is tight.</p>
@@ -613,8 +625,16 @@ footer {{
     <em>these implementations</em> under <em>this evaluator</em>, not a refutation of the underlying published
     work. A canonical strategy poorly specified will fail for reasons that have nothing to do with the
     concept.</li>
+    <li><strong>The corpus contains fewer distinct strategies than it appears to.</strong> Eight names
+    resolve to one strategy (&sect;3.3) and are collapsed here. Four further pairs coincide on most but not
+    all groups &mdash; <code>expected_value</code>/<code>vol_target_sizer</code>,
+    <code>range_trading</code>/<code>rqa_determinism</code>,
+    <code>dynamic_bracket</code>/<code>inverse_variance</code>,
+    <code>amount_flow</code>/<code>predicted_vwap</code> &mdash; and are <em>not</em> collapsed, because they
+    are not exact aliases. If they turn out to be trivially different, the effective corpus is smaller than
+    45 and every count here is correspondingly inflated.</li>
     <li><strong>Incomplete base coverage.</strong> The base sweep has completed 558 of 961 groups. The matched
-    sample of 343 groups is therefore drawn from a partial and not-randomly-selected footprint &mdash; the base
+    sample of 451 groups is therefore drawn from a partial and not-randomly-selected footprint &mdash; the base
     sweep was ordered by oracle Sharpe, so the matched sample may over-represent groups that performed well
     under the oracle. Extending base coverage is the cheapest available improvement to this study.</li>
     <li><strong>Two groups fail reproducibly.</strong> Groups containing certain international symbols raise
@@ -625,7 +645,7 @@ footer {{
 
 <section>
   <h2 class="sec"><span class="no">07</span>Full results</h2>
-  <p>All 51 strategies present in every regime, ordered by base-model Sharpe. Read each row left to right
+  <p>All 45 distinct strategies present in every regime, ordered by base-model Sharpe. Read each row left to right
   as floor, system, ceiling.</p>
 </section>
 </div>
@@ -684,6 +704,21 @@ WHERE  stage = ?
   AND  signal_count &gt;= 3       -- excludes degenerate 1-2 signal groups
 GROUP  BY strategy_name
 ORDER  BY w_sharpe DESC;</pre>
+  <h3>8.1 &mdash; Revision note</h3>
+  <p>The first published version of this paper reported a matched sample of 343 groups and 51 strategies,
+  with an oracle median of +0.32 and a base median of +0.28 &mdash; and concluded from those that the base
+  model came within 0.04 of the perfect-foresight median. Two corrections were applied afterwards.</p>
+  <p>First, the eight aliased names described in &sect;3.3 were counted as eight strategies rather than one.
+  All eight are unprofitable in every regime and sit near the middle of the oracle distribution, so seven
+  redundant copies dragged the oracle median down by roughly a factor of seven. Second, a targeted backfill
+  of the naive sweep &mdash; 186 groups the oracle and base sweeps had covered and naive had not &mdash;
+  grew the matched sample from 343 groups to 451.</p>
+  <p>The direction of every conclusion survived both corrections; several magnitudes did not. The
+  &ldquo;within 0.04 of perfect foresight&rdquo; claim was an artefact of the aliasing and is withdrawn: the
+  corrected gap between the base and oracle medians is +0.16 against +2.20. The naive floor also rose
+  (8 of 51 profitable, median &minus;0.76, becoming 13 of 45 and &minus;0.72), largely because the backfill
+  added FX and commodity groups, which are the one segment that is profitable without any forecast at all.
+  That last result is treated in the companion note, <em>Where Strategies Travel</em>.</p>
   <p>Reproducing a single regime for one group requires no database access:</p>
   <pre class="sql">uv run ./strategy/kairos_strategies.py --interval 1d --backtest_period 6m \\
     --pred_samples 100 --assets &lt;SYMBOLS&gt; --no_disabled_filter \\
@@ -695,14 +730,14 @@ ORDER  BY w_sharpe DESC;</pre>
 <section>
   <h2 class="sec"><span class="no">09</span>Conclusion</h2>
   <p>Separating the forecast from the rule that consumes it changes what a backtest number means. On this
-  corpus, over 2.1 million matched signals, the separation gives three results that hold together.</p>
-  <p>Strategy logic alone does not carry the corpus. With no forward information, 43 of 51 strategies lose
-  money and the median sits well below zero; the few survivors win on bracket geometry rather than on
-  direction. Forecasting is the term that matters &mdash; perfect foresight moves the median into profit and
-  the upper quartile to +8.51 &mdash; but it is not universal solvent: half the corpus stays unprofitable
-  knowing the future, and some strategies lose <em>more</em> the better their information gets. And the
-  pretrained model earns its place, quadrupling the count of profitable strategies and pulling the median
-  to within 0.04 of the perfect-foresight median, while capturing only a twelfth of its upper-quartile
+  corpus, over 2.8 million matched signals, the separation gives three results that hold together.</p>
+  <p>Strategy logic alone does not carry the corpus. With no forward information, 32 of 45 strategies lose
+  money and the median sits below zero; the survivors win on bracket geometry rather than on direction.
+  Forecasting is the term that matters &mdash; perfect foresight lifts the median to +2.20 and the upper
+  quartile to +9.96 &mdash; but it is not a universal solvent: 18 of 45 stay unprofitable knowing the
+  future, and some strategies lose <em>more</em> the better their information gets. And the pretrained model
+  earns its place, more than doubling the count of profitable strategies and putting more of them above zero
+  than perfect foresight does, while capturing barely a fourteenth of the oracle&rsquo;s upper-quartile
   magnitude and still ranking strategies more like the no-information regime than like the oracle.</p>
   <p>The practical reading: the coupling between model and corpus is real and worth investing in, roughly
   half the corpus should be repaired or retired regardless of model quality, and the distance between the
@@ -713,7 +748,7 @@ ORDER  BY w_sharpe DESC;</pre>
 
 <footer>
   Kairos Project &middot; research note, 29 August 2026 &middot; generated from data/pipeline_results.db at commit 2db63e4.<br>
-  Matched sample: 343 asset groups, 51 strategies, 2,114,754 signals across three regimes.
+  Matched sample: 451 asset groups, 45 distinct strategies, 2,814,025 signals across three regimes.
   Figures are shadow-performance measurements without transaction costs and are not investment advice.
 </footer>
 '''
