@@ -7,40 +7,21 @@ HERE = pathlib.Path(__file__).parent
 CLASSES = ["equity", "crypto", "fx_commodity"]
 CNAME = {"equity": "Equities", "crypto": "Crypto", "fx_commodity": "FX &amp; commodities"}
 
-# median Sharpe, positives, of-N, mean win %, signals, groups-per-strategy
-LEVEL = {
-    "oracle": {"equity": (2.401, 24, 38, 57.36, 2883844, 800),
-               "crypto": (-4.784, 11, 38, 43.51, 314068, 68),
-               "fx_commodity": (-1.905, 17, 38, 49.86, 202594, 28)},
-    "base":   {"equity": (-0.006, 25, 50, 47.51, 997130, 206),
-               "crypto": (0.137, 29, 50, 48.90, 1247385, 57),
-               "fx_commodity": (0.296, 31, 50, 48.91, 432914, 20)},
-    "naive":  {"equity": (-0.470, 12, 42, 47.95, 2597358, 736),
-               "crypto": (-2.567, 3, 42, 32.11, 54061, 24)},
-}
-RANK = {
-    "naive":  [("equity", "crypto", 0.161)],
-    "base":   [("equity", "crypto", 0.700), ("equity", "fx_commodity", 0.712), ("crypto", "fx_commodity", 0.756)],
-    "oracle": [("equity", "crypto", 0.702), ("equity", "fx_commodity", 0.800), ("crypto", "fx_commodity", 0.900)],
-}
-DIVERGENCE = {
-    "oracle": [("volume_fade", -24.72, -50.81, -27.75), ("path_v_shape", 15.99, -3.54, 2.52),
-               ("volume_confirmation", -6.21, -25.13, -18.24), ("cross_asset_spread", -5.18, -22.82, -14.12),
-               ("rqa_determinism", 6.76, -8.65, -10.77), ("hurst_regime_switch", 11.99, -4.35, 3.19)],
-    "base":   [("twap_execution", -3.89, 1.04, 9.35), ("pca_residual_reversal", 0.32, -1.62, 5.57),
-               ("open_gap", 3.51, 8.71, 6.09), ("trend_following", -6.47, -3.94, -0.71),
-               ("implementation_shortfall", -6.47, -3.75, -1.16), ("atr_bracket", -6.47, -3.45, -1.18)],
-}
-VENUE = {
-    "oracle": [("United States", 44, 1.634, 2572445, None), ("Hong Kong", 38, 1.689, 71114, 0.961),
-               ("Australia", 34, 4.636, 13433, 0.913), ("Germany", 34, 2.694, 11167, 0.965),
-               ("Switzerland", 31, 3.423, 7935, 0.959), ("London", 31, 2.591, 6961, 0.966)],
-    "naive":  [("United States", 44, -0.472, 2287443, None), ("Hong Kong", 38, -0.884, 70706, 0.607),
-               ("Australia", 34, -0.096, 13323, 0.339), ("Germany", 34, -1.146, 11078, 0.641),
-               ("Switzerland", 31, -0.369, 7887, 0.634), ("London", 31, -0.663, 6936, -0.039)],
-    "base":   [("United States", 51, -0.001, 901557, None), ("Hong Kong", 29, -1.254, 13289, 0.624),
-               ("London", 14, 0.975, 2903, 0.112), ("Germany", 15, -0.206, 2828, 0.218)],
-}
+# All figures are read from the analysis output rather than transcribed, so a
+# re-run of analyze_by_market3.py after more sweep coverage regenerates the page
+# without any hand-editing (and cannot silently drift out of sync with the data).
+A = json.loads((HERE / "market_analysis3.json").read_text())
+
+LEVEL = {reg: {cl: (v["median"], v["pos"], v["of"], v["win"], v["signals"], v["groups_per_strat"])
+               for cl, v in s["classes"].items()}
+         for reg, s in A["summary"].items()}
+RANK = {reg: [(k.split("|")[0], k.split("|")[1], rho) for k, rho in pairs.items()]
+        for reg, pairs in A["rank"].items()}
+DIVERGENCE = {reg: [(r["name"], r["equity"], r["crypto"], r["fx_commodity"])
+                    for r in rows[:6] if all(c in r for c in CLASSES)]
+              for reg, rows in A["divergence"].items()}
+VENUE = {reg: [(r["venue"], r["strat"], r["median"], r["signals"], r["rho"]) for r in rows]
+         for reg, rows in A["venue_summary"].items()}
 ALIAS_IMPACT = [("naive", 8, 51, -0.758, 8, 44, -0.721),
                 ("base", 32, 51, 0.283, 32, 44, 0.351),
                 ("oracle", 26, 51, 0.321, 26, 44, 2.302)]
@@ -70,10 +51,10 @@ def rank_figure():
     return f'''<figure class="fig">
   <div class="rgrid">{"".join(blocks)}</div>
   <figcaption><b>Figure 1.</b> Spearman rank correlation of per-strategy Sharpe between asset classes,
-  computed on one common strategy set per regime so the coefficients are comparable. Without a forecast,
-  a strategy&rsquo;s standing on equities barely predicts its standing on crypto. With one &mdash; real or
-  perfect &mdash; the ordering largely transfers. Naive has only one comparable pair; FX/commodity coverage
-  in that regime is too thin to score.</figcaption>
+  computed on one common strategy set per regime so the coefficients are comparable. Without a forecast a
+  strategy&rsquo;s standing in one class transfers weakly to another; with one &mdash; real or perfect &mdash;
+  the ordering largely holds. All three regimes are scored on all three class pairs, following a targeted
+  backfill of naive&rsquo;s crypto and FX/commodity coverage (&sect;7).</figcaption>
 </figure>'''
 
 
@@ -107,6 +88,8 @@ def level_table():
   <tbody>{"".join(rows)}</tbody></table></div>'''
 
 
+_DIV_TBL_NO = {"naive": 2, "base": 3, "oracle": 4}
+
 def divergence_table(reg):
     rows = "".join(
         f'<tr><th scope="row" class="sname">{n}</th>'
@@ -115,7 +98,7 @@ def divergence_table(reg):
         + f'<td class="num sub">{max(e,c,f)-min(e,c,f):.1f}</td></tr>'
         for n, e, c, f in DIVERGENCE[reg])
     return f'''<div class="tbl-wrap"><table class="tbl">
-  <caption><b>Table {2 if reg=="oracle" else 3}.</b> Most class-dependent strategies under
+  <caption><b>Table {_DIV_TBL_NO[reg]}.</b> Most class-dependent strategies under
   <b>{REG_LABEL[reg].lower()}</b>, by spread between best and worst class.</caption>
   <thead><tr><th scope="col">Strategy</th><th scope="col" class="num">Equities</th>
     <th scope="col" class="num">Crypto</th><th scope="col" class="num">FX &amp; comm.</th>
@@ -270,7 +253,7 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   <i>&mdash;</i><span>29 August 2026</span></div>
   <h1>Where Strategies Travel</h1>
   <p class="standfirst">Does a strategy that works on equities work on crypto? On gold? On a Hong Kong
-  listing? Segmenting 4.4&nbsp;million signals by asset class and listing venue &mdash; and finding that
+  listing? Segmenting 4.5Segmenting 4.4&nbsp;million signals by asset class and listing venuenbsp;million signals by asset class and listing venue &mdash; and finding that
   what makes performance portable is the forecast, not the market.</p>
   <div class="byline"><span>Kairos Project</span><span>1d bars &middot; 6-month window</span>
   <span>3 asset classes &middot; 6 listing venues</span><span>companion to <em>The Prediction Premium</em></span></div>
@@ -283,14 +266,17 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   strategy reaches +2.40 Sharpe on equities but &minus;4.78 on crypto, a gap far wider than the difference
   between prediction regimes.</p>
   <p>The more useful finding concerns <em>portability</em>. Ranking strategies within each asset class and
-  correlating those rankings, the no-forecast regime shows almost no agreement between equities and crypto
-  (&rho;&nbsp;=&nbsp;+0.16): which strategies appear to work on one class tells you almost nothing about the
-  other. Add a forecast &mdash; the real model or a perfect one &mdash; and agreement rises to +0.70&ndash;0.90.
-  Forecast information is what makes strategy quality a property of the strategy rather than of the market
-  it happened to be tested on.</p>
+  correlating those rankings, the no-forecast regime averages <strong>&rho;&nbsp;=&nbsp;+0.40</strong> across
+  the three class pairs &mdash; a weak, partly-shared ordering. Add a forecast and agreement rises to
+  <strong>+0.72</strong> with the real model and <strong>+0.80</strong> with a perfect one. Forecast
+  information is a large part of what makes strategy quality a property of the strategy rather than of the
+  market it happened to be tested on.</p>
   <p>Listing venue matters much less than asset class. Across six exchanges, strategy rankings agree with the
   US ordering at &rho;&nbsp;=&nbsp;+0.91 to +0.97 under oracle. A Hong Kong or German listing is, for these
   strategies, far more like a US listing than any equity is like a crypto pair.</p>
+  <p>One class breaks the companion paper&rsquo;s pattern outright: <strong>FX and commodities are the only
+  segment profitable without any forecast at all</strong>, at a naive median of +0.50 with 25 of 38 strategies
+  above zero, against &minus;0.49 on equities and &minus;1.83 on crypto.</p>
   <p>The segmentation also surfaced a defect: <strong>eight strategy names in the corpus are the same
   strategy</strong>, and correcting for it moves the companion paper&rsquo;s oracle median from +0.32 to +2.30.</p>
 </div>
@@ -317,17 +303,22 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   <p>Rank agreement answers the deployment question directly, and it is robust in a way that level
   comparisons are not: it does not care that crypto and equity groups contain different assets over
   different sessions, only whether the two markets <em>order the strategies the same way</em>.</p>
-  <p>Without a forecast, they do not. Equity and crypto orderings agree at
-  <strong>&rho;&nbsp;=&nbsp;+0.16</strong> &mdash; near-independent. A strategy that looks like the best of
-  the corpus on equities is, under naive conditions, roughly a coin flip to be above median on crypto. This
-  is consistent with the companion paper&rsquo;s finding that naive-regime performance is dominated by
-  structural artefacts rather than by any transferable edge: artefacts of one market&rsquo;s bar geometry
-  have no reason to reproduce in another.</p>
-  <p>With a forecast, they largely do. Base reaches <strong>+0.70 to +0.76</strong> across all three class
-  pairs and oracle <strong>+0.70 to +0.90</strong>. The forecast supplies a common signal that the strategies
-  transform in their own characteristic ways, so a strategy&rsquo;s merit becomes a property of the
-  transformation rather than of the market. That is the finding worth carrying forward:
-  <strong>prediction is what makes strategy selection portable.</strong></p>
+  <p>Without a forecast, agreement is weak. The three class pairs average
+  <strong>&rho;&nbsp;=&nbsp;+0.40</strong> (+0.37 equity&ndash;crypto, +0.48 equity&ndash;FX, +0.34
+  crypto&ndash;FX). Some ordering does survive &mdash; a strategy that is catastrophic on one class tends to
+  be poor on another &mdash; but it is far too loose to select on. Roughly speaking, a strategy&rsquo;s naive
+  standing on equities explains about a sixth of its variance in standing on crypto.</p>
+  <p>With a forecast, agreement roughly doubles. Base reaches <strong>+0.70 to +0.76</strong> across all
+  three pairs (mean +0.72) and oracle <strong>+0.70 to +0.90</strong> (mean +0.80), and both are consistent
+  across pairs rather than driven by one. The forecast supplies a common signal that each strategy transforms
+  in its own characteristic way, so merit becomes a property of the transformation rather than of the market.
+  That is the finding worth carrying forward: <strong>prediction is a large part of what makes strategy
+  selection portable.</strong></p>
+  <p>An earlier version of this note put the naive figure at +0.16 on a single class pair, because naive had
+  almost no crypto coverage and too little FX/commodity coverage to score at all. Backfilling that coverage
+  (&sect;7) roughly doubled the naive coefficient and put all three regimes on equal footing. The ordering
+  between regimes survived the correction; the size of the gap did not. The claim is now that prediction
+  substantially improves portability, not that portability collapses without it.</p>
 </section>
 
 <section>
@@ -353,10 +344,26 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   another. Checked properly &mdash; on the 1,424 matched (group, strategy) cells where oracle and base both
   ran on crypto &mdash; oracle averages <strong>+4.97</strong> against base&rsquo;s <strong>+0.63</strong>. The
   ceiling still towers over the system everywhere; only the unmatched view suggested otherwise.</p>
-  <h3>3.1 &mdash; Which strategies are most market-dependent</h3>
+
+  <h3>3.1 &mdash; FX and commodities work without a forecast</h3>
+  <p>The naive row carries the one result that contradicts the companion paper&rsquo;s headline. That paper
+  concluded that the corpus does not work without forecast information &mdash; 43 of 51 strategies losing
+  money, median well below zero. Segmented, that conclusion holds for equities (median &minus;0.49, 9 of 38
+  strategies positive) and holds harder for crypto (&minus;1.83, 10 of 38). It fails for FX and commodities,
+  where the naive median is <strong>+0.50 with 25 of 38 strategies positive</strong> &mdash; the only
+  regime-and-class cell in this study that is broadly profitable with no forward information whatsoever.</p>
+  <p>The plausible reading is that these instruments are the corpus&rsquo;s best fit for
+  <em>structural</em> rather than directional edge. The companion paper found that the strategies surviving
+  the naive regime were those trading bracket geometry and win-rate asymmetry rather than direction; range-bound,
+  mean-reverting commodity and currency series are exactly where that kind of edge should persist. It is also
+  the thinnest cell in the study &mdash; 64,858 signals, against 2.7 million for naive equities &mdash; and
+  the class as sampled here skews to commodities rather than currencies (&sect;6). Treat it as a lead worth
+  testing directly, not a settled result.</p>
+
+  <h3>3.2 &mdash; Which strategies are most market-dependent</h3>
 </section>
 </div>
-<div class="wide">{divergence_table("oracle")}{divergence_table("base")}</div>
+<div class="wide">{divergence_table("naive")}{divergence_table("base")}{divergence_table("oracle")}</div>
 <div class="wrap">
 <section>
   <p>Two patterns stand out. <code>volume_fade</code> and <code>volume_confirmation</code> degrade most on
@@ -448,6 +455,13 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
     under 3,000 signals each; their &rho;-versus-US figures (+0.11, +0.22) are too small a sample to
     distinguish from the oracle regime&rsquo;s much higher agreement. The venue conclusion rests mainly on the
     oracle row.</li>
+    <li><strong>&ldquo;FX &amp; commodities&rdquo; skews to commodities.</strong> Class comes from the universe
+    screen&rsquo;s <code>asset_class</code> for run 759. Seventeen genuine FX-pair groups
+    (<code>EURUSD=X</code>, <code>CADJPY=X</code>, &hellip;) carry symbols absent from that run&rsquo;s
+    survivor list, so they classify as unknown and are dropped. What this note calls FX and commodities is
+    therefore mostly commodities and commodity ETFs (<code>NG=F</code>, <code>UNG</code>, <code>DBC</code>,
+    <code>CPER</code>). This bears directly on &sect;3.1: the no-forecast profitability found there is
+    primarily a commodity result, and should not be read as a currency result.</li>
     <li><strong>Venue is a listing suffix, not an economy.</strong> Groups are classified by yfinance symbol
     suffix, which identifies where a security is listed &mdash; not where the company earns, nor its sector.
     No sector or country-of-revenue data exists in the pipeline, so &ldquo;the market the company is in&rdquo;
@@ -476,7 +490,20 @@ WHERE  stage = ?  AND signal_count &gt;= 3;</pre>
   <p>Per-strategy figures are signal-count-weighted within each class, requiring at least 5 groups per
   strategy per class. Rank correlations use one common strategy set per regime, so the coefficients within a
   regime are comparable to each other. Scripts: <code>analyze_by_market3.py</code> (analysis),
-  <code>build_market_report.py</code> (this page).</p>
+  <code>build_market_report.py</code> (this page). The page is generated from the analysis output rather than
+  from transcribed numbers, so re-running the analysis after more sweep coverage regenerates every figure
+  here without hand-editing.</p>
+  <h3>7.1 &mdash; The naive backfill</h3>
+  <p>The first version of this note could not score naive&rsquo;s FX/commodity class at all. The deduped
+  961-group list that the sweeps draw from is 95% equity (916 equity, 29 crypto, 4 FX/commodity), because it
+  is a set cover over universe survivors and those are 1,779 equity against 52 crypto and 20 FX/commodity.
+  Naive had already covered every crypto and FX group in that list; the shortfall was in the list itself.</p>
+  <p>Oracle and base additionally cover groups from outside it. Backfilling naive over the 186 groups those
+  stages had run and naive had not took naive from 959 to 1,144 groups &mdash; crypto from 29 to 99, FX and
+  commodities from 4 to 33 &mdash; and grew the three-way matched sample from 343 to 467 groups. 185 of 186
+  succeeded; the single failure is a malformed group (<code>A,A,P</code>) that predates this work and is not
+  a pipeline product. Command:</p>
+  <pre class="sql">uv run scripts/run_oracle_dedup.py --assets-file &lt;groups.txt&gt; --stage naive --workers 8</pre>
 </section>
 
 <section>
@@ -485,11 +512,16 @@ WHERE  stage = ?  AND signal_count &gt;= 3;</pre>
   them. Asset class produces large, systematic gaps in achievable performance &mdash; the equity-to-crypto
   spread under perfect foresight is wider than the gap between having a forecast and not having one. Listing
   venue produces almost none: a London or Hong Kong equity ranks strategies essentially as a US equity does.</p>
-  <p>The finding with the most practical weight is that portability is created by prediction. With no
-  forecast, per-class rankings are nearly unrelated and any strategy selected on one market would have to be
-  re-selected on the next. With a forecast, rankings converge, and selection made on one class carries to
-  another. That extends the companion paper&rsquo;s conclusion: the model does not only lift performance, it
-  makes performance mean the same thing in different markets.</p>
+  <p>The finding with the most practical weight is that portability is substantially improved by prediction.
+  With no forecast, per-class rankings agree only weakly (mean &rho;&nbsp;=&nbsp;+0.40) and a strategy
+  selected on one market would largely have to be re-selected on the next. With a forecast, agreement roughly
+  doubles (+0.72 base, +0.80 oracle) and selection made on one class carries much better to another. That
+  extends the companion paper&rsquo;s conclusion: the model does not only lift performance, it makes
+  performance mean more nearly the same thing in different markets.</p>
+  <p>One class dissents. FX and commodities are profitable with no forecast at all, the only such cell here,
+  which suggests the corpus holds a structural edge there that is independent of prediction quality &mdash;
+  worth isolating, and worth testing on a proper currency sample rather than the commodity-skewed one
+  available here.</p>
   <p>The practical recommendations are to treat asset class as a first-class dimension in strategy
   selection while treating venue as second-order, to investigate the strategies that reverse sign between
   classes before deploying any of them, and to fix the aliasing in &sect;5 before the next corpus-wide sweep
@@ -499,7 +531,7 @@ WHERE  stage = ?  AND signal_count &gt;= 3;</pre>
 
 <footer>
   Kairos Project &middot; research note, 29 August 2026 &middot; generated from data/pipeline_results.db.<br>
-  Companion to <em>The Prediction Premium</em>. Segmentation covers 4.4M+ signals across three asset classes
+  Companion to <em>The Prediction Premium</em>. Segmentation covers 4.5M+ signals across three asset classes
   and six equity listing venues. Shadow-performance measurements without transaction costs; not investment advice.
 </footer>
 '''

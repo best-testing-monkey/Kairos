@@ -58,7 +58,8 @@ def spearman(a,b,keys):
 
 CLASSES=("equity","crypto","fx_commodity")
 STAGES=[("oracle_results","oracle"),("oracle_results","naive"),("model_results","base")]
-report={"alias_collapsed":sorted(ALIAS),"by_class":{},"by_venue":{},"rank":{},"divergence":{}}
+report={"alias_collapsed":sorted(ALIAS),"by_class":{},"by_venue":{},"rank":{},
+        "divergence":{},"summary":{},"venue_summary":{}}
 
 for tbl,stage in STAGES:
     rows=conn.execute(f"""SELECT strategy_name,sharpe,signal_count,win_rate,avg_pnl_per_trade,assets
@@ -69,12 +70,17 @@ for tbl,stage in STAGES:
     report["by_class"][stage]={c:byc[c] for c in have}
 
     print(f"\n{'='*74}\n{stage.upper()}   (common strategy set n={len(common)}, aliases collapsed)\n{'='*74}")
+    report["summary"][stage]={"common_n":len(common),"classes":{}}
     for c in have:
         d=byc[c]; sub=sorted(d[k]["sharpe"] for k in common)
         tot=sum(d[k]["signals"] for k in common)
         win=sum(d[k]["win"]*d[k]["signals"] for k in common)/tot
+        gps=sum(x['groups'] for x in d.values())//max(len(d),1)
+        report["summary"][stage]["classes"][c]={
+            "median":st.median(sub),"pos":sum(1 for v in sub if v>0),"of":len(sub),
+            "win":win*100,"signals":tot,"groups_per_strat":gps}
         print(f"  {c:13s} median {st.median(sub):+8.3f}  {sum(1 for v in sub if v>0):2d}/{len(sub)} pos"
-              f"  win {win*100:5.2f}%  {tot:>9,d} sig  ({len(d)} strat, {sum(x['groups'] for x in d.values())//max(len(d),1)} grp/strat)")
+              f"  win {win*100:5.2f}%  {tot:>9,d} sig  ({len(d)} strat, {gps} grp/strat)")
     rk={}
     for i in range(len(have)):
         for j in range(i+1,len(have)):
@@ -98,11 +104,14 @@ for tbl,stage in STAGES:
     report["by_venue"][stage]=byv
     if byv:
         print("  equity by listing venue:")
+        report["venue_summary"][stage]=[]
         for v,d in sorted(byv.items(),key=lambda kv:-sum(x["signals"] for x in kv[1].values())):
             sub=sorted(x["sharpe"] for x in d.values()); tot=sum(x["signals"] for x in d.values())
             shared=sorted(set(byv.get("US",{}))&set(d))
             rho=spearman(byv["US"],d,shared) if "US" in byv and v!="US" and len(shared)>=8 else None
             rtxt=f"  rho_vs_US {rho:+.3f}" if rho is not None else ""
+            report["venue_summary"][stage].append(
+                {"venue":VENUE.get(v,v),"strat":len(d),"median":st.median(sub),"signals":tot,"rho":rho})
             print(f"    {VENUE.get(v,v):16s} {len(d):3d} strat  median {st.median(sub):+7.3f}"
                   f"  {tot:>9,d} sig{rtxt}")
 
