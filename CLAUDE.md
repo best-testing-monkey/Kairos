@@ -1019,7 +1019,8 @@ Within a class, Sharpe is likewise exact, computed from that class's own pooled
 list. Read one or the other, never a weighted blend of the per-class rows.
 `kairos_pipeline.strategy_class_stats(conn, stage=..., asset_class=...)` enforces
 this — `asset_class=None` reads the corpus table, and a class cell below
-`CLASS_STATS_MIN_SIGNALS` (30, uncalibrated) falls back to corpus with
+`CLASS_STATS_MIN_SIGNALS` (30 — Baz's call, chosen for statistical relevance;
+not a placeholder pending calibration) falls back to corpus with
 `source="corpus"` on the returned dict.
 
 **Attribution is exact for new sweeps, approximate for backfilled rows.**

@@ -145,13 +145,14 @@ group is either mis-attributed or dropped as mixed. Repoint it at
 `strategy_class_stats` and the papers gain exact per-class numbers, including for
 the ~1.3% of groups that are genuinely mixed.
 
-## Calibration still owed
+## Calibration — closed (2026-08-30)
 
-`CLASS_STATS_MIN_SIGNALS = 30` (`kairos_pipeline.py`) is a starting default, not a
-calibrated one — there was no per-class history to tune it against when it was
-written. For scale: `AllocationConfig.min_n` is 50, `n0` is 100,
-`refresh_disabled_strategies` uses 5, the viability report 3. Tune it against real
-per-class volume before anything live depends on the fallback boundary.
+`CLASS_STATS_MIN_SIGNALS = 30` (`kairos_pipeline.py`) was a starting default with
+no per-class history to tune it against when it was written. Baz has since
+confirmed 30 as the intended value, chosen for statistical relevance — not a
+placeholder pending further tuning. For scale, still useful context:
+`AllocationConfig.min_n` is 50, `n0` is 100, `refresh_disabled_strategies` uses
+5, the viability report 3.
 
 ## Known limitation carried from phase 1
 
