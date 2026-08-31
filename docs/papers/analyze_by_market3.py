@@ -13,6 +13,10 @@ from collections import defaultdict
 DB = "/media/baz/MonkeyWorks/PycharmProjects/Kairos/data/pipeline_results.db"
 HERE = pathlib.Path(__file__).parent
 MIN_SIGNALS, MIN_GROUPS = 3, 5
+# One walk-forward exit rule for all three stages landed 2026-08-29; the re-sweep
+# that followed starts on this date. Earlier rows were scored one bar ahead and
+# force-closed at that bar's close -- a different ruler, so they are excluded.
+EXIT_RULE_CUTOFF = "2026-08-30"
 
 ALIAS = {"onchain_flow_filter", "insider_cluster", "gaussian_process", "fractal_dimension",
          "dark_pool_filter", "cot_positioning_filter", "cds_spread_filter"}  # drop; keep trend_following
@@ -56,9 +60,16 @@ report={"alias_collapsed":sorted(ALIAS),"by_class":{},"by_venue":{},"rank":{},
         "divergence":{},"summary":{},"venue_summary":{}}
 
 for stage in STAGES:
-    rows=conn.execute(f"""SELECT strategy_name,sharpe,signal_count,win_rate,avg_pnl_per_trade,assets,asset_class
-                          FROM strategy_class_stats WHERE stage=? AND asset_class!='mixed' AND signal_count>=?""",
-                      (stage,MIN_SIGNALS)).fetchall()
+    rows=conn.execute("""SELECT s.strategy_name,s.sharpe,s.signal_count,s.win_rate,s.avg_pnl_per_trade,
+                                s.assets,s.asset_class
+                         FROM strategy_class_stats s JOIN runs r ON r.run_id=s.run_id
+                         WHERE s.stage=? AND s.asset_class!='mixed' AND s.signal_count>=?
+                           AND r.timestamp>=?""",
+                      (stage,MIN_SIGNALS,EXIT_RULE_CUTOFF)).fetchall()
+    ngroups=conn.execute("""SELECT COUNT(DISTINCT s.assets) FROM strategy_class_stats s
+                            JOIN runs r ON r.run_id=s.run_id
+                            WHERE s.stage=? AND r.timestamp>=?""",(stage,EXIT_RULE_CUTOFF)).fetchone()[0]
+    report.setdefault("coverage",{})[stage]=ngroups
     byc=weighted(rows, lambda r:(r["asset_class"] if r["asset_class"] in CLASSES else None))
     have=[c for c in CLASSES if byc.get(c)]
     common=sorted(set.intersection(*[set(byc[c]) for c in have])) if have else []

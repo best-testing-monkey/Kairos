@@ -29,7 +29,9 @@ def _box(stage):
     )
 
 BOX = {s: _box(s) for s in STAGES}
-AX_LO, AX_HI = -6.0, 10.0
+NSTRAT = len(rows)
+NGROUPS = data["matched_groups"]
+AX_LO, AX_HI = -6.0, 12.0
 def pct(v):
     return max(0.0, min(100.0, (v - AX_LO) / (AX_HI - AX_LO) * 100.0))
 
@@ -37,7 +39,7 @@ LABEL = {"naive": "Naive", "base": "Base model", "oracle": "Oracle"}
 SUB = {"naive": "no prediction", "base": "Kronos-base", "oracle": "perfect foresight"}
 
 def figure():
-    ticks = [-6, -4, -2, 0, 2, 4, 6, 8, 10]
+    ticks = [-6, -4, -2, 0, 2, 4, 6, 8, 10, 12]
     tick_html = "".join(
         f'<span class="tick{" tick-zero" if t == 0 else ""}" style="left:{pct(t):.3f}%">{t}</span>'
         for t in ticks)
@@ -67,11 +69,11 @@ def figure():
     {"".join(rowhtml)}
     <div class="bp-axis"><div class="bp-label"></div><div class="bp-track">{tick_html}</div><div class="bp-med"></div></div>
   </div>
-  <figcaption><b>Figure 1.</b> Distribution of per-strategy signal-weighted Sharpe across the 45 distinct strategies
+  <figcaption><b>Figure 1.</b> Distribution of per-strategy signal-weighted Sharpe across the {NSTRAT} distinct strategies
   evaluated in all three regimes. Boxes span the first to third quartile; the vertical rule is the median;
   whiskers are clipped at the axis bounds with the true extremes printed at each end. The naive box sits
-  almost entirely left of zero, clearing it only at the third quartile. The base model's median crosses it.
-  Oracle's box extends to +9.96, filling the scale.</figcaption>
+  entirely left of zero. The base model's median crosses it. Oracle's box runs off the scale at
+  {BOX["oracle"]["q3"]:+.2f}, on a true maximum of {BOX["oracle"]["mx"]:+.2f}.</figcaption>
 </figure>'''
 
 def summary_table():
@@ -81,7 +83,7 @@ def summary_table():
         cells.append(f'''<tr data-stage="{s}">
       <th scope="row"><span class="swatch"></span>{LABEL[s]}</th>
       <td class="num">{b["n"]:,}</td>
-      <td class="num">{b["pos"]} / 45</td>
+      <td class="num">{b["pos"]} / {NSTRAT}</td>
       <td class="num">{b["med"]:+.3f}</td>
       <td class="num">{b["q1"]:+.2f}</td>
       <td class="num">{b["q3"]:+.2f}</td>
@@ -346,16 +348,17 @@ footer {{
 
 <header class="mast">
   <div class="eyebrow">
-    <span>Kairos Research Note</span><i>&mdash;</i><span>Strategy Evaluation</span><i>&mdash;</i><span>29 August 2026</span>
+    <span>Kairos Research Note</span><i>&mdash;</i><span>Strategy Evaluation</span><i>&mdash;</i><span>31 August 2026</span>
   </div>
   <h1>The Prediction Premium</h1>
   <p class="standfirst">How much of a trading strategy&rsquo;s measured edge comes from the strategy,
-  and how much comes from the forecast it is fed? A three-regime experiment over 2.1&nbsp;million signals.</p>
+  and how much comes from the forecast it is fed? A three-regime experiment, re-run end to end on a
+  single exit rule.</p>
   <div class="byline">
     <span>Kairos Project</span>
     <span>1d bars &middot; 6-month window</span>
-    <span>127 strategies &middot; 451 matched asset groups</span>
-    <span>commit 2db63e4</span>
+    <span>127 strategies &middot; {NGROUPS} matched asset groups</span>
+    <span>commit e8c596a</span>
   </div>
 </header>
 
@@ -366,13 +369,20 @@ footer {{
   over the same assets and the same period under three prediction regimes &mdash; a <strong>naive</strong> floor
   with no forecast information, an <strong>oracle</strong> ceiling with perfect foresight of the next bar, and the
   <strong>base</strong> regime driven by the pretrained Kronos forecasting model.</p>
-  <p>On a matched sample of 451 asset groups and the 45 distinct strategies that produced signals in all
-  three regimes, the results separate cleanly. Stripped of forecast information, only 13 of 45 strategies
-  hold a positive signal-weighted Sharpe and the median strategy sits at &minus;0.72. Given perfect
-  foresight, the median rises to +2.20 and the upper quartile to +9.96 &mdash; but 18 of 45 still lose money
-  knowing the future. The base model recovers the <em>breadth</em> of that improvement, lifting 29 of 45
-  strategies above zero &mdash; more than the oracle&rsquo;s own 27 &mdash; while its median of +0.16 and
-  upper quartile of +0.72 capture only a small fraction of the <em>magnitude</em>.</p>
+  <p>All three regimes are now scored by one walk-forward exit rule, correcting the asymmetry the first
+  edition of this note listed as its largest caveat (&sect;8.1). On a matched sample of {NGROUPS} asset groups and
+  the {NSTRAT} distinct strategies that produced signals in all three regimes, the results separate cleanly.
+  Stripped of forecast information, only {BOX["naive"]["pos"]} of {NSTRAT} strategies hold a positive
+  signal-weighted Sharpe and the median strategy sits at {BOX["naive"]["med"]:+.2f}. Given perfect foresight,
+  the median rises to {BOX["oracle"]["med"]:+.2f} and the upper quartile to {BOX["oracle"]["q3"]:+.2f} &mdash;
+  but {NSTRAT - BOX["oracle"]["pos"]} of {NSTRAT} still lose money knowing the future. The base model sits
+  between them, lifting {BOX["base"]["pos"]} of {NSTRAT} strategies above zero to a median of
+  {BOX["base"]["med"]:+.2f} &mdash; most of the way to the oracle on <em>breadth</em>, and a small fraction of
+  the way on <em>magnitude</em>.</p>
+  <p>The three-regime sample is thin, and honestly so: the base sweep is being re-run on the new exit rule and
+  has reached {NGROUPS} of 961 groups, so the matched sample is a fraction of its predecessor and is ordered by
+  oracle Sharpe rather than drawn at random (&sect;3.3, &sect;6). The oracle and naive sweeps are complete and
+  exactly paired at 961 groups; where a claim needs only those two, we report it on the full corpus.</p>
   <p>We conclude that forecast quality is the dominant term in this corpus&rsquo;s measured performance, that
   a substantial subset of strategies is unsalvageable by any forecast, and that the pretrained model
   supplies real, measurable directional information &mdash; without yet supplying conviction.</p>
@@ -485,13 +495,20 @@ footer {{
   <p>All runs use daily bars over a six-month backtest window with 100 prediction samples per bar.</p>
 
   <h3>3.3 &mdash; Matched sample</h3>
-  <p><strong>Matched sample.</strong> The three sweeps have unequal coverage &mdash; the oracle sweep has run
-  over 1,180 groups, naive over 959, and the base sweep is still in progress at 558. Comparing regimes on
-  their full, unequal footprints would confound regime with asset mix. Every figure in this note is
-  therefore computed on the <strong>451 groups present in all three sweeps</strong> (matched on assets, interval and backtest
-  period), restricted further to the <strong>45 distinct strategies that fired signals in all three
-  regimes</strong>. This is the paper&rsquo;s central methodological commitment: all comparisons are
-  paired.</p>
+  <p><strong>Only rows scored by the current exit rule count.</strong> Every result here comes from the
+  re-sweep that followed the exit-rule unification of 29 August 2026 (&sect;3.4, &sect;8.1). Rows written before
+  it were scored one bar ahead and force-closed, which is a different measurement, so they are excluded
+  outright rather than blended in. Oracle and naive are complete: <strong>961 of 961 groups</strong> each, the
+  same 961, so those two regimes are exactly paired for the first time. The base sweep is still running and
+  has reached <strong>{NGROUPS} groups</strong>.</p>
+  <p><strong>Matched sample.</strong> Comparing regimes on unequal footprints would confound regime with asset
+  mix. Every three-regime figure in this note is therefore computed on the <strong>{NGROUPS} groups present in all three sweeps</strong>
+  (matched on assets, interval and backtest period), restricted further to the <strong>{NSTRAT} distinct
+  strategies that fired signals in all three regimes</strong> &mdash; {BOX["naive"]["n"] + BOX["base"]["n"] + BOX["oracle"]["n"]:,} signals in all. This is the paper&rsquo;s central
+  methodological commitment: all comparisons are paired. It costs sample size here &mdash; the previous
+  edition matched 451 groups &mdash; and the base sweep is ordered by oracle Sharpe rather than shuffled, so
+  the {NGROUPS} groups over-represent assets the oracle did well on. Both effects are visible in the results and
+  are quantified in &sect;4.4.</p>
   <p><strong>Aliased strategies are collapsed.</strong> Eight strategy names in the corpus are the same
   strategy: <code>trend_following</code> and seven filters that wrap it
   (<code>cds_spread_filter</code>, <code>cot_positioning_filter</code>, <code>dark_pool_filter</code>,
@@ -508,6 +525,20 @@ footer {{
   emits is scored independently against the price series, with no capital constraint, no position limit,
   and no competition between strategies for allocation. This measures signal quality, not portfolio
   outcome, and the two are not interchangeable.</p>
+  <p><strong>One exit rule, all three regimes.</strong> A signal is resolved by walking forward one bar at a
+  time from its entry: the opening gap is checked before the intrabar range, and the stop before the target,
+  so a bar that could have hit both is booked as a loss. A bar where neither triggers means the position is
+  still open, and the walk continues. A signal whose stop and target are both still untouched when the data
+  runs out is <strong>excluded</strong> rather than closed at an arbitrary price. The regimes differ in one
+  respect only, and deliberately: oracle and base enter at the next bar&rsquo;s open, while naive enters at
+  that bar&rsquo;s close, because the naive regime exists to strip out the future information the oracle used
+  to pick the trade in the first place.</p>
+  <p>Excluding unresolved signals is a mild survivorship selection &mdash; a trade that drifts to the end of
+  the window without touching either barrier is dropped rather than counted as the roughly flat outcome it
+  was. Force-closing it at the last bar was the alternative, and it reintroduces exactly the arbitrary exit
+  this rule removes. One consequence to expect: oracle and base signal counts are lower here than in the
+  previous edition, because those regimes previously force-closed every signal and therefore counted every
+  signal.</p>
 </section>
 
 <section>
@@ -516,15 +547,15 @@ footer {{
   {summary_table()}
 
   <h3>4.1 &mdash; Without prediction, the corpus does not work</h3>
-  <p>The naive regime is the weakest of the three. Across 1,014,688 signals, <strong>13 of 45
+  <p>The naive regime is the weakest of the three. Across {BOX["naive"]["n"]:,} signals, <strong>{BOX["naive"]["pos"]} of {NSTRAT}
   strategies</strong> hold a positive signal-weighted Sharpe, the median strategy sits at
-  <strong>&minus;0.72</strong>, mean win rate at 46.1%, and the median return per trade is negative at
-  <strong>&minus;0.062%</strong>. Nearly three-quarters of the corpus loses money with no forward
-  information, and the third quartile only barely clears zero at +0.14.</p>
+  <strong>{BOX["naive"]["med"]:+.2f}</strong>, mean win rate at {BOX["naive"]["win"]:.1f}%, and the median return per trade is negative at
+  <strong>{BOX["naive"]["pnl"]:+.3f}%</strong>. More than three-quarters of the corpus loses money with no forward
+  information, and the third quartile does not reach zero at all ({BOX["naive"]["q3"]:+.2f}).</p>
   <p>The survivors are mostly not forecast-shaped. The strongest, <code>bollinger_validation</code>, posts
-  +5.53 &mdash; but on 379 signals, a fraction of a percent of the volume the mainstream strategies
-  generate. The two thickest positives, <code>support_confluence</code> (+1.56) and
-  <code>martingale_floor</code> (+0.81), are structural rather than directional: both derive their edge from
+  +6.54 &mdash; but on 145 signals, a fraction of a percent of the volume the mainstream strategies
+  generate. The two thickest positives, <code>support_confluence</code> (+1.29) and
+  <code>martingale_floor</code> (+0.98), are structural rather than directional: both derive their edge from
   bracket geometry and win-rate asymmetry rather than from calling direction. Strip out the forecast and
   what remains profitable is largely what never depended on direction in the first place.</p>
   <p>This includes implementations of families that have been standard teaching material in quantitative
@@ -534,47 +565,69 @@ footer {{
 
   <h3>4.2 &mdash; Prediction is the difference, but it does not rescue everything</h3>
   <p>Handed a perfect one-step forecast, the corpus moves decisively. The median Sharpe rises to
-  <strong>+2.20</strong>, mean win rate to <strong>57.5%</strong>, and median return per trade to
-  <strong>+0.353%</strong> &mdash; roughly eight times the base model&rsquo;s. The oracle beats the naive
-  floor on <strong>31 of 45 strategies</strong>. The upper tail is where the effect is most visible:
-  oracle&rsquo;s third quartile is <strong>+9.96</strong> against naive&rsquo;s +0.14, and its best performer
-  reaches +49.28. Whatever these strategies are for, forecast quality is the input that makes them work.</p>
-  <p>And yet <strong>18 of 45 strategies remain unprofitable with perfect foresight.</strong>
-  Oracle&rsquo;s worst result, <code>volume_fade</code> at &minus;33.52, is far worse than its own naive
-  result of &minus;2.14 &mdash; perfect information made it decisively worse, because a strategy that acts
+  <strong>{BOX["oracle"]["med"]:+.2f}</strong>, mean win rate to <strong>{BOX["oracle"]["win"]:.1f}%</strong>, and median return per trade to
+  <strong>{BOX["oracle"]["pnl"]:+.3f}%</strong> &mdash; roughly five times the base model&rsquo;s. The oracle beats the naive
+  floor on <strong>30 of {NSTRAT} strategies</strong>. The upper tail is where the effect is most visible:
+  oracle&rsquo;s third quartile is <strong>{BOX["oracle"]["q3"]:+.2f}</strong> against naive&rsquo;s {BOX["naive"]["q3"]:+.2f}, and its best performer,
+  <code>cross_asset_rank</code>, reaches {BOX["oracle"]["mx"]:+.2f}. Whatever these strategies are for, forecast quality is
+  the input that makes them work.</p>
+  <p>And yet <strong>{NSTRAT - BOX["oracle"]["pos"]} of {NSTRAT} strategies remain unprofitable with perfect foresight.</strong>
+  Oracle&rsquo;s worst result, <code>volume_fade</code> at &minus;27.44, is far worse than its own naive
+  result of &minus;0.18 &mdash; perfect information made it decisively worse, because a strategy that acts
   confidently on a correct forecast in the wrong direction loses faster than one that barely acts at all.
-  Oracle&rsquo;s distribution is by far the widest of the three in both directions, spanning &minus;33.52 to
-  +49.28. This is the finding that resists a comfortable reading: for two-fifths of the corpus, no
+  Oracle&rsquo;s distribution is by far the widest of the three in both directions, spanning {BOX["oracle"]["mn"]:+.2f} to
+  {BOX["oracle"]["mx"]:+.2f}. This is the finding that resists a comfortable reading: for a third of the corpus, no
   improvement in forecasting will help, because the decision rule sitting on top of the forecast is itself
   broken.</p>
 
   <h3>4.3 &mdash; The base model supplies real information</h3>
   <p>The pretrained Kronos model, with no fine-tuning, moves the corpus decisively on breadth. It lifts
-  <strong>29 of 45 strategies</strong> above zero &mdash; more than double the naive count of 13, and
-  <em>more</em> than the oracle&rsquo;s own 27 &mdash; and beats the naive floor head-to-head on
-  <strong>36 of 45</strong>, its strongest head-to-head margin. The median Sharpe turns positive at
-  <strong>+0.16</strong> and median return per trade at <strong>+0.043%</strong>.</p>
-  <p>The individual movements are large where they matter. <code>cross_asset_rank</code> goes from
-  &minus;12.79 to +0.72; <code>open_gap</code> from &minus;0.82 to +5.32; <code>high_low</code> from
-  &minus;0.68 to +3.27; <code>conditional_path</code> from &minus;1.37 to +1.48. These are strategies that do
-  not work at all without a forecast and do work with this one. The model is not decorative.</p>
+  <strong>{BOX["base"]["pos"]} of {NSTRAT} strategies</strong> above zero &mdash; more than twice the naive count of
+  {BOX["naive"]["pos"]}, and within two of the oracle&rsquo;s own {BOX["oracle"]["pos"]} &mdash; and beats the naive floor head-to-head on
+  <strong>28 of {NSTRAT}</strong>. The median Sharpe turns positive at
+  <strong>{BOX["base"]["med"]:+.2f}</strong> and median return per trade at <strong>{BOX["base"]["pnl"]:+.3f}%</strong>, double the
+  naive figure&rsquo;s magnitude and opposite in sign.</p>
+  <p>The individual movements are large where they matter. <code>open_gap</code> goes from &minus;0.72 to
+  +2.55; <code>high_low</code> from &minus;0.83 to +0.94; <code>conditional_path</code> from &minus;1.04 to
+  +0.65; <code>rsi_divergence</code> from &minus;1.42 to +0.15. These are strategies that do not work at all
+  without a forecast and do work with this one. The model is not decorative.</p>
+  <p>One detail is worth naming because it looks like a contradiction. The base regime&rsquo;s mean win rate
+  is <strong>{BOX["base"]["win"]:.1f}%</strong>, <em>below</em> naive&rsquo;s {BOX["naive"]["win"]:.1f}%, while its median return per trade is
+  positive and naive&rsquo;s is not. The model is not winning more often; it is winning better. What it
+  changes is which side of an asymmetric bracket the trade sits on, which is what a directional forecast
+  should change and what a win-rate count is blind to.</p>
 
   <div class="callout">
     <h4>The qualification this result carries</h4>
-    <p>The base model matches the oracle on <em>breadth</em> and captures little of its
-    <em>magnitude</em>. It puts more strategies above zero than perfect foresight does (29 against 27), but
-    its median is +0.16 against oracle&rsquo;s +2.20, its third quartile +0.72 against +9.96 &mdash; a
-    fourteenfold gap &mdash; and its best strategy reaches +12.14 against +49.28. The model finds the
-    direction; it does not yet find the conviction.</p>
-    <p>A second measurement sharpens this. Ranking the 45 strategies by Sharpe within each regime and
+    <p>The base model nearly matches the oracle on <em>breadth</em> and captures little of its
+    <em>magnitude</em>. It puts {BOX["base"]["pos"]} strategies above zero against perfect foresight&rsquo;s {BOX["oracle"]["pos"]}, but
+    its median is {BOX["base"]["med"]:+.2f} against oracle&rsquo;s {BOX["oracle"]["med"]:+.2f}, its third quartile {BOX["base"]["q3"]:+.2f} against
+    {BOX["oracle"]["q3"]:+.2f} &mdash; a sixteenfold gap &mdash; and its best strategy reaches {BOX["base"]["mx"]:+.2f} against
+    {BOX["oracle"]["mx"]:+.2f}. The model finds the direction; it does not yet find the conviction.</p>
+    <p>A second measurement sharpens this. Ranking the {NSTRAT} strategies by Sharpe within each regime and
     correlating those rankings, the base ordering still resembles the <em>naive</em> ordering
-    (Spearman <span class="mono">&rho;&nbsp;=&nbsp;+0.569</span>) more closely than it resembles the
-    <em>oracle</em> ordering (<span class="mono">&rho;&nbsp;=&nbsp;+0.467</span>). The base model shifts
+    (Spearman <span class="mono">&rho;&nbsp;=&nbsp;+0.556</span>) more closely than it resembles the
+    <em>oracle</em> ordering (<span class="mono">&rho;&nbsp;=&nbsp;+0.346</span>). The base model shifts
     performance levels upward across the board, but which strategies it favours is still governed
     substantially by the same structural factors that operate with no forecast at all. Reading this result
     as &ldquo;the base model approaches perfect foresight&rdquo; would be wrong; it clears the floor
     convincingly and has barely started up the wall.</p>
   </div>
+
+  <h3>4.4 &mdash; What the full corpus says, where it can</h3>
+  <p>The {NGROUPS}-group matched sample is small and non-random, so the two complete regimes deserve a reading of
+  their own. Oracle and naive both cover all <strong>961 groups</strong> and share <strong>46 strategies</strong>, on
+  2,726,372 and 2,713,432 signals respectively &mdash; a paired comparison over the whole corpus with no
+  base-coverage constraint at all.</p>
+  <p>There, the naive floor sits at a median of <strong>&minus;0.54</strong> with 11 of 46 strategies
+  positive, and the oracle ceiling at <strong>+1.23</strong> with 25 of 46, the oracle beating the floor on 28
+  of 46. Every directional conclusion in &sect;4.1 and &sect;4.2 survives at full corpus scale; the magnitudes
+  are smaller.</p>
+  <p>That gap is the sample-ordering effect, and it is worth measuring rather than asserting. The oracle
+  median is {BOX["oracle"]["med"]:+.2f} on the {NGROUPS} matched groups against +1.23 on all 961 &mdash; the matched groups are
+  materially easier for a perfect forecast, exactly as an ordering by oracle Sharpe predicts. Read the base
+  column against the oracle column <em>within</em> the matched sample, where both faced the same assets. Do
+  not read either against the full-corpus numbers above.</p>
 </section>
 
 <section>
@@ -583,19 +636,19 @@ footer {{
   width is the honest measure of how much a strategy&rsquo;s reported performance is attributable to
   forecasting rather than to itself &mdash; and for this corpus, that width is most of the number.</p>
   <p>Three groups fall out of the paired comparison. <strong>Forecast-dependent strategies</strong>
-  (<code>cross_asset_rank</code>, <code>open_gap</code>, <code>high_low</code>, <code>conditional_path</code>)
+  (<code>open_gap</code>, <code>high_low</code>, <code>conditional_path</code>, <code>rsi_divergence</code>)
   are unprofitable at the floor and profitable with the base model. These are the corpus&rsquo;s real
   assets, and their performance is a direct claim about forecast quality.
   <strong>Structurally profitable strategies</strong> (<code>support_confluence</code>,
-  <code>martingale_floor</code>, <code>fade_extreme</code>) clear zero even at the floor; their edge is
-  bracket geometry and does not depend on knowing direction. <strong>Irreparable strategies</strong>
-  (<code>volume_fade</code>, <code>gbm_direction</code>, <code>trend_following+arima_agree</code>,
-  <code>atr_bracket</code>) lose money in all three regimes, several of them losing <em>more</em> as
-  information improves.</p>
+  <code>martingale_floor</code>, <code>bollinger_validation</code>, <code>fade_extreme</code>) clear zero even
+  at the floor; their edge is bracket geometry and does not depend on knowing direction.
+  <strong>Irreparable strategies</strong> (<code>volume_fade</code>, <code>gbm_direction</code>,
+  <code>pca_residual_reversal</code>, <code>atr_bracket</code>) lose money in all three regimes &mdash; nine
+  of {NSTRAT} do &mdash; several of them losing <em>more</em> as information improves.</p>
   <p>That third group is the most actionable output here. A strategy that loses money with perfect
   foresight cannot be fixed by a better model, more training data, or a longer fine-tune. It should be
   repaired at the decision rule or removed from the corpus, and the resources currently spent evaluating
-  it across every sweep should go elsewhere. Two-fifths of the corpus is in this position.</p>
+  it across every sweep should go elsewhere. A third of the corpus is in this position.</p>
   <p>For the strategies that are not, the gap between the base column and the oracle column is the
   remaining headroom, and it is large. The pretrained model has demonstrated that the coupling works. What
   it has not yet demonstrated is that the coupling is tight.</p>
@@ -606,16 +659,24 @@ footer {{
   <p>These results are internally consistent, but several constraints bound how far they generalise. They
   are listed in descending order of how much they should temper the conclusions.</p>
   <ol>
-    <li><strong>The exit rule is not identical across regimes.</strong> The oracle and base regimes are scored
-    by an evaluator that checks stop and target one bar ahead and then closes at that bar&rsquo;s close.
-    The naive regime uses a multi-bar evaluator that walks forward until a genuine stop or target triggers.
-    This asymmetry was a deliberate consequence of how the naive regime was built, but it means the floor
-    and the ceiling are not measured with the same ruler. The direction of the resulting bias is not
-    established; a single-bar forced close truncates both winners and losers. This is the most significant
-    caveat in the study and the first thing that should be corrected in a follow-up.</li>
+    <li><strong>Thin, non-random base coverage.</strong> The base sweep has re-run {NGROUPS} of 961 groups under the
+    current exit rule, so the three-regime matched sample is {NGROUPS} groups against the previous
+    edition&rsquo;s 451, and it is ordered by oracle Sharpe rather than shuffled. &sect;4.4 measures what that
+    ordering is worth: the oracle median is {BOX["oracle"]["med"]:+.2f} on these {NGROUPS} groups against +1.23 on all 961.
+    Every three-regime figure in this note should be read as provisional and expected to move as coverage
+    grows. The two-regime figures in &sect;4.4 are not affected &mdash; oracle and naive are complete. This is
+    a transient state, not a design choice, and it is the single largest caveat in this edition.</li>
+    <li><strong>Superseded: the exit rule is now identical across regimes.</strong> Earlier editions carried
+    this as the study&rsquo;s largest caveat &mdash; oracle and base were scored by an evaluator that checked
+    stop and target one bar ahead and then closed at that bar&rsquo;s close, while naive walked forward to a
+    genuine trigger, so the floor and the ceiling were not measured with the same ruler. As of 29 August 2026
+    all three regimes share one walk-forward rule (&sect;3.4) and every figure in this edition comes from a
+    re-sweep under it. What replaces the caveat is narrower: unresolved signals are now excluded rather than
+    force-closed, which is a mild survivorship selection the naive regime always had and the other two have
+    now acquired.</li>
     <li><strong>No transaction costs.</strong> No commission, spread, slippage, borrow, or financing is applied
-    anywhere. Median base-regime return per trade is +0.051%, which is well inside realistic round-trip
-    costs for most of this universe. The base regime&rsquo;s profitability claim is a claim about signal
+    anywhere. Median base-regime return per trade is {BOX["base"]["pnl"]:+.3f}%, which is inside realistic round-trip
+    costs for much of this universe. The base regime&rsquo;s profitability claim is a claim about signal
     content, not about a tradeable edge.</li>
     <li><strong>Shadow accounting is not a portfolio.</strong> Every signal is scored independently with equal
     notional and no capital constraint. Strategies do not compete for allocation, positions do not
@@ -624,10 +685,10 @@ footer {{
     simultaneous signals across a group are non-independent by construction, and the effective sample size
     is smaller than the raw signal counts suggest. Real deployment on constrained capital will not
     reproduce these figures.</li>
-    <li><strong>No significance testing.</strong> Fifty-one strategies were compared across three regimes with no
+    <li><strong>No significance testing.</strong> {NSTRAT} strategies were compared across three regimes with no
     correction for multiple comparisons. With that many candidates, several positive results are expected by
     chance alone. Individual per-strategy figures &mdash; particularly thin ones like
-    <code>bollinger_validation</code>&rsquo;s 616 naive signals &mdash; should be read as indicative, not
+    <code>bollinger_validation</code>&rsquo;s 145 naive signals &mdash; should be read as indicative, not
     established. The aggregate distributional claims rest on far firmer ground than any single row.</li>
     <li><strong>One interval, one window, one regime of markets.</strong> All results are daily bars over a single
     six-month period. There is no walk-forward across market regimes, no intraday replication, and no
@@ -644,20 +705,20 @@ footer {{
     <code>dynamic_bracket</code>/<code>inverse_variance</code>,
     <code>amount_flow</code>/<code>predicted_vwap</code> &mdash; and are <em>not</em> collapsed, because they
     are not exact aliases. If they turn out to be trivially different, the effective corpus is smaller than
-    45 and every count here is correspondingly inflated.</li>
-    <li><strong>Incomplete base coverage.</strong> The base sweep has completed 558 of 961 groups. The matched
-    sample of 451 groups is therefore drawn from a partial and not-randomly-selected footprint &mdash; the base
-    sweep was ordered by oracle Sharpe, so the matched sample may over-represent groups that performed well
-    under the oracle. Extending base coverage is the cheapest available improvement to this study.</li>
-    <li><strong>Two groups fail reproducibly.</strong> Groups containing certain international symbols raise
-    <code>ValueError: cannot convert float NaN to integer</code> under no-prediction mode, consistently, across
-    every sweep type. They are excluded from all sweeps and remain un-root-caused.</li>
+    {NSTRAT} and every count here is correspondingly inflated. On this sample <code>atr_bracket</code>,
+    <code>trend_following</code> and <code>implementation_shortfall</code> also agree to two decimals in the
+    naive and base regimes, which is worth a look.</li>
+    <li><strong>Previously reported failures did not recur.</strong> Earlier editions excluded two groups that
+    raised <code>ValueError: cannot convert float NaN to integer</code> under no-prediction mode. The
+    re-swept oracle and naive sweeps each completed all 961 groups with no failures, so nothing is excluded
+    from those two regimes on this ground. The base sweep is still running and has not yet covered the whole
+    list.</li>
   </ol>
 </section>
 
 <section>
   <h2 class="sec"><span class="no">07</span>Full results</h2>
-  <p>All 45 distinct strategies present in every regime, ordered by base-model Sharpe. Read each row left to right
+  <p>All {NSTRAT} distinct strategies present in every regime, ordered by base-model Sharpe. Read each row left to right
   as floor, system, ceiling.</p>
 </section>
 </div>
@@ -692,6 +753,11 @@ avg_pnl_per_trade, assets, interval, backtest_period</dd>
     <dt>CSV mirrors</dt><dd>results/{{naive,oracle}}_oracle_results_&lt;ts&gt;.csv
 results/base_model_results_&lt;ts&gt;.csv</dd>
     <dt>Group source</dt><dd>select_deduped_groups(conn, correlation_run_id=760)  -&gt; 961 groups</dd>
+    <dt>Exit-rule cutoff</dt><dd>runs.timestamp &gt;= '2026-08-30'   -- the one-exit-rule re-sweep
+                     (oracle 961/961, naive 961/961, base {NGROUPS}/961)
+                     earlier rows use the retired one-bar rule and are excluded</dd>
+    <dt>Table source</dt><dd>make_paper_table.py  -&gt; paper_table.json  -&gt; build_paper.py
+audit_paper.py       re-derives every figure from the DB independently</dd>
     <dt>Screening criteria</dt><dd>kairos_pipeline.py: passes_universe_screen()  -- bars/volume/ATR gates
                      liquidity_threshold()    -- $50M equity, $10M crypto, 0 FX
                      min_bars = KairosSettings.lookback = 300
@@ -717,7 +783,25 @@ WHERE  stage = ?
 GROUP  BY strategy_name
 ORDER  BY w_sharpe DESC;</pre>
   <h3>8.1 &mdash; Revision note</h3>
-  <p>The first published version of this paper reported a matched sample of 343 groups and 51 strategies,
+  <p><strong>31 August 2026 &mdash; one exit rule.</strong> Until 29 August 2026 the oracle and base regimes
+  were scored by an evaluator that checked stop and target exactly one bar ahead and then closed the position
+  at that bar&rsquo;s close, while the naive regime walked forward until a genuine stop or target triggered.
+  The floor and the ceiling were measured with different rulers, and part of the gap between them was an
+  artefact of that difference rather than of forecast quality. It was listed as this study&rsquo;s largest
+  limitation from the first edition. All three regimes now share the single walk-forward rule described in
+  &sect;3.4, the whole corpus was re-swept under it, and that limitation is retired.</p>
+  <p>Every figure in this edition comes from the re-sweep; no pre-fix row is used anywhere. The oracle and
+  naive sweeps are complete at 961 of 961 groups. The base sweep is not &mdash; it stands at {NGROUPS} groups and is
+  still running &mdash; so the three-regime matched sample fell from 451 groups and 45 strategies to {NGROUPS} groups
+  and {NSTRAT}, on {BOX["naive"]["n"] + BOX["base"]["n"] + BOX["oracle"]["n"]:,} signals against 2,814,025. The previous edition&rsquo;s
+  headline figures were: naive median &minus;0.72 with 13 of 45 positive; base +0.16 with 29 of 45; oracle
+  +2.20 with 27 of 45 and a third quartile of +9.96. Two conclusions changed. The oracle&rsquo;s advantage
+  over the base model is larger than it appeared, because the retired rule truncated the oracle&rsquo;s
+  winners along with its losers. And the base model no longer puts <em>more</em> strategies above zero than
+  the oracle does &mdash; that claim rested on the old ruler and is withdrawn; it now puts slightly fewer
+  ({BOX["base"]["pos"]} against {BOX["oracle"]["pos"]}). Everything else held its direction. Read the
+  three-regime numbers as provisional until base coverage catches up.</p>
+  <p><strong>Earlier revision.</strong> The first published version of this paper reported a matched sample of 343 groups and 51 strategies,
   with an oracle median of +0.32 and a base median of +0.28 &mdash; and concluded from those that the base
   model came within 0.04 of the perfect-foresight median. Two corrections were applied afterwards.</p>
   <p>First, the eight aliased names described in &sect;3.3 were counted as eight strategies rather than one.
@@ -742,14 +826,15 @@ ORDER  BY w_sharpe DESC;</pre>
 <section>
   <h2 class="sec"><span class="no">09</span>Conclusion</h2>
   <p>Separating the forecast from the rule that consumes it changes what a backtest number means. On this
-  corpus, over 2.8 million matched signals, the separation gives three results that hold together.</p>
-  <p>Strategy logic alone does not carry the corpus. With no forward information, 32 of 45 strategies lose
+  corpus, over {BOX["naive"]["n"] + BOX["base"]["n"] + BOX["oracle"]["n"]:,} signals matched across all three regimes &mdash; and 5.4 million more in the
+  two-regime check of &sect;4.4 &mdash; the separation gives three results that hold together.</p>
+  <p>Strategy logic alone does not carry the corpus. With no forward information, {NSTRAT - BOX["naive"]["pos"]} of {NSTRAT} strategies lose
   money and the median sits below zero; the survivors win on bracket geometry rather than on direction.
-  Forecasting is the term that matters &mdash; perfect foresight lifts the median to +2.20 and the upper
-  quartile to +9.96 &mdash; but it is not a universal solvent: 18 of 45 stay unprofitable knowing the
+  Forecasting is the term that matters &mdash; perfect foresight lifts the median to {BOX["oracle"]["med"]:+.2f} and the upper
+  quartile to {BOX["oracle"]["q3"]:+.2f} &mdash; but it is not a universal solvent: {NSTRAT - BOX["oracle"]["pos"]} of {NSTRAT} stay unprofitable knowing the
   future, and some strategies lose <em>more</em> the better their information gets. And the pretrained model
-  earns its place, more than doubling the count of profitable strategies and putting more of them above zero
-  than perfect foresight does, while capturing barely a fourteenth of the oracle&rsquo;s upper-quartile
+  earns its place, more than doubling the count of profitable strategies and coming within two of the count
+  perfect foresight achieves, while capturing about a sixteenth of the oracle&rsquo;s upper-quartile
   magnitude and still ranking strategies more like the no-information regime than like the oracle.</p>
   <p>The practical reading: the coupling between model and corpus is real and worth investing in, roughly
   half the corpus should be repaired or retired regardless of model quality, and the distance between the
@@ -759,8 +844,9 @@ ORDER  BY w_sharpe DESC;</pre>
 </div>
 
 <footer>
-  Kairos Project &middot; research note, 29 August 2026 &middot; generated from data/pipeline_results.db at commit 2db63e4.<br>
-  Matched sample: 451 asset groups, 45 distinct strategies, 2,814,025 signals across three regimes.
+  Kairos Project &middot; research note, 31 August 2026 &middot; generated from data/pipeline_results.db at commit e8c596a.<br>
+  Matched sample: {NGROUPS} asset groups, {NSTRAT} distinct strategies, {BOX["naive"]["n"] + BOX["base"]["n"] + BOX["oracle"]["n"]:,} signals across three regimes;
+  961 groups in the complete oracle&ndash;naive pair.
   Figures are shadow-performance measurements without transaction costs and are not investment advice.
 </footer>
 '''

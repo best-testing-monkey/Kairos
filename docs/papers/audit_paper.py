@@ -13,12 +13,16 @@ DB = "/media/baz/MonkeyWorks/PycharmProjects/Kairos/data/pipeline_results.db"
 PAGE = pathlib.Path("/media/baz/MonkeyWorks/PycharmProjects/Kairos/docs/papers/prediction_premium.html")
 ALIAS = {"cds_spread_filter", "cot_positioning_filter", "dark_pool_filter", "fractal_dimension",
          "gaussian_process", "insider_cluster", "onchain_flow_filter"}  # trend_following kept
+# Rows older than the one-exit-rule re-sweep were scored one bar ahead and
+# force-closed; they are a different ruler and are excluded everywhere.
+CUTOFF = "2026-08-30"
 
 c = sqlite3.connect(DB); c.row_factory = sqlite3.Row
 
 def key_groups(tbl, stage):
     return {(r[0], r[1], r[2]) for r in c.execute(
-        f"SELECT DISTINCT assets,interval,backtest_period FROM {tbl} WHERE stage=?", (stage,))}
+        f"""SELECT DISTINCT o.assets,o.interval,o.backtest_period FROM {tbl} o
+            JOIN runs r ON r.run_id=o.run_id WHERE o.stage=? AND r.timestamp>=?""", (stage, CUTOFF))}
 
 matched = (key_groups("oracle_results", "oracle")
            & key_groups("oracle_results", "naive")
@@ -26,9 +30,10 @@ matched = (key_groups("oracle_results", "oracle")
 
 def stats(tbl, stage):
     agg = {}
-    for r in c.execute(f"""SELECT strategy_name,sharpe,signal_count,win_rate,avg_pnl_per_trade,
-                                  assets,interval,backtest_period
-                           FROM {tbl} WHERE stage=? AND signal_count>=3""", (stage,)):
+    for r in c.execute(f"""SELECT o.strategy_name,o.sharpe,o.signal_count,o.win_rate,o.avg_pnl_per_trade,
+                                  o.assets,o.interval,o.backtest_period
+                           FROM {tbl} o JOIN runs r ON r.run_id=o.run_id
+                           WHERE o.stage=? AND o.signal_count>=3 AND r.timestamp>=?""", (stage, CUTOFF)):
         if (r["assets"], r["interval"], r["backtest_period"]) not in matched: continue
         if r["strategy_name"] in ALIAS: continue
         d = agg.setdefault(r["strategy_name"], {"s": 0, "ws": 0.0, "ww": 0.0, "wp": 0.0})
