@@ -8,6 +8,7 @@ multi_predictor.predict_all(), but the stub returns {} immediately, so no
 strategy ever evaluates). select_prioritized_groups()/_chunked() are pure
 DB/list logic.
 """
+import json
 import os
 import sys
 import threading
@@ -331,3 +332,238 @@ def test_resolve_gpu_workers_auto_matches_worked_example():
     assert "vram_free=5210MiB -> 2" in log
     assert "ram_avail=8100MiB -> 6" in log
     assert "max=4" in log
+
+
+# ============================================================================
+# VRAM calibration bug fix: _phase1_with_vram_calibration() actually moves
+# per_worker_vram_mib, using per-process usage (_probe_own_vram_mib) instead
+# of a whole-GPU memory.free before/after delta that a sibling session's own
+# GPU usage can swamp. See _probe_own_vram_mib()'s docstring for the root
+# cause this replaces.
+# ============================================================================
+
+def test_probe_own_vram_mib_sums_only_the_given_pids(monkeypatch):
+    """Direct per-pid attribution: a third pid present in nvidia-smi's
+    output (a sibling session/display server) must not be counted."""
+    csv = "111, 560\n222, 560\n999, 4000\n"
+
+    def fake_run(cmd, **kwargs):
+        assert "--query-compute-apps=pid,used_memory" in cmd
+        class R:
+            stdout = csv
+        return R()
+
+    monkeypatch.setattr(rmp.subprocess, "run", fake_run)
+    assert rmp._probe_own_vram_mib([111, 222]) == 1120.0
+
+
+def test_probe_own_vram_mib_no_pids_given_is_zero_not_none():
+    assert rmp._probe_own_vram_mib([]) == 0.0
+
+
+def test_probe_own_vram_mib_none_of_our_pids_present_is_zero_not_none(monkeypatch):
+    monkeypatch.setattr(
+        rmp.subprocess, "run",
+        lambda cmd, **kw: type("R", (), {"stdout": "999, 4000\n"})(),
+    )
+    assert rmp._probe_own_vram_mib([111]) == 0.0
+
+
+def test_probe_own_vram_mib_nvidia_smi_failure_is_none(monkeypatch):
+    def raise_(*a, **kw):
+        raise FileNotFoundError("no nvidia-smi")
+    monkeypatch.setattr(rmp.subprocess, "run", raise_)
+    assert rmp._probe_own_vram_mib([111]) is None
+
+
+def test_phase1_calibration_moves_estimate_from_a_known_per_worker_peak():
+    """The regression test for the actual bug: feed a fake per-process VRAM
+    sampler reporting a known peak for our own pids, and assert the NEXT
+    chunk's decide_gpu_workers() input reflects it, not the DEFAULT seed --
+    this is exactly what was broken (evidence: 7 straight chunks on a live
+    run all showed vram_allows computed from the untouched 2200 seed)."""
+    gpu_workers = 2
+    fake_own_usage = {"value": 0.0}
+
+    def fake_probe_own_vram(pids):
+        # Simulate the pool having spawned 2 workers, each holding ~560MiB,
+        # once run_phase1_fn has "started" the pool.
+        return fake_own_usage["value"]
+
+    def run_phase1_fn(pids_out):
+        pids_out.extend([111, 222])
+        fake_own_usage["value"] = 1120.0  # 2 workers x 560MiB, sampled mid-run
+        time.sleep(0.05)  # give the sampler thread (interval=0.01 below) a chance to poll
+        return "phase1-result"
+
+    result, new_vram, new_rss = rmp._phase1_with_vram_calibration(
+        gpu_workers, rmp.DEFAULT_PER_WORKER_VRAM_MIB, rmp.DEFAULT_PER_WORKER_RSS_MIB,
+        auto=True, run_phase1_fn=run_phase1_fn, probe_own_vram_fn=fake_probe_own_vram,
+        sample_interval=0.01,
+    )
+
+    assert result == "phase1-result"
+    assert new_vram == pytest.approx(560.0)  # 1120 / 2 workers, not stuck at the 2200 seed
+    assert new_vram != rmp.DEFAULT_PER_WORKER_VRAM_MIB
+
+    # And the next chunk's auto-sizing decision actually reflects the update.
+    n = rmp.decide_gpu_workers(free_vram_mib=5614, avail_ram_mib=1_000_000,
+                                per_worker_vram_mib=new_vram, per_worker_rss_mib=new_rss,
+                                max_workers=4)
+    assert n == 4  # floor((5614-512)/560) = 9, capped at max_workers=4 -- NOT the old-bug's 2
+
+
+def test_phase1_calibration_no_usage_seen_keeps_seed():
+    """If our own pids never show any VRAM usage (e.g. every date in the
+    chunk was already a cache hit, so predict_all_batch/model load never
+    ran), the estimate must stay at whatever it was -- 0.0 usage is a valid
+    reading, not something to divide into a bogus near-zero per-worker mib."""
+    result, new_vram, _ = rmp._phase1_with_vram_calibration(
+        2, rmp.DEFAULT_PER_WORKER_VRAM_MIB, rmp.DEFAULT_PER_WORKER_RSS_MIB,
+        auto=True, run_phase1_fn=lambda pids: pids.extend([111, 222]) or "r",
+        probe_own_vram_fn=lambda pids: 0.0,
+    )
+    assert new_vram == rmp.DEFAULT_PER_WORKER_VRAM_MIB
+
+
+def test_phase1_calibration_auto_off_skips_sampling_entirely():
+    calls = []
+    result, new_vram, new_rss = rmp._phase1_with_vram_calibration(
+        2, rmp.DEFAULT_PER_WORKER_VRAM_MIB, rmp.DEFAULT_PER_WORKER_RSS_MIB,
+        auto=False, run_phase1_fn=lambda pids: calls.append(pids) or "r",
+        probe_own_vram_fn=lambda pids: 9999.0,
+    )
+    assert result == "r"
+    assert new_vram == rmp.DEFAULT_PER_WORKER_VRAM_MIB
+    assert new_rss == rmp.DEFAULT_PER_WORKER_RSS_MIB
+    assert calls == [[]]  # run_phase1_fn still gets a (unused) pids list
+
+
+def test_run_phase1_serial_path_reports_own_pid(monkeypatch):
+    """gpu_workers<=1, no pool -- the caller's own pid is the one holding
+    the CUDA context, so pids_out must get it (not stay empty)."""
+    monkeypatch.setattr(rmp, "_prewarm_group", lambda *a, **kw: (1, 0))
+    pids = []
+    rmp.run_phase1([(1, ["AAA"], "AAA", 1.0)], None, "1d", "6m", 100,
+                    "/tmp/x", 0, gpu_workers=1, pids_out=pids)
+    assert pids == [os.getpid()]
+
+
+# ============================================================================
+# --control-file: live workers/gpu_workers/chunk_size rebalancing
+# ============================================================================
+
+def test_control_file_missing_is_silent_and_unchanged(tmp_path):
+    w, g, c, changes = rmp._load_control_overrides(
+        str(tmp_path / "nope.json"), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert (w, g, c, changes) == (4, 2, 16, [])
+
+
+def test_control_file_applies_valid_values(tmp_path):
+    p = tmp_path / "control.json"
+    p.write_text(json.dumps({"workers": 3, "gpu_workers": 3, "chunk_size": 8}))
+    w, g, c, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert (w, g, c) == (3, 3, 8)
+    assert changes == ["workers 4 -> 3", "gpu_workers 2 -> 3", "chunk_size 16 -> 8"]
+
+
+def test_control_file_gpu_workers_auto_string_accepted(tmp_path):
+    p = tmp_path / "control.json"
+    p.write_text(json.dumps({"gpu_workers": "auto"}))
+    w, g, c, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert g == "auto"
+    assert changes == ["gpu_workers 2 -> auto"]
+
+
+def test_control_file_unchanged_values_produce_no_change_log(tmp_path):
+    p = tmp_path / "control.json"
+    p.write_text(json.dumps({"workers": 4}))
+    _, _, _, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert changes == []
+
+
+def test_control_file_malformed_json_survives_and_keeps_current(tmp_path, capsys):
+    p = tmp_path / "control.json"
+    p.write_text("{not valid json")
+    w, g, c, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert (w, g, c, changes) == (4, 2, 16, [])
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_control_file_non_object_json_survives_and_keeps_current(tmp_path, capsys):
+    p = tmp_path / "control.json"
+    p.write_text("[1, 2, 3]")
+    w, g, c, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert (w, g, c, changes) == (4, 2, 16, [])
+    assert "WARNING" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad_workers", [0, -1, 3.5, "3", None, True, 999])
+def test_control_file_wrong_type_or_out_of_range_workers_keeps_current(tmp_path, capsys, bad_workers):
+    p = tmp_path / "control.json"
+    p.write_text(json.dumps({"workers": bad_workers}))
+    w, g, c, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert (w, g, c, changes) == (4, 2, 16, [])
+    assert "WARNING" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad_gw", [0, -1, "fast", None, 999])
+def test_control_file_wrong_type_or_out_of_range_gpu_workers_keeps_current(tmp_path, capsys, bad_gw):
+    p = tmp_path / "control.json"
+    p.write_text(json.dumps({"gpu_workers": bad_gw}))
+    w, g, c, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert (w, g, c, changes) == (4, 2, 16, [])
+    assert "WARNING" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("bad_cs", [0, -5, 3.5, "16", None])
+def test_control_file_wrong_type_or_out_of_range_chunk_size_keeps_current(tmp_path, capsys, bad_cs):
+    p = tmp_path / "control.json"
+    p.write_text(json.dumps({"chunk_size": bad_cs}))
+    w, g, c, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert (w, g, c, changes) == (4, 2, 16, [])
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_control_file_never_raises_on_unreadable_file(tmp_path):
+    """A directory where a file is expected -- open() raises IsADirectoryError.
+    Must be swallowed like any other malformed-file case, never propagate."""
+    p = tmp_path / "control.json"
+    p.mkdir()
+    w, g, c, changes = rmp._load_control_overrides(
+        str(p), workers=4, gpu_workers=2, chunk_size=16, cpu_count=16,
+    )
+    assert (w, g, c, changes) == (4, 2, 16, [])
+
+
+def test_warn_if_over_physical_fires_over_budget(capsys):
+    rmp._warn_if_over_physical(6, 4, physical=8, context="test:")
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_warn_if_over_physical_silent_within_budget(capsys):
+    rmp._warn_if_over_physical(2, 2, physical=8, context="test:")
+    assert capsys.readouterr().out == ""
+
+
+def test_warn_if_over_physical_skips_auto(capsys):
+    """gpu_workers='auto' varies per chunk -- can't sum it, so no warning."""
+    rmp._warn_if_over_physical(100, "auto", physical=8, context="test:")
+    assert capsys.readouterr().out == ""

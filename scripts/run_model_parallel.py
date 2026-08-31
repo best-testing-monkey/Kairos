@@ -50,11 +50,23 @@ at once under --pipeline (this chunk's phase 2 reads + the next chunk's phase
 if a chunk's prewarm gets evicted (oldest-mtime) before its own phase 2 reads
 it, that phase 2 silently degrades to per-worker model loads instead of
 cache hits.
+
+--control-file lets --workers/--gpu-workers/--chunk-size be rebalanced while
+the sweep is running, without killing it: the file is re-read before each
+chunk and any recognized keys override the current values from that chunk
+onward (gpu_workers may also be the string "auto"). ponytail: chunk_size is
+only honored live in the non-pipelined path -- --pipeline's lookahead
+prefetch needs the chunk list built one chunk ahead of time, so a chunk_size
+edit there takes effect for chunks not yet prefetched, one chunk later than
+the sequential path. Example:
+    echo '{"workers":2,"gpu_workers":4}' > data/sweep_control.json
 """
 from __future__ import annotations
 
 import argparse
 import gc
+import json
+import math
 import os
 import subprocess
 import sys
@@ -73,6 +85,7 @@ BACKTEST_PERIOD = "6m"
 PRED_SAMPLES = 100
 
 DEFAULT_CACHE_DIR = os.path.join(REPO_ROOT, "data", "predcache_sweep")
+DEFAULT_CONTROL_FILE = os.path.join(REPO_ROOT, "data", "sweep_control.json")
 _PREWARM_GC_INTERVAL = 500  # mirrors kairos_papertrade.py's _PREWARM_GC_INTERVAL
 
 # --gpu-workers auto sizing (see decide_gpu_workers() below / --gpu-workers-max
@@ -198,6 +211,54 @@ def _probe_free_vram_mib():
         return None
 
 
+def _probe_own_vram_mib(pids):
+    """Sum of VRAM (MiB) actually used by OUR OWN subprocess pids, via
+    `nvidia-smi --query-compute-apps`. This is the fix for the calibration
+    bug in _phase1_with_vram_calibration(): the old approach sampled
+    memory.free (whole-GPU) before/after and inferred usage from the delta,
+    which is exactly what _probe_free_vram_mib()'s docstring warns not to
+    trust for calibration -- it includes the display server AND any sibling
+    session's own sweep. On this box that's not a hypothetical: multiple
+    run_model_parallel.py sweeps run concurrently (see ps), and a 6GB card
+    running 3 of them at once means the "before" and "min-during" whole-GPU
+    readings are dominated by processes we don't control, so the delta
+    computed from them was landing at <=0 on every single chunk -- the
+    per_worker_vram_mib update was silently skipped every time, forever,
+    not because of noise but because the two other sweeps kept the free
+    number saturated regardless of what our own workers did.
+
+    Querying --query-compute-apps instead gives a DIRECT, per-pid reading --
+    no before/after delta needed at all, so it can't be swamped by anyone
+    else's GPU usage. Returns 0.0 (not None) if nvidia-smi succeeds but none
+    of `pids` show up yet (e.g. workers haven't loaded a model onto the GPU
+    yet) -- that is a valid "no usage seen" reading, not a probe failure.
+    Returns None only when nvidia-smi itself fails (no GPU, driver hiccup,
+    etc), mirroring _probe_free_vram_mib()'s None-vs-0 contract.
+    """
+    if not pids:
+        return 0.0
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+    except Exception:
+        return None
+    pid_set = set(pids)
+    total = 0.0
+    for line in out.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            pid, used = int(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        if pid in pid_set:
+            total += used
+    return total
+
+
 def _resolve_gpu_workers_for_chunk(gpu_workers_arg, gpu_workers_max, per_worker_vram_mib,
                                     per_worker_rss_mib, cpu_workers_running=0,
                                     probe_vram_fn=_probe_free_vram_mib, probe_ram_mib_fn=None):
@@ -223,17 +284,25 @@ def _resolve_gpu_workers_for_chunk(gpu_workers_arg, gpu_workers_max, per_worker_
 
 
 class _MinSampler:
-    """ponytail: coarse ~1s-poll min-value tracker used to self-calibrate the
-    per-worker VRAM/RAM estimates chunk-to-chunk. Not an NVML event hook, and
-    a concurrent process on the same GPU/box pollutes the reading -- good
-    enough to nudge the next chunk's --gpu-workers auto decision, not a
-    precise profiler. Upgrade path: NVML polling thread if this ever proves
-    too noisy in practice."""
+    """ponytail: coarse ~1s-poll extreme-value tracker used to self-calibrate
+    the per-worker VRAM/RAM estimates chunk-to-chunk. Not an NVML event hook
+    -- good enough to nudge the next chunk's --gpu-workers auto decision, not
+    a precise profiler. Upgrade path: NVML polling thread if this ever
+    proves too noisy in practice.
 
-    def __init__(self, probe_fn, interval=1.0):
+    Tracks the running MINIMUM by default (used for RAM: "available" is a
+    free-quantity, so the low point is the peak usage). Pass keep_max=True
+    to track the running MAXIMUM instead (used for VRAM since 2026-08-31:
+    _probe_own_vram_mib() reports a used-quantity directly, so the high
+    point -- not a before/after delta -- is the peak usage; see that
+    function's docstring for why the delta approach this replaced was
+    unreliable with concurrent GPU users on the box)."""
+
+    def __init__(self, probe_fn, interval=1.0, keep_max=False):
         self._probe_fn = probe_fn
         self._interval = interval
-        self.min_value = None
+        self._keep_max = keep_max
+        self.extreme_value = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -244,8 +313,13 @@ class _MinSampler:
     def _run(self):
         while not self._stop.is_set():
             v = self._probe_fn()
-            if v is not None and (self.min_value is None or v < self.min_value):
-                self.min_value = v
+            if v is not None:
+                if self.extreme_value is None:
+                    self.extreme_value = v
+                elif self._keep_max and v > self.extreme_value:
+                    self.extreme_value = v
+                elif not self._keep_max and v < self.extreme_value:
+                    self.extreme_value = v
             self._stop.wait(self._interval)
 
     def __exit__(self, *exc):
@@ -254,31 +328,42 @@ class _MinSampler:
 
 
 def _phase1_with_vram_calibration(gpu_workers, per_worker_vram_mib, per_worker_rss_mib,
-                                   auto, probe_vram_fn, run_phase1_fn):
-    """Runs run_phase1_fn() (a zero-arg closure around run_phase1()) and, only
-    when auto, samples free VRAM/RAM around the call to refine
-    per_worker_vram_mib/per_worker_rss_mib from what THIS phase actually
-    used -- so the NEXT chunk's decide_gpu_workers() call sizes better than
-    the fixed seed. No sampling overhead when auto is off.
+                                   auto, run_phase1_fn, probe_own_vram_fn=_probe_own_vram_mib,
+                                   sample_interval=1.0):
+    """Runs run_phase1_fn(pool_pids) -- a one-arg closure around run_phase1()
+    that must extend the given list with the pids of whatever GPU worker
+    process(es) it spawns (run_phase1's own pids_out= param does this) -- and,
+    only when auto, samples per-process VRAM usage + free RAM around the call
+    to refine per_worker_vram_mib/per_worker_rss_mib from what THIS phase
+    actually used, so the NEXT chunk's decide_gpu_workers() call sizes better
+    than the fixed seed. No sampling overhead when auto is off.
+
+    VRAM is measured directly via probe_own_vram_fn(pids) (see
+    _probe_own_vram_mib's docstring for why this replaced a memory.free
+    before/after delta). RAM stays on the free-quantity delta pattern since
+    kp_predcache._read_mem_available_bytes() is a whole-box reading with no
+    per-pid equivalent available.
+
+    sample_interval is the _MinSampler poll period (default 1.0s in
+    production); tests pass a much smaller value so a fast fake
+    run_phase1_fn still gets sampled at least once.
 
     Returns (run_phase1 result, new_per_worker_vram_mib, new_per_worker_rss_mib).
     """
+    pool_pids = []
     if not auto:
-        return run_phase1_fn(), per_worker_vram_mib, per_worker_rss_mib
+        return run_phase1_fn(pool_pids), per_worker_vram_mib, per_worker_rss_mib
 
-    free_vram_before = probe_vram_fn()
     ram_before_mib = kp_predcache._read_mem_available_bytes() / (1024 ** 2)
-    vram_sampler = _MinSampler(probe_vram_fn)
-    ram_sampler = _MinSampler(lambda: kp_predcache._read_mem_available_bytes() / (1024 ** 2))
+    vram_sampler = _MinSampler(lambda: probe_own_vram_fn(pool_pids), interval=sample_interval, keep_max=True)
+    ram_sampler = _MinSampler(lambda: kp_predcache._read_mem_available_bytes() / (1024 ** 2), interval=sample_interval)
     with vram_sampler, ram_sampler:
-        result = run_phase1_fn()
+        result = run_phase1_fn(pool_pids)
 
-    if free_vram_before is not None and vram_sampler.min_value is not None and gpu_workers > 0:
-        used = free_vram_before - vram_sampler.min_value
-        if used > 0:
-            per_worker_vram_mib = max(used / gpu_workers, 256.0)
-    if ram_sampler.min_value is not None and gpu_workers > 0:
-        used = ram_before_mib - ram_sampler.min_value
+    if vram_sampler.extreme_value and gpu_workers > 0:  # 0.0 (no usage seen) is falsy -- correctly skipped
+        per_worker_vram_mib = max(vram_sampler.extreme_value / gpu_workers, 256.0)
+    if ram_sampler.extreme_value is not None and gpu_workers > 0:
+        used = ram_before_mib - ram_sampler.extreme_value
         if used > 0:
             per_worker_rss_mib = max(used / gpu_workers, 256.0)
     return result, per_worker_vram_mib, per_worker_rss_mib
@@ -394,19 +479,26 @@ def _abort_if_prewarm_wholly_failed(chunk, hits, misses, failures):
 
 
 def run_phase1(chunk, model_path, interval, backtest_period, pred_samples,
-               cache_dir, cache_max_bytes, gpu_workers, force_pool=False):
+               cache_dir, cache_max_bytes, gpu_workers, force_pool=False, pids_out=None):
     """chunk: list of (group_id, assets, assets_key, sharpe). Returns (hits, misses, failures).
 
     force_pool=True always dispatches through ProcessPoolExecutor, even for
     gpu_workers<=1 -- required under --pipeline so phase 1's Python work runs
     in a worker process, not inline on the thread that's supposed to let
     phase 2 run concurrently (an inline call would hold the GIL on the main
-    thread's ThreadPoolExecutor worker and block phase 2's own submits)."""
+    thread's ThreadPoolExecutor worker and block phase 2's own submits).
+
+    pids_out, if given, is extended with the pid(s) actually doing the GPU
+    work -- the pool's forked child pids, or (serial path) this process's own
+    pid. _phase1_with_vram_calibration() uses this to filter its VRAM
+    sampling to processes we actually spawned, see _probe_own_vram_mib()."""
     total_hits = total_misses = 0
     failures = []
     if gpu_workers <= 1 and not force_pool:
         # Fully serial (default): no subprocess/pickling overhead, one GPU
         # user at a time -- the safe default for a single GPU box.
+        if pids_out is not None:
+            pids_out.append(os.getpid())
         for group_id, assets, assets_key, _sharpe in chunk:
             try:
                 hits, misses = _prewarm_group(assets, model_path, interval, backtest_period, pred_samples)
@@ -421,6 +513,8 @@ def run_phase1(chunk, model_path, interval, backtest_period, pred_samples,
                             pred_samples, cache_dir, cache_max_bytes): ak
                 for gid, assets, ak, _sharpe in chunk
             }
+            if pids_out is not None:
+                pids_out.extend(getattr(pool, "_processes", {}).keys())
             for fut in as_completed(futures):
                 _gid, ak, status, hits, misses, err = fut.result()
                 if status == "fail":
@@ -519,6 +613,79 @@ def run_pipelined(chunks, phase1_fn, phase2_fn, on_prefetch_fail=None):
             yield chunk, phase1_result, phase2_result, phase1_wait_s, phase2_s, wall_s, fell_back
 
 
+# ── --control-file: live workers/gpu_workers/chunk_size rebalancing ────────
+
+def _load_control_overrides(path, workers, gpu_workers, chunk_size, cpu_count):
+    """Re-read before each chunk. Returns (workers, gpu_workers, chunk_size,
+    changes) where changes is a list of "key old -> new" strings for values
+    that actually changed -- empty when nothing changed, INCLUDING a missing
+    file, so callers can stay silent in the normal (no control file) case.
+
+    Never raises. A missing file is normal and silent. Malformed JSON, a
+    non-object top level, wrong types, or an out-of-range count are each a
+    single WARNING line naming the problem, keeping the PRIOR value for that
+    key -- a typo'd control file must not kill an hours-long sweep."""
+    if not os.path.isfile(path):
+        return workers, gpu_workers, chunk_size, []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as exc:
+        print(f"[control-file] WARNING: could not parse {path}: {exc} -- keeping current values")
+        return workers, gpu_workers, chunk_size, []
+    if not isinstance(data, dict):
+        print(f"[control-file] WARNING: {path} must contain a JSON object, got "
+              f"{type(data).__name__} -- keeping current values")
+        return workers, gpu_workers, chunk_size, []
+
+    def _valid_count(v):
+        return isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= cpu_count
+
+    changes = []
+
+    if "workers" in data:
+        v = data["workers"]
+        if not _valid_count(v):
+            print(f"[control-file] WARNING: 'workers'={v!r} invalid (must be an integer "
+                  f"1..{cpu_count}) -- keeping workers={workers}")
+        elif v != workers:
+            changes.append(f"workers {workers} -> {v}")
+            workers = v
+
+    if "gpu_workers" in data:
+        v = data["gpu_workers"]
+        if v == "auto" or _valid_count(v):
+            if v != gpu_workers:
+                changes.append(f"gpu_workers {gpu_workers} -> {v}")
+                gpu_workers = v
+        else:
+            print(f"[control-file] WARNING: 'gpu_workers'={v!r} invalid (must be an integer "
+                  f"1..{cpu_count} or 'auto') -- keeping gpu_workers={gpu_workers}")
+
+    if "chunk_size" in data:
+        v = data["chunk_size"]
+        if not (isinstance(v, int) and not isinstance(v, bool) and v >= 1):
+            print(f"[control-file] WARNING: 'chunk_size'={v!r} invalid (must be a positive "
+                  f"integer) -- keeping chunk_size={chunk_size}")
+        elif v != chunk_size:
+            changes.append(f"chunk_size {chunk_size} -> {v}")
+            chunk_size = v
+
+    return workers, gpu_workers, chunk_size, changes
+
+
+def _warn_if_over_physical(workers, gpu_workers, physical, context):
+    """Advisory only -- mirrors the pre-existing --pipeline startup check.
+    Skipped when gpu_workers is "auto": the real per-chunk count varies and
+    is whatever decide_gpu_workers() just sized it to, not this value."""
+    if gpu_workers == "auto":
+        return
+    total = workers + gpu_workers
+    if total > physical:
+        print(f"WARNING: {context} workers ({workers}) + gpu_workers ({gpu_workers}) = {total} "
+              f"processes > {physical} physical cores. Peak RAM may be tight -- consider lower values.")
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 def _gpu_workers_arg(v):
@@ -558,6 +725,11 @@ def _parse_args():
     p.add_argument("--pipeline", action="store_true",
                     help="Overlap chunk N+1's phase 1 (GPU prewarm) with chunk N's phase 2 (CPU "
                          "replay). Default off (current sequential behaviour). See module docstring.")
+    p.add_argument("--control-file", default=DEFAULT_CONTROL_FILE,
+                    help="JSON file re-read before each chunk to rebalance --workers/--gpu-workers/"
+                         "--chunk-size live, without restarting the sweep (default: "
+                         "data/sweep_control.json). Missing file is normal/silent; a malformed one "
+                         "warns and keeps the current values. See module docstring for the format.")
     return p.parse_args()
 
 
@@ -589,49 +761,72 @@ def main():
 
     print(f"Unprocessed groups: {len(prioritized)} (of {len(groups)} total deduped, "
           f"correlation run_id={correlation_run_id}). Stage={args.stage!r} model_path={model_path!r}. "
-          f"Budget: {args.max_hours}h. Chunk size: {args.chunk_size}. Cache dir: {cache_dir}")
+          f"Budget: {args.max_hours}h. Chunk size: {args.chunk_size}. Cache dir: {cache_dir}. "
+          f"Control file: {args.control_file}")
 
-    chunks = list(_chunked(prioritized, args.chunk_size))
     done_total = stage_failed_total = prewarm_failed_total = 0
     per_worker_vram_mib = DEFAULT_PER_WORKER_VRAM_MIB
     per_worker_rss_mib = DEFAULT_PER_WORKER_RSS_MIB
-    gpu_auto = args.gpu_workers == "auto"
-    # Under --pipeline, phase 1's prewarm runs concurrently with phase 2's
-    # --workers pool, so the RAM term of --gpu-workers auto's sizing must
-    # treat those workers as already-committed RAM, not free RAM.
-    cpu_workers_running = args.workers if args.pipeline else 0
+    cpu_count = os.cpu_count() or 1
+    physical = cpu_count // 2
+
+    # Mutable, control-file-adjustable balance. Read via these, not args.*,
+    # everywhere below -- args.* stays the launch-time value only.
+    current_workers = args.workers
+    current_gpu_workers = args.gpu_workers
+    current_chunk_size = args.chunk_size
+
+    def _apply_control(chunk_label):
+        nonlocal current_workers, current_gpu_workers, current_chunk_size
+        current_workers, current_gpu_workers, current_chunk_size, changes = _load_control_overrides(
+            args.control_file, current_workers, current_gpu_workers, current_chunk_size, cpu_count,
+        )
+        if changes:
+            print(f"[chunk {chunk_label}] control-file: " + ", ".join(changes))
+            _warn_if_over_physical(current_workers, current_gpu_workers, physical, "control-file:")
 
     def _resolve_gw():
+        # Under --pipeline, phase 1's prewarm runs concurrently with phase 2's
+        # --workers pool, so the RAM term of --gpu-workers auto's sizing must
+        # treat those workers as already-committed RAM, not free RAM.
+        cpu_workers_running = current_workers if args.pipeline else 0
         return _resolve_gpu_workers_for_chunk(
-            args.gpu_workers, args.gpu_workers_max, per_worker_vram_mib, per_worker_rss_mib,
+            current_gpu_workers, args.gpu_workers_max, per_worker_vram_mib, per_worker_rss_mib,
             cpu_workers_running,
         )
 
     if args.pipeline:
-        cpu_count = os.cpu_count() or 1
-        physical = cpu_count // 2
         # auto mode's actual gpu-workers varies per chunk; use the ceiling for this startup check.
-        worst_case_gw = args.gpu_workers_max if gpu_auto else args.gpu_workers
-        if worst_case_gw + args.workers > physical:
-            print(f"WARNING: --pipeline with gpu-workers(~{worst_case_gw}) + --workers {args.workers} "
-                  f"= {worst_case_gw + args.workers} processes > {physical} physical cores "
-                  f"(cpu_count={cpu_count} logical). Peak RAM may be tight (~1.1GB/prewarm process "
-                  f"measured) -- consider a lower --workers.")
+        worst_case_gw = args.gpu_workers_max if args.gpu_workers == "auto" else args.gpu_workers
+        _warn_if_over_physical(args.workers, worst_case_gw, physical, "--pipeline startup:")
+
+        # ponytail: chunk_size is NOT live-adjustable under --pipeline -- the chunk
+        # list is built once, up front, because run_pipelined()'s lookahead prefetch
+        # needs random access to "chunk i+1" one step before chunk i finishes. A
+        # control-file chunk_size edit is still parsed/validated (so a typo still
+        # just warns, never crashes) but only takes effect for workers/gpu_workers;
+        # rebuilding the chunk list live would need run_pipelined() to pull chunks
+        # from a queue instead of indexing a fixed list -- add that if chunk_size
+        # needs to move mid-pipelined-run.
+        chunks = list(_chunked(prioritized, current_chunk_size))
+        phase1_calls = 0
 
         def _phase1_call(chunk_):
-            nonlocal per_worker_vram_mib, per_worker_rss_mib
+            nonlocal per_worker_vram_mib, per_worker_rss_mib, phase1_calls
+            phase1_calls += 1
+            _apply_control(f"~{phase1_calls}")
             gw, gw_log = _resolve_gw()
             print(f"  [prewarm] groups={len(chunk_)} {gw_log}")
             result, per_worker_vram_mib, per_worker_rss_mib = _phase1_with_vram_calibration(
-                gw, per_worker_vram_mib, per_worker_rss_mib, gpu_auto, _probe_free_vram_mib,
-                lambda: run_phase1(chunk_, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
-                                    cache_dir, cache_max_bytes, gw, force_pool=True),
+                gw, per_worker_vram_mib, per_worker_rss_mib, current_gpu_workers == "auto",
+                lambda pids: run_phase1(chunk_, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
+                                         cache_dir, cache_max_bytes, gw, force_pool=True, pids_out=pids),
             )
             return result
 
         def _phase2_call(chunk_):
             return run_phase2(chunk_, args.stage, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
-                               extra_env, args.workers)
+                               extra_env, current_workers)
 
         def _on_prefetch_fail(chunk_, exc):
             print(f"  [prefetch FAIL] {exc} -- falling back to inline prewarm for this chunk")
@@ -666,29 +861,35 @@ def main():
                 # the next chunk's prewarm is already submitted in the background by the time
                 # this chunk's results are in hand -- there's no cheap earlier point to gate on.
                 if time.time() >= deadline:
-                    remaining = sum(len(c) for c in chunks[ci:])
+                    n_remaining = sum(len(c) for c in chunks[ci:])
                     print(f"\n[budget] {args.max_hours}h elapsed after chunk {ci}/{len(chunks)}. "
-                          f"{remaining} groups remain for next invocation.")
+                          f"{n_remaining} groups remain for next invocation.")
                     break
         finally:
             gen.close()  # waits out any in-flight prefetch before returning
     else:
-        for ci, chunk in enumerate(chunks, 1):
+        remaining = list(prioritized)
+        ci = 0
+        while remaining:
             if time.time() >= deadline:
-                remaining = sum(len(c) for c in chunks[ci - 1:])
-                print(f"\n[budget] {args.max_hours}h elapsed, stopping before chunk {ci}/{len(chunks)}. "
-                      f"{remaining} groups remain for next invocation.")
+                print(f"\n[budget] {args.max_hours}h elapsed, stopping before chunk {ci + 1}. "
+                      f"{len(remaining)} groups remain for next invocation.")
                 break
+            ci += 1
+            _apply_control(ci)
+            chunk, remaining = remaining[:current_chunk_size], remaining[current_chunk_size:]
+            est_total = ci + math.ceil(len(remaining) / current_chunk_size) if remaining else ci
 
             gw, gw_log = _resolve_gw()
+            gpu_auto = current_gpu_workers == "auto"
             if gpu_auto:
-                print(f"[chunk {ci}/{len(chunks)}] {gw_log}")
+                print(f"[chunk {ci}/{est_total}] {gw_log}")
 
             t0 = time.time()
             (hits, misses, p1_failures), per_worker_vram_mib, per_worker_rss_mib = _phase1_with_vram_calibration(
-                gw, per_worker_vram_mib, per_worker_rss_mib, gpu_auto, _probe_free_vram_mib,
-                lambda: run_phase1(chunk, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
-                                    cache_dir, cache_max_bytes, gw),
+                gw, per_worker_vram_mib, per_worker_rss_mib, gpu_auto,
+                lambda pids: run_phase1(chunk, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
+                                         cache_dir, cache_max_bytes, gw, pids_out=pids),
             )
             t1 = time.time()
             # A prewarm failure for a SOME groups doesn't block phase 2 -- those
@@ -700,7 +901,7 @@ def main():
             _abort_if_prewarm_wholly_failed(chunk, hits, misses, p1_failures)
             done, stage_failed, p2_failures = run_phase2(
                 chunk, args.stage, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
-                extra_env, args.workers,
+                extra_env, current_workers,
             )
             t2 = time.time()
 
@@ -711,7 +912,7 @@ def main():
             for ak, err in p2_failures:
                 print(f"  [stage FAIL] {ak}: {err}")
 
-            print(f"[chunk {ci}/{len(chunks)}] groups={len(chunk)} prewarm_hits={hits} "
+            print(f"[chunk {ci}/{est_total}] groups={len(chunk)} prewarm_hits={hits} "
                   f"prewarm_misses={misses} phase1_s={t1 - t0:.1f} phase2_s={t2 - t1:.1f} "
                   f"done_total={done_total} stage_failed_total={stage_failed_total} "
                   f"prewarm_failed_total={prewarm_failed_total}")
