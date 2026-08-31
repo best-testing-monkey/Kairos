@@ -93,17 +93,104 @@ _PREWARM_GC_INTERVAL = 500  # mirrors kairos_papertrade.py's _PREWARM_GC_INTERVA
 # refines them chunk-to-chunk from what was actually observed.
 VRAM_HEADROOM_MIB = 512
 RAM_HEADROOM_MIB = 1024
-# Seeded at the HEAVIEST model's footprint (Kronos-base, ~3.6GB on a 4-asset
-# group), not an average. The seed's only job is to keep chunk 1 safe before
-# calibration has any data, and the asymmetry matters: seeding too high costs a
-# smaller model one under-parallelised chunk, while seeding too low OOMs the
-# GPU on chunk 1 -- and an OOM here can deadlock the pool rather than fail
-# cleanly (2026-08-31). _phase1_with_vram_calibration() corrects this both
-# directions from chunk 2, so mini/small quickly get their real (much smaller)
-# figure. Was 2200, which would have picked 2 workers for base = ~7.2GB on a
-# 5.8GB card.
-DEFAULT_PER_WORKER_VRAM_MIB = 3600.0
+# Seed for the FIXED --gpu-workers <int> path only (per_worker_vram_mib, fed
+# to decide_gpu_workers()/_phase1_with_vram_calibration()) -- --gpu-workers
+# auto no longer sizes off a single scalar at all, see
+# estimate_group_vram_mib()/pack_waves() below. Raised 2026-08-31 from 3600 to
+# 5200: base's actual measured 4-asset-group peak (scripts/benchmark_models.py,
+# data/model_benchmark.json) is 5124 MiB, and 3600 was BELOW that -- an
+# under-estimate on exactly the case this seed exists to protect chunk 1
+# against, before any calibration data exists. An OOM here can deadlock the
+# pool rather than fail cleanly (2026-08-31 incident) -- estimate high.
+DEFAULT_PER_WORKER_VRAM_MIB = 5200.0
 DEFAULT_PER_WORKER_RSS_MIB = 1100.0
+
+
+# ── Per-group VRAM estimate table + wave packing (added 2026-08-31) ────────
+# Measured via scripts/benchmark_models.py (serial, pred_samples=100, 1d/6m,
+# peak per-process VRAM via nvidia-smi --query-compute-apps, 20 stratified
+# groups x 3 models, 0 failures) -- see data/model_benchmark.json for the
+# full per-group run data these two points per model were read off. Only
+# n=1 and n=4 were actually measured; estimate_group_vram_mib() interpolates/
+# extrapolates the rest.
+_VRAM_TABLE_MIB = {
+    "NeoQuasar/Kronos-base": {1: 1348.0, 4: 5124.0},
+    "NeoQuasar/Kronos-small": {1: 682.0, 4: 3164.0},
+    "NeoQuasar/Kronos-mini": {1: 562.0, 4: 2818.0},
+}
+_VRAM_TABLE_DEFAULT_MODEL = "NeoQuasar/Kronos-base"  # finetuned checkpoints are base-derived
+
+
+def estimate_group_vram_mib(model_id, n_assets):
+    """Estimate peak per-process VRAM (MiB) for one phase-1 prewarm worker
+    running a group of `n_assets` assets under `model_id`. Linear
+    interpolation between the measured n=1/n=4 points, linear extrapolation
+    beyond n=4, never below the n=1 value. An unknown model_id (e.g. a local
+    finetuned checkpoint path, which won't be a key in the table) falls back
+    to base's profile -- the conservative choice, since finetuned checkpoints
+    are Kronos-base derived."""
+    row = _VRAM_TABLE_MIB.get(model_id) or _VRAM_TABLE_MIB[_VRAM_TABLE_DEFAULT_MODEL]
+    v1, v4 = row[1], row[4]
+    slope = (v4 - v1) / 3.0  # per additional asset from n=1 to n=4
+    return max(v1 + slope * (n_assets - 1), v1)
+
+
+def calibrate_vram_table(model_id, n_assets, observed_peak_mib):
+    """Revise _VRAM_TABLE_MIB[model_id][n_assets] upward from an actually-
+    observed per-process VRAM peak (see run_phase1_packed()'s per-wave
+    sampling). Only ever raises the stored value -- a single low reading may
+    just mean that worker hadn't peaked yet when sampled, not that the true
+    peak fell. Downward revision across runs is out of scope: this table is
+    a module-level dict, never written to disk, so there is no cross-run
+    state to half-implement eviction for.
+
+    ponytail: only the n=1/n=4 anchor points are ever calibrated (matching
+    estimate_group_vram_mib()'s 2-point interpolation) -- an observation at
+    some other group size (n=2/3, n>4) is not folded back in, since that
+    would mean inventing a 3rd knot and a piecewise-interpolation scheme the
+    bimodal 1-vs-4-asset corpus (see module docstring) doesn't need today.
+    Add a real per-n table if a wider size distribution ever makes that
+    worth it."""
+    if n_assets not in (1, 4):
+        return
+    row = _VRAM_TABLE_MIB.setdefault(model_id, dict(_VRAM_TABLE_MIB[_VRAM_TABLE_DEFAULT_MODEL]))
+    row[n_assets] = max(row.get(n_assets, 0.0), observed_peak_mib)
+
+
+def pack_waves(groups, model_id, budget_mib, max_concurrent):
+    """First-fit-decreasing bin packing of `groups` (list of (group_id,
+    assets, assets_key, sharpe) -- the same tuple shape run_phase1/run_phase2
+    chunks already use) into waves of VRAM-fitting, concurrently-runnable
+    groups: sort by estimated VRAM descending, place each group into the
+    first wave it fits (current wave total + its cost <= budget_mib, and the
+    wave has fewer than max_concurrent members), else start a new wave.
+
+    A group whose estimate alone exceeds budget_mib still gets its own wave
+    of size 1 -- never dropped -- logged loudly, since the card likely can't
+    actually hold it and an OOM is the expected outcome.
+
+    Pure: no I/O, no GPU probing. Returns list[list[group]]."""
+    sized = sorted(
+        ((estimate_group_vram_mib(model_id, len(g[1])), g) for g in groups),
+        key=lambda t: t[0], reverse=True,
+    )
+    waves = []  # list of [running_total_mib, [group, ...]]
+    for cost, g in sized:
+        if cost > budget_mib:
+            print(f"[pack_waves] WARNING: group {g[2]!r} estimated {cost:.0f} MiB alone exceeds "
+                  f"the {budget_mib:.0f} MiB budget -- giving it its own wave; OOM is likely.")
+            waves.append([cost, [g]])
+            continue
+        for w in waves:
+            if len(w[1]) < max_concurrent and w[0] + cost <= budget_mib:
+                w[0] += cost
+                w[1].append(g)
+                break
+        else:
+            waves.append([cost, [g]])
+    result = [w[1] for w in waves]
+    assert sum(len(w) for w in result) == len(groups), "pack_waves lost or duplicated a group"
+    return result
 
 # ponytail: pin each subprocess to 1 BLAS thread so N workers ~= N busy cores
 # instead of oversubscribing -- copied from scripts/run_oracle_dedup.py's
@@ -184,16 +271,37 @@ def _chunked(seq, n):
 
 # ── --gpu-workers auto: per-chunk sizing from free VRAM/RAM ─────────────────
 
+def _ram_allows(avail_ram_mib, per_worker_rss_mib, cpu_workers_running):
+    """How many per_worker_rss_mib-sized workers fit in available RAM after
+    headroom and already-running CPU workers -- the RAM term shared by
+    decide_gpu_workers() (fixed --gpu-workers <int> path) and
+    decide_max_concurrent() (--gpu-workers auto's wave-size ceiling), so
+    there is exactly one RAM-fits-N-workers formula in this file."""
+    ram_for_workers = avail_ram_mib - RAM_HEADROOM_MIB - cpu_workers_running * per_worker_rss_mib
+    return int(ram_for_workers // per_worker_rss_mib)
+
+
 def decide_gpu_workers(free_vram_mib, avail_ram_mib, per_worker_vram_mib,
                         per_worker_rss_mib, max_workers, cpu_workers_running=0):
-    """Pure sizing rule for --gpu-workers auto. No I/O -- every input is a
-    plain number, so this is unit-testable without a GPU. cpu_workers_running
-    is the number of --workers phase-2 processes already competing for RAM
-    (nonzero only under --pipeline, where phase 1 and phase 2 run at once)."""
+    """Pure sizing rule for the FIXED --gpu-workers <int> path. No I/O --
+    every input is a plain number, so this is unit-testable without a GPU.
+    cpu_workers_running is the number of --workers phase-2 processes already
+    competing for RAM (nonzero only under --pipeline, where phase 1 and
+    phase 2 run at once)."""
     vram_allows = int((free_vram_mib - VRAM_HEADROOM_MIB) // per_worker_vram_mib)
-    ram_for_workers = avail_ram_mib - RAM_HEADROOM_MIB - cpu_workers_running * per_worker_rss_mib
-    ram_allows = int(ram_for_workers // per_worker_rss_mib)
+    ram_allows = _ram_allows(avail_ram_mib, per_worker_rss_mib, cpu_workers_running)
     return max(1, min(vram_allows, ram_allows, max_workers))
+
+
+def decide_max_concurrent(avail_ram_mib, per_worker_rss_mib, physical_cores, cpu_workers_running=0):
+    """Non-VRAM ceiling for pack_waves()'s wave size under --gpu-workers
+    auto: min(physical cores, RAM-derived limit). VRAM itself is handled
+    separately by pack_waves()'s own bin-packing against
+    estimate_group_vram_mib() -- this only bounds concurrency the way
+    physical CPU/RAM would, reusing decide_gpu_workers()'s RAM term
+    (_ram_allows()) rather than a second RAM reader."""
+    ram_allows = _ram_allows(avail_ram_mib, per_worker_rss_mib, cpu_workers_running)
+    return max(1, min(ram_allows, physical_cores))
 
 
 def _probe_free_vram_mib():
@@ -534,6 +642,127 @@ def run_phase1(chunk, model_path, interval, backtest_period, pred_samples,
     return total_hits, total_misses, failures
 
 
+def _calibrate_wave(wave, model_id, observed_total_peak_mib):
+    """Feeds one wave's observed total per-pid VRAM peak back into
+    calibrate_vram_table(), attributing it to the wave's group size -- only
+    when every group in the wave shares the same n_assets (an uneven wave's
+    average total/len doesn't attribute cleanly to either size, so it's
+    skipped rather than guessed)."""
+    if not wave or not observed_total_peak_mib:
+        return
+    sizes = {len(g[1]) for g in wave}
+    if len(sizes) != 1:
+        return
+    n = next(iter(sizes))
+    calibrate_vram_table(model_id, n, observed_total_peak_mib / len(wave))
+
+
+def run_phase1_packed(chunk, model_path, interval, backtest_period, pred_samples,
+                       cache_dir, cache_max_bytes, budget_mib, max_concurrent,
+                       chunk_label="?", n_chunks="?",
+                       probe_own_vram_fn=_probe_own_vram_mib, sample_interval=1.0,
+                       calibrate=True, pids_out=None):
+    """--gpu-workers auto phase-1 driver: bin-pack `chunk` into VRAM-fitting
+    waves (pack_waves()) and run each wave through run_phase1(), one
+    ProcessPoolExecutor(max_workers=len(wave)) per wave (force_pool=True
+    unconditionally -- packed waves always dispatch through the pool, even a
+    size-1 wave, so this stays safe to call from inside --pipeline's
+    background-thread prefetch same as the fixed-int path's force_pool
+    requirement). Waves run one after another, never overlapping each other.
+    Logs each wave so the packing decision is auditable:
+      [chunk 3/10] wave 1/3: 3 groups, est 4044/5296 MiB (sizes 1,1,1)
+
+    When calibrate, samples each wave's own peak per-pid VRAM (same
+    _MinSampler/_probe_own_vram_mib mechanism as
+    _phase1_with_vram_calibration()) and feeds it into calibrate_vram_table()
+    for waves where every group is the same size.
+
+    Returns (hits, misses, failures) -- same shape as run_phase1()."""
+    waves = pack_waves(chunk, model_path, budget_mib, max_concurrent)
+    total_hits = total_misses = 0
+    failures = []
+    for wi, wave in enumerate(waves, start=1):
+        sizes = ",".join(str(len(g[1])) for g in wave)
+        est = sum(estimate_group_vram_mib(model_path, len(g[1])) for g in wave)
+        print(f"[chunk {chunk_label}/{n_chunks}] wave {wi}/{len(waves)}: {len(wave)} groups, "
+              f"est {est:.0f}/{budget_mib:.0f} MiB (sizes {sizes})")
+
+        wave_pids = []
+        if calibrate:
+            sampler = _MinSampler(lambda: probe_own_vram_fn(wave_pids), interval=sample_interval, keep_max=True)
+            with sampler:
+                hits, misses, wave_failures = run_phase1(
+                    wave, model_path, interval, backtest_period, pred_samples, cache_dir, cache_max_bytes,
+                    gpu_workers=len(wave), force_pool=True, pids_out=wave_pids,
+                )
+            _calibrate_wave(wave, model_path, sampler.extreme_value)
+        else:
+            hits, misses, wave_failures = run_phase1(
+                wave, model_path, interval, backtest_period, pred_samples, cache_dir, cache_max_bytes,
+                gpu_workers=len(wave), force_pool=True, pids_out=wave_pids,
+            )
+
+        if pids_out is not None:
+            pids_out.extend(wave_pids)
+        total_hits += hits
+        total_misses += misses
+        failures.extend(wave_failures)
+    return total_hits, total_misses, failures
+
+
+def _phase1_auto_for_chunk(chunk, model_path, interval, backtest_period, pred_samples, cache_dir,
+                            cache_max_bytes, gpu_workers_max, per_worker_rss_mib, physical_cores,
+                            cpu_workers_running, chunk_label, n_chunks,
+                            probe_vram_fn=_probe_free_vram_mib, probe_ram_mib_fn=None,
+                            sample_interval=1.0, pids_out=None):
+    """--gpu-workers auto phase 1 for one chunk: probe free VRAM/RAM the
+    existing way (nvidia-smi only -- see _probe_free_vram_mib()'s docstring
+    for why torch must never do this probe), derive a wave-packing budget
+    (free VRAM - VRAM_HEADROOM_MIB) and max_concurrent (RAM/physical-cores
+    ceiling via decide_max_concurrent()), then run_phase1_packed().
+
+    Also refines per_worker_rss_mib from this chunk's own RAM delta for the
+    next chunk's decide_max_concurrent() call -- the same RAM-delta pattern
+    _phase1_with_vram_calibration() uses, kept separate here because that
+    helper's single-pool-size VRAM math doesn't apply once one chunk can run
+    through several differently-sized wave pools; VRAM calibration instead
+    happens per-wave inside run_phase1_packed() via calibrate_vram_table().
+
+    Returns (hits, misses, failures, new_per_worker_rss_mib)."""
+    read_ram_mib = probe_ram_mib_fn or (lambda: kp_predcache._read_mem_available_bytes() / (1024 ** 2))
+    free_vram_mib = probe_vram_fn()
+    if free_vram_mib is None:
+        print(f"[chunk {chunk_label}/{n_chunks}] gpu-workers=1 (auto: no GPU probe available -- nvidia-smi failed)")
+        hits, misses, failures = run_phase1(
+            chunk, model_path, interval, backtest_period, pred_samples, cache_dir, cache_max_bytes,
+            gpu_workers=1, force_pool=True, pids_out=pids_out,
+        )
+        return hits, misses, failures, per_worker_rss_mib
+
+    ram_avail_mib = read_ram_mib()
+    budget_mib = max(free_vram_mib - VRAM_HEADROOM_MIB, 0.0)
+    max_concurrent = min(
+        decide_max_concurrent(ram_avail_mib, per_worker_rss_mib, physical_cores, cpu_workers_running),
+        gpu_workers_max,
+    )
+
+    ram_before_mib = ram_avail_mib
+    ram_sampler = _MinSampler(read_ram_mib, interval=sample_interval)
+    with ram_sampler:
+        hits, misses, failures = run_phase1_packed(
+            chunk, model_path, interval, backtest_period, pred_samples, cache_dir, cache_max_bytes,
+            budget_mib, max_concurrent, chunk_label=chunk_label, n_chunks=n_chunks,
+            sample_interval=sample_interval, pids_out=pids_out,
+        )
+
+    new_rss = per_worker_rss_mib
+    if ram_sampler.extreme_value is not None and max_concurrent > 0:
+        used = ram_before_mib - ram_sampler.extreme_value
+        if used > 0:
+            new_rss = max(used / max_concurrent, 256.0)
+    return hits, misses, failures, new_rss
+
+
 # ── Phase 2: CPU-parallel model-stage run ───────────────────────────────────
 
 def _run_stage_worker(group_id, assets, assets_key, stage, model_path, interval, backtest_period,
@@ -824,10 +1053,21 @@ def main():
             nonlocal per_worker_vram_mib, per_worker_rss_mib, phase1_calls
             phase1_calls += 1
             _apply_control(f"~{phase1_calls}")
+            if current_gpu_workers == "auto":
+                # Under --pipeline, phase 1 runs concurrently with phase 2's
+                # --workers pool, so max_concurrent's RAM term must treat
+                # those workers as already-committed RAM (mirrors the old
+                # _resolve_gw()'s cpu_workers_running handling).
+                hits, misses, p1_failures, per_worker_rss_mib = _phase1_auto_for_chunk(
+                    chunk_, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES, cache_dir, cache_max_bytes,
+                    args.gpu_workers_max, per_worker_rss_mib, physical, cpu_workers_running=current_workers,
+                    chunk_label=f"~{phase1_calls}", n_chunks=len(chunks),
+                )
+                return hits, misses, p1_failures
             gw, gw_log = _resolve_gw()
             print(f"  [prewarm] groups={len(chunk_)} {gw_log}")
             result, per_worker_vram_mib, per_worker_rss_mib = _phase1_with_vram_calibration(
-                gw, per_worker_vram_mib, per_worker_rss_mib, current_gpu_workers == "auto",
+                gw, per_worker_vram_mib, per_worker_rss_mib, False,
                 lambda pids: run_phase1(chunk_, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
                                          cache_dir, cache_max_bytes, gw, force_pool=True, pids_out=pids),
             )
@@ -889,17 +1129,21 @@ def main():
             chunk, remaining = remaining[:current_chunk_size], remaining[current_chunk_size:]
             est_total = ci + math.ceil(len(remaining) / current_chunk_size) if remaining else ci
 
-            gw, gw_log = _resolve_gw()
             gpu_auto = current_gpu_workers == "auto"
-            if gpu_auto:
-                print(f"[chunk {ci}/{est_total}] {gw_log}")
-
             t0 = time.time()
-            (hits, misses, p1_failures), per_worker_vram_mib, per_worker_rss_mib = _phase1_with_vram_calibration(
-                gw, per_worker_vram_mib, per_worker_rss_mib, gpu_auto,
-                lambda pids: run_phase1(chunk, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
-                                         cache_dir, cache_max_bytes, gw, pids_out=pids),
-            )
+            if gpu_auto:
+                hits, misses, p1_failures, per_worker_rss_mib = _phase1_auto_for_chunk(
+                    chunk, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES, cache_dir, cache_max_bytes,
+                    args.gpu_workers_max, per_worker_rss_mib, physical, cpu_workers_running=0,
+                    chunk_label=ci, n_chunks=est_total,
+                )
+            else:
+                gw, gw_log = _resolve_gw()
+                (hits, misses, p1_failures), per_worker_vram_mib, per_worker_rss_mib = _phase1_with_vram_calibration(
+                    gw, per_worker_vram_mib, per_worker_rss_mib, False,
+                    lambda pids: run_phase1(chunk, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
+                                             cache_dir, cache_max_bytes, gw, pids_out=pids),
+                )
             t1 = time.time()
             # A prewarm failure for a SOME groups doesn't block phase 2 -- those
             # groups' stage subprocesses just fall back to loading the model

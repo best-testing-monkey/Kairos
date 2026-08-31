@@ -567,3 +567,182 @@ def test_warn_if_over_physical_skips_auto(capsys):
     """gpu_workers='auto' varies per chunk -- can't sum it, so no warning."""
     rmp._warn_if_over_physical(100, "auto", physical=8, context="test:")
     assert capsys.readouterr().out == ""
+
+
+# ============================================================================
+# estimate_group_vram_mib: per-group VRAM estimate table
+# ============================================================================
+
+_BASE = "NeoQuasar/Kronos-base"
+_SMALL = "NeoQuasar/Kronos-small"
+_MINI = "NeoQuasar/Kronos-mini"
+
+
+def test_estimate_group_vram_known_models_at_measured_points():
+    assert rmp.estimate_group_vram_mib(_BASE, 1) == 1348.0
+    assert rmp.estimate_group_vram_mib(_BASE, 4) == 5124.0
+    assert rmp.estimate_group_vram_mib(_SMALL, 1) == 682.0
+    assert rmp.estimate_group_vram_mib(_SMALL, 4) == 3164.0
+    assert rmp.estimate_group_vram_mib(_MINI, 1) == 562.0
+    assert rmp.estimate_group_vram_mib(_MINI, 4) == 2818.0
+
+
+def test_estimate_group_vram_interpolates_n2_n3():
+    # base: slope = (5124-1348)/3 = 1258.667/asset
+    v2 = rmp.estimate_group_vram_mib(_BASE, 2)
+    v3 = rmp.estimate_group_vram_mib(_BASE, 3)
+    assert v2 == pytest.approx(1348.0 + 1258.6666666666667)
+    assert v3 == pytest.approx(1348.0 + 2 * 1258.6666666666667)
+    assert 1348.0 < v2 < v3 < 5124.0
+
+
+def test_estimate_group_vram_extrapolates_beyond_n4():
+    v4 = rmp.estimate_group_vram_mib(_BASE, 4)
+    v8 = rmp.estimate_group_vram_mib(_BASE, 8)
+    assert v8 > v4
+
+
+def test_estimate_group_vram_unknown_model_falls_back_to_base():
+    unknown = "/local/finetuned/checkpoint-dir"
+    assert rmp.estimate_group_vram_mib(unknown, 1) == rmp.estimate_group_vram_mib(_BASE, 1)
+    assert rmp.estimate_group_vram_mib(unknown, 4) == rmp.estimate_group_vram_mib(_BASE, 4)
+
+
+def test_estimate_group_vram_none_model_falls_back_to_base():
+    assert rmp.estimate_group_vram_mib(None, 1) == rmp.estimate_group_vram_mib(_BASE, 1)
+
+
+def test_estimate_group_vram_never_below_n1_value():
+    v1 = rmp.estimate_group_vram_mib(_BASE, 1)
+    assert rmp.estimate_group_vram_mib(_BASE, 0) >= v1
+    assert rmp.estimate_group_vram_mib(_BASE, -5) >= v1
+
+
+# ============================================================================
+# calibrate_vram_table: upward-only refinement of the n=1/n=4 anchors
+# ============================================================================
+
+@pytest.fixture(autouse=True)
+def _restore_vram_table():
+    """calibrate_vram_table() mutates module-level state -- isolate tests."""
+    import copy
+    saved = copy.deepcopy(rmp._VRAM_TABLE_MIB)
+    yield
+    rmp._VRAM_TABLE_MIB.clear()
+    rmp._VRAM_TABLE_MIB.update(saved)
+
+
+def test_calibrate_vram_table_raises_known_anchor():
+    rmp.calibrate_vram_table(_BASE, 1, 2000.0)
+    assert rmp._VRAM_TABLE_MIB[_BASE][1] == 2000.0
+
+
+def test_calibrate_vram_table_never_lowers():
+    rmp.calibrate_vram_table(_BASE, 1, 500.0)  # below the measured 1348.0
+    assert rmp._VRAM_TABLE_MIB[_BASE][1] == 1348.0
+
+
+def test_calibrate_vram_table_ignores_non_anchor_n():
+    rmp.calibrate_vram_table(_BASE, 2, 9999.0)
+    assert 2 not in rmp._VRAM_TABLE_MIB[_BASE]
+
+
+def test_calibrate_vram_table_creates_row_for_unknown_model():
+    rmp.calibrate_vram_table("/local/checkpoint", 4, 6000.0)
+    assert rmp._VRAM_TABLE_MIB["/local/checkpoint"][4] == 6000.0
+    # base's own row is untouched
+    assert rmp._VRAM_TABLE_MIB[_BASE][4] == 5124.0
+
+
+# ============================================================================
+# pack_waves: first-fit-decreasing bin packing
+# ============================================================================
+
+def _g(group_id, n_assets):
+    assets = [f"A{group_id}_{i}" for i in range(n_assets)]
+    return (group_id, assets, ",".join(assets), 1.0)
+
+
+def test_pack_waves_largest_first_ordering():
+    groups = [_g(1, 1), _g(2, 4), _g(3, 1)]
+    # base budget big enough for the 4-asset group (5124) plus headroom, but
+    # not both a 4-asset and a 1-asset group together.
+    waves = rmp.pack_waves(groups, _BASE, budget_mib=5200, max_concurrent=8)
+    assert waves[0][0][0] == 2  # the 4-asset group placed first (largest)
+
+
+def test_pack_waves_never_exceeds_budget():
+    groups = [_g(i, n) for i, n in enumerate([1, 1, 1, 4, 4, 1, 4])]
+    budget = 5300.0
+    waves = rmp.pack_waves(groups, _BASE, budget_mib=budget, max_concurrent=8)
+    for wave in waves:
+        total = sum(rmp.estimate_group_vram_mib(_BASE, len(g[1])) for g in wave)
+        assert total <= budget + 1e-6
+
+
+def test_pack_waves_respects_max_concurrent():
+    groups = [_g(i, 1) for i in range(10)]  # tiny groups, VRAM never binds
+    waves = rmp.pack_waves(groups, _BASE, budget_mib=1_000_000, max_concurrent=3)
+    for wave in waves:
+        assert len(wave) <= 3
+
+
+def test_pack_waves_oversized_single_group_gets_own_wave(capsys):
+    groups = [_g(1, 4)]  # 5124 MiB, budget too small
+    waves = rmp.pack_waves(groups, _BASE, budget_mib=1000.0, max_concurrent=8)
+    assert waves == [[groups[0]]]
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_pack_waves_union_equals_input_no_duplicates_no_losses():
+    groups = [_g(i, n) for i, n in enumerate([1, 4, 1, 1, 4, 1, 4, 1])]
+    waves = rmp.pack_waves(groups, _BASE, budget_mib=5300.0, max_concurrent=4)
+    flattened = [g for wave in waves for g in wave]
+    assert sorted(g[0] for g in flattened) == sorted(g[0] for g in groups)
+    assert len(flattened) == len(groups)
+
+
+def test_pack_waves_bimodal_mix_on_5296_budget():
+    """10x 1-asset + 10x 4-asset base groups on a 5296 MiB budget (5808 MiB
+    card - 512 MiB headroom). 4-asset groups (5124 MiB) can't share a wave
+    with anything else at that budget -> 10 waves of size 1. 1-asset groups
+    (1348 MiB) pack 3-per-wave (3*1348=4044 <= 5296, 4*1348=5392 > 5296) ->
+    4 waves (3,3,3,1). Total: 14 waves for 20 groups -- vs. a single fixed
+    scalar sized for the worst case (5124 MiB/worker) giving exactly 1
+    worker at a time, 20 waves."""
+    groups = [_g(i, 4) for i in range(10)] + [_g(10 + i, 1) for i in range(10)]
+    waves = rmp.pack_waves(groups, _BASE, budget_mib=5296.0, max_concurrent=8)
+    sizes = sorted(len(w) for w in waves)
+    assert sizes == [1] * 10 + [1, 3, 3, 3]
+    assert len(waves) == 14
+    flattened = [g for wave in waves for g in wave]
+    assert sorted(g[0] for g in flattened) == sorted(g[0] for g in groups)
+
+
+# ============================================================================
+# decide_max_concurrent: RAM/physical-core ceiling reused from
+# decide_gpu_workers' RAM term (_ram_allows), not a second RAM reader.
+# ============================================================================
+
+def test_decide_max_concurrent_ram_bound():
+    n = rmp.decide_max_concurrent(avail_ram_mib=5000, per_worker_rss_mib=1100, physical_cores=100)
+    assert n == 3  # floor((5000-1024)/1100) = 3, matches decide_gpu_workers' RAM term
+
+
+def test_decide_max_concurrent_physical_cores_bound():
+    n = rmp.decide_max_concurrent(avail_ram_mib=1_000_000, per_worker_rss_mib=100, physical_cores=4)
+    assert n == 4
+
+
+def test_decide_max_concurrent_never_below_one():
+    n = rmp.decide_max_concurrent(avail_ram_mib=100, per_worker_rss_mib=1100, physical_cores=8)
+    assert n == 1
+
+
+def test_decide_max_concurrent_matches_decide_gpu_workers_ram_term():
+    """Same RAM inputs must produce the same RAM-derived count as
+    decide_gpu_workers when VRAM/max_workers aren't binding in either."""
+    gw = rmp.decide_gpu_workers(free_vram_mib=1_000_000, avail_ram_mib=6000,
+                                 per_worker_vram_mib=1, per_worker_rss_mib=1100, max_workers=1000)
+    mc = rmp.decide_max_concurrent(avail_ram_mib=6000, per_worker_rss_mib=1100, physical_cores=1000)
+    assert gw == mc
