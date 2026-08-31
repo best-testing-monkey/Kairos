@@ -1014,8 +1014,10 @@ def main():
     if args.limit is not None:
         prioritized = prioritized[: args.limit]
 
-    print(f"Unprocessed groups: {len(prioritized)} (of {len(groups)} total deduped, "
-          f"correlation run_id={correlation_run_id}). Stage={args.stage!r} model_path={model_path!r}. "
+    _src = (f"from {args.assets_file}" if args.assets_file
+            else f"correlation run_id={correlation_run_id}")
+    print(f"Unprocessed groups: {len(prioritized)} (of {len(groups)} total, "
+          f"{_src}). Stage={args.stage!r} model_path={model_path!r}. "
           f"Budget: {args.max_hours}h. Chunk size: {args.chunk_size}. Cache dir: {cache_dir}. "
           f"Control file: {args.control_file}")
 
