@@ -949,6 +949,11 @@ def _parse_args():
                     help="Only run groups that already have a model_results row for this stage.")
     p.add_argument("--require-since", default=None, metavar="YYYY-MM-DD",
                     help="With --require-stage, require that row written on/after this runs.timestamp date.")
+    p.add_argument("--assets-file", default=None, metavar="FILE",
+                    help="Explicit group list (one comma-joined asset set per line, '#' comments "
+                         "allowed), bypassing select_deduped_groups' priority ordering. Use it to "
+                         "pin an identical group set across stages -- the eligible pool differs per "
+                         "stage, so priority selection would give each model different groups.")
     p.add_argument("--workers", type=int, default=8, help="Phase-2 CPU worker processes (default: 8).")
     p.add_argument("--gpu-workers", type=_gpu_workers_arg, default=1,
                     help="Phase-1 GPU worker processes (default: 1 -- fully serial). Pass 'auto' to "
@@ -988,8 +993,20 @@ def main():
                       KAIROS_PRED_CACHE_MAX_BYTES=os.environ["KAIROS_PRED_CACHE_MAX_BYTES"])
 
     conn = kp.get_connection(kp.DB_PATH)
-    correlation_run_id = latest_correlation_run_id(conn, INTERVAL)
-    groups = kp.select_deduped_groups(conn, correlation_run_id)
+    if args.assets_file:
+        # Explicit group list, one comma-joined asset set per line, bypassing
+        # select_deduped_groups' priority ordering. Mirrors the same option on
+        # scripts/run_oracle_dedup.py. Needed to pin an IDENTICAL group set
+        # across several stages: the eligible pool differs per stage (a group
+        # is eligible if it lacks a row for THAT stage), so priority selection
+        # would hand each model a different 20 and quietly ruin a comparison.
+        with open(args.assets_file) as fh:
+            lines = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+        groups = [(-1, ln.split(",")) for ln in lines]
+        print(f"Group list: {len(groups)} from {args.assets_file} (priority ordering bypassed)")
+    else:
+        correlation_run_id = latest_correlation_run_id(conn, INTERVAL)
+        groups = kp.select_deduped_groups(conn, correlation_run_id)
     prioritized = select_prioritized_groups(
         conn, groups, args.stage, model_path, args.require_stage, args.require_since,
     )
