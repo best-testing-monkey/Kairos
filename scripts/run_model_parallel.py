@@ -175,17 +175,19 @@ def decide_gpu_workers(free_vram_mib, avail_ram_mib, per_worker_vram_mib,
 
 
 def _probe_free_vram_mib():
-    """Free VRAM in MiB via torch.cuda.mem_get_info() if torch+CUDA are
-    available, else `nvidia-smi --query-gpu=memory.free`. Returns None (not
-    0) when neither works -- no GPU on this box, CPU-only CI, etc -- so
-    callers can tell "no GPU" apart from "GPU reports 0 MiB free"."""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            free_b, _total_b = torch.cuda.mem_get_info()
-            return free_b / (1024 ** 2)
-    except Exception:
-        pass
+    """Free VRAM in MiB, via `nvidia-smi` ONLY. Returns None (not 0) when that
+    fails -- no GPU on this box, CPU-only CI, etc -- so callers can tell
+    "no GPU" apart from "GPU reports 0 MiB free".
+
+    DO NOT probe with torch.cuda.mem_get_info() here, however tempting: it
+    initialises a CUDA context *in this parent process*, and the phase-1
+    prewarm pool is a fork-based ProcessPoolExecutor. A forked child of a
+    CUDA-initialised parent dies with "Cannot re-initialize CUDA in forked
+    subprocess", which is exactly what happened on 2026-08-31: every prewarm
+    worker failed, the cache stayed empty, and phase 2 silently fell back to
+    loading one model per worker until the GPU OOM'd (25 groups lost).
+    Shelling out keeps this process CUDA-free so fork stays safe.
+    """
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
@@ -360,6 +362,35 @@ def _prewarm_worker(group_id, assets_key, assets, model_path, interval, backtest
         return (group_id, assets_key, "done", hits, misses, None)
     except Exception as exc:
         return (group_id, assets_key, "fail", 0, 0, str(exc))
+
+
+class PrewarmWhollyFailed(RuntimeError):
+    """Every group in a chunk failed to prewarm -- the split is not working."""
+
+
+def _abort_if_prewarm_wholly_failed(chunk, hits, misses, failures):
+    """Stop the run when a chunk prewarmed NOTHING.
+
+    Phase 2 is designed to survive a per-group prewarm miss by loading the
+    model itself, which is the right call for one bad group. But when the
+    prewarm fails for the WHOLE chunk, that fallback stops being a safety net
+    and becomes a hazard: every phase-2 worker loads its own model
+    simultaneously, and N concurrent models OOM the GPU. That is not
+    hypothetical -- on 2026-08-31 a CUDA-in-forked-parent bug failed 100% of
+    prewarms, and the run ground on for three chunks losing 25 groups to
+    CUDA OOM instead of stopping at the first sign.
+
+    Failing loudly here costs one chunk. Absorbing it cost 25 groups and an
+    hour of GPU time.
+    """
+    if failures and hits == 0 and misses == 0 and len(failures) >= len(chunk):
+        raise PrewarmWhollyFailed(
+            f"prewarm failed for all {len(chunk)} groups in this chunk and cached "
+            f"nothing (hits=0, misses=0). Phase 2 would fall back to one model "
+            f"load per worker and OOM the GPU, so stopping instead.\n"
+            f"First error: {failures[0][1]}\n"
+            f"Groups already completed are committed; re-run to resume."
+        )
 
 
 def run_phase1(chunk, model_path, interval, backtest_period, pred_samples,
@@ -622,6 +653,8 @@ def main():
                 for ak, err in p2_failures:
                     print(f"  [stage FAIL] {ak}: {err}")
 
+                _abort_if_prewarm_wholly_failed(chunk, hits, misses, p1_failures)
+
                 fb_note = " prefetch_fallback=1" if fell_back else ""
                 print(f"[chunk {ci}/{len(chunks)}] groups={len(chunk)} prewarm_hits={hits} "
                       f"prewarm_misses={misses} phase1_wait_s={phase1_wait_s:.1f} "
@@ -658,8 +691,13 @@ def main():
                                     cache_dir, cache_max_bytes, gw),
             )
             t1 = time.time()
-            # A prewarm failure for a group doesn't block phase 2 -- that group's
-            # stage subprocess just falls back to loading the model itself.
+            # A prewarm failure for a SOME groups doesn't block phase 2 -- those
+            # groups' stage subprocesses just fall back to loading the model
+            # themselves. A prewarm failure for ALL of them is a different animal
+            # and must not be absorbed the same way: see the guard's docstring.
+            for ak, err in p1_failures:
+                print(f"  [prewarm FAIL] {ak}: {err}")
+            _abort_if_prewarm_wholly_failed(chunk, hits, misses, p1_failures)
             done, stage_failed, p2_failures = run_phase2(
                 chunk, args.stage, model_path, INTERVAL, BACKTEST_PERIOD, PRED_SAMPLES,
                 extra_env, args.workers,
@@ -670,8 +708,6 @@ def main():
             stage_failed_total += stage_failed
             prewarm_failed_total += len(p1_failures)
 
-            for ak, err in p1_failures:
-                print(f"  [prewarm FAIL] {ak}: {err}")
             for ak, err in p2_failures:
                 print(f"  [stage FAIL] {ak}: {err}")
 
