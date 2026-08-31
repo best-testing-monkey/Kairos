@@ -62,7 +62,8 @@ def load_stage(conn, stage):
         f"SELECT m.assets, m.strategy_name, m.sharpe, m.signal_count, m.win_rate "
         f"FROM {table} m JOIN runs r ON r.run_id = m.run_id "
         f"WHERE m.{pred} AND m.interval=? AND m.backtest_period=? "
-        f"  AND r.timestamp >= ?",
+        f"  AND r.timestamp >= ? "
+        f"ORDER BY m.run_id",
         (INTERVAL, BACKTEST_PERIOD, EXIT_RULE_CUTOFF),
     ).fetchall()
     out: dict[str, dict[str, tuple]] = {}
@@ -71,7 +72,11 @@ def load_stage(conn, stage):
             continue
         if sharpe is None:
             continue
-        # Latest run wins if a group was swept more than once.
+        # Latest run wins if a group was swept more than once. The ORDER BY
+        # is load-bearing, not cosmetic: 6 mini groups were swept twice on
+        # 2026-08-31 (orphaned pool workers from a killed sweep kept running
+        # alongside its replacement), and without ordering the overwrite
+        # picked a row at the DB's whim, making the comparison unreproducible.
         out.setdefault(assets, {})[strat] = (sharpe, n or 0, win)
     return out
 
@@ -102,7 +107,8 @@ def load_stage_by_class(conn, stage):
         "SELECT c.assets, c.asset_class, c.strategy_name, c.sharpe, c.signal_count "
         "FROM strategy_class_stats c JOIN runs r ON r.run_id = c.run_id "
         "WHERE c.stage=? AND c.interval=? AND c.backtest_period=? "
-        "  AND r.timestamp >= ?",
+        "  AND r.timestamp >= ? "
+        "ORDER BY c.run_id",
         (stage, INTERVAL, BACKTEST_PERIOD, EXIT_RULE_CUTOFF),
     ).fetchall()
     out: dict[tuple, dict] = {}
