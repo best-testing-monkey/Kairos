@@ -333,6 +333,51 @@ class TestPrepareModelSwitch:
         kairos_strategies._prepare_model_switch(model_path="repo/b")
         # No exception raised -> confirmed no heavy loading occurred.
 
+    def test_model_path_none_resolves_to_exact_base_pairing(self):
+        # Regression pin (kairos/models.py registry wiring): model_path=None
+        # must still resolve to exactly this pair, or every existing
+        # kairos_predcache/signals_cache key and DB row for stage='base'
+        # would silently diverge from what a fresh run produces.
+        requested = kairos_strategies._prepare_model_switch(model_path=None)
+        assert requested == ("NeoQuasar/Kronos-Tokenizer-base", "NeoQuasar/Kronos-base")
+
+    def test_is_batch_cached_resolves_same_model_id_as_prepare_model_switch(self, monkeypatch, tmp_path):
+        # Cache-key identity: is_batch_cached()'s mdl_src must match
+        # _prepare_model_switch()'s mdl_src for the same model_path, or a
+        # real prewarm-vs-predict pair would silently miss each other
+        # (kairos_predcache.make_key() folds model_id straight into the key).
+        import kairos_predcache
+
+        monkeypatch.setenv("KAIROS_PRED_CACHE_DIR", str(tmp_path))
+        kairos_predcache._singleton = None
+        kairos_predcache._singleton_dir = None
+
+        captured = {}
+        real_shared_cache_key = kairos_strategies._shared_cache_key
+
+        def _capturing_shared_cache_key(symbol, df, mdl_src, pred_len):
+            captured["mdl_src"] = mdl_src
+            return real_shared_cache_key(symbol, df, mdl_src, pred_len)
+
+        monkeypatch.setattr(kairos_strategies, "_shared_cache_key", _capturing_shared_cache_key)
+
+        df = pd.DataFrame(
+            {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]},
+            index=pd.date_range("2024-01-01", periods=1),
+        )
+
+        for model_path in (None, "small", "NeoQuasar/Kronos-base"):
+            _tok_src, mdl_src_switch = kairos_strategies._prepare_model_switch(model_path=model_path)
+
+            captured.clear()
+            kairos_strategies.is_batch_cached({"BTC-USD": df}, model_path=model_path)
+
+            assert captured["mdl_src"] == mdl_src_switch
+
+        monkeypatch.delenv("KAIROS_PRED_CACHE_DIR", raising=False)
+        kairos_predcache._singleton = None
+        kairos_predcache._singleton_dir = None
+
 
 # ============================================================================
 # _materialize_model — no-op when weights already loaded for requested_src

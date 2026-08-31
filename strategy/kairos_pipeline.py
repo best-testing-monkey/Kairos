@@ -1607,7 +1607,8 @@ def run_stage_model(conn, stage, assets, interval="1d", backtest_period="6m",
     subprocess so --stage auto's per-run prediction cache is shared across
     the group subprocesses it spawns.
     """
-    assert stage in ("base", "finetuned")
+    from kairos.models import MODELS as _REGISTRY_MODELS
+    assert stage in ("base", "finetuned", *_REGISTRY_MODELS)
     run_id = start_run(conn, stage, interval, {
         "assets": assets, "backtest_period": backtest_period,
         "pred_samples": pred_samples, "model_path": model_path,

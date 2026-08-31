@@ -1,39 +1,7 @@
-"""Model registry: maps model short-names to HuggingFace IDs and config."""
-
-MODELS: dict[str, dict] = {
-    "kronos-mini": {
-        "model_id": "NeoQuasar/Kronos-mini",
-        "tokenizer_id": "NeoQuasar/Kronos-Tokenizer-2k",
-        "max_context": 2048,
-    },
-    "kronos-small": {
-        "model_id": "NeoQuasar/Kronos-small",
-        "tokenizer_id": "NeoQuasar/Kronos-Tokenizer-base",
-        "max_context": 512,
-    },
-    "kronos-base": {
-        "model_id": "NeoQuasar/Kronos-base",
-        "tokenizer_id": "NeoQuasar/Kronos-Tokenizer-base",
-        "max_context": 512,
-    },
-}
-
-
-def resolve(name: str) -> dict:
-    """Return the model config for *name*, or raise ValueError."""
-    if name in MODELS:
-        return MODELS[name]
-    # Allow a HF repo ID to be passed directly (owner/repo form)
-    if "/" in name:
-        return {
-            "model_id": name,
-            "tokenizer_id": "NeoQuasar/Kronos-Tokenizer-base",
-            "max_context": 512,
-        }
-    raise ValueError(
-        f"Unknown model {name!r}. Known names: {', '.join(MODELS)}. "
-        "You can also pass a HuggingFace repo ID directly (e.g. owner/repo)."
-    )
+"""Model registry re-export -- moved to kairos/models.py so it can be shared
+by strategy/kairos_strategies.py without importing anything under cli/.
+"""
+from kairos.models import MODELS, resolve  # noqa: F401
 
 
 def load_predictor(model_name: str, device: str = "cpu"):

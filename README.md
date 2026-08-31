@@ -169,8 +169,8 @@ data.  Two strategies are supported:
 
 | Model | Params | d_model | n_layers | n_heads | ff_dim |
 |-------|--------|---------|----------|---------|--------|
-| Kronos-mini  |   4.1M |  ~128  |   6  |  8  |  512  |
-| Kronos-small |  24.7M |  ~384  |  12  | 12  | 1024  |
+| Kronos-mini  |   4.1M |   256  |   4  |  4  |  512  |
+| Kronos-small |  24.7M |   512  |   8  |  8  | 1024  |
 | Kronos-base  | 102.3M |   832  |  12  | 16  | 2048  |
 | **Kronos-large** | **~499M** | **1536** | **22** | **24** | **4096** |
 

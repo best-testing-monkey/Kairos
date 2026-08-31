@@ -7,6 +7,7 @@ from pandas import DataFrame
 
 from kairos.adapter import to_kronos_frame
 from kairos.calendars import future_timestamps
+from kairos.models import resolve as _resolve_model
 import kairos_predcache
 
 sys.path.insert(0, '.')
@@ -277,8 +278,9 @@ def _prepare_model_switch(model_path=None, tokenizer_path=None):
     """
     global _loaded_model_src
 
-    tok_src = tokenizer_path or "NeoQuasar/Kronos-Tokenizer-base"
-    mdl_src = model_path or "NeoQuasar/Kronos-base"
+    cfg = _resolve_model(model_path or "base")
+    mdl_src = cfg["model_id"]
+    tok_src = tokenizer_path or cfg["tokenizer_id"]
     requested_src = (tok_src, mdl_src)
 
     if _model_switch_needed(requested_src, _loaded_model_src):
@@ -348,7 +350,8 @@ def _materialize_model(requested_src):
         )
         print(f"  → CPU mode: INT8 dynamic quantisation, {torch.get_num_threads()} threads")
 
-    bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=512)
+    max_context = _resolve_model(mdl_src)["max_context"]
+    bt_predictor = KronosPredictor(bt_model, bt_tokenizer, max_context=max_context)
     _weights_loaded_src = requested_src
 
 
@@ -473,7 +476,7 @@ def is_batch_cached(assets: dict, model_path=None, pred_len=1) -> bool:
     if shared_cache is None:
         return False
 
-    mdl_src = model_path or "NeoQuasar/Kronos-base"
+    mdl_src = _resolve_model(model_path or "base")["model_id"]
     for symbol, df in assets.items():
         key = _shared_cache_key(symbol, df, mdl_src, pred_len)
         if not shared_cache.has(key):
@@ -772,8 +775,10 @@ def predict_kairos_cloud(signal: Optional[pd.DataFrame]= None, **kwargs) -> List
 
     pred_historic = kwargs.get('pred_historic', 0)
     pred_num = kwargs.get('pred_num', 1)
-    model_path = kwargs.get("model") or KairosSettings.model or "NeoQuasar/Kronos-base"
-    tokenizer_path = kwargs.get("tokenizer") or KairosSettings.tokenizer or "NeoQuasar/Kronos-Tokenizer-base"
+    _tokenizer_override = kwargs.get("tokenizer") or KairosSettings.tokenizer
+    _cfg = _resolve_model((kwargs.get("model") or KairosSettings.model) or "base")
+    model_path = _cfg["model_id"]
+    tokenizer_path = _tokenizer_override or _cfg["tokenizer_id"]
     symbol = kwargs.get("symbol") or KairosSettings.symbol
     lookback = KairosSettings.lookback
     pred_samples = KairosSettings.pred_samples
