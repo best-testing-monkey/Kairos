@@ -93,7 +93,16 @@ _PREWARM_GC_INTERVAL = 500  # mirrors kairos_papertrade.py's _PREWARM_GC_INTERVA
 # refines them chunk-to-chunk from what was actually observed.
 VRAM_HEADROOM_MIB = 512
 RAM_HEADROOM_MIB = 1024
-DEFAULT_PER_WORKER_VRAM_MIB = 2200.0  # Kronos-small ~2.2GB/4-asset group; base ~3.6GB -- conservative seed
+# Seeded at the HEAVIEST model's footprint (Kronos-base, ~3.6GB on a 4-asset
+# group), not an average. The seed's only job is to keep chunk 1 safe before
+# calibration has any data, and the asymmetry matters: seeding too high costs a
+# smaller model one under-parallelised chunk, while seeding too low OOMs the
+# GPU on chunk 1 -- and an OOM here can deadlock the pool rather than fail
+# cleanly (2026-08-31). _phase1_with_vram_calibration() corrects this both
+# directions from chunk 2, so mini/small quickly get their real (much smaller)
+# figure. Was 2200, which would have picked 2 workers for base = ~7.2GB on a
+# 5.8GB card.
+DEFAULT_PER_WORKER_VRAM_MIB = 3600.0
 DEFAULT_PER_WORKER_RSS_MIB = 1100.0
 
 # ponytail: pin each subprocess to 1 BLAS thread so N workers ~= N busy cores
