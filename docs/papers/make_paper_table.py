@@ -59,8 +59,48 @@ def agg(rows):
 S = {s: agg(rows) for s, rows in R.items()}
 common = sorted(set.intersection(*(set(v) for v in S.values())), key=lambda k: -S["base"][k]["sh"])
 
+# ---------------------------------------------------------------------------
+# The naive regime was rebuilt on 2026-09-01 (CLAUDE.md, "Naive baseline"): it
+# forecasts the withheld last bar instead of reusing the oracle's decision. The
+# paper carries a "superseded" note about it, and that note needs measured
+# numbers rather than adjectives. Computed against the pre-rebuild backup while
+# it still exists; if the backup has been deleted, the previously recorded block
+# is preserved rather than dropped, so re-running this never silently strips the
+# figures out of the paper.
+BACKUP = "/media/baz/MonkeyWorks/PycharmProjects/Kairos/data/pipeline_results.db.bak-20260901-prenaive-nopeek"
+
+
+def naive_revision():
+    import os, statistics as stx
+    if not os.path.exists(BACKUP):
+        try:
+            return json.loads((HERE / "paper_table.json").read_text()).get("naive_revision")
+        except Exception:
+            return None
+    ob = sqlite3.connect(BACKUP)
+    cell = lambda cur: {(r[0], r[1]): r[2] for r in cur}
+    q = """SELECT assets, strategy_name, sharpe FROM oracle_results
+           WHERE stage='naive' AND interval='1d' AND backtest_period='6m'"""
+    old_c, new_c = cell(ob.execute(q)), cell(conn.execute(q))
+    ob.close()
+    keys = [k for k in new_c if k in old_c]
+    if not keys:
+        return None
+    deltas = [new_c[k] - old_c[k] for k in keys]
+    return {
+        "cells": len(keys),
+        "identical": sum(1 for d in deltas if d == 0.0),
+        "pct_identical": round(100.0 * sum(1 for d in deltas if d == 0.0) / len(keys), 1),
+        "mean_delta": round(stx.mean(deltas), 4),
+        "median_delta": round(stx.median(deltas), 4),
+        "old_median": round(stx.median([old_c[k] for k in keys]), 3),
+        "new_median": round(stx.median([new_c[k] for k in keys]), 3),
+    }
+
+
 data = {
     "matched_groups": len(matched),
+    "naive_revision": naive_revision(),
     "rows": [{"name": k,
               "n": {s: S[s][k]["n"] for s in S},
               "sh": {s: round(S[s][k]["sh"], 3) for s in S},

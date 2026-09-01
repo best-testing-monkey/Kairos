@@ -43,6 +43,25 @@ def _box(stage):
 BOX = {s: _box(s) for s in STAGES}
 NSTRAT = len(rows)
 NGROUPS = data["matched_groups"]
+
+# Measured old-vs-new comparison for the rebuilt naive regime (see the
+# "superseded" entry in the limitations). None if the pre-rebuild backup has
+# been deleted and no figures were ever recorded, in which case the entry is
+# simply omitted rather than rendered with adjectives in place of numbers.
+NR = data.get("naive_revision")
+NAIVE_REVISION_LI = "" if not NR else f'''
+    <li><strong>Superseded: the naive regime no longer reads the next bar.</strong> Through the previous
+    edition the naive regime reused the oracle&rsquo;s decision and corrected only the accounting, so its
+    decision step read a bar that had not happened when the decision was made. The advantage this conferred
+    was nil, and provably so: entry re-anchored to the close of the foreseen bar, which spends the move
+    before the fill. Old-regime-at-date-<i>d</i> is input-for-input identical to new-regime-at-date-<i>d</i>+1.
+    Re-sweeping and comparing cell by cell bears that out &mdash; of {NR["cells"]:,} matched (group, strategy)
+    cells, <strong>{NR["identical"]:,} ({NR["pct_identical"]:.1f}%)</strong> are unchanged to the last decimal,
+    the median change is {NR["median_delta"]:+.3f} and the mean {NR["mean_delta"]:+.3f}; the pooled median
+    moves from {NR["old_median"]:+.3f} to {NR["new_median"]:+.3f}. The regime is now constructed by
+    withholding (&sect;2), so it is free of lookahead by construction rather than by cancellation. Naive
+    figures here therefore differ slightly from the previous edition, and the conclusions drawn from them do
+    not.</li>'''
 AX_LO, AX_HI = -6.0, 12.0
 def pct(v):
     return max(0.0, min(100.0, (v - AX_LO) / (AX_HI - AX_LO) * 100.0))
@@ -684,6 +703,7 @@ footer {{
     Every three-regime figure in this note should be read as provisional and expected to move as coverage
     grows. The two-regime figures in &sect;4.4 are not affected &mdash; oracle and naive are complete. This is
     a transient state, not a design choice, and it is the single largest caveat in this edition.</li>
+{NAIVE_REVISION_LI}
     <li><strong>Superseded: the exit rule is now identical across regimes.</strong> Earlier editions carried
     this as the study&rsquo;s largest caveat &mdash; oracle and base were scored by an evaluator that checked
     stop and target one bar ahead and then closed at that bar&rsquo;s close, while naive walked forward to a
