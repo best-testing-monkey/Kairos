@@ -595,23 +595,36 @@ commands, e.g. `export UV_CACHE_DIR=/tmp/uv-cache-kairos` before
   stage runs; it also drives the production `disabled_strategies` gate via
   `refresh_disabled_strategies()`.
 - **Naive baseline** (`--naive-baseline`, implies `--no-prediction`,
-  `config.naive_baseline=True`): keeps oracle's real decision (direction +
-  relative stop/target %, from its genuine future-peeking distribution)
-  completely unchanged — the *decision* is not recomputed. What changes is
-  the accounting: entry is re-anchored to the real bar oracle peeked at (by
-  the time this trade could exist, that bar has closed for real — it's no
-  longer a peek), stop/target recomputed from the same relative offsets
-  against that new entry, and the trade resolved only against genuinely
-  later bars, walking forward until a real stop/target trigger — or
-  excluding the signal if data runs out first, never force-closing it at an
-  arbitrary point. Implemented in
-  `KairosOrchestrator._compute_shadow_performance_naive()`, mirroring the
-  exact terminal-exit-reason contract `kairos_signal_replay.py` already
+  `config.naive_baseline=True`): a **persistence forecast**. The most recent
+  bar is withheld from the history the strategy sees, and handed back as the
+  forecast distribution — "the next bar repeats the last completed one",
+  stated with near-certainty. **Rebuilt 2026-09-01; read the note below
+  before trusting any older description of this mode, including earlier
+  versions of this file.** Nothing in the decision touches a bar that has
+  not happened. The accounting matches: entry is the withheld bar's close
+  (it has closed by the time the trade can be placed), stop/target keep the
+  same relative offsets, and only strictly later bars resolve it, walking
+  forward until a real trigger — or excluding the signal if data runs out
+  first, never force-closing at an arbitrary point.
+
+  **The withholding is load-bearing, in two separate places.** It is what
+  keeps the distribution's *centre* (close of the bar before the forecast
+  bar) distinct from its *shape* (the forecast bar), which is what stops
+  this collapsing into the zero-drift trap described below. And it must
+  apply to `context["returns_window"]`/`context["realized_vol"]` too, not
+  just `AssetPrediction.history` — those are part of "what the strategy
+  gets", and leaving them untruncated lets a strategy read the forecast bar
+  directly, making the forecast trivially self-fulfilling. That second
+  half was a real bug for a few hours on 2026-09-01, caught by a first-group
+  sanity check. Both halves live in `_make_realized_predictions` /
+  `_run_day`. A **floor**: measures how much of a strategy's edge depends on
+  prediction quality at all.
+
+  Evaluation is `KairosOrchestrator._compute_shadow_performance(naive=True)`,
+  mirroring the exact terminal-exit-reason contract `kairos_signal_replay.py`
   established for `BacktestEngine._check_exit` (open-gap-then-intrabar,
-  "close" means keep holding not force-exit) — reimplemented as a plain
-  pandas loop, no `BacktestEngine`/phantom_trader dependency. A **floor**:
-  measures how much of a strategy's edge depends on prediction quality at
-  all, with zero future peek anywhere in the decision.
+  "close" means keep holding not force-exit) — a plain pandas loop, no
+  `BacktestEngine`/phantom_trader dependency.
 
   **This mode went through a real methodology correction on 2026-08-28,
   worth knowing before touching it again.** An earlier implementation
@@ -626,8 +639,35 @@ commands, e.g. `export UV_CACHE_DIR=/tmp/uv-cache-kairos` before
   deleted outright rather than kept as a labeled-flawed artifact. The
   corrected version above (originally prototyped under the name
   "lagged oracle" mid-session, then renamed to take over the `naive`
-  identity once confirmed correct) reuses oracle's real decision instead of
+  identity once confirmed correct) reused oracle's real decision instead of
   re-deriving one from a self-referential bar, which avoids the same trap.
+
+  **That reuse-the-oracle version was itself replaced on 2026-09-01, and the
+  reason is subtle enough to be worth writing down.** It fed the
+  distribution-construction step the *next* bar — `_make_realized_predictions`
+  was shared unchanged by both modes, and its own docstring said "Always a
+  future peek ... shared unchanged by both oracle and naive modes". So the
+  decision read a bar that had not happened; only the accounting was
+  no-peek. `from_bar` takes open/high/low verbatim from the forecast bar and
+  clips sampled closes to `[low, high]`, so when the realised range does not
+  span the entry price *every* sample lands on the correct side — a total
+  directional leak, not a partial one.
+
+  **It did not, however, corrupt the published numbers, and that is the
+  interesting part.** Foreseeing a bar and then entering at that same bar's
+  *close* is worth nothing: the move is spent by fill time. Line the two up
+  and old-naive-at-date-`d` is input-for-input identical to
+  new-naive-at-date-`d+1` — the same measurement, re-indexed by one bar. A
+  38-group A/B during the re-sweep found **67.7% of (group, strategy) cells
+  byte-identical**, median Sharpe delta exactly 0.000, mean −0.107, aggregate
+  median −0.520 → −0.549. The old implementation was a persistence baseline
+  that described itself as a peek. It was replaced because being free of
+  lookahead *by cancellation* rather than *by construction* is not a property
+  worth relying on — any change to the entry convention would have silently
+  turned it into a real one — not because its results were wrong.
+
+  Do not "simplify" the new mode back toward reusing oracle's decision on the
+  grounds that the numbers barely move. They barely move by coincidence.
 
   Also surfaced while fixing this: `_compute_shadow_performance()` (oracle's
   own evaluator, and the one every `oracle_results` Sharpe/win-rate number
