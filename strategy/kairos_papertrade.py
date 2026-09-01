@@ -1841,7 +1841,8 @@ def _format_start_message(base_now, args) -> str:
     return (
         f"🟢 Kairos papertrade starting: window ending {base_now.strftime('%Y-%m-%d %H:%M')}, "
         f"interval={args.interval}, months_back={args.months_back}, top_n={args.top_n}, "
-        f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}, "
+        f"capital={args.capital}, broker={args.broker}, naive={args.naive}, "
+        f"base_only={args.base_only}, "
         f"max_leverage={args.max_leverage}, margin_utilization={args.margin_utilization}"
     )
 
@@ -1849,7 +1850,8 @@ def _format_start_sim_message(base_now, args) -> str:
     return (
         f"🟢 Kairos papertrade simulating: window ending {base_now.strftime('%Y-%m-%d %H:%M')}, "
         f"interval={args.interval}, months_back={args.months_back}, top_n={args.top_n}, "
-        f"capital={args.capital}, broker={args.broker}, base_only={args.base_only}, "
+        f"capital={args.capital}, broker={args.broker}, naive={args.naive}, "
+        f"base_only={args.base_only}, "
         f"max_leverage={args.max_leverage}, margin_utilization={args.margin_utilization}"
     )
 
@@ -2002,6 +2004,17 @@ def main(argv=None):
         now = datetime.strptime(args.effective_per, fmt)
     base_now = now if now is not None else datetime.now()
 
+    if args.naive:
+        # No model is loaded at all on this path, so there is nothing for the
+        # finetuned overlay to overlay and nothing for the prediction prewarm
+        # to warm. Forced here rather than only inside kairos_signals.run
+        # because papertrade's own prewarm/report-hash bookkeeping reads both
+        # out of run_kwargs directly -- and ahead of the start notification,
+        # so it reports the flags the run will actually use rather than the
+        # ones the caller typed.
+        args.base_only = True
+        args.pred_cache = False
+
     _notify(_format_start_message(base_now, args), enabled=args.notify)
 
     try:
@@ -2013,15 +2026,6 @@ def main(argv=None):
         import phantom as ph
         from phantom.models.order import Order
         from allocation import fetch_signals, allocate, AllocationConfig, load_cluster_map
-
-        if args.naive:
-            # No model is loaded at all on this path, so there is nothing for
-            # the finetuned overlay to overlay and nothing for the prediction
-            # prewarm to warm. Forced here (not just inside kairos_signals.run)
-            # because papertrade's own prewarm/report-hash bookkeeping reads
-            # these two out of run_kwargs directly.
-            args.base_only = True
-            args.pred_cache = False
 
         run_kwargs = dict(
             db_path=args.db, out_dir=args.out,
