@@ -51,6 +51,17 @@ for _reg, _missing in _incomplete.items():
             f"incomplete, so this page would report partial data as final. Finish the sweep, "
             f"re-run analyze_by_market3.py, then re-run this.")
 
+# The class check above is necessary but NOT sufficient: a sweep part-way through
+# the corpus still populates all three classes long before it finishes, so it
+# would sail past. Oracle and naive both cover the full deduped list, so naive
+# falling short of oracle means its sweep is still running and every figure on
+# this page is a moving target. (Base is legitimately mid-sweep -- excluded.)
+if COVERAGE.get("naive", 0) < COVERAGE.get("oracle", 0):
+    raise SystemExit(
+        f"{__file__}: naive covers {COVERAGE.get('naive')} groups against oracle's "
+        f"{COVERAGE.get('oracle')} -- that sweep is unfinished. Finish it, re-run "
+        f"analyze_by_market3.py, then re-run this.")
+
 
 def _nv(cl):
     med, pos, of, win, sig, gps = LEVEL["naive"][cl]

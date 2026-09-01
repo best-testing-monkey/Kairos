@@ -1092,10 +1092,24 @@ they behave very differently:
   the actual papertrade work items — 120/120 groups on `1d` and 16/16 on `1h`
   are oracle-tested, so step 2 fires for none of them. If you are wondering
   why a class-stats change had no effect on live signals, this is why.
-- **Selection stats** (n, win rate, Sharpe, EV) — deliberately NOT per-class;
-  they stay per-GROUP. See the ticket's item 5: the group's own backtest is
-  more specific evidence than a class average, so sourcing them per class
-  would lose information. Don't "fix" this without reading that first.
+- **Selection stats** (n, win rate, Sharpe, EV) — now prefer the per-class row,
+  falling back to the group row. **This reverses what this file and the
+  ticket's item 5 both said, and the correction is worth understanding
+  (Baz, 2026-09-01).** Item 5 argued class data is coarser than the group's
+  own backtest, so preferring it would lose information. That is true of
+  `kairos_pipeline.strategy_class_stats()`, which aggregates *across* runs
+  into a class-wide average. It is false of the raw table joined on
+  `run_id`: rows are keyed `(run_id, strategy_name, asset_class)`, so within
+  one run the class rows **partition** that group's signals. Verified —
+  44,680 of 44,680 (run, strategy) pairs have per-class `signal_count`
+  summing exactly to the group row, none exceeding it (this is the same
+  invariant recorded above, read the other way round). So joined on run_id a
+  class row is a strict *subset* of the group row, split by class: finer
+  evidence about the ticker being traded, not coarser. Join exactly on
+  `viability_report.base_run_id`/`oracle_run_id` rather than latest-run-wins.
+  Measured a no-op on the current 1d universe (all 913 joinable cells agree,
+  since no run there is multi-class) — it only bites on mixed groups, which
+  is exactly where it should.
 
 Two known gaps: `asset_class` reaches `Candidate` and the selection DSL but
 appears in **no report header**, so it is filterable but invisible; and both

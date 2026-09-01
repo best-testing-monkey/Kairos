@@ -98,8 +98,15 @@ def naive_revision():
     }
 
 
+# Distinct groups per stage, so build_paper.py can refuse to render from a
+# half-finished sweep. Without this a partial naive sweep silently shrinks the
+# matched sample instead of erroring -- it looks like a smaller study, not a bug.
+coverage = {stage: len({(r["assets"], r["interval"], r["backtest_period"]) for r in rows})
+            for (_t, stage), rows in zip(STAGES, R.values())}
+
 data = {
     "matched_groups": len(matched),
+    "coverage": coverage,
     "naive_revision": naive_revision(),
     "rows": [{"name": k,
               "n": {s: S[s][k]["n"] for s in S},

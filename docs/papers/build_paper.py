@@ -42,6 +42,17 @@ def _box(stage):
 
 BOX = {s: _box(s) for s in STAGES}
 NSTRAT = len(rows)
+COV = data.get("coverage", {})
+# Oracle and naive both cover the full deduped corpus; base is legitimately
+# mid-sweep. If naive is short of oracle its sweep is still running, and every
+# figure here would be computed on a moving target -- the matched sample would
+# just look smaller rather than wrong, which is the dangerous failure mode.
+if COV.get("naive") is not None and COV.get("oracle") is not None and COV["naive"] < COV["oracle"]:
+    raise SystemExit(
+        f"{__file__}: naive covers {COV['naive']} groups against oracle's {COV['oracle']} -- "
+        f"that sweep is unfinished, so this page would report partial data as final. "
+        f"Finish it, re-run make_paper_table.py, then re-run this.")
+
 NGROUPS = data["matched_groups"]
 
 # Measured old-vs-new comparison for the rebuilt naive regime (see the
