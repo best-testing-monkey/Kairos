@@ -657,8 +657,9 @@ commands, e.g. `export UV_CACHE_DIR=/tmp/uv-cache-kairos` before
   interesting part.** Foreseeing a bar and then entering at that same bar's
   *close* is worth nothing: the move is spent by fill time. Line the two up
   and old-naive-at-date-`d` is input-for-input identical to
-  new-naive-at-date-`d+1` — the same measurement, re-indexed by one bar. The full 961-group re-sweep (2026-09-01) confirms it: of 37,267
-  matched (group, strategy) cells, **23,558 (63.2%) are byte-identical**, the
+  new-naive-at-date-`d+1` — the same measurement, re-indexed by one bar. The
+  full 961-group re-sweep (2026-09-01) confirms it: of 37,267 matched
+  (group, strategy) cells, **23,558 (63.2%) are byte-identical**, the
   median Sharpe change is exactly 0.000 and the mean −0.020; the pooled median
   moves −0.288 → −0.301, and coverage is unchanged (50 cells new-only, 27
   old-only). Small-sample readings taken during the sweep ran as high as 67.7%
@@ -978,6 +979,28 @@ match against what you just launched, or timestamp), not just "looks like
 a leftover." A live sweep's own group was killed by mistake this way on
 2026-08-27 — the sweep's per-group error handling absorbed it as a `[FAIL]`
 and moved on, but the group still needed a manual one-off re-run to backfill.
+
+**The mirror-image mistake: grepping for the wrong name and declaring "clean".**
+`ProcessPoolExecutor` children are `fork`ed, so they inherit the *parent's*
+command line — a pool worker of `run_oracle_dedup.py` shows in `ps` as
+`run_oracle_dedup.py ...`, never as `kairos_strategies.py`, even though what it
+runs is a `kairos_strategies` subprocess. Checking for orphans with
+`ps ... | grep kairos_strategies | awk '$2==1'` therefore finds nothing and looks
+clean while eight idle workers sit there. This happened twice on 2026-09-01, both
+times reported as "no orphaned pool children"; a sibling session found them 8
+hours later. Grep for the PARENT script's name instead:
+
+```bash
+ps -eo pid,ppid,cmd | awk '$2==1' | grep -E 'run_oracle_dedup|run_model_parallel|kairos_strategies'
+```
+
+They survive because **`kill` (SIGTERM) on the parent skips the pool's
+`__exit__`** — Python does not raise on SIGTERM, so `with ProcessPoolExecutor(...)`
+never shuts down and the children are orphaned. A *normally completed* run reaps
+them correctly, so this is a consequence of aborting a sweep, not a bug in the
+script. Always run the check above after killing a sweep parent. Their combined
+RSS also overstates the reclaim: forked children share copy-on-write pages, so
+8 × ~340MB returned ~350MB, not 2.7GB.
 
 ### Eight strategy names are the same strategy (found 2026-08-29)
 
