@@ -13,6 +13,7 @@ from typing import Optional
 
 from openpyxl.styles import Protection
 
+from kairos_backtest import asset_class_of_symbol
 from kairos_signals import _ev_pct_value, format_table
 from signal_selection import SignalSelectionRule, evaluate_condition, resolve_column, rule_matches
 
@@ -295,10 +296,12 @@ def fetch_signals(stats_rows, advice_rows):
         size = stats_row.get("size", 0.0)
         advised_liquidity_pct = size * 100.0 if size else 0.0
 
+        ticker = stats_row.get("symbol", "")
+
         # Construct the Candidate
         candidate = Candidate(
             strategy=stats_row.get("strategy", ""),
-            ticker=stats_row.get("symbol", ""),
+            ticker=ticker,
             direction=direction,
             entry=float(stats_row.get("entry", 0.0)),
             stop=float(stats_row.get("stop", 0.0)),
@@ -313,7 +316,12 @@ def fetch_signals(stats_rows, advice_rows):
             avg_loss_pct=None,  # Not present in current data; v1 nullable
             avg_holding_days=None,  # Not present in current data; v1 nullable
             model=stats_row.get("model", ""),
-            asset_class=stats_row.get("asset_class", ""),
+            # Per-INSTRUMENT 3-way class, not viability_report.asset_class (which is
+            # asset_class_for's 5-way GROUP-majority label). A candidate row is one
+            # ticker, so the group label mislabels a lone crypto name in a mostly-equity
+            # group, and its "commodity"/"fx" values can never match strategy_class_stats'
+            # "fx_commodity". This makes the report column and the stats agree.
+            asset_class=asset_class_of_symbol(ticker) if ticker else "",
             class_prior_win_rate=stats_row.get("class_prior_win_rate"),
         )
 
