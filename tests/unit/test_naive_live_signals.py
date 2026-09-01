@@ -229,3 +229,35 @@ def test_class_split_survives_a_missing_table(tmp_path):
     import sqlite3
     conn = sqlite3.connect(tmp_path / "empty.db")
     assert ks._class_split_stats(conn, [{"base_run_id": 1}]) == {}
+
+
+# --------------------------------------------------------------------------
+# Report de-dup namespacing
+# --------------------------------------------------------------------------
+
+def test_naive_does_not_share_a_seen_table_with_a_base_only_run(monkeypatch, tmp_path):
+    """A naive run forces base_only, so without the regime in the key it lands
+    on the identical seen_v2_<hash> table as a --base-only run over the same
+    window and resumes from the other regime's cached rows. Both hashed to
+    7e1b5c56 before this was fixed."""
+    monkeypatch.setenv("PHANTOM_DATA", str(tmp_path))
+    import kairos_papertrade as kp
+
+    groups = {("A,B", "1d"): [{"strategy_name": "s"}]}
+    monkeypatch.setattr(kp._kairos_signals_mod, "_connect_with_retry",
+                        lambda *a, **kw: __import__("sqlite3").connect(":memory:"))
+    monkeypatch.setattr(kp._kairos_signals_mod, "load_work_items", lambda *a, **kw: [])
+    monkeypatch.setattr(kp._kairos_signals_mod, "group_items", lambda rows: groups)
+    monkeypatch.setattr(kp._kairos_signals_mod, "load_accepted_finetuned", lambda c: {})
+
+    now = _dt.datetime(2026, 9, 1)
+    base = kp._make_report_hash(now, "1d", {"base_only": True})
+    naive = kp._make_report_hash(now, "1d", {"base_only": True, "naive": True})
+
+    # Both hashes must separate: legacy is a READ fallback, so sharing it is
+    # the same leak by the other door.
+    assert base[0] != naive[0]
+    assert base[1] != naive[1]
+    # And a non-naive run must keep the hash it already had, or every
+    # completed 6-month window silently regenerates.
+    assert base == kp._make_report_hash(now, "1d", {"base_only": True, "naive": False})

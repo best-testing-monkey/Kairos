@@ -428,6 +428,7 @@ def _make_report_hash(base_now, interval, run_kwargs):
     """
     db_path = run_kwargs.get("db_path", DB_PATH)
     base_only = run_kwargs.get("base_only", False)
+    naive = run_kwargs.get("naive", False)
 
     # See kairos_signals._connect_with_retry's docstring for why this isn't
     # a plain sqlite3.connect() -- a live run crashed here (and in run()'s
@@ -442,16 +443,28 @@ def _make_report_hash(base_now, interval, run_kwargs):
     finally:
         conn.close()
 
+    # A naive run has the same window, interval and groups as a --base-only
+    # one, and forces base_only itself, so without this it lands on the very
+    # same table name and resumes from the other regime's cached rows --
+    # serving base signals for a naive run, or the reverse. Verified: both
+    # hashed to 7e1b5c56 before this. Folded in only when naive is set, so
+    # every existing base/finetuned table keeps the hash it already has and no
+    # completed 6-month window regenerates. Both hashes get it: legacy is a
+    # READ fallback, and a naive run falling back to a legacy base table is
+    # the same leak by the other door. There are no legacy naive tables to
+    # miss -- the mode did not exist before this.
+    regime = ["naive"] if naive else []
+
     # Legacy hash: identical to the pre-fix computation so existing
     # seen_<hash> tables continue to be found.
-    legacy_key = [base_now, interval, "base"]
+    legacy_key = [base_now, interval, "base"] + regime
     legacy_key += groups
     legacy_hash = hashlib.sha256(
         json.dumps(legacy_key, sort_keys=True, default=json_default).encode()
     ).hexdigest()
 
     # v2 hash: additionally folds in accepted-finetuned model paths.
-    v2_key = [base_now, interval, "base", "v2"]
+    v2_key = [base_now, interval, "base", "v2"] + regime
     v2_key += sorted(groups)
     if not base_only and accepted_finetuned:
         finetuned = []
