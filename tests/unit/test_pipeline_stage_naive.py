@@ -19,13 +19,37 @@ import kairos_pipeline as kp
 
 @pytest.fixture
 def isolated_db(monkeypatch):
-    """Point the module's DB at a throwaway file so a CLI test never touches
-    the real pipeline_results.db."""
+    """Point the CLI's DB at a throwaway file so a test never touches the real
+    pipeline_results.db.
+
+    Patching kp.DB_PATH is NOT enough and looks like it works: get_connection
+    is declared `def get_connection(db_path=DB_PATH)`, so the default is bound
+    at function-definition time and reassigning the module attribute afterwards
+    changes nothing. A run driven that way connects to the real database and
+    writes real rows -- observed for real on 2026-09-01, which is why this
+    fixture patches the function instead. (resolve_disabled_strategies in
+    kairos_strategies.py deliberately avoids the same trap by resolving its
+    default at call time; get_connection does not.)
+    """
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
+    real_get_connection = kp.get_connection
     monkeypatch.setattr(kp, "DB_PATH", path)
+    monkeypatch.setattr(kp, "get_connection",
+                        lambda db_path=path: real_get_connection(path))
     yield path
     os.unlink(path)
+
+
+def test_fixture_really_isolates_the_db(isolated_db):
+    """Guards the guard: if this fixture silently stopped redirecting, every
+    other test here would quietly write to the production database."""
+    conn = kp.get_connection()
+    try:
+        db_file = conn.execute("PRAGMA database_list").fetchall()[0][2]
+    finally:
+        conn.close()
+    assert db_file == isolated_db, f"CLI would have written to {db_file}"
 
 
 @pytest.fixture
