@@ -1545,17 +1545,23 @@ def run_stage_oracle(conn, assets, interval="1d", backtest_period="6m", pred_sam
 
 
 def run_stage_naive(conn, assets, interval="1d", backtest_period="6m", pred_samples=100):
-    """Naive baseline: oracle's real decision, no-peek accounting.
+    """Naive baseline: a persistence forecast, with no peek anywhere.
 
-    Keeps oracle's real distribution-driven decision (direction + relative
-    stop/target %) exactly as computed -- it was derived from oracle's real
-    future-peeking distribution, and that's not being redone here. What
-    changes is entry/exit accounting: entry is re-anchored to the real bar
-    oracle peeked at (by the time this trade could exist, that bar has
-    closed for real -- no longer a peek), and the trade is then resolved
-    only against genuinely later bars, walking forward until stop/target
-    triggers or real data runs out. See
-    KairosOrchestrator._compute_shadow_performance_naive for the mechanics.
+    The most recent bar is withheld from the history the strategy sees and
+    handed back as the forecast distribution -- "the next bar repeats the
+    last completed one", stated with near-certainty. Entry is that withheld
+    bar's close (it has closed for real by the time the trade could be
+    placed), and only strictly later bars resolve it, walking forward until
+    a genuine stop/target trigger or excluding the signal if data runs out.
+    See KairosOrchestrator._make_realized_predictions and
+    _compute_shadow_performance(naive=True) for the mechanics.
+
+    Rewritten 2026-09-01 (01aff70/2ba8b43). This docstring previously
+    described the superseded design, in which naive REUSED oracle's
+    future-peeking decision and changed only the accounting; that version
+    was free of lookahead by cancellation rather than by construction. See
+    CLAUDE.md's "Naive baseline" bullet for why the numbers barely moved
+    across the change, which is a coincidence and not something to rely on.
 
     Deliberately does NOT call refresh_disabled_strategies, unlike
     run_stage_oracle. This measures how much a strategy depends on
@@ -2875,8 +2881,8 @@ def _build_parser():
     """Build and return the argparse parser (extracted for testability)."""
     parser = argparse.ArgumentParser(description="Kairos staged asset-discovery pipeline")
     parser.add_argument("--stage", required=True,
-                         choices=["universe", "correlation", "oracle", "base", "finetuned", "auto",
-                                  "rebuild_disabled", "finetune_next"])
+                         choices=["universe", "correlation", "oracle", "naive", "base", "finetuned",
+                                  "auto", "rebuild_disabled", "finetune_next"])
     parser.add_argument("--interval", default="1d")
     parser.add_argument("--intervals", nargs="+", default=None,
                          help="Bar intervals for --stage auto (e.g. 1d 1h)")
@@ -3021,15 +3027,26 @@ def main(argv=None):
     elif args.stage == "correlation":
         run_stage_correlation(conn, asset_class_filter=args.asset_class, interval=args.interval,
                                min_abs_corr=min_abs_corr)
-    elif args.stage == "oracle":
+    elif args.stage in ("oracle", "naive"):
+        # Same asset resolution for both; they differ only in which no-model
+        # mode runs and whether the production disable gate is refreshed
+        # afterwards (naive never refreshes it -- see run_stage_naive).
         assets = args.assets
         if args.group_id is not None:
             assets = _group_symbols_from_db(conn, args.group_id, interval=args.interval)
         if not assets:
-            raise SystemExit("--stage oracle requires --assets SYM... or --group_id N")
-        run_stage_oracle(conn, assets, interval=args.interval,
-                          backtest_period=args.backtest_period, pred_samples=args.pred_samples,
-                          disable_min_signals=args.disable_min_signals)
+            raise SystemExit(f"--stage {args.stage} requires --assets SYM... or --group_id N")
+        if args.stage == "naive":
+            # --disable_min_signals is deliberately not forwarded: naive results
+            # never reach the disable gate, so there is no threshold to apply.
+            run_stage_naive(conn, assets, interval=args.interval,
+                             backtest_period=args.backtest_period,
+                             pred_samples=args.pred_samples)
+        else:
+            run_stage_oracle(conn, assets, interval=args.interval,
+                              backtest_period=args.backtest_period,
+                              pred_samples=args.pred_samples,
+                              disable_min_signals=args.disable_min_signals)
     elif args.stage in ("base", "finetuned"):
         assets = args.assets
         if args.group_id is not None:
