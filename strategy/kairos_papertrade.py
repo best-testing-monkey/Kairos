@@ -2559,7 +2559,12 @@ def main(argv=None):
             "start": start_dt.isoformat(), "end": end_dt.isoformat(),
             "interval": args.interval, "months_back": args.months_back,
             "capital": args.capital, "currency": "EUR", "broker": args.broker,
-            "base_only": args.base_only, "top_n": args.top_n,
+            # --naive forces base_only, so without recording it here a naive
+            # result is indistinguishable from a base-only one in the saved
+            # artifact -- and these two regimes are exactly what the run is
+            # meant to be compared across.
+            "base_only": args.base_only, "naive": args.naive,
+            "top_n": args.top_n,
             "num_days": len(dated_rows),
             "margin_rejected_count": margin_rejected_count,
             "phantom_fill_rejected_count": phantom_fill_rejected_count,
