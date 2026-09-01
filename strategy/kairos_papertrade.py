@@ -31,6 +31,7 @@ day again, as originally designed -- no client-side per-ticker workaround
 needed.
 """
 import argparse
+import contextlib
 import gc
 import hashlib
 import json
@@ -1903,6 +1904,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                              "has no TOP clause of its own.")
     parser.add_argument("--capital", type=float, default=200.0)
     parser.add_argument("--broker", default="IBKR")
+    parser.add_argument("--naive", action="store_true", default=False,
+                        help="Trade the persistence baseline instead of a "
+                             "Kronos forecast: the last completed bar is "
+                             "withheld and handed back as the forecast (see "
+                             "kairos_signals._naive_predict_fn). No model and "
+                             "no GPU, so this implies --base-only and "
+                             "--no-pred-cache and does not take the GPU lock. "
+                             "This is the live counterpart of the naive sweep "
+                             "stage, priced the same way its shadow evaluator "
+                             "prices it.")
     parser.add_argument("--base-only", dest="base_only", action="store_true", default=False,
                         help="Skip the accepted-finetuned overlay pass and use only the base model (default: off — finetuned overlay is used when an accepted model exists)")
     parser.add_argument("--include-finetuned", dest="base_only", action="store_false",
@@ -2003,11 +2014,21 @@ def main(argv=None):
         from phantom.models.order import Order
         from allocation import fetch_signals, allocate, AllocationConfig, load_cluster_map
 
+        if args.naive:
+            # No model is loaded at all on this path, so there is nothing for
+            # the finetuned overlay to overlay and nothing for the prediction
+            # prewarm to warm. Forced here (not just inside kairos_signals.run)
+            # because papertrade's own prewarm/report-hash bookkeeping reads
+            # these two out of run_kwargs directly.
+            args.base_only = True
+            args.pred_cache = False
+
         run_kwargs = dict(
             db_path=args.db, out_dir=args.out,
             min_ev_pct=args.min_ev_pct,
             cluster_map_path=args.cluster_map,
             base_only=args.base_only,
+            naive=args.naive,
             signal_selection=parsed_signal_selection,
         )
 
@@ -2024,7 +2045,10 @@ def main(argv=None):
         # will block (and, if the lock isn't freed within GpuLock's 5-minute
         # timeout, fail with OpsError) for as long as this loop runs --
         # accepted tradeoff over the alternative of colliding outright.
-        with GpuLock():
+        # A naive run never touches the GPU, so taking the shared lock would
+        # block finetune_next/daily_signals/weekly_discovery for hours over
+        # nothing -- see the note above for why the lock is held so widely.
+        with (contextlib.nullcontext() if args.naive else GpuLock()):
             if args.pred_cache:
                 # Populate the persistent shared prediction cache model-major
                 # via prewarm_prediction_cache() BEFORE the date-major

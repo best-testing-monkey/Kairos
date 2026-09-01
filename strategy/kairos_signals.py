@@ -179,7 +179,8 @@ def _cache_as_of_value(now: datetime, interval: str):
 
 
 def _signals_cache_key(strategy_name, assets_str, interval, as_of_date, lookback,
-                        pred_samples, min_ev_pct, model_path, checkpoint_fingerprint) -> str:
+                        pred_samples, min_ev_pct, model_path, checkpoint_fingerprint,
+                        naive=False) -> str:
     """Canonical cache key for one strategy's rows within one group/pass.
 
     as_of_date is whatever _cache_as_of_value(now, interval) returned -- a
@@ -189,11 +190,19 @@ def _signals_cache_key(strategy_name, assets_str, interval, as_of_date, lookback
     kairos_strategies._model_checkpoint_fingerprint) busts the cache when a
     finetuned checkpoint is retrained in place at the same model_path,
     mirroring kairos_predcache.make_key's own key design.
+
+    naive selects the persistence baseline instead of a model forecast, which
+    changes the cached rows completely while every other component of the key
+    stays identical (it has no model_path of its own to key on). Without it a
+    naive pass and a base pass over the same group/date collide and serve each
+    other's signals. It occupies the model slot rather than adding a field, so
+    existing base/finetuned keys are byte-identical to before.
     """
     parts = [
         str(strategy_name), str(assets_str), str(interval), as_of_date.isoformat(),
         str(lookback), str(pred_samples), str(min_ev_pct),
-        str(model_path or "base"), str(checkpoint_fingerprint or ""),
+        str(model_path or ("naive" if naive else "base")),
+        str(checkpoint_fingerprint or ""),
     ]
     return "|".join(parts)
 
@@ -719,6 +728,79 @@ def write_spreadsheet(stats_rows, advice_rows, out_path, fmt,
 # Orchestration
 # =============================================================================
 
+def _naive_predict_fn(assets_dict, model_path=None):
+    """predict_fn for the naive persistence baseline: no model, no GPU.
+
+    Delegates to the SAME forecaster the naive sweep is scored with --
+    KairosOrchestrator._make_realized_predictions(naive=True) -- rather than
+    rebuilding the withhold-the-last-bar logic here. A second implementation
+    would be free to drift from the one the corpus was measured on, and this
+    codebase already carries six independent TP/SL checkers as a standing
+    example of how that ends (see CLAUDE.md).
+
+    Called as an unbound method against a stand-in, which is the established
+    pattern for these two functions: `naive` is a parameter rather than a
+    config read precisely so they can be driven without a real orchestrator
+    (see _compute_shadow_performance_naive). The naive branch reads nothing
+    off `self` but the warn-once set, and never looks at `date` -- only the
+    oracle branch uses _data_dict, hence the empty one.
+
+    History truncation is what makes this honest, and it is load-bearing in
+    two places (CLAUDE.md, "Naive baseline"): the returned AssetPrediction
+    carries the TRUNCATED history, so _build_context's returns_window and
+    realized_vol are derived from it automatically and no strategy can read
+    the forecast bar directly.
+
+    model_path is accepted and ignored to match _real_predict_fn's signature;
+    a persistence forecast has no model to switch to.
+    """
+    from types import SimpleNamespace
+    from kairos_orchestrator import KairosOrchestrator
+
+    stand_in = SimpleNamespace(
+        _data_dict={}, _nonfinite_bar_warned=_naive_nonfinite_warned,
+    )
+    return KairosOrchestrator._make_realized_predictions(
+        stand_in, None, assets_dict, naive=True,
+    )
+
+
+_naive_nonfinite_warned = set()
+"""Module-level so _naive_predict_fn's "warn once per symbol" holds across
+every call in a process, the way it does for one long-lived orchestrator."""
+
+
+def _reanchor_naive_signal(sig, entry):
+    """Move a naive signal's prices onto the withheld bar's close, in place.
+
+    The decision was made against the close of the bar BEFORE the withheld
+    one (that is what the strategy saw), but the trade cannot be placed until
+    the withheld bar has closed -- so it fills at `entry`, the latest real
+    price. Mirrors KairosOrchestrator._compute_shadow_performance(naive=True),
+    which does the identical re-anchoring when scoring the sweep, so a live
+    naive signal and its backtested twin are priced the same way.
+
+    That function writes it as `entry * (1 + (stop - ref) / ref)`, which is
+    just `stop * entry / ref` -- a uniform rescale. Applying the same factor
+    to expected_value keeps EV-as-a-percent-of-entry exactly invariant, so
+    the min_ev_pct gate downstream judges the same edge either way: only the
+    accounting moves, never the decision.
+
+    Without this the bracket stays anchored a bar behind and papertrade's
+    fill-time guard rejects the order outright for not bracketing the current
+    price (CLAUDE.md, "Stale-signal-cache brackets", commit 7cc66d4).
+    """
+    ref = sig.entry if sig.entry and sig.entry > 0 else 0.0
+    if ref <= 0 or entry <= 0:
+        return sig
+    scale = entry / ref
+    sig.entry = entry
+    sig.stop = sig.stop * scale
+    sig.target = sig.target * scale
+    sig.expected_value = sig.expected_value * scale
+    return sig
+
+
 def _real_predict_fn(assets_dict, model_path=None):
     """Default predict_fn: batched Kronos prediction (GPU/network required).
 
@@ -771,7 +853,7 @@ def _build_context(orchestrator, symbol, current_price, multi_preds, history):
     }
 
 
-def _class_prior_win_rate(interval, assets, model_path, db_path=DB_PATH):
+def _class_prior_win_rate(interval, assets, model_path, db_path=DB_PATH, stage=None):
     """Signal-count-weighted mean win rate across ALL strategies in this
     (model, asset class) cell, or None.
 
@@ -784,13 +866,22 @@ def _class_prior_win_rate(interval, assets, model_path, db_path=DB_PATH):
     stand in for a basket spanning several. Uses plain sqlite3 rather than
     importing kairos_pipeline, matching resolve_disabled_strategies' reasoning
     about the module import cycle.
+
+    stage selects which sweep's class stats to read. It used to be derived
+    from model_path alone ("finetuned" if set, else "base"), which left the
+    naive rows in strategy_class_stats unreachable even though the table
+    holds them: a naive run has no model_path, so it silently read base's
+    prior -- the wrong regime's base rate for a run generating no-model
+    signals. Passing it explicitly is the only way to select naive; None
+    keeps the historical model_path-derived behaviour exactly.
     """
     from kairos_backtest import asset_class_of_symbol
 
     classes = {asset_class_of_symbol(a) for a in assets}
     if len(classes) != 1:
         return None
-    stage = "finetuned" if model_path else "base"
+    if stage is None:
+        stage = "finetuned" if model_path else "base"
     clause = "model_path IS NULL" if model_path is None else "model_path = ?"
     params = [interval, next(iter(classes)), stage]
     if model_path is not None:
@@ -816,7 +907,7 @@ def _class_prior_win_rate(interval, assets, model_path, db_path=DB_PATH):
 def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label,
                data, pred_samples, min_ev_pct, conn=None, use_signal_cache=True,
                assets_str=None, as_of_date=None, lookback=None,
-               checkpoint_fingerprint=""):
+               checkpoint_fingerprint="", naive=False):
     """Generate stats/advice rows for one (assets, interval) group against
     already-fetched `data`.
 
@@ -860,7 +951,9 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
     skipped = []
 
     disabled = resolve_disabled_strategies(interval, assets, model_path=model_path)
-    class_prior = _class_prior_win_rate(interval, assets, model_path)
+    class_prior = _class_prior_win_rate(
+        interval, assets, model_path, stage="naive" if naive else None,
+    )
     config = OrchestratorConfig.for_interval(interval, disabled_strategies=disabled)
 
     def _dummy_predict(*a, **kw):
@@ -888,6 +981,7 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
             cache_key = _signals_cache_key(
                 strategy_name, assets_str, interval, as_of_date, lookback,
                 pred_samples, min_ev_pct, model_path, checkpoint_fingerprint,
+                naive=naive,
             )
             cached = _load_cached_group_result(conn, cache_key)
             if cached is not None:
@@ -934,6 +1028,14 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
 
             if sig is None:
                 continue
+
+            # Re-anchor before ANY downstream reader (the gates below, the
+            # rows built after them) sees the signal, so none of them ever
+            # observe the pre-anchor prices.
+            if naive:
+                sym_df = data.get(sym)
+                if sym_df is not None and len(sym_df):
+                    _reanchor_naive_signal(sig, float(sym_df["close"].iloc[-1]))
 
             # Match the backtest's gate (kairos_orchestrator._run_day:
             # `sig.size > 0`): zero-size non-FLAT signals are legit
@@ -1009,7 +1111,7 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         cluster_map_path=None, base_only=False, return_rows=False,
         on_group_timing=None, signal_selection=None, use_signal_cache=True,
         max_leverage=1.0, margin_utilization=0.8,
-        margin_config_path="config/margin_ibkr.yaml"):
+        margin_config_path="config/margin_ibkr.yaml", naive=False):
     """Run the full signals-report flow. Returns the path to the written report.
 
     now: the moment treated as "now" — stamps output filenames/report
@@ -1026,6 +1128,11 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
         write_spreadsheet); the path is printed to stdout.
     cluster_map_path: optional path to a CSV file mapping ticker -> cluster
         name for the portfolio allocation sheet/section.
+    naive: if True, generate signals from the persistence baseline instead of
+        a Kronos forecast -- the last completed bar is withheld from the
+        history the strategy sees and handed back as the forecast (see
+        _naive_predict_fn). No model, no GPU. Implies base_only, labels every
+        row "Naive", and keys the signals cache separately from a base pass.
     base_only: if True, skip the accepted-finetuned-model overlay pass
         entirely (every row is labeled "Base", no comparison section/tab).
         Useful for debugging a bad finetuned model, or to force a
@@ -1086,8 +1193,14 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
     kairos_strategies._dist_cache.clear()
     kairos_strategies._shared_keys.clear()
 
+    if naive:
+        # A persistence forecast has no model, so the finetuned overlay pass
+        # would be the same work under a different label. Forcing base_only
+        # here rather than asking the caller to pass both keeps the two flags
+        # from disagreeing.
+        base_only = True
     if predict_fn is None:
-        predict_fn = _real_predict_fn
+        predict_fn = _naive_predict_fn if naive else _real_predict_fn
     if lookback is None:
         lookback = LOOKBACK
     if now is None:
@@ -1125,12 +1238,13 @@ def run(db_path=DB_PATH, out_dir=RESULTS_DIR, intervals=None, pred_samples=100,
                     _group_t0 = time.monotonic()
                 group_stats, group_advice, group_skipped = _run_group(
                     assets, interval, group_rows, predict_fn,
-                    model_path=None, model_label="Base",
+                    model_path=None, model_label="Naive" if naive else "Base",
                     data=data, pred_samples=pred_samples, min_ev_pct=min_ev_pct,
                     conn=conn, use_signal_cache=use_signal_cache,
                     assets_str=assets_str, as_of_date=_cache_as_of_value(now, interval),
                     lookback=lookback,
                     checkpoint_fingerprint="",
+                    naive=naive,
                 )
                 if on_group_timing is not None:
                     on_group_timing(assets_str, interval, "Base",
@@ -1355,6 +1469,11 @@ def main(argv=None):
                              "entirely: every row is labeled 'Base' and no "
                              "comparison section/tab is produced. Useful "
                              "while debugging a bad finetuned model.")
+    parser.add_argument("--naive", action="store_true", default=False,
+                        help="Generate signals from the persistence baseline "
+                             "(withhold the last completed bar and forecast "
+                             "it) instead of a Kronos model. No GPU. Implies "
+                             "--base_only; rows are labeled 'Naive'.")
     parser.add_argument("--effective_per", default=None,
                         help='Treat this moment as "now": \'YYYYMMDD [HHnn]\' '
                              '(e.g. "20260615 1430" or "20260615"; time '
@@ -1440,6 +1559,7 @@ def main(argv=None):
         xlsx=args.xlsx, ods=args.ods, now=now,
         cluster_map_path=args.cluster_map,
         base_only=args.base_only,
+        naive=args.naive,
         signal_selection=parsed_signal_selection,
         use_signal_cache=args.use_signal_cache,
         max_leverage=args.max_leverage,
