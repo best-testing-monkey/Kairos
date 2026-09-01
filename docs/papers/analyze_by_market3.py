@@ -57,7 +57,12 @@ def spearman(a,b,keys):
 CLASSES=("equity","crypto","fx_commodity")
 STAGES=["oracle","naive","base"]
 report={"alias_collapsed":sorted(ALIAS),"by_class":{},"by_venue":{},"rank":{},
-        "divergence":{},"summary":{},"venue_summary":{}}
+        "divergence":{},"summary":{},"venue_summary":{},
+        "matched_cells":{}}
+
+# Raw rows per stage, kept so the matched-cell comparison below can be derived
+# instead of transcribed into build_market_report.py's prose by hand.
+RAW={}
 
 for stage in STAGES:
     rows=conn.execute("""SELECT s.strategy_name,s.sharpe,s.signal_count,s.win_rate,s.avg_pnl_per_trade,
@@ -70,6 +75,7 @@ for stage in STAGES:
                             JOIN runs r ON r.run_id=s.run_id
                             WHERE s.stage=? AND r.timestamp>=?""",(stage,EXIT_RULE_CUTOFF)).fetchone()[0]
     report.setdefault("coverage",{})[stage]=ngroups
+    RAW[stage]=rows
     byc=weighted(rows, lambda r:(r["asset_class"] if r["asset_class"] in CLASSES else None))
     have=[c for c in CLASSES if byc.get(c)]
     common=sorted(set.intersection(*[set(byc[c]) for c in have])) if have else []
@@ -120,6 +126,24 @@ for stage in STAGES:
                 {"venue":VENUE.get(v,v),"strat":len(d),"median":st.median(sub),"signals":tot,"rho":rho})
             print(f"    {VENUE.get(v,v):16s} {len(d):3d} strat  median {st.median(sub):+7.3f}"
                   f"  {tot:>9,d} sig{rtxt}")
+
+
+# ---------------------------------------------------------------------------
+# Levels are not comparable across stages on their own, because the stages cover
+# different group samples. These are the (group, strategy) cells where all three
+# stages actually ran, which is the only like-for-like comparison available.
+print(f"\n{'='*74}\nMATCHED (group, strategy) CELLS -- all three stages\n{'='*74}")
+cells={stage:{(r["assets"],r["strategy_name"],r["asset_class"]):r["sharpe"]
+              for r in RAW[stage] if r["strategy_name"] not in ALIAS}
+       for stage in STAGES}
+shared=set.intersection(*(set(c) for c in cells.values()))
+for c in CLASSES:
+    keys=[k for k in shared if k[2]==c]
+    if len(keys)<MIN_GROUPS: continue
+    report["matched_cells"][c]={"n":len(keys),
+        **{stage:st.median([cells[stage][k] for k in keys]) for stage in STAGES}}
+    m=report["matched_cells"][c]
+    print(f"  {c:13s} n={m['n']:5d}  " + "  ".join(f"{s} {m[s]:+7.2f}" for s in STAGES))
 
 json.dump(report,open(HERE/"market_analysis3.json","w"),indent=0)
 print(f"\nwrote {HERE/'market_analysis3.json'}")

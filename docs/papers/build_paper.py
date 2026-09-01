@@ -3,6 +3,18 @@
 import json, pathlib
 
 HERE = pathlib.Path(__file__).parent
+
+# Provenance stamped at generation time. Hand-maintained date and commit strings
+# had drifted from the run that actually produced the page, which defeats the
+# point of a provenance line.
+import datetime, subprocess
+STAMP = datetime.date.today().strftime("%-d %B %Y")
+try:
+    COMMIT = subprocess.check_output(
+        ["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"], text=True).strip()
+except Exception:
+    COMMIT = "unknown"
+
 data = json.loads((HERE / "paper_table.json").read_text())
 rows = data["rows"]
 
@@ -415,9 +427,10 @@ footer {{
   <div class="regimes">
     <div class="rg" data-stage="naive">
       <h4>Naive</h4><span class="flag">--naive-baseline &middot; floor</span>
-      <p>Reuses the oracle&rsquo;s decision unchanged, then re-anchors entry to the bar the oracle peeked at
-      &mdash; a bar that has genuinely closed by the time the trade could exist &mdash; and resolves the
-      outcome only against strictly later bars. No future information survives into the accounting.</p>
+      <p>The most recent bar is withheld from the history the strategy sees and handed back as the
+      forecast, asserted with near-certainty: the next bar is predicted to repeat the last completed one.
+      Nothing about the future is used anywhere. That bar has closed by the time the trade is placed, entry
+      is its close, and only strictly later bars resolve it.</p>
     </div>
     <div class="rg" data-stage="base">
       <h4>Base model</h4><span class="flag">NeoQuasar/Kronos-base &middot; system under test</span>
@@ -433,13 +446,18 @@ footer {{
     </div>
   </div>
 
-  <p>The naive regime deserves a note, because the obvious construction of it is wrong. An earlier
-  implementation fed the distribution-building step the <em>current</em> bar as both the centre and the
-  shape of the forecast. That is not a neutral no-information test: it silently asserts zero drift, which
-  centres every distribution exactly on the entry price and handicaps every directional strategy by
+  <p>The naive regime deserves a note, because two natural constructions of it are wrong in opposite
+  directions. The first fed the distribution-building step the <em>current</em> bar as both the centre and
+  the shape of the forecast. That is not a neutral no-information test: it silently asserts zero drift,
+  which centres every distribution exactly on the entry price and handicaps every directional strategy by
   construction. A full sweep was run on that version before the flaw was caught, and its results were
-  discarded. The regime described above avoids the trap by never re-deriving a decision at all &mdash; it
-  takes the oracle&rsquo;s real decision and corrects only the accounting.</p>
+  discarded. The second, which produced the previous edition of this note, took the oracle&rsquo;s decision
+  unchanged and corrected only the accounting, re-anchoring entry to the bar the oracle had peeked at. The
+  arithmetic there is sound &mdash; foreseeing a bar and then entering at its close is worth nothing, and
+  the re-anchoring cancels the advantage exactly &mdash; but the decision still read a bar that had not
+  happened, so the regime was free of lookahead by cancellation rather than by construction. Withholding
+  fixes both: the forecast bar is one the strategy could genuinely have held, and because it is withheld,
+  the distribution&rsquo;s centre stays distinct from its shape.</p>
 </section>
 
 <section>
@@ -531,8 +549,8 @@ footer {{
   still open, and the walk continues. A signal whose stop and target are both still untouched when the data
   runs out is <strong>excluded</strong> rather than closed at an arbitrary price. The regimes differ in one
   respect only, and deliberately: oracle and base enter at the next bar&rsquo;s open, while naive enters at
-  that bar&rsquo;s close, because the naive regime exists to strip out the future information the oracle used
-  to pick the trade in the first place.</p>
+  the close of its own withheld forecast bar, because that bar must have closed before a naive trade can
+  exist at all.</p>
   <p>Excluding unresolved signals is a mild survivorship selection &mdash; a trade that drifts to the end of
   the window without touching either barrier is dropped rather than counted as the roughly flat outcome it
   was. Force-closing it at the last bar was the alternative, and it reintroduces exactly the arbitrary exit
@@ -844,7 +862,7 @@ ORDER  BY w_sharpe DESC;</pre>
 </div>
 
 <footer>
-  Kairos Project &middot; research note, 31 August 2026 &middot; generated from data/pipeline_results.db at commit e8c596a.<br>
+  Kairos Project &middot; research note, {STAMP} &middot; generated from data/pipeline_results.db at commit {COMMIT}.<br>
   Matched sample: {NGROUPS} asset groups, {NSTRAT} distinct strategies, {BOX["naive"]["n"] + BOX["base"]["n"] + BOX["oracle"]["n"]:,} signals across three regimes;
   961 groups in the complete oracle&ndash;naive pair.
   Figures are shadow-performance measurements without transaction costs and are not investment advice.

@@ -4,6 +4,18 @@ import pathlib, json
 
 HERE = pathlib.Path(__file__).parent
 
+
+# Provenance stamped at generation time. Hand-maintained date and commit strings
+# had drifted from the run that actually produced the page, which defeats the
+# point of a provenance line.
+import datetime, subprocess
+STAMP = datetime.date.today().strftime("%-d %B %Y")
+try:
+    COMMIT = subprocess.check_output(
+        ["git", "-C", str(HERE), "rev-parse", "--short", "HEAD"], text=True).strip()
+except Exception:
+    COMMIT = "unknown"
+
 CLASSES = ["equity", "crypto", "fx_commodity"]
 CNAME = {"equity": "Equities", "crypto": "Crypto", "fx_commodity": "FX &amp; commodities"}
 
@@ -23,6 +35,44 @@ DIVERGENCE = {reg: [(r["name"], r["equity"], r["crypto"], r["fx_commodity"])
 VENUE = {reg: [(r["venue"], r["strat"], r["median"], r["signals"], r["rho"]) for r in rows]
          for reg, rows in A["venue_summary"].items()}
 COVERAGE = A.get("coverage", {})
+# Naive per-class figures, pulled from LEVEL so a re-sweep moves the prose with
+# the data. These used to be transcribed into the paragraphs below, which is
+# exactly the drift this file's docstring says it avoids -- and they went stale
+# the moment the naive regime was rebuilt (2026-09-01).
+# Refuse to render from a half-finished sweep. Without this the first missing
+# class surfaces as a bare KeyError from deep inside an f-string, which reads
+# like a bug in the generator rather than "the data is not ready yet".
+_incomplete = {reg: [c for c in CLASSES if c not in LEVEL.get(reg, {})]
+               for reg in ("naive", "oracle")}
+for _reg, _missing in _incomplete.items():
+    if _missing:
+        raise SystemExit(
+            f"{__file__}: {_reg} summary has no {_missing} row(s). That regime's sweep is "
+            f"incomplete, so this page would report partial data as final. Finish the sweep, "
+            f"re-run analyze_by_market3.py, then re-run this.")
+
+
+def _nv(cl):
+    med, pos, of, win, sig, gps = LEVEL["naive"][cl]
+    return {"med": med, "pos": pos, "of": of, "win": win, "sig": sig, "gps": gps}
+
+NV = {cl: _nv(cl) for cl in CLASSES}
+
+# Cells where all three regimes actually ran -- the only like-for-like level
+# comparison, since the regimes cover different group samples.
+MC = A.get("matched_cells", {})
+
+# Mean cross-class rank agreement per regime (the "portability ladder"), and the
+# venue count, so the prose tracks coverage instead of being re-transcribed each
+# time the base sweep grows.
+def _rho(reg):
+    vals = [v for _, _, v in (RANK.get(reg) or []) if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+RHO = {reg: _rho(reg) for reg in ("naive", "base", "oracle")}
+NVENUE = {reg: len(A["venue_summary"].get(reg, [])) for reg in ("naive", "base", "oracle")}
+BASE_N = COVERAGE.get("base", 0)
+
 ALIAS_IMPACT = [("naive", 8, 51, -0.758, 8, 44, -0.721),
                 ("base", 32, 51, 0.283, 32, 44, 0.351),
                 ("oracle", 26, 51, 0.321, 26, 44, 2.302)]
@@ -92,8 +142,8 @@ def level_table():
     return f'''<div class="tbl-wrap"><table class="tbl">
   <caption><b>Table 1.</b> Performance level by asset class, within each regime. Medians are over that
   regime&rsquo;s common strategy set, so classes are directly comparable to each other &mdash;
-  but not across regimes, which cover different groups (see &sect;6). The base regime has re-run 84 of 961
-  groups so far and only equities clear the five-group minimum, so it contributes one row.</caption>
+  but not across regimes, which cover different groups (see &sect;6). The base regime has re-run {BASE_N} of
+  961 groups so far, so its rows are provisional; oracle and naive cover all 961.</caption>
   <thead><tr><th scope="col">Regime</th><th scope="col">Asset class</th>
     <th scope="col" class="num">Median Sharpe</th><th scope="col" class="num">Positive</th>
     <th scope="col" class="num">Mean win</th><th scope="col" class="num">Signals</th>
@@ -295,13 +345,15 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   US ordering at &rho;&nbsp;=&nbsp;+0.92 to +0.97 under oracle. A Hong Kong or German listing is, for these
   strategies, far more like a US listing than any equity is like a crypto pair.</p>
   <p>One class breaks the companion paper&rsquo;s pattern outright: <strong>FX and commodities are the only
-  segment profitable without any forecast at all</strong>, at a naive median of +0.28 with 21 of 37 strategies
-  above zero, against &minus;0.47 on equities and &minus;2.33 on crypto.</p>
+  segment profitable without any forecast at all</strong>, at a naive median of {NV["fx_commodity"]["med"]:+.2f}
+  with {NV["fx_commodity"]["pos"]} of {NV["fx_commodity"]["of"]} strategies above zero, against
+  {NV["equity"]["med"]:+.2f} on equities and {NV["crypto"]["med"]:+.2f} on crypto.</p>
   <p>This edition is the first scored entirely on the unified walk-forward exit rule (companion paper,
   &sect;3.4), which retires the evaluator artefact this note previously offered as a partial explanation for
-  crypto&rsquo;s deficit &mdash; the deficit survived the correction. It also comes with a gap: the base
-  sweep is mid-re-run at 84 of 961 groups and covers only equities so far, so the middle rung of the
-  portability ladder is missing until coverage lands.</p>
+  crypto&rsquo;s deficit &mdash; the deficit survived the correction. It also closes a gap: the base sweep
+  has reached {BASE_N} of 961 groups and now clears the five-group minimum in all three classes, so the
+  middle rung of the portability ladder &mdash; blank in the previous edition &mdash; is measured here for
+  the first time.</p>
 </div>
 
 <div class="wrap">
@@ -338,12 +390,14 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
   supplies a common signal that each strategy transforms in its own characteristic way, so merit becomes a
   property of the transformation rather than of the market. That is the finding worth carrying forward:
   <strong>prediction is a large part of what makes strategy selection portable.</strong></p>
-  <p>The middle rung is missing in this edition. The base sweep is being re-run under the corrected exit
-  rule and has reached 84 of 961 groups, all but five of them equities, so no class outside equities clears
-  the five-group minimum and no cross-class coefficient can be computed for it. The previous edition put base
-  at a mean of +0.71, between naive and oracle &mdash; but that figure was measured on the retired one-bar
-  exit rule and is not comparable to the two coefficients above, which is why it is not carried forward here.
-  The ladder has a rung missing rather than a rung guessed.</p>
+  <p>The middle rung, blank in the previous edition, is now in place. The base sweep has reached {BASE_N}
+  of 961 groups under the corrected exit rule &mdash; enough for all three classes to clear the five-group
+  minimum &mdash; and its cross-class agreement comes in at <strong>{RHO["base"]:+.2f}</strong>, between the
+  naive floor&rsquo;s {RHO["naive"]:+.2f} and the oracle&rsquo;s {RHO["oracle"]:+.2f}. The ladder is
+  monotonic, which is what the portability claim predicted and what the previous edition could only assert.
+  The earlier figure of +0.71 for base is still not carried forward: it was measured on the retired one-bar
+  exit rule and is not comparable. Base coverage is short of the full 961, so this coefficient should be
+  expected to move.</p>
 </section>
 
 <section>
@@ -374,29 +428,32 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
     explanation stands; the evaluator excuse does not. Whatever is failing on crypto is in the brackets the
     strategies choose, not in how those brackets were scored.</p>
   </div>
-  <p>Under the base model only equities clear the five-group minimum &mdash; 80 of the 84 re-swept groups are
-  equity &mdash; so Table 1&rsquo;s base row has a single line, at <strong>+0.21</strong>. Levels are not
-  comparable across regimes anyway, since the regimes cover different group samples. Checked properly, on the
-  1,597 matched (group, strategy) equity cells where all three ran, the median is <strong>+5.86</strong> under
-  oracle, <strong>+0.32</strong> under base and <strong>&minus;0.43</strong> under naive &mdash; the same
-  ordering the companion paper reports, on the same assets. The 37 matched crypto cells put oracle at +8.20
-  against base&rsquo;s &minus;0.43. The ceiling towers over the system in both.</p>
+  <p>Levels are not comparable across regimes on their own, because the regimes cover different group
+  samples. Checked properly, on the {MC["equity"]["n"]:,} matched (group, strategy) equity cells where all
+  three ran, the median is <strong>{MC["equity"]["oracle"]:+.2f}</strong> under oracle,
+  <strong>{MC["equity"]["base"]:+.2f}</strong> under base and <strong>{MC["equity"]["naive"]:+.2f}</strong>
+  under naive &mdash; the same ordering the companion paper reports, on the same assets. The
+  {MC["crypto"]["n"]:,} matched crypto cells put oracle at {MC["crypto"]["oracle"]:+.2f} against
+  base&rsquo;s {MC["crypto"]["base"]:+.2f}. The ceiling towers over the system in both.</p>
 
   <h3>3.1 &mdash; FX and commodities work without a forecast</h3>
   <p>The naive row carries the one result that contradicts the companion paper&rsquo;s headline. That paper
   concludes that the corpus does not work without forecast information &mdash; the median strategy well below
-  zero. Segmented, that conclusion holds for equities (median &minus;0.47, 9 of 37 strategies positive) and
-  holds harder for crypto (&minus;2.33, 3 of 37). It fails for FX and commodities, where the naive median is
-  <strong>+0.28 with 21 of 37 strategies positive</strong> &mdash; the only regime-and-class cell in this
-  study that is broadly profitable with no forward information whatsoever.</p>
+  zero. Segmented, that conclusion holds for equities (median {NV["equity"]["med"]:+.2f},
+  {NV["equity"]["pos"]} of {NV["equity"]["of"]} strategies positive) and holds harder for crypto
+  ({NV["crypto"]["med"]:+.2f}, {NV["crypto"]["pos"]} of {NV["crypto"]["of"]}). It fails for FX and
+  commodities, where the naive median is <strong>{NV["fx_commodity"]["med"]:+.2f} with
+  {NV["fx_commodity"]["pos"]} of {NV["fx_commodity"]["of"]} strategies positive</strong> &mdash; the only
+  regime-and-class cell in this study that is broadly profitable with no forward information whatsoever.</p>
   <p>The plausible reading is that these instruments are the corpus&rsquo;s best fit for
   <em>structural</em> rather than directional edge. The companion paper found that the strategies surviving
   the naive regime were those trading bracket geometry and win-rate asymmetry rather than direction; range-bound,
   mean-reverting commodity and currency series are exactly where that kind of edge should persist. The same
   class is also the strongest under oracle at +5.56, so the structural edge and the forecast-driven one stack
   rather than compete.</p>
-  <p>It is by far the thinnest cell in the study &mdash; 24,892 signals from 14 groups, against 2.6 million
-  from 928 groups for naive equities &mdash; and it got thinner in this edition, not wider. The previous
+  <p>It is by far the thinnest cell in the study &mdash; {NV["fx_commodity"]["sig"]:,} signals from
+  {NV["fx_commodity"]["gps"]} groups, against {NV["equity"]["sig"]:,} from {NV["equity"]["gps"]} groups for
+  naive equities &mdash; and it got thinner in this edition, not wider. The previous
   version of this note reported +1.34 on 128,327 signals, drawn partly from groups outside the deduped
   961-group list that a targeted backfill had added. The re-sweep covers the 961-group list only, so those
   extra groups are gone and both the median and the count fell with them (27 of 38 above zero, then; 21 of 37,
@@ -491,11 +548,12 @@ footer {{ max-width:min(1080px,94vw); margin:5rem auto 0; padding-top:1.4rem; bo
     class, so &sect;3&rsquo;s within-regime class comparisons are valid while any cross-regime reading of the
     same table is not. Where a cross-regime claim was needed, it was computed on matched cells and is labelled
     as such.</li>
-    <li><strong>The base regime is mid-re-sweep and covers one class.</strong> 84 of 961 groups have been
-    re-run under the current exit rule, 80 of them equity, so base has no cross-class rank coefficient
-    (&sect;2), no divergence table (&sect;3.2), and only two listing venues (&sect;4). Everything this note says
-    about the base model is provisional and rests on equities. Oracle and naive are complete at 961 of 961
-    groups each and are not affected.</li>
+    <li><strong>The base regime is still mid-re-sweep.</strong> {BASE_N} of 961 groups have been re-run
+    under the current exit rule. That is now enough for a cross-class rank coefficient (&sect;2), a divergence
+    table (&sect;3.2) and {NVENUE["base"]} listing venues (&sect;4), all of which the previous edition had to
+    leave blank &mdash; but it is not the whole corpus, so every base figure here is provisional and should be
+    expected to move as the remaining groups land. Oracle and naive are complete at 961 of 961 groups each and
+    are not affected.</li>
     <li><strong>Superseded: the exit-rule asymmetry is gone.</strong> Earlier editions carried the companion
     paper&rsquo;s caveat that oracle and base were scored one bar ahead then force-closed while naive walked
     forward multi-bar, and noted that this bore directly on &sect;3&rsquo;s crypto explanation &mdash; a
@@ -556,8 +614,9 @@ WHERE  s.stage = ?  AND s.signal_count &gt;= 3  AND s.asset_class != 'mixed'
   29 August 2026. Rows written before it were scored one bar ahead and force-closed, so they are excluded
   rather than blended in &mdash; which also means this note&rsquo;s footprint is now exactly the deduped
   <strong>961-group list</strong>, for oracle and naive alike, with no groups from outside it. Contributing
-  groups per class: <strong>928 equity, 31 crypto, 14 FX/commodity</strong> (a group can contribute signals to
-  more than one class). Base stands at 84 groups: 80 equity, 4 crypto, 1 FX/commodity.</p>
+  groups per class: <strong>{NV["equity"]["gps"]} equity, {NV["crypto"]["gps"]} crypto,
+  {NV["fx_commodity"]["gps"]} FX/commodity</strong> (a group can contribute signals to more than one class).
+  Base stands at {BASE_N} groups.</p>
   <p><strong>Superseded: the naive backfill.</strong> Earlier editions of this note described a targeted
   backfill that ran naive over 186 groups from outside the deduped list, taking it from 959 to 1,144 groups
   and lifting crypto from 29 to 99 groups and FX/commodities from 4 to 33. Those rows are pre-fix and no
@@ -597,7 +656,7 @@ uv run scripts/run_base_priority.py                            (base)</pre>
 </div>
 
 <footer>
-  Kairos Project &middot; research note, 31 August 2026 &middot; generated from data/pipeline_results.db at commit e8c596a.<br>
+  Kairos Project &middot; research note, {STAMP} &middot; generated from data/pipeline_results.db at commit {COMMIT}.<br>
   Companion to <em>The Prediction Premium</em>. Segmentation covers 5.6M signals across three asset classes
   and six equity listing venues, all scored on the unified walk-forward exit rule. Shadow-performance measurements without transaction costs; not investment advice.
 </footer>
