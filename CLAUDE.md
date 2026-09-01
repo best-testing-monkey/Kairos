@@ -1075,9 +1075,33 @@ groups `'mixed'` (1,503 rows, 1.3%), invisible to per-class reads.
 to the corpus `signal_count` for the same (run, strategy). Sharpe will not match
 and must never be asserted to.
 
-**Nothing consumes these yet** — that is deliberate. See
-`docs/tickets/per-class-stats-wiring.md` for what phase 2 must wire, with call
-sites traced.
+**Phase 2 shipped in `d78c250`** — an earlier version of this file said
+"nothing consumes these yet", which was true when written and has been wrong
+since. `docs/tickets/per-class-stats-wiring.md` is the accurate record (items
+1-5 and 7 implemented, item 6 closed as won't-do). Three live consumers, and
+they behave very differently:
+
+- **Shrink prior** — `kairos_signals._class_prior_win_rate()` →
+  `allocation.compute_derived()`. Actually fires, for any single-class group
+  (returns `None` for mixed, restoring the old shrink-toward-0.5 exactly).
+  This is the only route by which per-class stats reach live behaviour today.
+- **Disabled-strategy gate** — step 2 of
+  `kairos_strategies.resolve_disabled_strategies()`. Wired, but **dead on the
+  live path**: step 1 returns for any group with an `oracle_results` row and
+  never falls through, and oracle is at 961/961. Measured 2026-09-01 against
+  the actual papertrade work items — 120/120 groups on `1d` and 16/16 on `1h`
+  are oracle-tested, so step 2 fires for none of them. If you are wondering
+  why a class-stats change had no effect on live signals, this is why.
+- **Selection stats** (n, win rate, Sharpe, EV) — deliberately NOT per-class;
+  they stay per-GROUP. See the ticket's item 5: the group's own backtest is
+  more specific evidence than a class average, so sourcing them per class
+  would lose information. Don't "fix" this without reading that first.
+
+Two known gaps: `asset_class` reaches `Candidate` and the selection DSL but
+appears in **no report header**, so it is filterable but invisible; and both
+readers hardcode `stage = "finetuned" if model_path else "base"`
+(`kairos_signals.py:793`, `kairos_strategies.py:1049`), so the `naive` rows in
+this table are unreachable without threading a stage parameter through.
 
 ### Four classifiers, none interchangeable
 
