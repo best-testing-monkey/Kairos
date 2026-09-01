@@ -531,6 +531,7 @@ def _candidate_to_dict(c: Candidate) -> dict:
         "avg_loss_pct": c.avg_loss_pct,
         "avg_holding_days": c.avg_holding_days,
         "model": c.model,
+        "asset_class": c.asset_class,
         "derived": {},  # Filled in by select_candidates
         "status": None,  # Filled in by select_candidates
         "flags": [],  # Filled in by select_candidates
@@ -1128,6 +1129,14 @@ _FORMULA_COLS = [
 # A-AN layout (see module docstring on column AM/AN redistribution formulas).
 _MODEL_COL = "AO"
 
+# Trailing plain-value Asset Class column, one further right again. Same
+# reasoning as _MODEL_COL: this is the per-INSTRUMENT 3-way class
+# (asset_class_of_symbol) that --signal-selection filters on and that
+# strategy_class_stats is keyed by, so a rule author needs to see the value
+# they are matching against. Trailing rather than beside Ticker precisely
+# because it must not shift the position-sensitive A-AN formula layout.
+_CLASS_COL = "AP"
+
 # Column letters (percent-labeled) that receive "0.0%" number format / ODS
 # percent cell style: visible Risk %, Reward %, EV raw %, EV net %, EV total,
 # Alloc %, plus helper risk_pct, reward_pct, loss_pct, alloc_raw_pct, and the
@@ -1298,7 +1307,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
         _STATIC_HEADERS
         + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:8]]
         + _HELPER_HEADERS
-        + ["Model"]
+        + ["Model", "Asset Class"]
     )
     for col_idx, header in enumerate(headers, start=1):
         ws.cell(row=_HEADER_ROW, column=col_idx, value=header)
@@ -1343,10 +1352,13 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
             ws.cell(row=excel_row, column=col_idx,
                     value=render_formula(col_letter, excel_row, "xlsx"))
 
-        # Trailing plain-value Model column, appended after all A-AN columns.
+        # Trailing plain-value Model and Asset Class columns, appended after
+        # all A-AN columns.
         model_col_idx = _xlsx_column_letter_to_index(_MODEL_COL)
         ws.cell(row=excel_row, column=model_col_idx,
                 value=row_data.get("model") or "")
+        ws.cell(row=excel_row, column=_xlsx_column_letter_to_index(_CLASS_COL),
+                value=row_data.get("asset_class") or "")
 
     # -------------------------------------------------------------------------
     # Percent number formatting: visible + helper percent-labeled columns,
@@ -1365,7 +1377,7 @@ def write_xlsx_sheet(workbook, result: AllocationResult, config: AllocationConfi
     # -------------------------------------------------------------------------
     # Autofilter over header + data rows
     # -------------------------------------------------------------------------
-    ws.auto_filter.ref = f"A{_HEADER_ROW}:{_MODEL_COL}{data_end_row}"
+    ws.auto_filter.ref = f"A{_HEADER_ROW}:{_CLASS_COL}{data_end_row}"
 
     # -------------------------------------------------------------------------
     # Section B: cluster exposure table
@@ -1676,7 +1688,7 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
         _STATIC_HEADERS
         + [_FORMULA_HEADERS[col] for col in _FORMULA_COLS[:8]]
         + _HELPER_HEADERS
-        + ["Model"]
+        + ["Model", "Asset Class"]
     )
     _ods_add_row(table, headers)
 
@@ -1728,8 +1740,10 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
             col_idx = _xlsx_column_letter_to_index(col_letter) - 1
             formulas[col_idx] = render_formula(col_letter, excel_row, "ods")
 
-        # Trailing plain-value Model column, appended after all A-AN columns.
-        values = static_values + [""] * len(_FORMULA_COLS) + [row_data.get("model") or ""]
+        # Trailing plain-value Model and Asset Class columns, appended after
+        # all A-AN columns.
+        values = (static_values + [""] * len(_FORMULA_COLS)
+                  + [row_data.get("model") or "", row_data.get("asset_class") or ""])
         percent_cols = static_percent_cols | formula_percent_cols
         _ods_add_row(table, values, formulas=formulas, percent_cols=percent_cols)
 
@@ -1749,7 +1763,7 @@ def write_ods_sheet(document, result: AllocationResult, config: AllocationConfig
         DatabaseRange(
             name="AllocationFilter",
             targetrangeaddress=(
-                f"'Allocation'.A{_HEADER_ROW}:'Allocation'.{_MODEL_COL}{data_end_row}"
+                f"'Allocation'.A{_HEADER_ROW}:'Allocation'.{_CLASS_COL}{data_end_row}"
             ),
             displayfilterbuttons="true",
         )
@@ -1858,8 +1872,8 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
     lines.append("")
 
     # Selected-position table via kairos_signals.format_table
-    headers = ["Ticker", "Dir", "Strategy", "Entry", "Stop", "Target", "EV net", "Score", "Alloc", "Model", "Leverage", "Margin %"]
-    align = ["l", "l", "l", "r", "r", "r", "r", "r", "r", "l", "r", "r"]
+    headers = ["Ticker", "Class", "Dir", "Strategy", "Entry", "Stop", "Target", "EV net", "Score", "Alloc", "Model", "Leverage", "Margin %"]
+    align = ["l", "l", "l", "l", "r", "r", "r", "r", "r", "r", "l", "r", "r"]
 
     selected_rows = [row for row in result.rows if row.get("status") == "SELECTED"]
     table_rows = []
@@ -1882,6 +1896,7 @@ def write_md_section(result: AllocationResult, config: AllocationConfig) -> str:
 
         table_rows.append({
             "Ticker": row.get("ticker", ""),
+            "Class": row.get("asset_class") or "",
             "Dir": direction.capitalize() if isinstance(direction, str) else "",
             "Strategy": row.get("strategy", ""),
             "Entry": f"{entry:.2f}" if entry is not None else "",

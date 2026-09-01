@@ -392,7 +392,7 @@ class TestAutofilter:
     def test_auto_filter_ref(self, workbook, result):
         ws = workbook["Allocation"]
         data_end_row = 20 + len(result.rows)
-        assert ws.auto_filter.ref == f"A20:AO{data_end_row}"
+        assert ws.auto_filter.ref == f"A20:AP{data_end_row}"
 
 
 class TestEvTotalSummaryRow:

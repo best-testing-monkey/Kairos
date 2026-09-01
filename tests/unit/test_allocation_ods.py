@@ -366,14 +366,14 @@ class TestAutofilter:
         assert "A20" in target
         assert ranges[0].getAttribute("displayfilterbuttons") == "true"
 
-    def test_database_range_extends_to_model_column(self, document, result):
-        """The range now ends at AO (Model), not AN, per the append-only column."""
+    def test_database_range_extends_to_last_trailing_column(self, document, result):
+        """The range ends at the LAST append-only column, now AP (Asset Class)."""
         from odf.table import DatabaseRange
 
         ranges = document.spreadsheet.getElementsByType(DatabaseRange)
         target = ranges[0].getAttribute("targetrangeaddress")
         data_end_row = 20 + len(result.rows)
-        assert f"AO{data_end_row}" in target
+        assert f"AP{data_end_row}" in target
         assert f"AN{data_end_row}" not in target
 
 
