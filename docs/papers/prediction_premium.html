@@ -215,7 +215,7 @@ footer {
   <div class="byline">
     <span>Kairos Project</span>
     <span>1d bars &middot; 6-month window</span>
-    <span>127 strategies &middot; 84 matched asset groups</span>
+    <span>127 strategies &middot; 783 matched asset groups</span>
     <span>commit e8c596a</span>
   </div>
 </header>
@@ -228,17 +228,17 @@ footer {
   with no forecast information, an <strong>oracle</strong> ceiling with perfect foresight of the next bar, and the
   <strong>base</strong> regime driven by the pretrained Kronos forecasting model.</p>
   <p>All three regimes are now scored by one walk-forward exit rule, correcting the asymmetry the first
-  edition of this note listed as its largest caveat (&sect;8.1). On a matched sample of 84 asset groups and
-  the 43 distinct strategies that produced signals in all three regimes, the results separate cleanly.
-  Stripped of forecast information, only 10 of 43 strategies hold a positive
-  signal-weighted Sharpe and the median strategy sits at -0.45. Given perfect foresight,
-  the median rises to +3.46 and the upper quartile to +10.24 &mdash;
-  but 15 of 43 still lose money knowing the future. The base model sits
-  between them, lifting 26 of 43 strategies above zero to a median of
-  +0.15 &mdash; most of the way to the oracle on <em>breadth</em>, and a small fraction of
+  edition of this note listed as its largest caveat (&sect;8.1). On a matched sample of 783 asset groups and
+  the 44 distinct strategies that produced signals in all three regimes, the results separate cleanly.
+  Stripped of forecast information, only 10 of 44 strategies hold a positive
+  signal-weighted Sharpe and the median strategy sits at -0.61. Given perfect foresight,
+  the median rises to +1.55 and the upper quartile to +9.04 &mdash;
+  but 19 of 44 still lose money knowing the future. The base model sits
+  between them, lifting 26 of 44 strategies above zero to a median of
+  +0.21 &mdash; most of the way to the oracle on <em>breadth</em>, and a small fraction of
   the way on <em>magnitude</em>.</p>
   <p>The three-regime sample is thin, and honestly so: the base sweep is being re-run on the new exit rule and
-  has reached 84 of 961 groups, so the matched sample is a fraction of its predecessor and is ordered by
+  has reached 783 of 961 groups, so the matched sample is a fraction of its predecessor and is ordered by
   oracle Sharpe rather than drawn at random (&sect;3.3, &sect;6). The oracle and naive sweeps are complete and
   exactly paired at 961 groups; where a claim needs only those two, we report it on the full corpus.</p>
   <p>We conclude that forecast quality is the dominant term in this corpus&rsquo;s measured performance, that
@@ -273,9 +273,10 @@ footer {
   <div class="regimes">
     <div class="rg" data-stage="naive">
       <h4>Naive</h4><span class="flag">--naive-baseline &middot; floor</span>
-      <p>Reuses the oracle&rsquo;s decision unchanged, then re-anchors entry to the bar the oracle peeked at
-      &mdash; a bar that has genuinely closed by the time the trade could exist &mdash; and resolves the
-      outcome only against strictly later bars. No future information survives into the accounting.</p>
+      <p>The most recent bar is withheld from the history the strategy sees and handed back as the
+      forecast, asserted with near-certainty: the next bar is predicted to repeat the last completed one.
+      Nothing about the future is used anywhere. That bar has closed by the time the trade is placed, entry
+      is its close, and only strictly later bars resolve it.</p>
     </div>
     <div class="rg" data-stage="base">
       <h4>Base model</h4><span class="flag">NeoQuasar/Kronos-base &middot; system under test</span>
@@ -291,13 +292,18 @@ footer {
     </div>
   </div>
 
-  <p>The naive regime deserves a note, because the obvious construction of it is wrong. An earlier
-  implementation fed the distribution-building step the <em>current</em> bar as both the centre and the
-  shape of the forecast. That is not a neutral no-information test: it silently asserts zero drift, which
-  centres every distribution exactly on the entry price and handicaps every directional strategy by
+  <p>The naive regime deserves a note, because two natural constructions of it are wrong in opposite
+  directions. The first fed the distribution-building step the <em>current</em> bar as both the centre and
+  the shape of the forecast. That is not a neutral no-information test: it silently asserts zero drift,
+  which centres every distribution exactly on the entry price and handicaps every directional strategy by
   construction. A full sweep was run on that version before the flaw was caught, and its results were
-  discarded. The regime described above avoids the trap by never re-deriving a decision at all &mdash; it
-  takes the oracle&rsquo;s real decision and corrects only the accounting.</p>
+  discarded. The second, which produced the previous edition of this note, took the oracle&rsquo;s decision
+  unchanged and corrected only the accounting, re-anchoring entry to the bar the oracle had peeked at. The
+  arithmetic there is sound &mdash; foreseeing a bar and then entering at its close is worth nothing, and
+  the re-anchoring cancels the advantage exactly &mdash; but the decision still read a bar that had not
+  happened, so the regime was free of lookahead by cancellation rather than by construction. Withholding
+  fixes both: the forecast bar is one the strategy could genuinely have held, and because it is withheld,
+  the distribution&rsquo;s centre stays distinct from its shape.</p>
 </section>
 
 <section>
@@ -358,14 +364,14 @@ footer {
   it were scored one bar ahead and force-closed, which is a different measurement, so they are excluded
   outright rather than blended in. Oracle and naive are complete: <strong>961 of 961 groups</strong> each, the
   same 961, so those two regimes are exactly paired for the first time. The base sweep is still running and
-  has reached <strong>84 groups</strong>.</p>
+  has reached <strong>783 groups</strong>.</p>
   <p><strong>Matched sample.</strong> Comparing regimes on unequal footprints would confound regime with asset
-  mix. Every three-regime figure in this note is therefore computed on the <strong>84 groups present in all three sweeps</strong>
-  (matched on assets, interval and backtest period), restricted further to the <strong>43 distinct
-  strategies that fired signals in all three regimes</strong> &mdash; 633,297 signals in all. This is the paper&rsquo;s central
+  mix. Every three-regime figure in this note is therefore computed on the <strong>783 groups present in all three sweeps</strong>
+  (matched on assets, interval and backtest period), restricted further to the <strong>44 distinct
+  strategies that fired signals in all three regimes</strong> &mdash; 5,698,914 signals in all. This is the paper&rsquo;s central
   methodological commitment: all comparisons are paired. It costs sample size here &mdash; the previous
   edition matched 451 groups &mdash; and the base sweep is ordered by oracle Sharpe rather than shuffled, so
-  the 84 groups over-represent assets the oracle did well on. Both effects are visible in the results and
+  the 783 groups over-represent assets the oracle did well on. Both effects are visible in the results and
   are quantified in &sect;4.4.</p>
   <p><strong>Aliased strategies are collapsed.</strong> Eight strategy names in the corpus are the same
   strategy: <code>trend_following</code> and seven filters that wrap it
@@ -389,8 +395,8 @@ footer {
   still open, and the walk continues. A signal whose stop and target are both still untouched when the data
   runs out is <strong>excluded</strong> rather than closed at an arbitrary price. The regimes differ in one
   respect only, and deliberately: oracle and base enter at the next bar&rsquo;s open, while naive enters at
-  that bar&rsquo;s close, because the naive regime exists to strip out the future information the oracle used
-  to pick the trade in the first place.</p>
+  the close of its own withheld forecast bar, because that bar must have closed before a naive trade can
+  exist at all.</p>
   <p>Excluding unresolved signals is a mild survivorship selection &mdash; a trade that drifts to the end of
   the window without touching either barrier is dropped rather than counted as the roughly flat outcome it
   was. Force-closing it at the last bar was the alternative, and it reintroduces exactly the arbitrary exit
@@ -408,48 +414,48 @@ footer {
         <div class="bp-label"><b>Naive</b><span>no prediction</span></div>
         <div class="bp-track">
           <i class="gl" style="left:0.000%"></i><i class="gl" style="left:11.111%"></i><i class="gl" style="left:22.222%"></i><i class="gl gl-zero" style="left:33.333%"></i><i class="gl" style="left:44.444%"></i><i class="gl" style="left:55.556%"></i><i class="gl" style="left:66.667%"></i><i class="gl" style="left:77.778%"></i><i class="gl" style="left:88.889%"></i><i class="gl" style="left:100.000%"></i>
-          <i class="whisk" style="left:0;width:27.383%"></i>
-          <i class="whisk" style="left:33.239%;right:0"></i>
-          <i class="box" style="left:27.383%;width:5.856%"></i>
-          <i class="med" style="left:30.861%"></i>
-          <span class="cap cap-lo">-12.5</span>
-          <span class="cap cap-hi">+6.5</span>
+          <i class="whisk" style="left:0;width:25.425%"></i>
+          <i class="whisk" style="left:32.381%;right:0"></i>
+          <i class="box" style="left:25.425%;width:6.955%"></i>
+          <i class="med" style="left:29.947%"></i>
+          <span class="cap cap-lo">-18.6</span>
+          <span class="cap cap-hi">+7.2</span>
         </div>
-        <div class="bp-med">-0.45</div>
+        <div class="bp-med">-0.61</div>
       </div>
       <div class="bp-row" data-stage="base">
         <div class="bp-label"><b>Base model</b><span>Kronos-base</span></div>
         <div class="bp-track">
           <i class="gl" style="left:0.000%"></i><i class="gl" style="left:11.111%"></i><i class="gl" style="left:22.222%"></i><i class="gl gl-zero" style="left:33.333%"></i><i class="gl" style="left:44.444%"></i><i class="gl" style="left:55.556%"></i><i class="gl" style="left:66.667%"></i><i class="gl" style="left:77.778%"></i><i class="gl" style="left:88.889%"></i><i class="gl" style="left:100.000%"></i>
-          <i class="whisk" style="left:0;width:28.944%"></i>
-          <i class="whisk" style="left:36.939%;right:0"></i>
-          <i class="box" style="left:28.944%;width:7.994%"></i>
-          <i class="med" style="left:34.172%"></i>
-          <span class="cap cap-lo">-15.3</span>
-          <span class="cap cap-hi">+4.3</span>
+          <i class="whisk" style="left:0;width:30.462%"></i>
+          <i class="whisk" style="left:38.880%;right:0"></i>
+          <i class="box" style="left:30.462%;width:8.418%"></i>
+          <i class="med" style="left:34.477%"></i>
+          <span class="cap cap-lo">-9.1</span>
+          <span class="cap cap-hi">+11.6</span>
         </div>
-        <div class="bp-med">+0.15</div>
+        <div class="bp-med">+0.21</div>
       </div>
       <div class="bp-row" data-stage="oracle">
         <div class="bp-label"><b>Oracle</b><span>perfect foresight</span></div>
         <div class="bp-track">
           <i class="gl" style="left:0.000%"></i><i class="gl" style="left:11.111%"></i><i class="gl" style="left:22.222%"></i><i class="gl gl-zero" style="left:33.333%"></i><i class="gl" style="left:44.444%"></i><i class="gl" style="left:55.556%"></i><i class="gl" style="left:66.667%"></i><i class="gl" style="left:77.778%"></i><i class="gl" style="left:88.889%"></i><i class="gl" style="left:100.000%"></i>
-          <i class="whisk" style="left:0;width:11.578%"></i>
-          <i class="whisk" style="left:90.217%;right:0"></i>
-          <i class="box" style="left:11.578%;width:78.639%"></i>
-          <i class="med" style="left:52.533%"></i>
-          <span class="cap cap-lo">-27.4</span>
-          <span class="cap cap-hi">+76.4</span>
+          <i class="whisk" style="left:0;width:1.398%"></i>
+          <i class="whisk" style="left:83.576%;right:0"></i>
+          <i class="box" style="left:1.398%;width:82.178%"></i>
+          <i class="med" style="left:41.938%"></i>
+          <span class="cap cap-lo">-28.2</span>
+          <span class="cap cap-hi">+39.0</span>
         </div>
-        <div class="bp-med">+3.46</div>
+        <div class="bp-med">+1.55</div>
       </div>
     <div class="bp-axis"><div class="bp-label"></div><div class="bp-track"><span class="tick" style="left:0.000%">-6</span><span class="tick" style="left:11.111%">-4</span><span class="tick" style="left:22.222%">-2</span><span class="tick tick-zero" style="left:33.333%">0</span><span class="tick" style="left:44.444%">2</span><span class="tick" style="left:55.556%">4</span><span class="tick" style="left:66.667%">6</span><span class="tick" style="left:77.778%">8</span><span class="tick" style="left:88.889%">10</span><span class="tick" style="left:100.000%">12</span></div><div class="bp-med"></div></div>
   </div>
-  <figcaption><b>Figure 1.</b> Distribution of per-strategy signal-weighted Sharpe across the 43 distinct strategies
+  <figcaption><b>Figure 1.</b> Distribution of per-strategy signal-weighted Sharpe across the 44 distinct strategies
   evaluated in all three regimes. Boxes span the first to third quartile; the vertical rule is the median;
   whiskers are clipped at the axis bounds with the true extremes printed at each end. The naive box sits
   entirely left of zero. The base model's median crosses it. Oracle's box runs off the scale at
-  +10.24, on a true maximum of +76.40.</figcaption>
+  +9.04, on a true maximum of +39.00.</figcaption>
 </figure>
   <div class="tbl-wrap">
 <table class="tbl">
@@ -462,40 +468,40 @@ footer {
   </tr></thead>
   <tbody><tr data-stage="naive">
       <th scope="row"><span class="swatch"></span>Naive</th>
-      <td class="num">215,085</td>
-      <td class="num">10 / 43</td>
-      <td class="num">-0.445</td>
-      <td class="num">-1.07</td>
-      <td class="num">-0.02</td>
-      <td class="num">48.51%</td>
-      <td class="num">-0.0434%</td>
+      <td class="num">2,030,797</td>
+      <td class="num">10 / 44</td>
+      <td class="num">-0.609</td>
+      <td class="num">-1.42</td>
+      <td class="num">-0.17</td>
+      <td class="num">47.26%</td>
+      <td class="num">-0.0579%</td>
     </tr><tr data-stage="base">
       <th scope="row"><span class="swatch"></span>Base model</th>
-      <td class="num">201,851</td>
-      <td class="num">26 / 43</td>
-      <td class="num">+0.151</td>
-      <td class="num">-0.79</td>
-      <td class="num">+0.65</td>
-      <td class="num">43.79%</td>
-      <td class="num">+0.0860%</td>
+      <td class="num">1,637,609</td>
+      <td class="num">26 / 44</td>
+      <td class="num">+0.206</td>
+      <td class="num">-0.52</td>
+      <td class="num">+1.00</td>
+      <td class="num">43.72%</td>
+      <td class="num">+0.0843%</td>
     </tr><tr data-stage="oracle">
       <th scope="row"><span class="swatch"></span>Oracle</th>
-      <td class="num">216,361</td>
-      <td class="num">28 / 43</td>
-      <td class="num">+3.456</td>
-      <td class="num">-3.92</td>
-      <td class="num">+10.24</td>
-      <td class="num">62.26%</td>
-      <td class="num">+0.4456%</td>
+      <td class="num">2,030,508</td>
+      <td class="num">25 / 44</td>
+      <td class="num">+1.549</td>
+      <td class="num">-5.75</td>
+      <td class="num">+9.04</td>
+      <td class="num">58.86%</td>
+      <td class="num">+0.2983%</td>
     </tr></tbody>
 </table></div>
 
   <h3>4.1 &mdash; Without prediction, the corpus does not work</h3>
-  <p>The naive regime is the weakest of the three. Across 215,085 signals, <strong>10 of 43
+  <p>The naive regime is the weakest of the three. Across 2,030,797 signals, <strong>10 of 44
   strategies</strong> hold a positive signal-weighted Sharpe, the median strategy sits at
-  <strong>-0.45</strong>, mean win rate at 48.5%, and the median return per trade is negative at
-  <strong>-0.043%</strong>. More than three-quarters of the corpus loses money with no forward
-  information, and the third quartile does not reach zero at all (-0.02).</p>
+  <strong>-0.61</strong>, mean win rate at 47.3%, and the median return per trade is negative at
+  <strong>-0.058%</strong>. More than three-quarters of the corpus loses money with no forward
+  information, and the third quartile does not reach zero at all (-0.17).</p>
   <p>The survivors are mostly not forecast-shaped. The strongest, <code>bollinger_validation</code>, posts
   +6.54 &mdash; but on 145 signals, a fraction of a percent of the volume the mainstream strategies
   generate. The two thickest positives, <code>support_confluence</code> (+1.29) and
@@ -509,34 +515,34 @@ footer {
 
   <h3>4.2 &mdash; Prediction is the difference, but it does not rescue everything</h3>
   <p>Handed a perfect one-step forecast, the corpus moves decisively. The median Sharpe rises to
-  <strong>+3.46</strong>, mean win rate to <strong>62.3%</strong>, and median return per trade to
-  <strong>+0.446%</strong> &mdash; roughly five times the base model&rsquo;s. The oracle beats the naive
-  floor on <strong>30 of 43 strategies</strong>. The upper tail is where the effect is most visible:
-  oracle&rsquo;s third quartile is <strong>+10.24</strong> against naive&rsquo;s -0.02, and its best performer,
-  <code>cross_asset_rank</code>, reaches +76.40. Whatever these strategies are for, forecast quality is
+  <strong>+1.55</strong>, mean win rate to <strong>58.9%</strong>, and median return per trade to
+  <strong>+0.298%</strong> &mdash; roughly five times the base model&rsquo;s. The oracle beats the naive
+  floor on <strong>28 of 44 strategies</strong>. The upper tail is where the effect is most visible:
+  oracle&rsquo;s third quartile is <strong>+9.04</strong> against naive&rsquo;s -0.17, and its best performer,
+  <code>cross_asset_rank</code>, reaches +39.00. Whatever these strategies are for, forecast quality is
   the input that makes them work.</p>
-  <p>And yet <strong>15 of 43 strategies remain unprofitable with perfect foresight.</strong>
+  <p>And yet <strong>19 of 44 strategies remain unprofitable with perfect foresight.</strong>
   Oracle&rsquo;s worst result, <code>volume_fade</code> at &minus;27.44, is far worse than its own naive
   result of &minus;0.18 &mdash; perfect information made it decisively worse, because a strategy that acts
   confidently on a correct forecast in the wrong direction loses faster than one that barely acts at all.
-  Oracle&rsquo;s distribution is by far the widest of the three in both directions, spanning -27.44 to
-  +76.40. This is the finding that resists a comfortable reading: for a third of the corpus, no
+  Oracle&rsquo;s distribution is by far the widest of the three in both directions, spanning -28.17 to
+  +39.00. This is the finding that resists a comfortable reading: for a third of the corpus, no
   improvement in forecasting will help, because the decision rule sitting on top of the forecast is itself
   broken.</p>
 
   <h3>4.3 &mdash; The base model supplies real information</h3>
   <p>The pretrained Kronos model, with no fine-tuning, moves the corpus decisively on breadth. It lifts
-  <strong>26 of 43 strategies</strong> above zero &mdash; more than twice the naive count of
-  10, and within two of the oracle&rsquo;s own 28 &mdash; and beats the naive floor head-to-head on
-  <strong>28 of 43</strong>. The median Sharpe turns positive at
-  <strong>+0.15</strong> and median return per trade at <strong>+0.086%</strong>, double the
+  <strong>26 of 44 strategies</strong> above zero &mdash; more than twice the naive count of
+  10, and within two of the oracle&rsquo;s own 25 &mdash; and beats the naive floor head-to-head on
+  <strong>35 of 44</strong>. The median Sharpe turns positive at
+  <strong>+0.21</strong> and median return per trade at <strong>+0.084%</strong>, double the
   naive figure&rsquo;s magnitude and opposite in sign.</p>
   <p>The individual movements are large where they matter. <code>open_gap</code> goes from &minus;0.72 to
   +2.55; <code>high_low</code> from &minus;0.83 to +0.94; <code>conditional_path</code> from &minus;1.04 to
   +0.65; <code>rsi_divergence</code> from &minus;1.42 to +0.15. These are strategies that do not work at all
   without a forecast and do work with this one. The model is not decorative.</p>
   <p>One detail is worth naming because it looks like a contradiction. The base regime&rsquo;s mean win rate
-  is <strong>43.8%</strong>, <em>below</em> naive&rsquo;s 48.5%, while its median return per trade is
+  is <strong>43.7%</strong>, <em>below</em> naive&rsquo;s 47.3%, while its median return per trade is
   positive and naive&rsquo;s is not. The model is not winning more often; it is winning better. What it
   changes is which side of an asymmetric bracket the trade sits on, which is what a directional forecast
   should change and what a win-rate count is blind to.</p>
@@ -544,11 +550,11 @@ footer {
   <div class="callout">
     <h4>The qualification this result carries</h4>
     <p>The base model nearly matches the oracle on <em>breadth</em> and captures little of its
-    <em>magnitude</em>. It puts 26 strategies above zero against perfect foresight&rsquo;s 28, but
-    its median is +0.15 against oracle&rsquo;s +3.46, its third quartile +0.65 against
-    +10.24 &mdash; a sixteenfold gap &mdash; and its best strategy reaches +4.35 against
-    +76.40. The model finds the direction; it does not yet find the conviction.</p>
-    <p>A second measurement sharpens this. Ranking the 43 strategies by Sharpe within each regime and
+    <em>magnitude</em>. It puts 26 strategies above zero against perfect foresight&rsquo;s 25, but
+    its median is +0.21 against oracle&rsquo;s +1.55, its third quartile +1.00 against
+    +9.04 &mdash; a sixteenfold gap &mdash; and its best strategy reaches +11.60 against
+    +39.00. The model finds the direction; it does not yet find the conviction.</p>
+    <p>A second measurement sharpens this. Ranking the 44 strategies by Sharpe within each regime and
     correlating those rankings, the base ordering still resembles the <em>naive</em> ordering
     (Spearman <span class="mono">&rho;&nbsp;=&nbsp;+0.556</span>) more closely than it resembles the
     <em>oracle</em> ordering (<span class="mono">&rho;&nbsp;=&nbsp;+0.346</span>). The base model shifts
@@ -559,7 +565,7 @@ footer {
   </div>
 
   <h3>4.4 &mdash; What the full corpus says, where it can</h3>
-  <p>The 84-group matched sample is small and non-random, so the two complete regimes deserve a reading of
+  <p>The 783-group matched sample is small and non-random, so the two complete regimes deserve a reading of
   their own. Oracle and naive both cover all <strong>961 groups</strong> and share <strong>46 strategies</strong>, on
   2,726,372 and 2,713,432 signals respectively &mdash; a paired comparison over the whole corpus with no
   base-coverage constraint at all.</p>
@@ -568,7 +574,7 @@ footer {
   of 46. Every directional conclusion in &sect;4.1 and &sect;4.2 survives at full corpus scale; the magnitudes
   are smaller.</p>
   <p>That gap is the sample-ordering effect, and it is worth measuring rather than asserting. The oracle
-  median is +3.46 on the 84 matched groups against +1.23 on all 961 &mdash; the matched groups are
+  median is +1.55 on the 783 matched groups against +1.23 on all 961 &mdash; the matched groups are
   materially easier for a perfect forecast, exactly as an ordering by oracle Sharpe predicts. Read the base
   column against the oracle column <em>within</em> the matched sample, where both faced the same assets. Do
   not read either against the full-corpus numbers above.</p>
@@ -588,7 +594,7 @@ footer {
   at the floor; their edge is bracket geometry and does not depend on knowing direction.
   <strong>Irreparable strategies</strong> (<code>volume_fade</code>, <code>gbm_direction</code>,
   <code>pca_residual_reversal</code>, <code>atr_bracket</code>) lose money in all three regimes &mdash; nine
-  of 43 do &mdash; several of them losing <em>more</em> as information improves.</p>
+  of 44 do &mdash; several of them losing <em>more</em> as information improves.</p>
   <p>That third group is the most actionable output here. A strategy that loses money with perfect
   foresight cannot be fixed by a better model, more training data, or a longer fine-tune. It should be
   repaired at the decision rule or removed from the corpus, and the resources currently spent evaluating
@@ -603,13 +609,26 @@ footer {
   <p>These results are internally consistent, but several constraints bound how far they generalise. They
   are listed in descending order of how much they should temper the conclusions.</p>
   <ol>
-    <li><strong>Thin, non-random base coverage.</strong> The base sweep has re-run 84 of 961 groups under the
-    current exit rule, so the three-regime matched sample is 84 groups against the previous
+    <li><strong>Thin, non-random base coverage.</strong> The base sweep has re-run 783 of 961 groups under the
+    current exit rule, so the three-regime matched sample is 783 groups against the previous
     edition&rsquo;s 451, and it is ordered by oracle Sharpe rather than shuffled. &sect;4.4 measures what that
-    ordering is worth: the oracle median is +3.46 on these 84 groups against +1.23 on all 961.
+    ordering is worth: the oracle median is +1.55 on these 783 groups against +1.23 on all 961.
     Every three-regime figure in this note should be read as provisional and expected to move as coverage
     grows. The two-regime figures in &sect;4.4 are not affected &mdash; oracle and naive are complete. This is
     a transient state, not a design choice, and it is the single largest caveat in this edition.</li>
+
+    <li><strong>Superseded: the naive regime no longer reads the next bar.</strong> Through the previous
+    edition the naive regime reused the oracle&rsquo;s decision and corrected only the accounting, so its
+    decision step read a bar that had not happened when the decision was made. The advantage this conferred
+    was nil, and provably so: entry re-anchored to the close of the foreseen bar, which spends the move
+    before the fill. Old-regime-at-date-<i>d</i> is input-for-input identical to new-regime-at-date-<i>d</i>+1.
+    Re-sweeping and comparing cell by cell bears that out &mdash; of 37,267 matched (group, strategy)
+    cells, <strong>23,558 (63.2%)</strong> are unchanged to the last decimal,
+    the median change is +0.000 and the mean -0.019; the pooled median
+    moves from -0.288 to -0.301. The regime is now constructed by
+    withholding (&sect;2), so it is free of lookahead by construction rather than by cancellation. Naive
+    figures here therefore differ slightly from the previous edition, and the conclusions drawn from them do
+    not.</li>
     <li><strong>Superseded: the exit rule is now identical across regimes.</strong> Earlier editions carried
     this as the study&rsquo;s largest caveat &mdash; oracle and base were scored by an evaluator that checked
     stop and target one bar ahead and then closed at that bar&rsquo;s close, while naive walked forward to a
@@ -619,7 +638,7 @@ footer {
     force-closed, which is a mild survivorship selection the naive regime always had and the other two have
     now acquired.</li>
     <li><strong>No transaction costs.</strong> No commission, spread, slippage, borrow, or financing is applied
-    anywhere. Median base-regime return per trade is +0.086%, which is inside realistic round-trip
+    anywhere. Median base-regime return per trade is +0.084%, which is inside realistic round-trip
     costs for much of this universe. The base regime&rsquo;s profitability claim is a claim about signal
     content, not about a tradeable edge.</li>
     <li><strong>Shadow accounting is not a portfolio.</strong> Every signal is scored independently with equal
@@ -629,7 +648,7 @@ footer {
     simultaneous signals across a group are non-independent by construction, and the effective sample size
     is smaller than the raw signal counts suggest. Real deployment on constrained capital will not
     reproduce these figures.</li>
-    <li><strong>No significance testing.</strong> 43 strategies were compared across three regimes with no
+    <li><strong>No significance testing.</strong> 44 strategies were compared across three regimes with no
     correction for multiple comparisons. With that many candidates, several positive results are expected by
     chance alone. Individual per-strategy figures &mdash; particularly thin ones like
     <code>bollinger_validation</code>&rsquo;s 145 naive signals &mdash; should be read as indicative, not
@@ -649,7 +668,7 @@ footer {
     <code>dynamic_bracket</code>/<code>inverse_variance</code>,
     <code>amount_flow</code>/<code>predicted_vwap</code> &mdash; and are <em>not</em> collapsed, because they
     are not exact aliases. If they turn out to be trivially different, the effective corpus is smaller than
-    43 and every count here is correspondingly inflated. On this sample <code>atr_bracket</code>,
+    44 and every count here is correspondingly inflated. On this sample <code>atr_bracket</code>,
     <code>trend_following</code> and <code>implementation_shortfall</code> also agree to two decimals in the
     naive and base regimes, which is worth a look.</li>
     <li><strong>Previously reported failures did not recur.</strong> Earlier editions excluded two groups that
@@ -662,7 +681,7 @@ footer {
 
 <section>
   <h2 class="sec"><span class="no">07</span>Full results</h2>
-  <p>All 43 distinct strategies present in every regime, ordered by base-model Sharpe. Read each row left to right
+  <p>All 44 distinct strategies present in every regime, ordered by base-model Sharpe. Read each row left to right
   as floor, system, ceiling.</p>
 </section>
 </div>
@@ -686,7 +705,7 @@ footer {
       <th scope="col" class="num">Naive</th><th scope="col" class="num">Base</th><th scope="col" class="num">Oracle</th>
     </tr>
   </thead>
-  <tbody><tr><th scope="row" class="sname">support_confluence</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:5.38%"></i><span>+1.29</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:18.12%"></i><span>+4.35</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:28.63%"></i><span>+6.87</span></td><td class="num sub">77.1</td><td class="num sub">82.5</td><td class="num sub">89.0</td><td class="num sub">2,297</td></tr><tr><th scope="row" class="sname">bollinger_validation</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:27.25%"></i><span>+6.54</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:17.88%"></i><span>+4.29</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+67.36</span></td><td class="num sub">62.8</td><td class="num sub">58.9</td><td class="num sub">100.0</td><td class="num sub">56</td></tr><tr><th scope="row" class="sname">martingale_floor</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:4.10%"></i><span>+0.98</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:12.38%"></i><span>+2.97</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:31.71%"></i><span>+7.61</span></td><td class="num sub">73.6</td><td class="num sub">88.8</td><td class="num sub">91.2</td><td class="num sub">2,271</td></tr><tr><th scope="row" class="sname">open_gap</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:3.00%"></i><span>-0.72</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:10.64%"></i><span>+2.55</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:12.03%"></i><span>+2.89</span></td><td class="num sub">43.0</td><td class="num sub">53.6</td><td class="num sub">43.5</td><td class="num sub">5,862</td></tr><tr><th scope="row" class="sname">fade_extreme</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:0.33%"></i><span>+0.08</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:10.03%"></i><span>+2.41</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+15.66</span></td><td class="num sub">49.0</td><td class="num sub">47.0</td><td class="num sub">100.0</td><td class="num sub">83</td></tr><tr><th scope="row" class="sname">path_high_low_sequence</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:0.72%"></i><span>+0.17</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:7.92%"></i><span>+1.90</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+20.27</span></td><td class="num sub">64.0</td><td class="num sub">43.4</td><td class="num sub">100.0</td><td class="num sub">152</td></tr><tr><th scope="row" class="sname">funding_rate_prediction</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.20%"></i><span>-0.53</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:4.97%"></i><span>+1.19</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:30.08%"></i><span>-7.22</span></td><td class="num sub">70.3</td><td class="num sub">73.9</td><td class="num sub">53.4</td><td class="num sub">345</td></tr><tr><th scope="row" class="sname">high_low</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:3.45%"></i><span>-0.83</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:3.90%"></i><span>+0.94</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:21.13%"></i><span>+5.07</span></td><td class="num sub">56.4</td><td class="num sub">53.6</td><td class="num sub">75.6</td><td class="num sub">8,322</td></tr><tr><th scope="row" class="sname">distribution_overlap</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.21%"></i><span>-0.29</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:3.87%"></i><span>+0.93</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:16.32%"></i><span>-3.92</span></td><td class="num sub">38.8</td><td class="num sub">40.6</td><td class="num sub">24.1</td><td class="num sub">357</td></tr><tr><th scope="row" class="sname">close_direction</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.43%"></i><span>-0.58</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:2.72%"></i><span>+0.65</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:14.32%"></i><span>+3.44</span></td><td class="num sub">42.6</td><td class="num sub">40.0</td><td class="num sub">52.2</td><td class="num sub">12,114</td></tr><tr><th scope="row" class="sname">conditional_path</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:4.33%"></i><span>-1.04</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:2.70%"></i><span>+0.65</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:0.03%"></i><span>+0.01</span></td><td class="num sub">39.1</td><td class="num sub">38.7</td><td class="num sub">38.9</td><td class="num sub">20,512</td></tr><tr><th scope="row" class="sname">cross_asset_rank</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:1.78%"></i><span>+0.43</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:2.57%"></i><span>+0.62</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+76.40</span></td><td class="num sub">63.3</td><td class="num sub">30.7</td><td class="num sub">90.0</td><td class="num sub">5,868</td></tr><tr><th scope="row" class="sname">path_v_shape</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.13%"></i><span>-0.27</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:2.17%"></i><span>+0.52</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+17.60</span></td><td class="num sub">59.1</td><td class="num sub">74.5</td><td class="num sub">93.6</td><td class="num sub">10,402</td></tr><tr><th scope="row" class="sname">matrix_profile_anomaly</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:6.77%"></i><span>-1.62</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.71%"></i><span>+0.41</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:27.00%"></i><span>-6.48</span></td><td class="num sub">37.3</td><td class="num sub">34.3</td><td class="num sub">23.1</td><td class="num sub">283</td></tr><tr><th scope="row" class="sname">inverse_variance</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.85%"></i><span>-0.45</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.52%"></i><span>+0.36</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:2.88%"></i><span>+0.69</span></td><td class="num sub">42.4</td><td class="num sub">38.1</td><td class="num sub">48.9</td><td class="num sub">7,657</td></tr><tr><th scope="row" class="sname">particle_filter</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.54%"></i><span>-0.37</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.44%"></i><span>+0.35</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:21.34%"></i><span>+5.12</span></td><td class="num sub">44.5</td><td class="num sub">38.2</td><td class="num sub">62.3</td><td class="num sub">12,281</td></tr><tr><th scope="row" class="sname">dynamic_bracket</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.79%"></i><span>-0.43</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.40%"></i><span>+0.34</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:14.40%"></i><span>+3.46</span></td><td class="num sub">43.0</td><td class="num sub">37.7</td><td class="num sub">54.4</td><td class="num sub">11,179</td></tr><tr><th scope="row" class="sname">volume_confirmation</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:0.38%"></i><span>+0.09</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.34%"></i><span>+0.32</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:23.31%"></i><span>-5.59</span></td><td class="num sub">59.4</td><td class="num sub">37.7</td><td class="num sub">49.2</td><td class="num sub">565</td></tr><tr><th scope="row" class="sname">expected_value</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:3.98%"></i><span>+0.96</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.23%"></i><span>+0.29</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+12.80</span></td><td class="num sub">45.2</td><td class="num sub">40.5</td><td class="num sub">70.8</td><td class="num sub">8,718</td></tr><tr><th scope="row" class="sname">vol_target_sizer</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:3.98%"></i><span>+0.96</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.22%"></i><span>+0.29</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+12.80</span></td><td class="num sub">45.2</td><td class="num sub">40.6</td><td class="num sub">70.8</td><td class="num sub">8,186</td></tr><tr><th scope="row" class="sname">path_high_low_execution</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:0.07%"></i><span>-0.02</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.13%"></i><span>+0.27</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:23.59%"></i><span>+5.66</span></td><td class="num sub">56.7</td><td class="num sub">53.4</td><td class="num sub">75.1</td><td class="num sub">14,717</td></tr><tr><th scope="row" class="sname">rsi_divergence</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:5.92%"></i><span>-1.42</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.63%"></i><span>+0.15</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:26.56%"></i><span>+6.37</span></td><td class="num sub">41.2</td><td class="num sub">39.2</td><td class="num sub">62.5</td><td class="num sub">1,190</td></tr><tr><th scope="row" class="sname">tail_asymmetry</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:5.78%"></i><span>-1.39</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.55%"></i><span>+0.13</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:0.60%"></i><span>-0.14</span></td><td class="num sub">28.0</td><td class="num sub">29.5</td><td class="num sub">16.4</td><td class="num sub">4,308</td></tr><tr><th scope="row" class="sname">skew</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.58%"></i><span>-0.62</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.52%"></i><span>+0.12</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:1.58%"></i><span>+0.38</span></td><td class="num sub">34.9</td><td class="num sub">33.6</td><td class="num sub">26.4</td><td class="num sub">1,167</td></tr><tr><th scope="row" class="sname">cross_asset_spread</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:0.03%"></i><span>+0.01</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.24%"></i><span>+0.06</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:12.16%"></i><span>-2.92</span></td><td class="num sub">56.6</td><td class="num sub">37.0</td><td class="num sub">43.6</td><td class="num sub">4,337</td></tr><tr><th scope="row" class="sname">bsts_decomposition</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.53%"></i><span>-0.61</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.10%"></i><span>+0.02</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:22.49%"></i><span>+5.40</span></td><td class="num sub">43.6</td><td class="num sub">37.6</td><td class="num sub">62.7</td><td class="num sub">5,537</td></tr><tr><th scope="row" class="sname">path_execution</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:3.66%"></i><span>-0.88</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:0.57%"></i><span>-0.14</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:9.75%"></i><span>+2.34</span></td><td class="num sub">33.7</td><td class="num sub">35.4</td><td class="num sub">38.0</td><td class="num sub">24,157</td></tr><tr><th scope="row" class="sname">rqa_determinism</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:0.74%"></i><span>-0.18</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:0.93%"></i><span>-0.22</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:36.80%"></i><span>+8.83</span></td><td class="num sub">50.3</td><td class="num sub">55.2</td><td class="num sub">83.0</td><td class="num sub">6,251</td></tr><tr><th scope="row" class="sname">range_trading</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.14%"></i><span>-0.27</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:0.93%"></i><span>-0.22</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:42.66%"></i><span>+10.24</span></td><td class="num sub">49.6</td><td class="num sub">55.2</td><td class="num sub">86.4</td><td class="num sub">6,251</td></tr><tr><th scope="row" class="sname">rl_meta_controller</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:4.02%"></i><span>-0.96</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:1.85%"></i><span>-0.44</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:34.52%"></i><span>+8.28</span></td><td class="num sub">44.6</td><td class="num sub">45.6</td><td class="num sub">73.0</td><td class="num sub">2,388</td></tr><tr><th scope="row" class="sname">volume_fade</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:0.77%"></i><span>-0.18</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:2.66%"></i><span>-0.64</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:50.00%"></i><span>-27.44</span></td><td class="num sub">54.9</td><td class="num sub">67.8</td><td class="num sub">7.5</td><td class="num sub">363</td></tr><tr><th scope="row" class="sname">hmm_regime</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.03%"></i><span>-0.25</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:3.20%"></i><span>-0.77</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:31.38%"></i><span>-7.53</span></td><td class="num sub">53.5</td><td class="num sub">71.8</td><td class="num sub">43.8</td><td class="num sub">170</td></tr><tr><th scope="row" class="sname">dfa_persistence</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:0.74%"></i><span>-0.18</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:3.29%"></i><span>-0.79</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+12.49</span></td><td class="num sub">50.0</td><td class="num sub">52.3</td><td class="num sub">88.7</td><td class="num sub">2,963</td></tr><tr><th scope="row" class="sname">rsi_filter</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:4.46%"></i><span>-1.07</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:3.38%"></i><span>-0.81</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:15.89%"></i><span>-3.81</span></td><td class="num sub">36.4</td><td class="num sub">31.2</td><td class="num sub">28.6</td><td class="num sub">946</td></tr><tr><th scope="row" class="sname">cvd_divergence</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:10.69%"></i><span>-2.56</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:5.29%"></i><span>-1.27</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:16.78%"></i><span>+4.03</span></td><td class="num sub">29.9</td><td class="num sub">29.9</td><td class="num sub">41.9</td><td class="num sub">4,667</td></tr><tr><th scope="row" class="sname">multi_factor_rank</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:5.50%"></i><span>-1.32</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:6.34%"></i><span>-1.52</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:17.96%"></i><span>-4.31</span></td><td class="num sub">34.8</td><td class="num sub">26.7</td><td class="num sub">22.6</td><td class="num sub">247</td></tr><tr><th scope="row" class="sname">hurst_regime_switch</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:0.76%"></i><span>-0.18</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:8.91%"></i><span>-2.14</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+15.36</span></td><td class="num sub">49.3</td><td class="num sub">43.4</td><td class="num sub">91.2</td><td class="num sub">1,844</td></tr><tr><th scope="row" class="sname">gbm_direction</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:3.52%"></i><span>-0.84</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:11.95%"></i><span>-2.87</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:23.39%"></i><span>-5.61</span></td><td class="num sub">39.9</td><td class="num sub">27.1</td><td class="num sub">23.7</td><td class="num sub">366</td></tr><tr><th scope="row" class="sname">pca_residual_reversal</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:5.12%"></i><span>-1.23</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:14.28%"></i><span>-3.43</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:24.47%"></i><span>-5.87</span></td><td class="num sub">36.8</td><td class="num sub">28.8</td><td class="num sub">25.3</td><td class="num sub">257</td></tr><tr><th scope="row" class="sname">implementation_shortfall</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:33.41%"></i><span>-8.02</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:33.74%"></i><span>-8.10</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:8.26%"></i><span>-1.98</span></td><td class="num sub">16.7</td><td class="num sub">5.9</td><td class="num sub">33.3</td><td class="num sub">628</td></tr><tr><th scope="row" class="sname">atr_bracket</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:33.42%"></i><span>-8.02</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:33.77%"></i><span>-8.11</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:33.67%"></i><span>-8.08</span></td><td class="num sub">16.7</td><td class="num sub">5.9</td><td class="num sub">16.7</td><td class="num sub">628</td></tr><tr><th scope="row" class="sname">trend_following</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:33.42%"></i><span>-8.02</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:33.77%"></i><span>-8.11</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:33.67%"></i><span>-8.08</span></td><td class="num sub">16.7</td><td class="num sub">5.9</td><td class="num sub">16.7</td><td class="num sub">628</td></tr><tr><th scope="row" class="sname">trend_following+arima_agree</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:50.00%"></i><span>-12.50</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:50.00%"></i><span>-15.28</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:42.67%"></i><span>+10.24</span></td><td class="num sub">0.0</td><td class="num sub">5.1</td><td class="num sub">33.3</td><td class="num sub">331</td></tr></tbody>
+  <tbody><tr><th scope="row" class="sname">bollinger_validation</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:30.05%"></i><span>+7.21</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:48.32%"></i><span>+11.60</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+39.00</span></td><td class="num sub">65.2</td><td class="num sub">70.3</td><td class="num sub">99.1</td><td class="num sub">454</td></tr><tr><th scope="row" class="sname">path_high_low_sequence</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:0.55%"></i><span>+0.13</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:21.24%"></i><span>+5.10</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+20.74</span></td><td class="num sub">64.8</td><td class="num sub">51.0</td><td class="num sub">100.0</td><td class="num sub">1,248</td></tr><tr><th scope="row" class="sname">fade_extreme</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:1.56%"></i><span>+0.37</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:15.48%"></i><span>+3.71</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+15.10</span></td><td class="num sub">49.8</td><td class="num sub">57.1</td><td class="num sub">100.0</td><td class="num sub">736</td></tr><tr><th scope="row" class="sname">martingale_floor</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:2.85%"></i><span>+0.68</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:15.20%"></i><span>+3.65</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:37.68%"></i><span>+9.04</span></td><td class="num sub">72.2</td><td class="num sub">87.0</td><td class="num sub">91.8</td><td class="num sub">12,671</td></tr><tr><th scope="row" class="sname">open_gap</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:3.17%"></i><span>-0.76</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:12.93%"></i><span>+3.10</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:3.91%"></i><span>+0.94</span></td><td class="num sub">42.4</td><td class="num sub">54.4</td><td class="num sub">39.5</td><td class="num sub">35,828</td></tr><tr><th scope="row" class="sname">support_confluence</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:4.63%"></i><span>+1.11</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:11.99%"></i><span>+2.88</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:29.32%"></i><span>+7.04</span></td><td class="num sub">75.2</td><td class="num sub">74.1</td><td class="num sub">88.9</td><td class="num sub">18,541</td></tr><tr><th scope="row" class="sname">volume_confirmation</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:0.71%"></i><span>-0.17</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:4.92%"></i><span>+1.18</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:30.30%"></i><span>-7.27</span></td><td class="num sub">60.7</td><td class="num sub">40.5</td><td class="num sub">46.6</td><td class="num sub">2,556</td></tr><tr><th scope="row" class="sname">cross_asset_rank</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:23.73%"></i><span>-5.70</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:4.91%"></i><span>+1.18</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:50.00%"></i><span>-13.76</span></td><td class="num sub">42.2</td><td class="num sub">33.4</td><td class="num sub">34.2</td><td class="num sub">52,370</td></tr><tr><th scope="row" class="sname">high_low</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:3.23%"></i><span>-0.78</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:4.26%"></i><span>+1.02</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:29.05%"></i><span>+6.97</span></td><td class="num sub">53.9</td><td class="num sub">50.3</td><td class="num sub">77.8</td><td class="num sub">52,859</td></tr><tr><th scope="row" class="sname">cross_asset_spread</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:1.80%"></i><span>+0.43</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:4.18%"></i><span>+1.00</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:20.32%"></i><span>-4.88</span></td><td class="num sub">57.2</td><td class="num sub">39.2</td><td class="num sub">41.4</td><td class="num sub">20,860</td></tr><tr><th scope="row" class="sname">path_v_shape</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.21%"></i><span>-0.53</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:4.16%"></i><span>+1.00</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+16.28</span></td><td class="num sub">58.2</td><td class="num sub">77.4</td><td class="num sub">92.5</td><td class="num sub">110,142</td></tr><tr><th scope="row" class="sname">conditional_path</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:5.93%"></i><span>-1.42</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:3.07%"></i><span>+0.74</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:3.01%"></i><span>-0.72</span></td><td class="num sub">37.4</td><td class="num sub">38.6</td><td class="num sub">37.0</td><td class="num sub">133,679</td></tr><tr><th scope="row" class="sname">volume_fade</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:0.17%"></i><span>+0.04</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:2.62%"></i><span>+0.63</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:50.00%"></i><span>-28.17</span></td><td class="num sub">57.9</td><td class="num sub">69.3</td><td class="num sub">6.5</td><td class="num sub">4,360</td></tr><tr><th scope="row" class="sname">tail_asymmetry</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:5.90%"></i><span>-1.42</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:2.11%"></i><span>+0.51</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:5.38%"></i><span>+1.29</span></td><td class="num sub">25.0</td><td class="num sub">30.4</td><td class="num sub">18.9</td><td class="num sub">44,764</td></tr><tr><th scope="row" class="sname">close_direction</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.60%"></i><span>-0.62</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:2.10%"></i><span>+0.50</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:10.28%"></i><span>+2.47</span></td><td class="num sub">41.6</td><td class="num sub">38.8</td><td class="num sub">49.5</td><td class="num sub">104,958</td></tr><tr><th scope="row" class="sname">path_high_low_execution</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:0.30%"></i><span>+0.07</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.94%"></i><span>+0.46</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:29.23%"></i><span>+7.01</span></td><td class="num sub">58.1</td><td class="num sub">54.8</td><td class="num sub">78.7</td><td class="num sub">135,785</td></tr><tr><th scope="row" class="sname">dynamic_bracket</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.41%"></i><span>-0.58</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.49%"></i><span>+0.36</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:7.53%"></i><span>+1.81</span></td><td class="num sub">41.9</td><td class="num sub">37.5</td><td class="num sub">50.4</td><td class="num sub">83,664</td></tr><tr><th scope="row" class="sname">particle_filter</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.06%"></i><span>-0.50</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.44%"></i><span>+0.35</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:14.57%"></i><span>+3.50</span></td><td class="num sub">43.3</td><td class="num sub">37.7</td><td class="num sub">57.9</td><td class="num sub">104,830</td></tr><tr><th scope="row" class="sname">inverse_variance</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.49%"></i><span>-0.60</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.37%"></i><span>+0.33</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:0.74%"></i><span>-0.18</span></td><td class="num sub">41.5</td><td class="num sub">37.7</td><td class="num sub">46.9</td><td class="num sub">52,878</td></tr><tr><th scope="row" class="sname">vol_target_sizer</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:1.83%"></i><span>+0.44</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.23%"></i><span>+0.30</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+13.45</span></td><td class="num sub">43.3</td><td class="num sub">40.1</td><td class="num sub">75.2</td><td class="num sub">74,897</td></tr><tr><th scope="row" class="sname">expected_value</th><td class="num sh pos" data-stage="naive"><i class="bar" style="left:50%;width:1.83%"></i><span>+0.44</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:1.22%"></i><span>+0.29</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+13.45</span></td><td class="num sub">43.3</td><td class="num sub">40.0</td><td class="num sub">75.2</td><td class="num sub">76,445</td></tr><tr><th scope="row" class="sname">distribution_overlap</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.48%"></i><span>-0.60</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.89%"></i><span>+0.21</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:16.38%"></i><span>-3.93</span></td><td class="num sub">37.3</td><td class="num sub">39.2</td><td class="num sub">23.5</td><td class="num sub">2,605</td></tr><tr><th scope="row" class="sname">bsts_decomposition</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.70%"></i><span>-0.65</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.83%"></i><span>+0.20</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:16.12%"></i><span>+3.87</span></td><td class="num sub">42.8</td><td class="num sub">37.3</td><td class="num sub">58.6</td><td class="num sub">49,057</td></tr><tr><th scope="row" class="sname">rsi_divergence</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:5.97%"></i><span>-1.43</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.74%"></i><span>+0.18</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:18.39%"></i><span>+4.41</span></td><td class="num sub">40.8</td><td class="num sub">38.9</td><td class="num sub">58.6</td><td class="num sub">9,207</td></tr><tr><th scope="row" class="sname">rsi_filter</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:3.70%"></i><span>-0.89</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.04%"></i><span>+0.01</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:26.68%"></i><span>-6.40</span></td><td class="num sub">37.9</td><td class="num sub">33.1</td><td class="num sub">23.9</td><td class="num sub">6,165</td></tr><tr><th scope="row" class="sname">hmm_regime</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:4.98%"></i><span>-1.19</span></td><td class="num sh pos" data-stage="base"><i class="bar" style="left:50%;width:0.00%"></i><span>+0.00</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:30.02%"></i><span>-7.20</span></td><td class="num sub">49.4</td><td class="num sub">72.2</td><td class="num sub">42.4</td><td class="num sub">1,517</td></tr><tr><th scope="row" class="sname">range_trading</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.14%"></i><span>-0.27</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:0.22%"></i><span>-0.05</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:41.51%"></i><span>+9.96</span></td><td class="num sub">49.1</td><td class="num sub">52.9</td><td class="num sub">86.2</td><td class="num sub">42,387</td></tr><tr><th scope="row" class="sname">rqa_determinism</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:0.99%"></i><span>-0.24</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:0.27%"></i><span>-0.07</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:38.96%"></i><span>+9.35</span></td><td class="num sub">49.3</td><td class="num sub">52.8</td><td class="num sub">83.8</td><td class="num sub">41,696</td></tr><tr><th scope="row" class="sname">skew</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:3.19%"></i><span>-0.77</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:0.80%"></i><span>-0.19</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:2.34%"></i><span>+0.56</span></td><td class="num sub">32.2</td><td class="num sub">33.1</td><td class="num sub">26.6</td><td class="num sub">12,385</td></tr><tr><th scope="row" class="sname">funding_rate_prediction</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.31%"></i><span>-0.32</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:1.00%"></i><span>-0.24</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:34.29%"></i><span>-8.23</span></td><td class="num sub">71.3</td><td class="num sub">72.9</td><td class="num sub">49.1</td><td class="num sub">761</td></tr><tr><th scope="row" class="sname">path_execution</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:5.09%"></i><span>-1.22</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:1.28%"></i><span>-0.31</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:9.38%"></i><span>+2.25</span></td><td class="num sub">32.5</td><td class="num sub">36.0</td><td class="num sub">37.8</td><td class="num sub">230,901</td></tr><tr><th scope="row" class="sname">multi_factor_rank</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:6.95%"></i><span>-1.67</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:2.00%"></i><span>-0.48</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:17.72%"></i><span>-4.25</span></td><td class="num sub">33.4</td><td class="num sub">28.3</td><td class="num sub">22.8</td><td class="num sub">2,659</td></tr><tr><th scope="row" class="sname">variance_risk_premium</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.59%"></i><span>-0.62</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:2.15%"></i><span>-0.52</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:30.56%"></i><span>-7.33</span></td><td class="num sub">37.5</td><td class="num sub">26.3</td><td class="num sub">16.4</td><td class="num sub">266</td></tr><tr><th scope="row" class="sname">rl_meta_controller</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.20%"></i><span>-0.53</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:2.28%"></i><span>-0.55</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:32.37%"></i><span>+7.77</span></td><td class="num sub">44.1</td><td class="num sub">42.0</td><td class="num sub">70.7</td><td class="num sub">17,832</td></tr><tr><th scope="row" class="sname">dfa_persistence</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:1.90%"></i><span>-0.46</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:2.32%"></i><span>-0.56</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:48.19%"></i><span>+11.56</span></td><td class="num sub">48.6</td><td class="num sub">49.0</td><td class="num sub">87.8</td><td class="num sub">20,173</td></tr><tr><th scope="row" class="sname">cvd_divergence</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:9.25%"></i><span>-2.22</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:4.03%"></i><span>-0.97</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:13.08%"></i><span>+3.14</span></td><td class="num sub">30.2</td><td class="num sub">32.2</td><td class="num sub">39.7</td><td class="num sub">37,212</td></tr><tr><th scope="row" class="sname">hurst_regime_switch</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:2.25%"></i><span>-0.54</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:5.65%"></i><span>-1.36</span></td><td class="num sh pos" data-stage="oracle"><i class="bar" style="left:50%;width:50.00%"></i><span>+14.01</span></td><td class="num sub">48.1</td><td class="num sub">40.7</td><td class="num sub">90.3</td><td class="num sub">12,550</td></tr><tr><th scope="row" class="sname">pca_residual_reversal</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:13.26%"></i><span>-3.18</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:5.71%"></i><span>-1.37</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:24.67%"></i><span>-5.92</span></td><td class="num sub">33.6</td><td class="num sub">26.9</td><td class="num sub">24.6</td><td class="num sub">1,514</td></tr><tr><th scope="row" class="sname">matrix_profile_anomaly</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:10.89%"></i><span>-2.61</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:6.78%"></i><span>-1.63</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:31.60%"></i><span>-7.58</span></td><td class="num sub">35.6</td><td class="num sub">32.1</td><td class="num sub">21.3</td><td class="num sub">2,471</td></tr><tr><th scope="row" class="sname">gbm_direction</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:7.30%"></i><span>-1.75</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:11.17%"></i><span>-2.68</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:29.38%"></i><span>-7.05</span></td><td class="num sub">37.3</td><td class="num sub">28.8</td><td class="num sub">22.1</td><td class="num sub">2,444</td></tr><tr><th scope="row" class="sname">trend_following</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:19.74%"></i><span>-4.74</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:26.75%"></i><span>-6.42</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:23.95%"></i><span>-5.75</span></td><td class="num sub">12.4</td><td class="num sub">7.4</td><td class="num sub">12.9</td><td class="num sub">5,402</td></tr><tr><th scope="row" class="sname">implementation_shortfall</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:19.74%"></i><span>-4.74</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:26.79%"></i><span>-6.43</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:20.51%"></i><span>-4.92</span></td><td class="num sub">12.4</td><td class="num sub">7.4</td><td class="num sub">15.5</td><td class="num sub">5,396</td></tr><tr><th scope="row" class="sname">atr_bracket</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:19.74%"></i><span>-4.74</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:26.80%"></i><span>-6.43</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:23.95%"></i><span>-5.75</span></td><td class="num sub">12.4</td><td class="num sub">7.4</td><td class="num sub">12.9</td><td class="num sub">5,396</td></tr><tr><th scope="row" class="sname">trend_following+arima_agree</th><td class="num sh neg" data-stage="naive"><i class="bar" style="right:50%;width:50.00%"></i><span>-18.60</span></td><td class="num sh neg" data-stage="base"><i class="bar" style="right:50%;width:37.74%"></i><span>-9.06</span></td><td class="num sh neg" data-stage="oracle"><i class="bar" style="right:50%;width:50.00%"></i><span>-15.89</span></td><td class="num sub">7.6</td><td class="num sub">7.7</td><td class="num sub">8.6</td><td class="num sub">3,088</td></tr></tbody>
 </table></div>
 </div>
 
@@ -717,7 +736,7 @@ avg_pnl_per_trade, assets, interval, backtest_period</dd>
 results/base_model_results_&lt;ts&gt;.csv</dd>
     <dt>Group source</dt><dd>select_deduped_groups(conn, correlation_run_id=760)  -&gt; 961 groups</dd>
     <dt>Exit-rule cutoff</dt><dd>runs.timestamp &gt;= '2026-08-30'   -- the one-exit-rule re-sweep
-                     (oracle 961/961, naive 961/961, base 84/961)
+                     (oracle 961/961, naive 961/961, base 783/961)
                      earlier rows use the retired one-bar rule and are excluded</dd>
     <dt>Table source</dt><dd>make_paper_table.py  -&gt; paper_table.json  -&gt; build_paper.py
 audit_paper.py       re-derives every figure from the DB independently</dd>
@@ -754,15 +773,15 @@ ORDER  BY w_sharpe DESC;</pre>
   limitation from the first edition. All three regimes now share the single walk-forward rule described in
   &sect;3.4, the whole corpus was re-swept under it, and that limitation is retired.</p>
   <p>Every figure in this edition comes from the re-sweep; no pre-fix row is used anywhere. The oracle and
-  naive sweeps are complete at 961 of 961 groups. The base sweep is not &mdash; it stands at 84 groups and is
-  still running &mdash; so the three-regime matched sample fell from 451 groups and 45 strategies to 84 groups
-  and 43, on 633,297 signals against 2,814,025. The previous edition&rsquo;s
+  naive sweeps are complete at 961 of 961 groups. The base sweep is not &mdash; it stands at 783 groups and is
+  still running &mdash; so the three-regime matched sample fell from 451 groups and 45 strategies to 783 groups
+  and 44, on 5,698,914 signals against 2,814,025. The previous edition&rsquo;s
   headline figures were: naive median &minus;0.72 with 13 of 45 positive; base +0.16 with 29 of 45; oracle
   +2.20 with 27 of 45 and a third quartile of +9.96. Two conclusions changed. The oracle&rsquo;s advantage
   over the base model is larger than it appeared, because the retired rule truncated the oracle&rsquo;s
   winners along with its losers. And the base model no longer puts <em>more</em> strategies above zero than
   the oracle does &mdash; that claim rested on the old ruler and is withdrawn; it now puts slightly fewer
-  (26 against 28). Everything else held its direction. Read the
+  (26 against 25). Everything else held its direction. Read the
   three-regime numbers as provisional until base coverage catches up.</p>
   <p><strong>Earlier revision.</strong> The first published version of this paper reported a matched sample of 343 groups and 51 strategies,
   with an oracle median of +0.32 and a base median of +0.28 &mdash; and concluded from those that the base
@@ -789,12 +808,12 @@ ORDER  BY w_sharpe DESC;</pre>
 <section>
   <h2 class="sec"><span class="no">09</span>Conclusion</h2>
   <p>Separating the forecast from the rule that consumes it changes what a backtest number means. On this
-  corpus, over 633,297 signals matched across all three regimes &mdash; and 5.4 million more in the
+  corpus, over 5,698,914 signals matched across all three regimes &mdash; and 5.4 million more in the
   two-regime check of &sect;4.4 &mdash; the separation gives three results that hold together.</p>
-  <p>Strategy logic alone does not carry the corpus. With no forward information, 33 of 43 strategies lose
+  <p>Strategy logic alone does not carry the corpus. With no forward information, 34 of 44 strategies lose
   money and the median sits below zero; the survivors win on bracket geometry rather than on direction.
-  Forecasting is the term that matters &mdash; perfect foresight lifts the median to +3.46 and the upper
-  quartile to +10.24 &mdash; but it is not a universal solvent: 15 of 43 stay unprofitable knowing the
+  Forecasting is the term that matters &mdash; perfect foresight lifts the median to +1.55 and the upper
+  quartile to +9.04 &mdash; but it is not a universal solvent: 19 of 44 stay unprofitable knowing the
   future, and some strategies lose <em>more</em> the better their information gets. And the pretrained model
   earns its place, more than doubling the count of profitable strategies and coming within two of the count
   perfect foresight achieves, while capturing about a sixteenth of the oracle&rsquo;s upper-quartile
@@ -807,8 +826,8 @@ ORDER  BY w_sharpe DESC;</pre>
 </div>
 
 <footer>
-  Kairos Project &middot; research note, 31 August 2026 &middot; generated from data/pipeline_results.db at commit e8c596a.<br>
-  Matched sample: 84 asset groups, 43 distinct strategies, 633,297 signals across three regimes;
+  Kairos Project &middot; research note, 1 September 2026 &middot; generated from data/pipeline_results.db at commit dcc187e.<br>
+  Matched sample: 783 asset groups, 44 distinct strategies, 5,698,914 signals across three regimes;
   961 groups in the complete oracle&ndash;naive pair.
   Figures are shadow-performance measurements without transaction costs and are not investment advice.
 </footer>

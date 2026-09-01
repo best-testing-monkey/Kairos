@@ -42,6 +42,7 @@ def _box(stage):
 
 BOX = {s: _box(s) for s in STAGES}
 NSTRAT = len(rows)
+H2H = data.get("head_to_head", {})
 COV = data.get("coverage", {})
 # Oracle and naive both cover the full deduped corpus; base is legitimately
 # mid-sweep. If naive is short of oracle its sweep is still running, and every
@@ -615,7 +616,7 @@ footer {{
   <p>Handed a perfect one-step forecast, the corpus moves decisively. The median Sharpe rises to
   <strong>{BOX["oracle"]["med"]:+.2f}</strong>, mean win rate to <strong>{BOX["oracle"]["win"]:.1f}%</strong>, and median return per trade to
   <strong>{BOX["oracle"]["pnl"]:+.3f}%</strong> &mdash; roughly five times the base model&rsquo;s. The oracle beats the naive
-  floor on <strong>30 of {NSTRAT} strategies</strong>. The upper tail is where the effect is most visible:
+  floor on <strong>{H2H["oracle>naive"]} of {NSTRAT} strategies</strong>. The upper tail is where the effect is most visible:
   oracle&rsquo;s third quartile is <strong>{BOX["oracle"]["q3"]:+.2f}</strong> against naive&rsquo;s {BOX["naive"]["q3"]:+.2f}, and its best performer,
   <code>cross_asset_rank</code>, reaches {BOX["oracle"]["mx"]:+.2f}. Whatever these strategies are for, forecast quality is
   the input that makes them work.</p>
@@ -632,7 +633,7 @@ footer {{
   <p>The pretrained Kronos model, with no fine-tuning, moves the corpus decisively on breadth. It lifts
   <strong>{BOX["base"]["pos"]} of {NSTRAT} strategies</strong> above zero &mdash; more than twice the naive count of
   {BOX["naive"]["pos"]}, and within two of the oracle&rsquo;s own {BOX["oracle"]["pos"]} &mdash; and beats the naive floor head-to-head on
-  <strong>28 of {NSTRAT}</strong>. The median Sharpe turns positive at
+  <strong>{H2H["base>naive"]} of {NSTRAT}</strong>. The median Sharpe turns positive at
   <strong>{BOX["base"]["med"]:+.2f}</strong> and median return per trade at <strong>{BOX["base"]["pnl"]:+.3f}%</strong>, double the
   naive figure&rsquo;s magnitude and opposite in sign.</p>
   <p>The individual movements are large where they matter. <code>open_gap</code> goes from &minus;0.72 to

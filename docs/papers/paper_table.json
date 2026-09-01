@@ -1,993 +1,1035 @@
 {
- "matched_groups": 84,
+ "matched_groups": 783,
+ "head_to_head": {
+  "base>naive": 35,
+  "oracle>base": 27,
+  "oracle>naive": 28
+ },
+ "coverage": {
+  "oracle": 961,
+  "naive": 961,
+  "base": 783
+ },
+ "naive_revision": {
+  "cells": 37267,
+  "identical": 23558,
+  "pct_identical": 63.2,
+  "mean_delta": -0.0195,
+  "median_delta": 0.0,
+  "old_median": -0.288,
+  "new_median": -0.301
+ },
  "rows": [
-  {
-   "name": "support_confluence",
-   "n": {
-    "oracle": 2013,
-    "naive": 1983,
-    "base": 2297
-   },
-   "sh": {
-    "oracle": 6.872,
-    "naive": 1.292,
-    "base": 4.349
-   },
-   "win": {
-    "oracle": 0.8902,
-    "naive": 0.7711,
-    "base": 0.8246
-   },
-   "pnl": {
-    "oracle": 0.00291,
-    "naive": 0.000411,
-    "base": 0.002513
-   }
-  },
   {
    "name": "bollinger_validation",
    "n": {
-    "oracle": 145,
-    "naive": 145,
-    "base": 56
+    "oracle": 556,
+    "naive": 560,
+    "base": 454
    },
    "sh": {
-    "oracle": 67.365,
-    "naive": 6.539,
-    "base": 4.291
+    "oracle": 39.002433,
+    "naive": 7.210949,
+    "base": 11.595613
    },
    "win": {
-    "oracle": 1.0,
-    "naive": 0.6276,
-    "base": 0.5893
+    "oracle": 0.991,
+    "naive": 0.6518,
+    "base": 0.7026
    },
    "pnl": {
-    "oracle": 0.027624,
-    "naive": 0.007167,
-    "base": 0.068698
-   }
-  },
-  {
-   "name": "martingale_floor",
-   "n": {
-    "oracle": 9809,
-    "naive": 9734,
-    "base": 2271
-   },
-   "sh": {
-    "oracle": 7.61,
-    "naive": 0.983,
-    "base": 2.971
-   },
-   "win": {
-    "oracle": 0.9121,
-    "naive": 0.7361,
-    "base": 0.8877
-   },
-   "pnl": {
-    "oracle": 0.006572,
-    "naive": 0.00034,
-    "base": 0.001201
-   }
-  },
-  {
-   "name": "open_gap",
-   "n": {
-    "oracle": 8190,
-    "naive": 8151,
-    "base": 5862
-   },
-   "sh": {
-    "oracle": 2.887,
-    "naive": -0.721,
-    "base": 2.554
-   },
-   "win": {
-    "oracle": 0.4354,
-    "naive": 0.4298,
-    "base": 0.5365
-   },
-   "pnl": {
-    "oracle": 0.003477,
-    "naive": -0.001187,
-    "base": 0.004743
-   }
-  },
-  {
-   "name": "fade_extreme",
-   "n": {
-    "oracle": 7084,
-    "naive": 7054,
-    "base": 83
-   },
-   "sh": {
-    "oracle": 15.662,
-    "naive": 0.08,
-    "base": 2.408
-   },
-   "win": {
-    "oracle": 1.0,
-    "naive": 0.4899,
-    "base": 0.4699
-   },
-   "pnl": {
-    "oracle": 0.013009,
-    "naive": 0.000226,
-    "base": 0.001021
+    "oracle": 0.024592,
+    "naive": 0.008027,
+    "base": 0.104848
    }
   },
   {
    "name": "path_high_low_sequence",
    "n": {
-    "oracle": 3368,
-    "naive": 3349,
-    "base": 152
+    "oracle": 29587,
+    "naive": 29591,
+    "base": 1248
    },
    "sh": {
-    "oracle": 20.271,
-    "naive": 0.174,
-    "base": 1.902
+    "oracle": 20.735651,
+    "naive": 0.132661,
+    "base": 5.096541
    },
    "win": {
     "oracle": 1.0,
-    "naive": 0.6399,
-    "base": 0.4342
+    "naive": 0.6476,
+    "base": 0.5096
    },
    "pnl": {
-    "oracle": 0.008096,
-    "naive": -0.000325,
-    "base": 0.014438
+    "oracle": 0.007653,
+    "naive": -0.00022,
+    "base": 0.034439
    }
   },
   {
-   "name": "funding_rate_prediction",
+   "name": "fade_extreme",
    "n": {
-    "oracle": 9165,
-    "naive": 9123,
-    "base": 345
+    "oracle": 56503,
+    "naive": 56347,
+    "base": 736
    },
    "sh": {
-    "oracle": -7.218,
-    "naive": -0.529,
-    "base": 1.193
+    "oracle": 15.097038,
+    "naive": 0.373872,
+    "base": 3.714943
    },
    "win": {
-    "oracle": 0.5342,
-    "naive": 0.7035,
-    "base": 0.7391
+    "oracle": 1.0,
+    "naive": 0.4982,
+    "base": 0.5707
    },
    "pnl": {
-    "oracle": -0.016444,
-    "naive": -0.001287,
-    "base": 0.006001
+    "oracle": 0.010787,
+    "naive": 0.000302,
+    "base": 0.006178
    }
   },
   {
-   "name": "high_low",
+   "name": "martingale_floor",
    "n": {
-    "oracle": 9376,
-    "naive": 9303,
-    "base": 8322
+    "oracle": 99108,
+    "naive": 99259,
+    "base": 12671
    },
    "sh": {
-    "oracle": 5.072,
-    "naive": -0.827,
-    "base": 0.937
+    "oracle": 9.043637,
+    "naive": 0.683258,
+    "base": 3.64862
    },
    "win": {
-    "oracle": 0.7558,
-    "naive": 0.5635,
-    "base": 0.5364
+    "oracle": 0.9176,
+    "naive": 0.7216,
+    "base": 0.8702
    },
    "pnl": {
-    "oracle": 0.003998,
-    "naive": -0.000661,
-    "base": 0.003418
+    "oracle": 0.007392,
+    "naive": 0.000236,
+    "base": 0.001582
    }
   },
   {
-   "name": "distribution_overlap",
+   "name": "open_gap",
    "n": {
-    "oracle": 4829,
-    "naive": 4799,
-    "base": 357
+    "oracle": 69464,
+    "naive": 69290,
+    "base": 35828
    },
    "sh": {
-    "oracle": -3.916,
-    "naive": -0.29,
-    "base": 0.929
+    "oracle": 0.937246,
+    "naive": -0.761768,
+    "base": 3.102092
    },
    "win": {
-    "oracle": 0.2406,
-    "naive": 0.3884,
-    "base": 0.4062
+    "oracle": 0.3953,
+    "naive": 0.4237,
+    "base": 0.544
    },
    "pnl": {
-    "oracle": -0.002269,
-    "naive": -0.000434,
-    "base": 0.000913
+    "oracle": 0.001621,
+    "naive": -0.000906,
+    "base": 0.006627
    }
   },
   {
-   "name": "close_direction",
+   "name": "support_confluence",
    "n": {
-    "oracle": 16184,
-    "naive": 16102,
-    "base": 12114
+    "oracle": 19735,
+    "naive": 19728,
+    "base": 18541
    },
    "sh": {
-    "oracle": 3.437,
-    "naive": -0.583,
-    "base": 0.652
+    "oracle": 7.036784,
+    "naive": 1.110162,
+    "base": 2.878195
    },
    "win": {
-    "oracle": 0.5221,
-    "naive": 0.426,
-    "base": 0.3998
+    "oracle": 0.8887,
+    "naive": 0.7522,
+    "base": 0.7405
    },
    "pnl": {
-    "oracle": 0.002097,
-    "naive": -0.000617,
-    "base": 0.001746
-   }
-  },
-  {
-   "name": "conditional_path",
-   "n": {
-    "oracle": 12146,
-    "naive": 12089,
-    "base": 20512
-   },
-   "sh": {
-    "oracle": 0.007,
-    "naive": -1.04,
-    "base": 0.649
-   },
-   "win": {
-    "oracle": 0.3894,
-    "naive": 0.3909,
-    "base": 0.3872
-   },
-   "pnl": {
-    "oracle": -5.6e-05,
-    "naive": -0.001099,
-    "base": 0.002745
-   }
-  },
-  {
-   "name": "cross_asset_rank",
-   "n": {
-    "oracle": 30,
-    "naive": 30,
-    "base": 5868
-   },
-   "sh": {
-    "oracle": 76.4,
-    "naive": 0.427,
-    "base": 0.617
-   },
-   "win": {
-    "oracle": 0.9,
-    "naive": 0.6333,
-    "base": 0.3073
-   },
-   "pnl": {
-    "oracle": 0.015547,
-    "naive": 0.004362,
-    "base": 0.003514
-   }
-  },
-  {
-   "name": "path_v_shape",
-   "n": {
-    "oracle": 7024,
-    "naive": 6985,
-    "base": 10402
-   },
-   "sh": {
-    "oracle": 17.598,
-    "naive": -0.271,
-    "base": 0.521
-   },
-   "win": {
-    "oracle": 0.9358,
-    "naive": 0.5908,
-    "base": 0.7454
-   },
-   "pnl": {
-    "oracle": 0.004648,
-    "naive": -0.000257,
-    "base": 0.001083
-   }
-  },
-  {
-   "name": "matrix_profile_anomaly",
-   "n": {
-    "oracle": 739,
-    "naive": 722,
-    "base": 283
-   },
-   "sh": {
-    "oracle": -6.48,
-    "naive": -1.624,
-    "base": 0.41
-   },
-   "win": {
-    "oracle": 0.2314,
-    "naive": 0.3726,
-    "base": 0.3428
-   },
-   "pnl": {
-    "oracle": -0.002214,
-    "naive": -0.001371,
-    "base": 0.0046
-   }
-  },
-  {
-   "name": "inverse_variance",
-   "n": {
-    "oracle": 10707,
-    "naive": 10650,
-    "base": 7657
-   },
-   "sh": {
-    "oracle": 0.69,
-    "naive": -0.445,
-    "base": 0.365
-   },
-   "win": {
-    "oracle": 0.4895,
-    "naive": 0.4243,
-    "base": 0.3812
-   },
-   "pnl": {
-    "oracle": 0.000403,
-    "naive": -0.000507,
-    "base": 0.001054
-   }
-  },
-  {
-   "name": "particle_filter",
-   "n": {
-    "oracle": 15181,
-    "naive": 15106,
-    "base": 12281
-   },
-   "sh": {
-    "oracle": 5.122,
-    "naive": -0.37,
-    "base": 0.346
-   },
-   "win": {
-    "oracle": 0.6228,
-    "naive": 0.4451,
-    "base": 0.3816
-   },
-   "pnl": {
-    "oracle": 0.004825,
-    "naive": -0.000421,
-    "base": 0.001743
-   }
-  },
-  {
-   "name": "dynamic_bracket",
-   "n": {
-    "oracle": 11974,
-    "naive": 11910,
-    "base": 11179
-   },
-   "sh": {
-    "oracle": 3.456,
-    "naive": -0.43,
-    "base": 0.335
-   },
-   "win": {
-    "oracle": 0.5435,
-    "naive": 0.4297,
-    "base": 0.3768
-   },
-   "pnl": {
-    "oracle": 0.003633,
-    "naive": -0.000425,
-    "base": 0.001386
+    "oracle": 0.004318,
+    "naive": 0.000262,
+    "base": 0.002008
    }
   },
   {
    "name": "volume_confirmation",
    "n": {
-    "oracle": 2504,
-    "naive": 2490,
-    "base": 565
+    "oracle": 24994,
+    "naive": 24980,
+    "base": 2556
    },
    "sh": {
-    "oracle": -5.595,
-    "naive": 0.091,
-    "base": 0.321
+    "oracle": -7.271981,
+    "naive": -0.171456,
+    "base": 1.181884
    },
    "win": {
-    "oracle": 0.4916,
-    "naive": 0.5936,
-    "base": 0.377
+    "oracle": 0.4658,
+    "naive": 0.607,
+    "base": 0.4049
    },
    "pnl": {
-    "oracle": -0.007321,
-    "naive": -0.000245,
-    "base": 0.001479
+    "oracle": -0.007979,
+    "naive": -0.000583,
+    "base": 0.003262
    }
   },
   {
-   "name": "expected_value",
+   "name": "cross_asset_rank",
    "n": {
-    "oracle": 2148,
-    "naive": 2133,
-    "base": 8718
+    "oracle": 149,
+    "naive": 161,
+    "base": 52370
    },
    "sh": {
-    "oracle": 12.803,
-    "naive": 0.956,
-    "base": 0.295
+    "oracle": -13.761042,
+    "naive": -5.695546,
+    "base": 1.178416
    },
    "win": {
-    "oracle": 0.7081,
-    "naive": 0.4524,
-    "base": 0.405
+    "oracle": 0.3423,
+    "naive": 0.4224,
+    "base": 0.3344
    },
    "pnl": {
-    "oracle": 0.015061,
-    "naive": 0.002003,
-    "base": 0.001136
+    "oracle": -0.001113,
+    "naive": -0.002381,
+    "base": 0.003945
    }
   },
   {
-   "name": "vol_target_sizer",
+   "name": "high_low",
    "n": {
-    "oracle": 2148,
-    "naive": 2133,
-    "base": 8186
+    "oracle": 88603,
+    "naive": 88906,
+    "base": 52859
    },
    "sh": {
-    "oracle": 12.803,
-    "naive": 0.956,
-    "base": 0.293
+    "oracle": 6.971559,
+    "naive": -0.775773,
+    "base": 1.023128
    },
    "win": {
-    "oracle": 0.7081,
-    "naive": 0.4524,
-    "base": 0.4062
+    "oracle": 0.7781,
+    "naive": 0.5395,
+    "base": 0.5034
    },
    "pnl": {
-    "oracle": 0.015061,
-    "naive": 0.002003,
-    "base": 0.001146
-   }
-  },
-  {
-   "name": "path_high_low_execution",
-   "n": {
-    "oracle": 16439,
-    "naive": 16332,
-    "base": 14717
-   },
-   "sh": {
-    "oracle": 5.662,
-    "naive": -0.017,
-    "base": 0.272
-   },
-   "win": {
-    "oracle": 0.7506,
-    "naive": 0.5666,
-    "base": 0.5344
-   },
-   "pnl": {
-    "oracle": 0.007867,
-    "naive": -0.000625,
-    "base": 0.000262
-   }
-  },
-  {
-   "name": "rsi_divergence",
-   "n": {
-    "oracle": 1304,
-    "naive": 1298,
-    "base": 1190
-   },
-   "sh": {
-    "oracle": 6.374,
-    "naive": -1.421,
-    "base": 0.151
-   },
-   "win": {
-    "oracle": 0.625,
-    "naive": 0.4122,
-    "base": 0.3924
-   },
-   "pnl": {
-    "oracle": 0.005202,
-    "naive": -0.001408,
-    "base": 0.003399
-   }
-  },
-  {
-   "name": "tail_asymmetry",
-   "n": {
-    "oracle": 968,
-    "naive": 963,
-    "base": 4308
-   },
-   "sh": {
-    "oracle": -0.144,
-    "naive": -1.387,
-    "base": 0.133
-   },
-   "win": {
-    "oracle": 0.1643,
-    "naive": 0.2804,
-    "base": 0.2948
-   },
-   "pnl": {
-    "oracle": 0.001643,
-    "naive": 2.3e-05,
-    "base": 0.00031
-   }
-  },
-  {
-   "name": "skew",
-   "n": {
-    "oracle": 2851,
-    "naive": 2838,
-    "base": 1167
-   },
-   "sh": {
-    "oracle": 0.379,
-    "naive": -0.62,
-    "base": 0.124
-   },
-   "win": {
-    "oracle": 0.2641,
-    "naive": 0.3495,
-    "base": 0.3359
-   },
-   "pnl": {
-    "oracle": 0.000476,
-    "naive": -0.000365,
-    "base": 0.00086
+    "oracle": 0.005155,
+    "naive": -0.000705,
+    "base": 0.004734
    }
   },
   {
    "name": "cross_asset_spread",
    "n": {
-    "oracle": 1054,
-    "naive": 1042,
-    "base": 4337
+    "oracle": 11350,
+    "naive": 11330,
+    "base": 20860
    },
    "sh": {
-    "oracle": -2.918,
-    "naive": 0.006,
-    "base": 0.058
+    "oracle": -4.877236,
+    "naive": 0.431161,
+    "base": 1.002927
    },
    "win": {
-    "oracle": 0.4364,
-    "naive": 0.5662,
-    "base": 0.3701
+    "oracle": 0.4143,
+    "naive": 0.5717,
+    "base": 0.3917
    },
    "pnl": {
-    "oracle": -0.005268,
-    "naive": 0.000102,
-    "base": -0.000851
+    "oracle": -0.00501,
+    "naive": 0.000411,
+    "base": 0.003468
    }
   },
   {
-   "name": "bsts_decomposition",
+   "name": "path_v_shape",
    "n": {
-    "oracle": 7087,
-    "naive": 7046,
-    "base": 5537
+    "oracle": 67595,
+    "naive": 67694,
+    "base": 110142
    },
    "sh": {
-    "oracle": 5.398,
-    "naive": -0.608,
-    "base": 0.023
+    "oracle": 16.277379,
+    "naive": -0.529456,
+    "base": 0.998393
    },
    "win": {
-    "oracle": 0.6268,
-    "naive": 0.4357,
-    "base": 0.3764
+    "oracle": 0.9253,
+    "naive": 0.5825,
+    "base": 0.7742
    },
    "pnl": {
-    "oracle": 0.004456,
-    "naive": -0.001023,
-    "base": 0.000844
+    "oracle": 0.004218,
+    "naive": -0.000602,
+    "base": 0.001215
    }
   },
   {
-   "name": "path_execution",
+   "name": "conditional_path",
    "n": {
-    "oracle": 10376,
-    "naive": 10316,
-    "base": 24157
+    "oracle": 118830,
+    "naive": 119009,
+    "base": 133679
    },
    "sh": {
-    "oracle": 2.339,
-    "naive": -0.879,
-    "base": -0.137
+    "oracle": -0.723007,
+    "naive": -1.423417,
+    "base": 0.737139
    },
    "win": {
-    "oracle": 0.3795,
-    "naive": 0.3369,
-    "base": 0.3541
+    "oracle": 0.3705,
+    "naive": 0.3735,
+    "base": 0.3863
    },
    "pnl": {
-    "oracle": 0.003464,
-    "naive": -0.001209,
-    "base": -0.000215
-   }
-  },
-  {
-   "name": "rqa_determinism",
-   "n": {
-    "oracle": 7727,
-    "naive": 7676,
-    "base": 6251
-   },
-   "sh": {
-    "oracle": 8.831,
-    "naive": -0.177,
-    "base": -0.224
-   },
-   "win": {
-    "oracle": 0.8296,
-    "naive": 0.5035,
-    "base": 0.5524
-   },
-   "pnl": {
-    "oracle": 0.005212,
-    "naive": -0.000196,
-    "base": -0.000383
-   }
-  },
-  {
-   "name": "range_trading",
-   "n": {
-    "oracle": 9661,
-    "naive": 9603,
-    "base": 6251
-   },
-   "sh": {
-    "oracle": 10.239,
-    "naive": -0.273,
-    "base": -0.224
-   },
-   "win": {
-    "oracle": 0.8637,
-    "naive": 0.4959,
-    "base": 0.5524
-   },
-   "pnl": {
-    "oracle": 0.009535,
-    "naive": -0.000237,
-    "base": -0.000383
-   }
-  },
-  {
-   "name": "rl_meta_controller",
-   "n": {
-    "oracle": 3287,
-    "naive": 3266,
-    "base": 2388
-   },
-   "sh": {
-    "oracle": 8.284,
-    "naive": -0.965,
-    "base": -0.444
-   },
-   "win": {
-    "oracle": 0.7298,
-    "naive": 0.4461,
-    "base": 0.4564
-   },
-   "pnl": {
-    "oracle": 0.007486,
-    "naive": -0.000517,
-    "base": 0.000153
+    "oracle": -0.00045,
+    "naive": -0.001384,
+    "base": 0.002745
    }
   },
   {
    "name": "volume_fade",
    "n": {
-    "oracle": 490,
-    "naive": 486,
-    "base": 363
+    "oracle": 3575,
+    "naive": 3528,
+    "base": 4360
    },
    "sh": {
-    "oracle": -27.444,
-    "naive": -0.184,
-    "base": -0.638
+    "oracle": -28.173311,
+    "naive": 0.04003,
+    "base": 0.628766
    },
    "win": {
-    "oracle": 0.0755,
-    "naive": 0.5494,
-    "base": 0.6777
+    "oracle": 0.0652,
+    "naive": 0.5788,
+    "base": 0.6931
    },
    "pnl": {
-    "oracle": -0.020372,
-    "naive": -0.000906,
-    "base": -0.003154
+    "oracle": -0.025257,
+    "naive": -0.002239,
+    "base": -0.002709
    }
   },
   {
-   "name": "hmm_regime",
+   "name": "tail_asymmetry",
    "n": {
-    "oracle": 1930,
-    "naive": 1904,
-    "base": 170
+    "oracle": 9648,
+    "naive": 9681,
+    "base": 44764
    },
    "sh": {
-    "oracle": -7.53,
-    "naive": -0.248,
-    "base": -0.767
+    "oracle": 1.290287,
+    "naive": -1.416738,
+    "base": 0.506367
    },
    "win": {
-    "oracle": 0.4378,
-    "naive": 0.5352,
-    "base": 0.7176
+    "oracle": 0.189,
+    "naive": 0.2497,
+    "base": 0.3037
    },
    "pnl": {
-    "oracle": -0.001946,
-    "naive": -0.000107,
-    "base": -0.004411
+    "oracle": 0.001957,
+    "naive": -0.000541,
+    "base": 0.001636
    }
   },
   {
-   "name": "dfa_persistence",
+   "name": "close_direction",
    "n": {
-    "oracle": 5148,
-    "naive": 5119,
-    "base": 2963
+    "oracle": 148250,
+    "naive": 148438,
+    "base": 104958
    },
    "sh": {
-    "oracle": 12.486,
-    "naive": -0.177,
-    "base": -0.79
+    "oracle": 2.466674,
+    "naive": -0.624332,
+    "base": 0.504836
    },
    "win": {
-    "oracle": 0.8866,
-    "naive": 0.4999,
-    "base": 0.5231
+    "oracle": 0.4947,
+    "naive": 0.416,
+    "base": 0.388
    },
    "pnl": {
-    "oracle": 0.013112,
-    "naive": -7.2e-05,
-    "base": -0.000611
+    "oracle": 0.001497,
+    "naive": -0.000616,
+    "base": 0.003353
+   }
+  },
+  {
+   "name": "path_high_low_execution",
+   "n": {
+    "oracle": 150713,
+    "naive": 150564,
+    "base": 135785
+   },
+   "sh": {
+    "oracle": 7.014479,
+    "naive": 0.072136,
+    "base": 0.464782
+   },
+   "win": {
+    "oracle": 0.7869,
+    "naive": 0.5815,
+    "base": 0.5476
+   },
+   "pnl": {
+    "oracle": 0.008558,
+    "naive": -0.000333,
+    "base": 0.000501
+   }
+  },
+  {
+   "name": "dynamic_bracket",
+   "n": {
+    "oracle": 108657,
+    "naive": 108608,
+    "base": 83664
+   },
+   "sh": {
+    "oracle": 1.807286,
+    "naive": -0.578714,
+    "base": 0.357135
+   },
+   "win": {
+    "oracle": 0.5043,
+    "naive": 0.4192,
+    "base": 0.3753
+   },
+   "pnl": {
+    "oracle": 0.001886,
+    "naive": -0.000576,
+    "base": 0.001813
+   }
+  },
+  {
+   "name": "particle_filter",
+   "n": {
+    "oracle": 133897,
+    "naive": 133839,
+    "base": 104830
+   },
+   "sh": {
+    "oracle": 3.497413,
+    "naive": -0.495124,
+    "base": 0.345227
+   },
+   "win": {
+    "oracle": 0.5793,
+    "naive": 0.4329,
+    "base": 0.3773
+   },
+   "pnl": {
+    "oracle": 0.003075,
+    "naive": -0.000528,
+    "base": 0.001582
+   }
+  },
+  {
+   "name": "inverse_variance",
+   "n": {
+    "oracle": 101389,
+    "naive": 101485,
+    "base": 52878
+   },
+   "sh": {
+    "oracle": -0.178708,
+    "naive": -0.598196,
+    "base": 0.329861
+   },
+   "win": {
+    "oracle": 0.4688,
+    "naive": 0.4151,
+    "base": 0.3774
+   },
+   "pnl": {
+    "oracle": -5.4e-05,
+    "naive": -0.000614,
+    "base": 0.001495
+   }
+  },
+  {
+   "name": "vol_target_sizer",
+   "n": {
+    "oracle": 20084,
+    "naive": 19986,
+    "base": 74897
+   },
+   "sh": {
+    "oracle": 13.446289,
+    "naive": 0.438237,
+    "base": 0.296281
+   },
+   "win": {
+    "oracle": 0.7522,
+    "naive": 0.4327,
+    "base": 0.4005
+   },
+   "pnl": {
+    "oracle": 0.016036,
+    "naive": 0.000884,
+    "base": 0.000665
+   }
+  },
+  {
+   "name": "expected_value",
+   "n": {
+    "oracle": 20084,
+    "naive": 19986,
+    "base": 76445
+   },
+   "sh": {
+    "oracle": 13.446289,
+    "naive": 0.438237,
+    "base": 0.29248
+   },
+   "win": {
+    "oracle": 0.7522,
+    "naive": 0.4327,
+    "base": 0.4004
+   },
+   "pnl": {
+    "oracle": 0.016036,
+    "naive": 0.000884,
+    "base": 0.000652
+   }
+  },
+  {
+   "name": "distribution_overlap",
+   "n": {
+    "oracle": 46421,
+    "naive": 46482,
+    "base": 2605
+   },
+   "sh": {
+    "oracle": -3.930389,
+    "naive": -0.595492,
+    "base": 0.212859
+   },
+   "win": {
+    "oracle": 0.2351,
+    "naive": 0.373,
+    "base": 0.3923
+   },
+   "pnl": {
+    "oracle": -0.002233,
+    "naive": -0.00062,
+    "base": 0.000393
+   }
+  },
+  {
+   "name": "bsts_decomposition",
+   "n": {
+    "oracle": 63857,
+    "naive": 63827,
+    "base": 49057
+   },
+   "sh": {
+    "oracle": 3.869176,
+    "naive": -0.648819,
+    "base": 0.198969
+   },
+   "win": {
+    "oracle": 0.5861,
+    "naive": 0.4284,
+    "base": 0.3729
+   },
+   "pnl": {
+    "oracle": 0.003161,
+    "naive": -0.000635,
+    "base": 0.000816
+   }
+  },
+  {
+   "name": "rsi_divergence",
+   "n": {
+    "oracle": 11510,
+    "naive": 11514,
+    "base": 9207
+   },
+   "sh": {
+    "oracle": 4.413763,
+    "naive": -1.43199,
+    "base": 0.177171
+   },
+   "win": {
+    "oracle": 0.586,
+    "naive": 0.4079,
+    "base": 0.3894
+   },
+   "pnl": {
+    "oracle": 0.003787,
+    "naive": -0.001087,
+    "base": 0.002156
    }
   },
   {
    "name": "rsi_filter",
    "n": {
-    "oracle": 552,
-    "naive": 549,
-    "base": 946
+    "oracle": 5671,
+    "naive": 5647,
+    "base": 6165
    },
    "sh": {
-    "oracle": -3.814,
-    "naive": -1.071,
-    "base": -0.811
+    "oracle": -6.402238,
+    "naive": -0.887723,
+    "base": 0.009121
    },
    "win": {
-    "oracle": 0.2862,
-    "naive": 0.3643,
-    "base": 0.3118
+    "oracle": 0.2393,
+    "naive": 0.3788,
+    "base": 0.3306
    },
    "pnl": {
-    "oracle": -0.001605,
-    "naive": 0.001343,
-    "base": -0.001613
+    "oracle": -0.002222,
+    "naive": -0.000431,
+    "base": 0.001068
    }
   },
   {
-   "name": "cvd_divergence",
+   "name": "hmm_regime",
    "n": {
-    "oracle": 1722,
-    "naive": 1713,
-    "base": 4667
+    "oracle": 14887,
+    "naive": 14963,
+    "base": 1517
    },
    "sh": {
-    "oracle": 4.028,
-    "naive": -2.565,
-    "base": -1.269
+    "oracle": -7.20442,
+    "naive": -1.1947,
+    "base": 0.000161
    },
    "win": {
-    "oracle": 0.4187,
-    "naive": 0.2995,
-    "base": 0.2993
+    "oracle": 0.4245,
+    "naive": 0.4939,
+    "base": 0.7225
    },
    "pnl": {
-    "oracle": 0.005272,
-    "naive": -0.00253,
-    "base": -0.000918
+    "oracle": -0.002028,
+    "naive": -0.000488,
+    "base": -0.003351
+   }
+  },
+  {
+   "name": "range_trading",
+   "n": {
+    "oracle": 75728,
+    "naive": 75676,
+    "base": 42387
+   },
+   "sh": {
+    "oracle": 9.962495,
+    "naive": -0.273942,
+    "base": -0.053224
+   },
+   "win": {
+    "oracle": 0.8623,
+    "naive": 0.4906,
+    "base": 0.5288
+   },
+   "pnl": {
+    "oracle": 0.008017,
+    "naive": -0.000183,
+    "base": -0.0
+   }
+  },
+  {
+   "name": "rqa_determinism",
+   "n": {
+    "oracle": 64177,
+    "naive": 64267,
+    "base": 41696
+   },
+   "sh": {
+    "oracle": 9.349207,
+    "naive": -0.236661,
+    "base": -0.065287
+   },
+   "win": {
+    "oracle": 0.8375,
+    "naive": 0.4929,
+    "base": 0.5285
+   },
+   "pnl": {
+    "oracle": 0.004792,
+    "naive": -0.00019,
+    "base": -2.4e-05
+   }
+  },
+  {
+   "name": "skew",
+   "n": {
+    "oracle": 27768,
+    "naive": 27798,
+    "base": 12385
+   },
+   "sh": {
+    "oracle": 0.562719,
+    "naive": -0.766141,
+    "base": -0.191575
+   },
+   "win": {
+    "oracle": 0.2663,
+    "naive": 0.3225,
+    "base": 0.3311
+   },
+   "pnl": {
+    "oracle": 0.000549,
+    "naive": -0.000678,
+    "base": 0.000568
+   }
+  },
+  {
+   "name": "funding_rate_prediction",
+   "n": {
+    "oracle": 76785,
+    "naive": 76820,
+    "base": 761
+   },
+   "sh": {
+    "oracle": -8.230189,
+    "naive": -0.315148,
+    "base": -0.239485
+   },
+   "win": {
+    "oracle": 0.4915,
+    "naive": 0.7126,
+    "base": 0.7293
+   },
+   "pnl": {
+    "oracle": -0.017378,
+    "naive": -0.000786,
+    "base": 0.001462
+   }
+  },
+  {
+   "name": "path_execution",
+   "n": {
+    "oracle": 100254,
+    "naive": 100289,
+    "base": 230901
+   },
+   "sh": {
+    "oracle": 2.250584,
+    "naive": -1.22163,
+    "base": -0.307256
+   },
+   "win": {
+    "oracle": 0.3779,
+    "naive": 0.3246,
+    "base": 0.3601
+   },
+   "pnl": {
+    "oracle": 0.002891,
+    "naive": -0.001315,
+    "base": -0.000517
    }
   },
   {
    "name": "multi_factor_rank",
    "n": {
-    "oracle": 6628,
-    "naive": 6593,
-    "base": 247
+    "oracle": 65702,
+    "naive": 65749,
+    "base": 2659
    },
    "sh": {
-    "oracle": -4.31,
-    "naive": -1.32,
-    "base": -1.522
+    "oracle": -4.253869,
+    "naive": -1.66891,
+    "base": -0.47885
    },
    "win": {
-    "oracle": 0.2256,
-    "naive": 0.3475,
-    "base": 0.2672
+    "oracle": 0.2277,
+    "naive": 0.3344,
+    "base": 0.2828
    },
    "pnl": {
-    "oracle": -0.002392,
-    "naive": -0.001372,
-    "base": 0.000392
+    "oracle": -0.002122,
+    "naive": -0.001533,
+    "base": 0.000378
+   }
+  },
+  {
+   "name": "variance_risk_premium",
+   "n": {
+    "oracle": 74504,
+    "naive": 74640,
+    "base": 266
+   },
+   "sh": {
+    "oracle": -7.333455,
+    "naive": -0.620793,
+    "base": -0.516823
+   },
+   "win": {
+    "oracle": 0.1638,
+    "naive": 0.3752,
+    "base": 0.2632
+   },
+   "pnl": {
+    "oracle": -0.002062,
+    "naive": -0.000616,
+    "base": -0.000189
+   }
+  },
+  {
+   "name": "rl_meta_controller",
+   "n": {
+    "oracle": 26954,
+    "naive": 26903,
+    "base": 17832
+   },
+   "sh": {
+    "oracle": 7.76783,
+    "naive": -0.527396,
+    "base": -0.547184
+   },
+   "win": {
+    "oracle": 0.7066,
+    "naive": 0.4407,
+    "base": 0.4198
+   },
+   "pnl": {
+    "oracle": 0.006061,
+    "naive": -0.000263,
+    "base": -7.6e-05
+   }
+  },
+  {
+   "name": "dfa_persistence",
+   "n": {
+    "oracle": 38369,
+    "naive": 38265,
+    "base": 20173
+   },
+   "sh": {
+    "oracle": 11.564626,
+    "naive": -0.4562,
+    "base": -0.556616
+   },
+   "win": {
+    "oracle": 0.8775,
+    "naive": 0.4863,
+    "base": 0.4896
+   },
+   "pnl": {
+    "oracle": 0.01089,
+    "naive": -0.000184,
+    "base": 5.9e-05
+   }
+  },
+  {
+   "name": "cvd_divergence",
+   "n": {
+    "oracle": 15375,
+    "naive": 15359,
+    "base": 37212
+   },
+   "sh": {
+    "oracle": 3.140157,
+    "naive": -2.221092,
+    "base": -0.967421
+   },
+   "win": {
+    "oracle": 0.397,
+    "naive": 0.3016,
+    "base": 0.3222
+   },
+   "pnl": {
+    "oracle": 0.003658,
+    "naive": -0.001988,
+    "base": -0.000931
    }
   },
   {
    "name": "hurst_regime_switch",
    "n": {
-    "oracle": 3427,
-    "naive": 3406,
-    "base": 1844
+    "oracle": 24764,
+    "naive": 24644,
+    "base": 12550
    },
    "sh": {
-    "oracle": 15.363,
-    "naive": -0.183,
-    "base": -2.138
+    "oracle": 14.005349,
+    "naive": -0.539671,
+    "base": -1.356375
    },
    "win": {
-    "oracle": 0.9116,
-    "naive": 0.493,
-    "base": 0.4338
+    "oracle": 0.9032,
+    "naive": 0.4808,
+    "base": 0.4072
    },
    "pnl": {
-    "oracle": 0.016448,
-    "naive": -9.3e-05,
-    "base": -0.000561
-   }
-  },
-  {
-   "name": "gbm_direction",
-   "n": {
-    "oracle": 573,
-    "naive": 572,
-    "base": 366
-   },
-   "sh": {
-    "oracle": -5.614,
-    "naive": -0.845,
-    "base": -2.867
-   },
-   "win": {
-    "oracle": 0.2373,
-    "naive": 0.3986,
-    "base": 0.2705
-   },
-   "pnl": {
-    "oracle": -0.001841,
-    "naive": -0.001199,
-    "base": -0.003274
+    "oracle": 0.013708,
+    "naive": -0.000129,
+    "base": 0.000203
    }
   },
   {
    "name": "pca_residual_reversal",
    "n": {
-    "oracle": 352,
-    "naive": 351,
-    "base": 257
+    "oracle": 3077,
+    "naive": 3071,
+    "base": 1514
    },
    "sh": {
-    "oracle": -5.872,
-    "naive": -1.228,
-    "base": -3.427
+    "oracle": -5.920784,
+    "naive": -3.183433,
+    "base": -1.370825
    },
    "win": {
-    "oracle": 0.2528,
-    "naive": 0.3675,
-    "base": 0.2879
+    "oracle": 0.246,
+    "naive": 0.3357,
+    "base": 0.2688
    },
    "pnl": {
-    "oracle": -0.001552,
-    "naive": -0.00056,
-    "base": -0.001036
+    "oracle": -0.00197,
+    "naive": -0.002014,
+    "base": 0.000189
    }
   },
   {
-   "name": "implementation_shortfall",
+   "name": "matrix_profile_anomaly",
    "n": {
-    "oracle": 6,
-    "naive": 6,
-    "base": 628
+    "oracle": 6812,
+    "naive": 6855,
+    "base": 2471
    },
    "sh": {
-    "oracle": -1.983,
-    "naive": -8.019,
-    "base": -8.097
+    "oracle": -7.584378,
+    "naive": -2.613537,
+    "base": -1.627207
    },
    "win": {
-    "oracle": 0.3333,
-    "naive": 0.1667,
-    "base": 0.0589
+    "oracle": 0.213,
+    "naive": 0.3559,
+    "base": 0.3209
    },
    "pnl": {
-    "oracle": 0.014424,
-    "naive": -0.005234,
-    "base": -0.000321
+    "oracle": -0.002241,
+    "naive": -0.001095,
+    "base": 0.002255
    }
   },
   {
-   "name": "atr_bracket",
+   "name": "gbm_direction",
    "n": {
-    "oracle": 6,
-    "naive": 6,
-    "base": 628
+    "oracle": 4587,
+    "naive": 4533,
+    "base": 2444
    },
    "sh": {
-    "oracle": -8.08,
-    "naive": -8.02,
-    "base": -8.105
+    "oracle": -7.050201,
+    "naive": -1.752836,
+    "base": -2.681202
    },
    "win": {
-    "oracle": 0.1667,
-    "naive": 0.1667,
-    "base": 0.0589
+    "oracle": 0.2208,
+    "naive": 0.3733,
+    "base": 0.2876
    },
    "pnl": {
-    "oracle": 0.005969,
-    "naive": -0.005233,
-    "base": -0.000322
+    "oracle": -0.00222,
+    "naive": -0.001522,
+    "base": 0.000488
    }
   },
   {
    "name": "trend_following",
    "n": {
-    "oracle": 6,
-    "naive": 6,
-    "base": 628
+    "oracle": 155,
+    "naive": 153,
+    "base": 5402
    },
    "sh": {
-    "oracle": -8.08,
-    "naive": -8.02,
-    "base": -8.105
+    "oracle": -5.748404,
+    "naive": -4.737841,
+    "base": -6.419524
    },
    "win": {
-    "oracle": 0.1667,
-    "naive": 0.1667,
-    "base": 0.0589
+    "oracle": 0.129,
+    "naive": 0.1242,
+    "base": 0.0737
    },
    "pnl": {
-    "oracle": 0.005969,
-    "naive": -0.005233,
-    "base": -0.000322
+    "oracle": 0.004481,
+    "naive": 0.00033,
+    "base": 0.000603
+   }
+  },
+  {
+   "name": "implementation_shortfall",
+   "n": {
+    "oracle": 155,
+    "naive": 153,
+    "base": 5396
+   },
+   "sh": {
+    "oracle": -4.923496,
+    "naive": -4.738091,
+    "base": -6.430291
+   },
+   "win": {
+    "oracle": 0.1548,
+    "naive": 0.1242,
+    "base": 0.0736
+   },
+   "pnl": {
+    "oracle": 0.006069,
+    "naive": 0.00033,
+    "base": 0.000594
+   }
+  },
+  {
+   "name": "atr_bracket",
+   "n": {
+    "oracle": 155,
+    "naive": 153,
+    "base": 5396
+   },
+   "sh": {
+    "oracle": -5.748404,
+    "naive": -4.737841,
+    "base": -6.4324
+   },
+   "win": {
+    "oracle": 0.129,
+    "naive": 0.1242,
+    "base": 0.0736
+   },
+   "pnl": {
+    "oracle": 0.004481,
+    "naive": 0.00033,
+    "base": 0.000593
    }
   },
   {
    "name": "trend_following+arima_agree",
    "n": {
-    "oracle": 3,
-    "naive": 3,
-    "base": 331
+    "oracle": 70,
+    "naive": 66,
+    "base": 3088
    },
    "sh": {
-    "oracle": 10.24,
-    "naive": -12.5,
-    "base": -15.278
+    "oracle": -15.888726,
+    "naive": -18.595665,
+    "base": -9.058442
    },
    "win": {
-    "oracle": 0.3333,
-    "naive": 0.0,
-    "base": 0.0514
+    "oracle": 0.0857,
+    "naive": 0.0758,
+    "base": 0.0771
    },
    "pnl": {
-    "oracle": 0.014474,
-    "naive": -0.000981,
-    "base": -0.000669
+    "oracle": 0.00095,
+    "naive": -0.008481,
+    "base": 0.00087
    }
   }
  ]

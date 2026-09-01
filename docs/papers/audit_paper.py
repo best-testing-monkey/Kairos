@@ -114,7 +114,7 @@ for s in ("naive","base","oracle"):
     d = derived[s]
     for label, val, fmt in (("median", d["med"], "%+.3f"), ("q1", d["q1"], "%+.2f"),
                             ("q3", d["q3"], "%+.2f"), ("win", d["win"], "%.2f%%"),
-                            ("pnl", d["pnl"], "%+.4f%%")):
+                            ("pnl", d["pnl"], "%+.3f%%")):   # page renders pnl at 3dp, not 4
         needle = (fmt % val)
         if needle not in txt:
             print(f"   table cell not found: {s}.{label} = {needle}")

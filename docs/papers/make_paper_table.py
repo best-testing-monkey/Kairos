@@ -79,9 +79,16 @@ def naive_revision():
             return None
     ob = sqlite3.connect(BACKUP)
     cell = lambda cur: {(r[0], r[1]): r[2] for r in cur}
-    q = """SELECT assets, strategy_name, sharpe FROM oracle_results
-           WHERE stage='naive' AND interval='1d' AND backtest_period='6m'"""
-    old_c, new_c = cell(ob.execute(q)), cell(conn.execute(q))
+    # Join runs and apply the cutoff on BOTH sides. The backup holds 1,146 naive
+    # groups but only 961 are post-cutoff; without this the old side pulls 185
+    # pre-exit-rule groups. Today they fall out of the intersection anyway (no
+    # group has two naive runs), so this changes no number -- it stops the
+    # figures being correct by luck.
+    q = """SELECT o.assets, o.strategy_name, o.sharpe
+           FROM runs r JOIN oracle_results o USING(run_id)
+           WHERE o.stage='naive' AND o.interval='1d' AND o.backtest_period='6m'
+             AND r.timestamp >= ?"""
+    old_c, new_c = cell(ob.execute(q, (EXIT_RULE_CUTOFF,))), cell(conn.execute(q, (EXIT_RULE_CUTOFF,)))
     ob.close()
     keys = [k for k in new_c if k in old_c]
     if not keys:
@@ -104,13 +111,25 @@ def naive_revision():
 coverage = {stage: len({(r["assets"], r["interval"], r["backtest_period"]) for r in rows})
             for (_t, stage), rows in zip(STAGES, R.values())}
 
+# Head-to-head wins, computed from the unrounded aggregation so they agree with
+# audit_paper.py's independent re-derivation. These were hardcoded in the prose
+# ("30 of 44", "28 of 44") against a derived denominator, so they silently went
+# stale while the sentence around them kept updating.
+head_to_head = {f"{a}>{b}": sum(1 for k in common if S[a][k]["sh"] > S[b][k]["sh"])
+                for a, b in (("base", "naive"), ("oracle", "base"), ("oracle", "naive"))}
+
 data = {
     "matched_groups": len(matched),
+    "head_to_head": head_to_head,
     "coverage": coverage,
     "naive_revision": naive_revision(),
     "rows": [{"name": k,
               "n": {s: S[s][k]["n"] for s in S},
-              "sh": {s: round(S[s][k]["sh"], 3) for s in S},
+              # 6dp, not 3: at 3dp hmm_regime's base Sharpe rounded to exactly
+              # 0.000 and dropped out of the positive count, disagreeing with
+              # audit_paper.py. The page formats to 2-3dp itself, so this is
+              # invisible in the output.
+              "sh": {s: round(S[s][k]["sh"], 6) for s in S},
               "win": {s: round(S[s][k]["win"], 4) for s in S},
               "pnl": {s: round(S[s][k]["pnl"], 6) for s in S}} for k in common],
 }
