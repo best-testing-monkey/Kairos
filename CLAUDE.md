@@ -657,10 +657,12 @@ commands, e.g. `export UV_CACHE_DIR=/tmp/uv-cache-kairos` before
   interesting part.** Foreseeing a bar and then entering at that same bar's
   *close* is worth nothing: the move is spent by fill time. Line the two up
   and old-naive-at-date-`d` is input-for-input identical to
-  new-naive-at-date-`d+1` — the same measurement, re-indexed by one bar. A
-  38-group A/B during the re-sweep found **67.7% of (group, strategy) cells
-  byte-identical**, median Sharpe delta exactly 0.000, mean −0.107, aggregate
-  median −0.520 → −0.549. The old implementation was a persistence baseline
+  new-naive-at-date-`d+1` — the same measurement, re-indexed by one bar. The full 961-group re-sweep (2026-09-01) confirms it: of 37,267
+  matched (group, strategy) cells, **23,558 (63.2%) are byte-identical**, the
+  median Sharpe change is exactly 0.000 and the mean −0.020; the pooled median
+  moves −0.288 → −0.301, and coverage is unchanged (50 cells new-only, 27
+  old-only). Small-sample readings taken during the sweep ran as high as 67.7%
+  identical at n=38; 63.2% is the settled figure. The old implementation was a persistence baseline
   that described itself as a peek. It was replaced because being free of
   lookahead *by cancellation* rather than *by construction* is not a property
   worth relying on — any change to the entry convention would have silently
