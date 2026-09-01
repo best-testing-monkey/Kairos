@@ -165,9 +165,67 @@ def test_naive_and_base_do_not_share_a_signals_cache_key():
     assert ks._signals_cache_key(*args, naive=True) != ks._signals_cache_key(*args)
 
 
-def test_existing_base_keys_are_unchanged():
-    """naive occupies the model slot, so no already-cached key is invalidated."""
+def test_naive_occupies_the_model_slot_rather_than_adding_a_field():
+    """Pins the key layout: naive replaces "base" in the model component, so a
+    base key keeps the shape it always had (the trailing grain token is a
+    separate, deliberate invalidation -- see _signals_cache_key)."""
     args = ("strat", "A,B", "1d", _dt.date(2026, 9, 1), 300, 100, 0.1, None, "")
-    assert ks._signals_cache_key(*args) == "|".join(
-        ["strat", "A,B", "1d", "2026-09-01", "300", "100", "0.1", "base", ""]
+    base = ks._signals_cache_key(*args).split("|")
+    naive = ks._signals_cache_key(*args, naive=True).split("|")
+
+    assert base[:8] == ["strat", "A,B", "1d", "2026-09-01", "300", "100", "0.1", "base"]
+    assert naive[7] == "naive"
+    assert base[:7] == naive[:7] and base[8:] == naive[8:]
+
+
+# --------------------------------------------------------------------------
+# Per-class stats preference (group+model+strategy+class over group+model+strategy)
+# --------------------------------------------------------------------------
+
+def _stats_db(tmp_path, rows):
+    """A pipeline_results.db holding just strategy_class_stats."""
+    import sqlite3
+    db = tmp_path / "pipeline_results.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE strategy_class_stats (run_id INTEGER, stage TEXT, "
+        "model_path TEXT, strategy_name TEXT, asset_class TEXT, sharpe REAL, "
+        "signal_count INTEGER, win_rate REAL, avg_pnl_per_trade REAL, "
+        "assets TEXT, interval TEXT, backtest_period TEXT, version TEXT, "
+        "PRIMARY KEY (run_id, strategy_name, asset_class))"
     )
+    conn.executemany(
+        "INSERT INTO strategy_class_stats (run_id, strategy_name, asset_class, "
+        "sharpe, signal_count, win_rate) VALUES (?,?,?,?,?,?)", rows,
+    )
+    conn.commit()
+    return conn
+
+
+def test_class_split_is_keyed_on_the_run_the_viability_row_cites(tmp_path):
+    """Exact join, not latest-run-wins: viability_report names its own run."""
+    conn = _stats_db(tmp_path, [
+        (5305, "amount_flow", "equity", -0.281, 169, 0.503),
+        (5305, "amount_flow", "fx_commodity", -0.847, 50, 0.460),
+        (9999, "amount_flow", "equity", 99.0, 1, 1.0),  # a different run
+    ])
+    split = ks._class_split_stats(conn, [{"base_run_id": 5305, "oracle_run_id": None}])
+
+    assert split[(5305, "amount_flow", "equity")]["signal_count"] == 169
+    assert split[(5305, "amount_flow", "fx_commodity")]["win_rate"] == 0.460
+    # The uncited run must not leak in.
+    assert (9999, "amount_flow", "equity") not in split
+
+
+def test_class_split_ignores_empty_cells_and_missing_runs(tmp_path):
+    conn = _stats_db(tmp_path, [(1, "s", "equity", 1.0, 0, 0.5)])
+    assert ks._class_split_stats(conn, [{"base_run_id": 1}]) == {}
+    assert ks._class_split_stats(conn, [{"base_run_id": None}]) == {}
+    assert ks._class_split_stats(None, [{"base_run_id": 1}]) == {}
+
+
+def test_class_split_survives_a_missing_table(tmp_path):
+    """Any DB problem falls back to the group stats rather than failing a run."""
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "empty.db")
+    assert ks._class_split_stats(conn, [{"base_run_id": 1}]) == {}

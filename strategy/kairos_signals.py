@@ -203,6 +203,12 @@ def _signals_cache_key(strategy_name, assets_str, interval, as_of_date, lookback
         str(lookback), str(pred_samples), str(min_ev_pct),
         str(model_path or ("naive" if naive else "base")),
         str(checkpoint_fingerprint or ""),
+        # Grain of the stats baked into the cached rows. Bumped when
+        # _run_group started preferring per-(run, strategy, class) stats over
+        # the group-pooled ones: the signals are unchanged but base_sharpe /
+        # base_win_rate / base_signals are not, and stale entries would
+        # otherwise be selected on the old numbers.
+        "grain2",
     ]
     return "|".join(parts)
 
@@ -904,6 +910,45 @@ def _class_prior_win_rate(interval, assets, model_path, db_path=DB_PATH, stage=N
             conn.close()
 
 
+def _class_split_stats(conn, group_rows):
+    """{(run_id, strategy_name, asset_class): row} for this group's cited runs.
+
+    strategy_class_stats is keyed (run_id, strategy_name, asset_class), so a
+    class row is the SUBSET of a group row covering just the symbols of that
+    class -- finer evidence about one ticker than the group row, which pools
+    every class in the basket together. For AGQ,PSLV,SIVR,SLV's amount_flow
+    that is equity 169 signals @ 0.503 win vs fx_commodity 50 @ 0.460, sharpe
+    -0.281 vs -0.847: one number per candidate today, from a mix that includes
+    instruments the candidate is not.
+
+    The join is exact rather than latest-run-wins: viability_report records
+    base_run_id/oracle_run_id, so each row names the very run its stats came
+    from, and the class split is read from that same run.
+
+    One query per group rather than per (strategy, symbol) -- this sits in the
+    per-date loop. Returns {} on any DB problem, which falls every caller back
+    to the group stats.
+    """
+    if conn is None:
+        return {}
+    run_ids = {r.get(k) for r in group_rows for k in ("base_run_id", "oracle_run_id")}
+    run_ids.discard(None)
+    if not run_ids:
+        return {}
+    placeholders = ",".join("?" for _ in run_ids)
+    try:
+        cur = conn.execute(
+            "SELECT run_id, strategy_name, asset_class, sharpe, win_rate, signal_count "
+            f"FROM strategy_class_stats WHERE run_id IN ({placeholders}) "
+            "AND signal_count > 0",
+            list(run_ids),
+        )
+        return {(r[0], r[1], r[2]): {"sharpe": r[3], "win_rate": r[4],
+                                     "signal_count": r[5]} for r in cur}
+    except sqlite3.Error:
+        return {}
+
+
 def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label,
                data, pred_samples, min_ev_pct, conn=None, use_signal_cache=True,
                assets_str=None, as_of_date=None, lookback=None,
@@ -950,10 +995,13 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
     advice_rows = []
     skipped = []
 
+    from kairos_backtest import asset_class_of_symbol
+
     disabled = resolve_disabled_strategies(interval, assets, model_path=model_path)
     class_prior = _class_prior_win_rate(
         interval, assets, model_path, stage="naive" if naive else None,
     )
+    class_split = _class_split_stats(conn, group_rows)
     config = OrchestratorConfig.for_interval(interval, disabled_strategies=disabled)
 
     def _dummy_predict(*a, **kw):
@@ -1062,6 +1110,19 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
                     )
                     continue
 
+            # This candidate is ONE ticker, so prefer the stats for its own
+            # instrument class over the group's pooled figure, falling back to
+            # the group when that run has no cell for the class (older sweeps
+            # predate the table, and a single-class group's split IS the group).
+            sym_class = asset_class_of_symbol(sym)
+            base_cell = class_split.get(
+                (row.get("base_run_id"), strategy_name, sym_class))
+            oracle_cell = class_split.get(
+                (row.get("oracle_run_id"), strategy_name, sym_class))
+
+            def _pick(cell, field, fallback_key):
+                return cell[field] if cell else row.get(fallback_key)
+
             strat_stats.append({
                 "strategy": strategy_name,
                 "symbol": sym,
@@ -1073,21 +1134,28 @@ def _run_group(assets, interval, group_rows, predict_fn, model_path, model_label
                 "stop": sig.stop,
                 "target": sig.target,
                 "expected_value": sig.expected_value,
-                "oracle_sharpe": row.get("oracle_sharpe"),
-                "base_sharpe": row.get("base_sharpe"),
-                "oracle_win_rate": row.get("oracle_win_rate"),
-                "base_win_rate": row.get("base_win_rate"),
+                "oracle_sharpe": _pick(oracle_cell, "sharpe", "oracle_sharpe"),
+                "base_sharpe": _pick(base_cell, "sharpe", "base_sharpe"),
+                "oracle_win_rate": _pick(oracle_cell, "win_rate", "oracle_win_rate"),
+                "base_win_rate": _pick(base_cell, "win_rate", "base_win_rate"),
                 "signals_per_week": row.get("signals_per_week"),
                 "model": model_label,
-                "asset_class": row.get("asset_class"),
+                # The per-INSTRUMENT class, matching the stats just chosen --
+                # not viability_report's 5-way group-majority label, which
+                # cannot agree with strategy_class_stats' taxonomy (eb0565a).
+                "asset_class": sym_class,
+                "stats_grain": "class" if base_cell else "group",
                 "class_prior_win_rate": class_prior,
             })
             strat_advice.append({
                 "expected_value": sig.expected_value,
                 "entry": sig.entry,
-                "base_win_rate": row.get("base_win_rate"),
-                "base_signals": row.get("base_signals"),
-                "oracle_signals": row.get("oracle_signals"),
+                "base_win_rate": _pick(base_cell, "win_rate", "base_win_rate"),
+                # n for the shrink/min_n math. The class cell's count is the
+                # honest one for this ticker: the group count includes trades
+                # on instruments of another class entirely.
+                "base_signals": _pick(base_cell, "signal_count", "base_signals"),
+                "oracle_signals": _pick(oracle_cell, "signal_count", "oracle_signals"),
                 "signal": signal_to_advice(strategy_name, sym, sig),
                 "model": model_label,
             })
