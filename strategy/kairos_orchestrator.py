@@ -1099,7 +1099,19 @@ class KairosOrchestrator:
         # 1b. Context enrichment computed once per day for the active universe:
         # trailing daily returns panel and per-symbol realized vol. Cheap
         # (pandas pct_change/std only) - safe to compute every day.
-        returns_window = self._compute_returns_window(histories)
+        #
+        # Naive withholds the most recent bar from each strategy's history and
+        # hands it back only as the forecast distribution. These two context
+        # keys are part of "what the strategy gets", so they must respect the
+        # same withholding -- otherwise a strategy reading returns_window sees
+        # the forecast bar directly and the forecast is trivially self-
+        # fulfilling. AssetPrediction.history is already the withheld-bar-free
+        # frame, so reuse it rather than recomputing the truncation.
+        context_histories = (
+            {sym: p.history for sym, p in multi_preds.items()}
+            if self.config.naive_baseline else histories
+        )
+        returns_window = self._compute_returns_window(context_histories)
         realized_vol = self._compute_realized_vol(returns_window)
 
         # 2. Evaluate all strategies for each asset (shadow recording only)

@@ -118,3 +118,36 @@ if __name__ == "__main__":
     test_naive_forecast_is_the_withheld_bar_so_it_carries_a_real_move()
     test_naive_needs_two_bars_and_skips_the_symbol_rather_than_crashing()
     print("ok")
+
+
+def test_context_returns_window_also_withholds_the_bar():
+    """context["returns_window"] is part of "what the strategy gets".
+
+    If it kept the withheld bar, a strategy reading it would see the forecast
+    directly instead of through the distribution, making the forecast trivially
+    self-fulfilling. Oracle is unaffected: its forecast bar is never in history
+    to begin with.
+    """
+    import types
+
+    df = _frame([10.0, 11.0, 12.0, 13.0, 40.0])
+    date = df.index[3]
+
+    seen = {}
+    for naive in (True, False):
+        orch = _orch(naive)
+        orch._data_dict = {"X": df}
+        orch.strategies = []  # no strategies: we only want the context inputs
+        captured = {}
+        real = orch._compute_returns_window
+
+        def spy(histories, _real=real, _c=captured):
+            _c["last_index"] = {s: h.index[-1] for s, h in histories.items()}
+            return _real(histories)
+
+        orch._compute_returns_window = spy
+        orch._run_day(date, {"X": df[df.index <= date]})
+        seen[naive] = captured["last_index"]["X"]
+
+    assert seen[True] == df.index[2]    # naive: withheld bar excluded
+    assert seen[False] == df.index[3]   # oracle: full history
