@@ -962,21 +962,48 @@ class KairosOrchestrator:
         return self._build_results()
 
     def _make_realized_predictions(self, date: pd.Timestamp,
-                                    histories: Dict[str, pd.DataFrame]) -> Dict:
-        """Oracle baseline: build AssetPrediction from the actual next bar.
+                                    histories: Dict[str, pd.DataFrame],
+                                    naive: bool = False) -> Dict:
+        """Build AssetPrediction from a single realized bar. Which bar depends
+        on the mode, and that is the whole difference between them:
 
-        Always a future peek (perfect-foresight ceiling) -- this is the
-        decision-making step, shared unchanged by both oracle and naive
-        modes. naive_baseline doesn't change how the decision is made; it
-        only changes how the resulting signal is scored afterward (see
-        KairosOrchestrator._compute_shadow_performance_naive).
+          - oracle (`naive_baseline=False`): the NEXT bar, which has not
+            happened yet. A deliberate future peek -- the perfect-foresight
+            ceiling.
+          - naive (`naive_baseline=True`): the LAST bar, withheld from the
+            history the strategy sees. Nothing here is a peek: that bar has
+            already closed by the time the trade can be placed, so this is the
+            textbook persistence forecast ("the next bar repeats the last one")
+            stated with near-certainty, and it is the floor.
+
+        Withholding matters. It is what keeps `center` (close of the bar BEFORE
+        the forecast bar) distinct from the forecast bar itself, so the
+        distribution carries the realized, already-known move into it. Feeding
+        the same bar as both center and shape is the removed `use_current_bar`
+        mode, which centred the distribution exactly on the entry price and so
+        handicapped every directional strategy by construction.
+
+        `_compute_shadow_performance(naive=True)` anchors entry to the close of
+        the same withheld bar and resolves only against strictly later bars.
+
+        `naive` is a parameter rather than a read of `self.config`, matching
+        `_compute_shadow_performance`: both are driven in tests against a bare
+        stand-in object that has no config.
         """
         result = {}
         for symbol, history in histories.items():
-            current_price = float(history.iloc[-1]["close"])
             full_df = self._data_dict.get(symbol)
-            future = full_df[full_df.index > date] if full_df is not None else pd.DataFrame()
-            bar = future.iloc[0] if not future.empty else history.iloc[-1]
+            if naive:
+                # Withhold the most recent bar and forecast it. Needs two bars:
+                # one to withhold, one to price the entry against.
+                if len(history) < 2:
+                    continue
+                bar = history.iloc[-1]
+                history = history.iloc[:-1]
+            else:
+                future = full_df[full_df.index > date] if full_df is not None else pd.DataFrame()
+                bar = future.iloc[0] if not future.empty else history.iloc[-1]
+            current_price = float(history.iloc[-1]["close"])
 
             # A bar with a missing or infinite OHLC value carries no information.
             # Skip this symbol for this date instead of letting it through:
@@ -1064,7 +1091,8 @@ class KairosOrchestrator:
         """
         # 1. Multi-asset predictions
         if self.config.no_prediction:
-            multi_preds = self._make_realized_predictions(date, histories)
+            multi_preds = self._make_realized_predictions(
+                date, histories, naive=self.config.naive_baseline)
         else:
             multi_preds = self.multi_predictor.predict_all(histories)
 
@@ -1228,11 +1256,10 @@ class KairosOrchestrator:
             the trade fills at the next bar's OPEN. That bar is then part of
             the holding period -- intrabar only, since there is no gap to
             check against a price you just filled at.
-          - naive (`naive=True`): oracle peeked at the next bar to decide, so
-            this trade cannot exist until that bar has CLOSED for real. Entry
-            re-anchors to that close and only genuinely later bars can resolve
-            it. The decision itself (direction, relative stop/target %) is
-            oracle's and is not recomputed -- only the accounting changes.
+          - naive (`naive=True`): the decision was made from the WITHHELD bar
+            (see _make_realized_predictions), so the trade cannot be placed
+            until that bar has CLOSED. Entry is its close, and every bar after
+            it can resolve the trade. Nothing here is a peek.
         """
         by_strategy: Dict[str, List[float]] = defaultdict(list)
         by_class: Dict[str, Dict[str, List[float]]] = defaultdict(lambda: defaultdict(list))
@@ -1249,11 +1276,20 @@ class KairosOrchestrator:
             full_df = self._data_dict.get(symbol)
             if full_df is None:
                 continue
-            future = full_df[full_df.index > date]
-            if future.empty:
+            walk = full_df[full_df.index > date]
+            if walk.empty:
                 continue
-            entry_bar = future.iloc[0]
-            entry = float(entry_bar["close"] if naive else entry_bar["open"])
+            if naive:
+                # The forecast bar is the one withheld from the strategy's
+                # history -- the last bar at or before `date`. It has closed
+                # for real, so entering at its close is actionable, and every
+                # bar in `walk` is genuinely later than it.
+                prior = full_df[full_df.index <= date]
+                if prior.empty:
+                    continue
+                entry = float(prior.iloc[-1]["close"])
+            else:
+                entry = float(walk.iloc[0]["open"])
             if entry <= 0:
                 continue
 
@@ -1265,11 +1301,11 @@ class KairosOrchestrator:
             stop_price = entry * (1.0 + (stop - ref) / ref)
             target_price = entry * (1.0 + (target - ref) / ref)
 
-            # naive entered at bar 0's close, so bar 0 is spent; model/oracle
-            # entered at bar 0's open, so bar 0 counts but has no gap to check.
+            # naive filled at the withheld bar's close, so walk[0] opens with a
+            # real gap against that fill; model/oracle filled at walk[0]'s own
+            # open, so that bar counts but has no gap to check against itself.
             exit_p = _resolve_exit(
-                future.iloc[1:] if naive else future,
-                direction, stop_price, target_price,
+                walk, direction, stop_price, target_price,
                 gap_check_first_bar=naive,
             )
             if exit_p is None:

@@ -1,6 +1,11 @@
 """test_asset_class_wiring.py — Unit tests for asset_class threading through signal selection.
 
-Tests that asset_class from viability_report flows through:
+asset_class is derived from the candidate's own TICKER (asset_class_of_symbol,
+the 3-way per-symbol classifier strategy_class_stats is keyed on), NOT from
+viability_report's 5-way group-majority label that arrives in stats_row. See
+tests/unit/test_candidate_asset_class.py.
+
+Tests that asset_class flows through:
   - STATS_COLUMNS (kairos_signals.py)
   - stats_rows dict (kairos_signals.py:920-946)
   - Candidate dataclass (allocation.py:20-43)
@@ -56,8 +61,8 @@ class TestAssetClassInCandidate:
         c = candidates[0]
         assert c.asset_class == "crypto"
 
-    def test_asset_class_empty_string_when_missing(self):
-        """When asset_class is missing from stats_row, Candidate gets empty string."""
+    def test_asset_class_derived_from_ticker_when_absent_from_stats_row(self):
+        """stats_row's asset_class is not consulted at all -- the ticker decides."""
         stats_rows = [
             {
                 "strategy": "momentum",
@@ -88,7 +93,7 @@ class TestAssetClassInCandidate:
 
         assert len(candidates) == 1
         c = candidates[0]
-        assert c.asset_class == ""
+        assert c.asset_class == "equity"  # from the MSFT ticker
 
     def test_multiple_asset_classes_in_candidates(self):
         """Multiple candidates with different asset_classes are preserved."""
@@ -123,7 +128,7 @@ class TestAssetClassInCandidate:
             },
             {
                 "strategy": "momentum",
-                "symbol": "EUR/USD",
+                "symbol": "EURUSD=X",
                 "direction": "SHORT",
                 "entry": 1.0800,
                 "stop": 1.0900,
@@ -159,7 +164,7 @@ class TestAssetClassInCandidate:
                 "base_win_rate": 0.52,
                 "base_signals": 60,
                 "oracle_signals": None,
-                "signal": "Sell EUR/USD",
+                "signal": "Sell EURUSD=X",
             },
         ]
         candidates = fetch_signals(stats_rows, advice_rows)
