@@ -143,17 +143,32 @@ query) or candidate lists probed by name, which is what
 
 ## Measured figures
 
-> **The margin percentages below are being re-measured (2026-09-02).** They were
-> computed by dividing `initMarginChange`, which IBKR denominates in the
-> **account base currency** (EUR), by a notional in the **contract's** currency
-> — a 1.16x understatement for every USD instrument. AAPL's real figures are
-> 33.04% long / 35.62% short, not the 28.49% / 30.71% shown. EUR-denominated
-> rows (IBDE40 at 9.34%) were always correct. Fixed in `8668d27`; this section
-> is rewritten once the forced re-sweep completes. **Commission figures are
-> unaffected** — they are absolute amounts and were never divided by notional.
+Full sweep of `CANDIDATE_UNIVERSE` plus discovered instruments, 2026-09-02.
+190 rows, 76 tradeable. Regenerate with
+`uv run python scripts/ibkr_instruments.py --report`.
 
-Commission round-trip as a share of notional, US stocks — the $1 minimum is the
-whole story at small size:
+**Margin percentages are computed against a notional converted to the account
+base currency.** `initMarginChange` is denominated in the base currency (EUR)
+while the notional is in the contract's, so dividing one by the other directly
+understates every USD figure by ~1.16x. That bug survived a full 153-symbol
+sweep because 28.5% is exactly what US equity margin is *supposed* to look
+like; a JPY-denominated CFD reading 0.02% is what finally exposed it. Every row
+now stores `base_currency` and `fx_rate_to_base`, and `--report` warns if any
+margin percentage lacks a rate.
+
+### Commission
+
+| Class | Formula |
+|---|---|
+| US stock / stock CFD | **min $1.00**, $0.005/share, cap 1% of value |
+| Index CFD | ~0.005–0.06% of notional, min ~€0.5–0.93 |
+| Metals (CFD and spot) | min ~€1.62 gold, €1.83 silver |
+| Spot FX and FX CFD | 0.20 bp of trade value, **min €1.7252** |
+| Futures | $2.36–$3.01 per contract |
+| Crypto | unmeasurable — whatIf cannot price it |
+
+Round-trip commission as a share of notional, US stocks. The floor is the whole
+story at small size:
 
 | Notional | Round trip |
 |---|---|
@@ -165,30 +180,38 @@ whole story at small size:
 | $65,212 | 0.00% |
 
 `AllocationConfig.round_trip_cost_pct = 0.15` is accurate near $1,300 notional
-and nowhere else.
+and nowhere else. Kairos's measured average trade is ~€18, which is below the
+fractional-share barrier and cannot be placed at all.
 
-Initial margin, measured vs. what `config/margin_ibkr.yaml` assumed before this:
+### Initial margin
 
-| Instrument | Assumed | Measured |
+| Instrument | Long | Short |
 |---|---|---|
-| AAPL cash stock / stock CFD | 20% | 28.49% long, 30.71% short |
-| IBUS500 index CFD | 5% | 7.29% |
-| XAUUSD gold CFD | 5% | 8.78% |
-| EUR.USD FX CFD | 3.33% | 2.88% |
-| GC=F future | — | 8.85% |
-| CL=F future | — | 16.26% |
+| US equity (40 symbols) | 32.82–35.70%, mean 33.11% | mean 35.61% |
+| DIA (only tradeable ETF) | 12.01% | 12.01% |
+| Index CFD (13) | 6.68–10.82% | mean 9.15% |
+| Gold — XAUUSD CFD / CMDTY | 10.29% / 10.68% | same |
+| Silver — XAGUSD CFD / CMDTY | 18.13% / 19.00% | 20.34% (CMDTY) |
+| FX CFD | EUR 3.32, GBP 3.74, USD/JPY 3.31, AUD 5.00 | same |
+| Spot FX | 0% (SELL direction) | mean 3.09% |
+| Futures | ZS 7.24, ZC 7.59, GC 10.24, NG 13.70, CL 17.97, SI 19.20 | ~same |
 
-US stock CFDs carry **the same margin as the cash share** (28.49% vs 28.50%) —
-the CFD wrapper buys no leverage here. Oil and gold differ by ~2x, so one
-`commodity_other` rate cannot cover both.
+Two things a single per-class rate cannot capture: **ETFs margin at roughly a
+third of single stocks** (DIA 12.01% vs equity 33.11%), and **futures span
+7–19%**, so oil and grain cannot share a rate.
 
-Commission by class:
+**US stock CFDs carry the same margin as the cash share** — the CFD wrapper
+buys no leverage here.
 
-| Class | Formula |
-|---|---|
-| US stock / stock CFD | $0.005/share, **min $1.00**, cap 1% of value |
-| Index CFD | ~0.005% of notional, min $1.00 |
-| Gold CFD | min $2.00 |
-| Spot FX | 0.20 bp of trade value, **min €1.7252** (the $2 floor in EUR) |
-| Futures (GC) | $2.51/contract |
-| Crypto | unmeasurable via whatIf |
+### What is not tradeable
+
+| | n | Why |
+|---|---|---|
+| crypto | 62 | 54 have no PAXOS contract; 8 exist but cannot be margined |
+| ETFs | 26 | PRIIPs/KID, per product |
+| FX pairs | 21 | non-EUR pairs are leveraged from a EUR-only account |
+| futures | 2 | HG=F, ZW=F returned no commission |
+
+**50 of 153 universe symbols are tradeable on this account.** The tradeable
+route to an index is an index CFD — `^GSPC`/`^IXIC`/`^DJI` resolve only as
+`IND`, which is data-only.
