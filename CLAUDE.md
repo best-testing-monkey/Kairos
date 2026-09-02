@@ -1058,13 +1058,28 @@ for that before concluding a strategy went quiet. Tests in
 
 ### Per-(model, instrument class) stats: `strategy_class_stats`
 
-Sweeps record per-strategy stats **twice**: the long-standing corpus row (one per
-strategy per group, in `oracle_results`/`model_results`) and, since 2026-08-29, a
-per-(strategy, asset class) row in `strategy_class_stats`. Motivation is in
+Three named grains, not two, and "corpus" is retired below as a stat-scope word
+(kept only as a noun for the swept collection itself, e.g. "the 961-group
+corpus") — the same word was doing two different jobs two sentences apart in
+the version of this section that predates this rewrite: "corpus row" meant one
+group's own row, "corpus number" two sentences later meant a figure pooled
+across an entire class of groups. **group-level** = one row per (run, strategy,
+stage), in `oracle_results`/`model_results`. **class-level** = one row per
+(run, strategy, class, stage), in `strategy_class_stats` — still scoped to a
+single run, exactly like group-level; "group" isn't named in this term because
+every non-pooled grain already carries that scope by default. **pooled** =
+aggregated across every run of a stage, optionally filtered to one class —
+the only grain where run-scope is actually collapsed, which is why it's the
+only one that needs to say so.
+
+Sweeps record per-strategy stats **twice**: the long-standing group-level row
+(one per strategy per group, in `oracle_results`/`model_results`) and, since
+2026-08-29, a class-level row in `strategy_class_stats`. Motivation is in
 `docs/papers/where_strategies_travel.html` — strategy quality is strongly
 class-dependent (oracle median +2.40 on equities vs −4.78 on crypto, and some
-strategies reverse sign between classes), so one corpus number averages away the
-thing you would select on.
+strategies reverse sign between classes — both are *pooled* medians, taken
+across every equity/crypto group respectively), so one pooled number averages
+away the thing you would select on.
 
 **It is a separate table on purpose.** Adding an `asset_class` column to the
 results tables would change their grain to (run, strategy, class), and seven
@@ -1075,18 +1090,23 @@ strategy_name)`), while `run_stage_rebuild_disabled`, `build_viability_report`,
 and `docs/papers/*.py` would each silently pick one arbitrary class per strategy.
 Keeping the results tables untouched makes this purely additive.
 
-**Never reconstruct a corpus figure from per-class rows.** Sharpe is a ratio and
-does not recombine across classes — `signal_count` sums and `win_rate` /
-`avg_pnl_per_trade` are per-trade means that would recombine exactly, but Sharpe
-would not, and it is the number everything reads. The corpus Sharpe stays what it
-always was: a true value over the group's pooled `pnl_list` in the results tables.
-Within a class, Sharpe is likewise exact, computed from that class's own pooled
-list. Read one or the other, never a weighted blend of the per-class rows.
-`kairos_pipeline.strategy_class_stats(conn, stage=..., asset_class=...)` enforces
-this — `asset_class=None` reads the corpus table, and a class cell below
-`CLASS_STATS_MIN_SIGNALS` (30 — Baz's call, chosen for statistical relevance;
-not a placeholder pending calibration) falls back to corpus with
-`source="corpus"` on the returned dict.
+**Never reconstruct a pooled figure from class-level rows, or either from the
+other.** Sharpe is a ratio and does not recombine across classes —
+`signal_count` sums and `win_rate` / `avg_pnl_per_trade` are per-trade means
+that would recombine exactly, but Sharpe would not, and it is the number
+everything reads. A group-level Sharpe stays what it always was: a true value
+over that one run's own pooled `pnl_list` in the results tables. A class-level
+Sharpe is likewise exact, computed from that run's own per-class `pnl_list`.
+Read the grain you need directly, never reconstruct one from a weighted blend
+of a finer or coarser one. `kairos_pipeline.strategy_class_stats(conn,
+stage=..., asset_class=...)` returns the *pooled* grain only —
+`asset_class=None` pools every class together, `asset_class=X` pools every
+run's class-X rows — and a pooled-class cell below `CLASS_STATS_MIN_SIGNALS`
+(30 — Baz's call, chosen for statistical relevance; not a placeholder pending
+calibration) falls back to the pooled-all-classes figure. The returned dict
+still tags that fallback `source="corpus"` (code-level string, `kairos_pipeline.py:1415`,
+asserted on in `test_class_stats.py`) — left as-is here since renaming it
+is a code change with test-visible surface, not a documentation edit.
 
 **Attribution is exact for new sweeps, approximate for backfilled rows.**
 `_compute_shadow_performance{,_naive}` attribute each signal to its own symbol's
@@ -1096,9 +1116,9 @@ the 111,657 historical rows — the per-symbol breakdown was gone before they we
 persisted — so it derives class from group composition and marks genuinely mixed
 groups `'mixed'` (1,503 rows, 1.3%), invisible to per-class reads.
 
-**The invariant that catches attribution bugs:** per-class `signal_count`s must sum
-to the corpus `signal_count` for the same (run, strategy). Sharpe will not match
-and must never be asserted to.
+**The invariant that catches attribution bugs:** a run's class-level
+`signal_count`s must sum to that same run's group-level `signal_count`, for the
+same (run, strategy). Sharpe will not match and must never be asserted to.
 
 **Phase 2 shipped in `d78c250`** — an earlier version of this file said
 "nothing consumes these yet", which was true when written and has been wrong
@@ -1117,20 +1137,21 @@ they behave very differently:
   the actual papertrade work items — 120/120 groups on `1d` and 16/16 on `1h`
   are oracle-tested, so step 2 fires for none of them. If you are wondering
   why a class-stats change had no effect on live signals, this is why.
-- **Selection stats** (n, win rate, Sharpe, EV) — now prefer the per-class row,
-  falling back to the group row. **This reverses what this file and the
-  ticket's item 5 both said, and the correction is worth understanding
+- **Selection stats** (n, win rate, Sharpe, EV) — now prefer the class-level
+  row, falling back to the group-level row. **This reverses what this file and
+  the ticket's item 5 both said, and the correction is worth understanding
   (Baz, 2026-09-01).** Item 5 argued class data is coarser than the group's
-  own backtest, so preferring it would lose information. That is true of
-  `kairos_pipeline.strategy_class_stats()`, which aggregates *across* runs
-  into a class-wide average. It is false of the raw table joined on
+  own backtest, so preferring it would lose information. That is true of the
+  *pooled* grain (`kairos_pipeline.strategy_class_stats()`, which aggregates
+  *across* runs). It is false of the class-level table joined on
   `run_id`: rows are keyed `(run_id, strategy_name, asset_class)`, so within
-  one run the class rows **partition** that group's signals. Verified —
-  44,680 of 44,680 (run, strategy) pairs have per-class `signal_count`
-  summing exactly to the group row, none exceeding it (this is the same
-  invariant recorded above, read the other way round). So joined on run_id a
-  class row is a strict *subset* of the group row, split by class: finer
-  evidence about the ticker being traded, not coarser. Join exactly on
+  one run the class-level rows **partition** that run's group-level signals.
+  Verified — 44,680 of 44,680 (run, strategy) pairs have class-level
+  `signal_count` summing exactly to the group-level row, none exceeding it
+  (this is the same invariant recorded above, read the other way round).
+  So joined on run_id a class-level row is a strict *subset* of the
+  group-level row, split by class: finer evidence about the ticker being
+  traded, not coarser. Join exactly on
   `viability_report.base_run_id`/`oracle_run_id` rather than latest-run-wins.
   Measured a no-op on the current 1d universe (all 913 joinable cells agree,
   since no run there is multi-class) — it only bites on mixed groups, which
