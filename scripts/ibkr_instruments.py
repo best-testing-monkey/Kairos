@@ -320,7 +320,7 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
     # patchy -- AAPL's last daily bar was 8 days old and 5.3% off, which both
     # risks an off-market rejection and skews every margin percentage, since
     # those are computed against qty*price while IBKR uses the real price.
-    live = snapshot_price(ib, con, pace, resolve=False)
+    live = snapshot_price(ib, con, pace)
     if live and live > 0:
         price, base["ref_price"], base["ref_price_date"] = live, live, "ibkr_delayed"
 
@@ -530,11 +530,10 @@ def run_discover(ib, conn, prices, args):
                contract.currency or "")
         if key in done:
             continue
+        # No pre-snapshot here: sweep_one already takes a delayed snapshot off
+        # the qualified contract and falls back to this mirror price, so
+        # fetching one first just doubles the market-data calls.
         price, pdate = (prices.get(yf_sym, (None, None)) if yf_sym else (None, None))
-        if price is None:
-            # No local mirror row (index CFDs, spot metals). Fall back to a
-            # delayed IBKR snapshot -- one extra call, discover-only.
-            price, pdate = snapshot_price(ib, contract, args.pace), "ibkr_delayed"
         row = sweep_one(ib, contract, cls, tif, yf_sym, price, pdate,
                         False, args.pace)
         upsert(conn, row)
@@ -544,19 +543,10 @@ def run_discover(ib, conn, prices, args):
               flush=True)
 
 
-def snapshot_price(ib, contract, pace, resolve=True):
-    """Delayed snapshot price, or None if this contract has no entitlement.
-
-    `resolve=False` when the caller already holds a qualified contract.
-    """
+def snapshot_price(ib, con, pace):
+    """Delayed snapshot price for an already-qualified contract, or None if it
+    has no market-data entitlement."""
     try:
-        con = contract
-        if resolve:
-            details = ib.reqContractDetails(contract)
-            ib.sleep(pace)
-            if not details:
-                return None
-            con = details[0].contract
         ticker = ib.reqMktData(con, "", True, False)
         ib.sleep(max(4.0, pace))
         ib.cancelMktData(con)
