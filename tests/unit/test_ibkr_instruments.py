@@ -130,3 +130,75 @@ class TestNum:
     def test_passes_ordinary_values_through(self):
         assert ibi._num(2.51) == 2.51
         assert ibi._num("3.5") == 3.5
+
+
+class TestUpsertDoesNotDowngrade:
+    """A retry during an IBKR outage must not destroy a good row.
+
+    This is the failure that motivated the guard: the sec-def farm dropped
+    mid-sweep, reqContractDetails began timing out, and fully-populated rows
+    (contract metadata plus the exact rejection reason) were rewritten as bare
+    'error' rows.
+    """
+
+    def _row(self, status, note=""):
+        return dict(
+            yf_symbol="SPY", ib_symbol="SPY", sec_type="STK", exchange="SMART",
+            currency="USD", con_id=756733, local_symbol="SPY",
+            primary_exchange="ARCA", long_name="SPDR S&P 500", instrument_class="etf",
+            broker="IBKR", included_in_universe=1, min_tick=0.01, min_size=1.0,
+            size_increment=1.0, ref_price=761.89, ref_price_date="ibkr_delayed",
+            small_qty=None, small_notional=None, small_commission=None,
+            large_qty=None, large_notional=None, large_commission=None,
+            commission_currency=None, commission_min=None, commission_rate_pct=None,
+            init_margin_pct=None, maint_margin_pct=None, short_init_margin_pct=None,
+            trading_hours=None, time_zone=None, status=status, note=note,
+            measured_at="2026-09-02T15:00:00",
+        )
+
+    def _conn(self):
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(ibi.SCHEMA)
+        return conn
+
+    def _status(self, conn):
+        return conn.execute("SELECT status FROM ibkr_instruments").fetchone()[0]
+
+    def test_transient_error_cannot_replace_a_known_rejection(self):
+        conn = self._conn()
+        assert ibi.upsert(conn, self._row("no_commission", "201:No Trading Permission"))
+        assert ibi.upsert(conn, self._row("error", "details:")) is False
+        assert self._status(conn) == "no_commission"
+        # The reason text survives, which is the whole point.
+        note = conn.execute("SELECT note FROM ibkr_instruments").fetchone()[0]
+        assert "No Trading Permission" in note
+
+    def test_error_cannot_replace_a_definitive_no_contract(self):
+        conn = self._conn()
+        ibi.upsert(conn, self._row("no_contract"))
+        assert ibi.upsert(conn, self._row("error")) is False
+        assert self._status(conn) == "no_contract"
+
+    def test_better_result_does_replace(self):
+        conn = self._conn()
+        ibi.upsert(conn, self._row("error"))
+        assert ibi.upsert(conn, self._row("ok")) is True
+        assert self._status(conn) == "ok"
+
+    def test_equal_rank_still_writes_so_fresh_measurements_land(self):
+        conn = self._conn()
+        ibi.upsert(conn, self._row("ok", "first"))
+        assert ibi.upsert(conn, self._row("ok", "second")) is True
+        assert conn.execute("SELECT note FROM ibkr_instruments").fetchone()[0] == "second"
+
+    def test_force_overrides_the_guard(self):
+        # Needed if IBKR genuinely delists something that was previously ok.
+        conn = self._conn()
+        ibi.upsert(conn, self._row("ok"))
+        assert ibi.upsert(conn, self._row("error"), force=True) is True
+        assert self._status(conn) == "error"
+
+    def test_first_write_always_lands(self):
+        conn = self._conn()
+        assert ibi.upsert(conn, self._row("error")) is True

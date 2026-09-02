@@ -425,7 +425,31 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
     return base
 
 
-def upsert(conn, row):
+# How informative a row is. A retry that learns less than what is already
+# stored must not overwrite it: when IBKR's sec-def farm dropped mid-run,
+# reqContractDetails started timing out and rewrote fully-populated rows
+# (contract metadata plus the exact rejection reason) as bare 'error' rows,
+# destroying good data on a transient outage.
+_STATUS_RANK = {
+    "ok": 4,
+    "no_commission": 3,      # contract resolved, rejection reason captured
+    "no_whatif_crypto": 3,   # ditto, and terminal
+    "no_price": 2,           # contract resolved, price unavailable
+    "no_contract": 1,        # definitive: IBKR does not list it
+    "error": 0,              # transient or unknown
+}
+
+
+def upsert(conn, row, force=False):
+    """Write a row unless it would replace a strictly more informative one."""
+    if not force:
+        prev = conn.execute(
+            "SELECT status FROM ibkr_instruments WHERE ib_symbol=? AND sec_type=? "
+            "AND exchange=? AND currency=?",
+            (row["ib_symbol"], row["sec_type"], row["exchange"], row["currency"]),
+        ).fetchone()
+        if prev and _STATUS_RANK.get(row["status"], 0) < _STATUS_RANK.get(prev[0], 0):
+            return False
     cols = list(row)
     conn.execute(
         f"INSERT OR REPLACE INTO ibkr_instruments ({','.join(cols)}) "
@@ -433,6 +457,7 @@ def upsert(conn, row):
         [row[c] for c in cols],
     )
     conn.commit()
+    return True
 
 
 def already_done(conn) -> set:
@@ -500,9 +525,10 @@ def _sweep_pairs(ib, conn, prices, args, pairs, done):
         price, pdate = prices.get(sym, (None, None))
         row = sweep_one(ib, contract, inst_class, tif, sym, price, pdate,
                         True, args.pace)
-        upsert(conn, row)
+        written = upsert(conn, row, force=args.force)
         c = row["small_commission"]
         print(f"  [{i}/{len(pairs)}] {sym:16s} {row['sec_type']:6s} {row['status']:16s} "
+              f"{'' if written else '(kept better prior row) '}"
               f"comm={'-' if c is None else format(c, '.4f')} "
               f"margin={'-' if row['init_margin_pct'] is None else format(row['init_margin_pct'], '.2f') + '%'}"
               f"{'  ' + row['note'][:60] if row['note'] else ''}",
@@ -536,7 +562,7 @@ def run_discover(ib, conn, prices, args):
         price, pdate = (prices.get(yf_sym, (None, None)) if yf_sym else (None, None))
         row = sweep_one(ib, contract, cls, tif, yf_sym, price, pdate,
                         False, args.pace)
-        upsert(conn, row)
+        upsert(conn, row, force=args.force)
         print(f"  [{i}/{len(targets)}] {contract.symbol:10s} {row['sec_type']:6s} "
               f"{row['status']:14s} margin="
               f"{'-' if row['init_margin_pct'] is None else format(row['init_margin_pct'], '.2f') + '%'}",
@@ -592,6 +618,9 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pace", type=float, default=1.5,
                     help="seconds between IBKR requests (default 1.5, be civil)")
+    ap.add_argument("--force", action="store_true",
+                    help="allow a retry to overwrite a more informative existing row "
+                         "(normally refused, so a transient outage cannot destroy data)")
     ap.add_argument("--request-timeout", type=float, default=45.0,
                     help="seconds to wait for any single IBKR request (default 45; "
                          "0 waits forever, which is ib_async's default and hangs "
