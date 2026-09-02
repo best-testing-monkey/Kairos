@@ -299,7 +299,7 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
     # risks an off-market rejection and skews every margin percentage, since
     # those are computed against qty*price while IBKR uses the real price.
     live = snapshot_price(ib, con, pace, resolve=False)
-    if live:
+    if live and live > 0:
         price, base["ref_price"], base["ref_price_date"] = live, live, "ibkr_delayed"
 
     if price is None or price <= 0:
@@ -549,7 +549,10 @@ def snapshot_price(ib, contract, pace, resolve=True):
         ib.cancelMktData(con)
         for cand in (ticker.last, ticker.close, ticker.marketPrice(), ticker.bid):
             v = _num(cand)
-            if v:
+            # IBKR returns -1.0 as "no data available" on delayed/halted
+            # feeds. Treating that as a price silently overwrites the good
+            # mirror fallback with a negative number.
+            if v and v > 0:
                 return v
     except Exception:  # noqa: BLE001
         return None
