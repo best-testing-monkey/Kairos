@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS ibkr_instruments (
     broker               TEXT NOT NULL DEFAULT 'IBKR',
     included_in_universe INTEGER NOT NULL,
     min_tick             REAL,
+    price_magnifier      REAL,
     min_size             REAL,
     size_increment       REAL,
     ref_price            REAL,
@@ -151,6 +152,10 @@ def connect_db() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(ibkr_instruments)")}
+    if "price_magnifier" not in cols:
+        conn.execute("ALTER TABLE ibkr_instruments ADD COLUMN price_magnifier REAL")
+        conn.commit()
     return conn
 
 
@@ -284,7 +289,7 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
         included_in_universe=1 if in_universe else 0,
         ref_price=price, ref_price_date=price_date, measured_at=now,
         con_id=None, local_symbol=None, primary_exchange=None, long_name=None,
-        min_tick=None, min_size=None, size_increment=None,
+        min_tick=None, price_magnifier=None, min_size=None, size_increment=None,
         small_qty=None, small_notional=None, small_commission=None,
         large_qty=None, large_notional=None, large_commission=None,
         commission_currency=None, commission_min=None, commission_rate_pct=None,
@@ -309,6 +314,7 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
         exchange=con.exchange or "", currency=con.currency or "",
         primary_exchange=con.primaryExchange or "", long_name=d.longName or "",
         min_tick=_num(d.minTick), min_size=_num(d.minSize),
+        price_magnifier=_num(d.priceMagnifier),
         size_increment=_num(d.sizeIncrement),
         trading_hours=(d.tradingHours or "")[:200], time_zone=d.timeZoneId or "",
     )
@@ -339,7 +345,14 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
             return base
 
     mult = float(con.multiplier or 1)
-    unit = price * mult
+    # CBOT grains quote in cents per bushel (ZC at 542 means $5.42), so the
+    # quoted price must be divided by priceMagnifier before it means money.
+    # Without this the notional is 100x too high and every derived percentage
+    # 100x too low -- ZC read as 0.066% initial margin instead of 6.6%.
+    magnifier = base["price_magnifier"] or 1.0
+    if magnifier <= 0:
+        magnifier = 1.0
+    unit = price * mult / magnifier
 
     # Always whole units. `sizeIncrement` says 0.0001 for AAPL and 0.01 for
     # EUR.USD, but the API rejects any fractional quantity outright (10243 /
