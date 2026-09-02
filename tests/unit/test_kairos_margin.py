@@ -30,8 +30,8 @@ def test_load_margin_config_populates_top_level_fields(cfg: MarginConfig) -> Non
 def test_margin_class_exposes_required_fields(cfg: MarginConfig) -> None:
     fx = cfg.classes["fx_major"]
     assert fx.name == "fx_major"
-    assert fx.initial_margin_pct == pytest.approx(2.88)
-    assert fx.maintenance_margin_pct == pytest.approx(1.44)
+    assert fx.initial_margin_pct == pytest.approx(3.32)
+    assert fx.maintenance_margin_pct == pytest.approx(1.66)
     assert fx.financing_spread_pct == pytest.approx(1.5)
 
 
@@ -39,14 +39,24 @@ def test_margin_class_exposes_required_fields(cfg: MarginConfig) -> None:
 def test_fx_major_pairs_classified(symbol: str, cfg: MarginConfig) -> None:
     cls = classify_symbol(symbol, cfg)
     assert cls.name == "fx_major"
-    assert cls.initial_margin_pct == pytest.approx(2.88)
+    assert cls.initial_margin_pct == pytest.approx(3.32)
+
+
+def test_fx_major_aud_override(cfg: MarginConfig) -> None:
+    # AUDUSD=X measures as an outlier (5.00% vs. the 3.32% class rate for
+    # EUR/GBP/JPY) -- overridden per-symbol rather than raising the whole
+    # class.
+    cls = classify_symbol("AUDUSD=X", cfg)
+    assert cls.name == "fx_major"
+    assert cls.initial_margin_pct == pytest.approx(5.00)
+    assert cls.maintenance_margin_pct == pytest.approx(2.50)
 
 
 @pytest.mark.parametrize("symbol", ["GC=F", "^GSPC", "SPY", "QQQ"])
 def test_index_gold_major_classified(symbol: str, cfg: MarginConfig) -> None:
     cls = classify_symbol(symbol, cfg)
     assert cls.name == "index_gold_major"
-    assert cls.initial_margin_pct == pytest.approx(8.78)
+    assert cls.initial_margin_pct == pytest.approx(10.82)
 
 
 def test_commodity_other_futures_classified(cfg: MarginConfig) -> None:
@@ -66,7 +76,7 @@ def test_crypto_spot_when_cfd_disabled(cfg: MarginConfig) -> None:
 def test_equity_cfd_default_for_plain_ticker(cfg: MarginConfig) -> None:
     cls = classify_symbol("AAPL", cfg)
     assert cls.name == "equity_cfd"
-    assert cls.initial_margin_pct == pytest.approx(30.71)
+    assert cls.initial_margin_pct == pytest.approx(35.61)
 
 
 def test_per_symbol_override_wins(cfg: MarginConfig) -> None:
@@ -82,7 +92,7 @@ def test_per_symbol_override_wins(cfg: MarginConfig) -> None:
     cls = classify_symbol("AAPL", cfg)
     assert cls.name == "equity_cfd"
     assert cls.initial_margin_pct == pytest.approx(50.0)
-    assert cls.maintenance_margin_pct == pytest.approx(15.36)
+    assert cls.maintenance_margin_pct == pytest.approx(17.81)
 
 
 def test_disabled_crypto_cfd_fallthrough_to_spot(cfg: MarginConfig) -> None:

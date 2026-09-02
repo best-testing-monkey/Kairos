@@ -63,22 +63,22 @@ def test_compute_daily_snapshot_two_positions(cfg) -> None:
     # BTC-USD is crypto_spot (initial_margin_pct=100.0): its full current
     # market value (close_price * quantity = 39000 * 0.1 = 3900.0) is what
     # contributes to equity, not just its P&L delta (100.0) -- see
-    # compute_daily_snapshot's equity note. AAPL (equity_cfd, measured
-    # 2026-09-02 at 30.71% initial / 15.36% maintenance) still contributes
-    # only its delta (50.0), unaffected.
+    # compute_daily_snapshot's equity note. AAPL (equity_cfd, final
+    # currency-corrected figure measured 2026-09-02: 35.61% initial /
+    # 17.81% maintenance) still contributes only its delta (50.0), unaffected.
     # equity = cash(8250) + AAPL_delta(50) + BTC_full_value(3900) = 12200.0
-    # initial_margin_used = AAPL_notional(1000)*0.3071 + BTC_notional(4000)*1.0 = 4307.1
-    # maintenance_margin_used = AAPL_notional(1000)*0.1536 + BTC_notional(4000)*0.0 = 153.6
+    # initial_margin_used = AAPL_notional(1000)*0.3561 + BTC_notional(4000)*1.0 = 4356.1
+    # maintenance_margin_used = AAPL_notional(1000)*0.1781 + BTC_notional(4000)*0.0 = 178.1
     expected = DailySnapshot(
         date=datetime.date(2026, 8, 7),
         cash=8250.0,
         unrealized_pnl=150.0,
         equity=12200.0,
         gross_notional=5000.0,
-        initial_margin_used=4307.1,
-        maintenance_margin_used=153.6,
-        free_margin=12200.0 - 4307.1,
-        margin_utilization=4307.1 / 12200.0,
+        initial_margin_used=4356.1,
+        maintenance_margin_used=178.1,
+        free_margin=12200.0 - 4356.1,
+        margin_utilization=4356.1 / 12200.0,
         financing_accrued_day=0.0,
         liquidations=0,
     )
@@ -109,14 +109,14 @@ def _make_snapshot(
 def test_admission_check_accepts_below_cap(cfg) -> None:
     alloc = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
     account = _make_snapshot(equity=10000.0)
-    # Equity CFD initial margin is 30.71%; 20000 * 0.3071 = 6142 <= 8000 cap.
+    # Equity CFD initial margin is 35.61%; 20000 * 0.3561 = 7122 <= 8000 cap.
     assert admission_check(20000.0, "AAPL", account, cfg, alloc) is True
 
 
 def test_admission_check_rejects_above_cap(cfg) -> None:
     alloc = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
     account = _make_snapshot(equity=10000.0)
-    # Equity CFD initial margin is 30.71%; 50000 * 0.3071 = 15355 > 8000 cap.
+    # Equity CFD initial margin is 35.61%; 50000 * 0.3561 = 17805 > 8000 cap.
     assert admission_check(50000.0, "AAPL", account, cfg, alloc) is False
 
 
