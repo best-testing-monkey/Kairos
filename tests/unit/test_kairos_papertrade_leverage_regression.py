@@ -403,7 +403,7 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
         # happens to fall into the same default bucket, but the min() is
         # taken generically over whatever classes actually appear.
         min_initial_margin_pct_fraction = min(c.initial_margin_pct for c in classes.values()) / 100.0
-        assert min_initial_margin_pct_fraction == pytest.approx(0.20)
+        assert min_initial_margin_pct_fraction == pytest.approx(0.3071)
 
         rows = client._conn.execute(
             "SELECT date, equity, gross_notional FROM kairos_mtm_daily "
@@ -450,20 +450,21 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
         # the persisted kairos_mtm_daily snapshots instead of live position
         # rows. Day 1 (wave 1 alone, nothing else using margin yet): each of
         # TICK1/TICK2 sizes at Kelly's own 30% Stage-1 cap, untouched by
-        # Stage 2.5, so day 1's initial_margin_used is ~12% of equity (2 *
-        # 30% * 20% margin_pct = 12% before entry costs shave equity down
-        # slightly; 0.121071... confirmed empirically, pinned exactly like
-        # this file's other hand-derived values).
+        # Stage 2.5, so day 1's initial_margin_used is ~18.6% of equity (2 *
+        # 30% * 30.71% margin_pct, equity_cfd measured 2026-09-02, before
+        # entry costs shave equity down slightly; 0.1859052615648489
+        # confirmed empirically, pinned exactly like this file's other
+        # hand-derived values).
         by_date = {r[0]: r for r in client._conn.execute(
             "SELECT date, equity, gross_notional, initial_margin_used, margin_utilization "
             "FROM kairos_mtm_daily WHERE account_name = ? ORDER BY date",
             ("exposure_cap_test",),
         ).fetchall()}
         day1_row = by_date["2024-01-02"]
-        assert day1_row[4] == pytest.approx(0.1210714826211976, rel=1e-9)  # margin_utilization
+        assert day1_row[4] == pytest.approx(0.1859052615648489, rel=1e-9)  # margin_utilization
 
         # Day 2 (wave 1 + wave 2 together): Stage 2.5 targets the day's
-        # REMAINING headroom (0.2 - 0.121071... ~= 0.079) for wave 2, sized
+        # REMAINING headroom (0.2 - 0.1859... ~= 0.014) for wave 2, sized
         # in PERCENTAGE-OF-EQUITY terms against day 1's *persisted*
         # admission_snapshot.equity (not phantom's raw account.cash -- using
         # raw cash here was a real bug, fixed in kairos_papertrade.py: the
@@ -474,18 +475,18 @@ def test_exposure_cap_bounds_peak_gross_notional(monkeypatch, tmp_path):
         # slightly different, TODAY's-own equity figure (corrected_cash +
         # unrealized_pnl, drifted from day 1's persisted snapshot by entry
         # costs/financing accrual even with flat, non-moving bars) -- so the
-        # ACHIEVED utilization (0.20282..., pinned exactly, confirmed
-        # empirically) lands close to, and here just barely over, the 20%
-        # target rather than bit-for-bit on it. That small residual gap is
-        # inherent to the system using more than one cash/equity tracker
-        # (see docs/papertrade_loss_analysis.md and the 10%-tolerance bound
-        # check above), not a sizing bug -- what matters here is that it's
-        # dramatically closer to the 20% target than the pre-Stage-2.5
-        # behavior would have left it (~0.121, since Kelly alone never asked
-        # for more and nothing used to scale allocations up to fill the rest
-        # of the budget).
+        # ACHIEVED utilization (0.20179281667023227, pinned exactly,
+        # confirmed empirically) lands close to, and here just barely under,
+        # the 20% target rather than bit-for-bit on it. That small residual
+        # gap is inherent to the system using more than one cash/equity
+        # tracker (see docs/papertrade_loss_analysis.md and the
+        # 10%-tolerance bound check above), not a sizing bug -- what matters
+        # here is that it's dramatically closer to the 20% target than the
+        # pre-Stage-2.5 behavior would have left it (~0.186, since Kelly
+        # alone never asked for more and nothing used to scale allocations
+        # up to fill the rest of the budget).
         day2_row = by_date["2024-01-03"]
-        assert day2_row[4] == pytest.approx(0.20282169644247902, rel=1e-9)  # margin_utilization
+        assert day2_row[4] == pytest.approx(0.20179281667023227, rel=1e-9)  # margin_utilization
         assert day2_row[4] > day1_row[4]  # meaningfully closer to the 20% target than day 1 was
     finally:
         client._conn.close()
@@ -976,16 +977,17 @@ def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path
     Scenario (ticket's suggested structure): wave 1 (TICK1, TICK2) is
     offered on day0 -- admitted unchecked (first-ever batch, `last_snapshot`
     is None) -- and same-day round-trips (fills + take-profits) on day1,
-    each consuming ~600 EUR of initial margin (30%-of-cash leveraged
+    each consuming ~921 EUR of initial margin (30%-of-cash leveraged
     Kelly-capped alloc -- max_leverage=2.0 doubles the legacy 15% cap to
-    30% for equity_cfd's 20% margin class, see `_candidate`'s docstring --
-    * 20% equity_cfd initial_margin_pct). Wave 2 (TICK3..TICK6) is then
-    offered on day1 too, so it is admission-checked against `last_snapshot`
-    from day1 -- the same snapshot day1's round trips should have fed into.
-    `margin_utilization` is set tight enough (0.26) that wave 2's aggregate
-    notional fits entirely if day1's (already-closed) usage is ignored (0
-    rejected -- the pre-fix/BUG-02 symptom, confirmed empirically) but must
-    partially breach the cap once day1's real usage is correctly counted
+    30% for equity_cfd's margin class, see `_candidate`'s docstring --
+    * 30.71% equity_cfd initial_margin_pct, measured 2026-09-02). Wave 2
+    (TICK3..TICK6) is then offered on day1 too, so it is admission-checked
+    against `last_snapshot` from day1 -- the same snapshot day1's round
+    trips should have fed into. `margin_utilization` is set tight enough
+    (0.32) that wave 2's aggregate notional fits entirely if day1's
+    (already-closed) usage is ignored (0 rejected -- the pre-fix/BUG-02
+    symptom, confirmed empirically) but must partially breach the cap once
+    day1's real usage is correctly counted
     (some but not all of wave 2 rejected, confirmed empirically on the
     fixed code). Candidates use base_win_rate=0.99 (see `_candidate`'s
     docstring) so Kelly sizing saturates the leveraged 30% cap cleanly.
@@ -1023,7 +1025,7 @@ def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path
         monkeypatch, tmp_path, dated_rows, bars_by_ticker,
         argv_extra=[
             "--capital", str(CAPITAL_6), "--top-n", "6",
-            "--max-leverage", "2.0", "--margin-utilization", "0.26",
+            "--max-leverage", "2.0", "--margin-utilization", "0.32",
         ],
         account_name="bug02_admission_test",
     )
@@ -1049,7 +1051,7 @@ def test_admission_check_counts_same_day_round_trip_margin(monkeypatch, tmp_path
         # empirically against BUG-01-fixed-but-BUG-02-unfixed code.
         day1_gross_notional, day1_initial_margin = rows["2024-01-02"][1], rows["2024-01-02"][2]
         assert day1_gross_notional == pytest.approx(6000.0, rel=1e-9)
-        assert day1_initial_margin == pytest.approx(1200.0, rel=1e-9)
+        assert day1_initial_margin == pytest.approx(6000.0 * 0.3071, rel=1e-9)
 
         # The cap must actually have been load-bearing for wave 2 (not
         # vacuously satisfied): at least one, but not all, of wave 2's 4
@@ -1103,8 +1105,9 @@ def test_sync_margin_classes_matches_config(monkeypatch, tmp_path):
 
         # equity_cfd (Kairos's catch-all, match=None/symbols=None) becomes
         # phantom's default_margin_pct, not a MarginClassRule -- no longer
-        # the bundled profile's original 0.25.
-        assert profile.margin.default_margin_pct == pytest.approx(0.20)
+        # the bundled profile's original 0.25, nor the old 0.20 estimate
+        # (measured 2026-09-02 at 30.71%).
+        assert profile.margin.default_margin_pct == pytest.approx(0.3071)
 
         by_label = {rule.label: rule for rule in profile.margin.classes}
         assert set(by_label) == {
@@ -1114,7 +1117,7 @@ def test_sync_margin_classes_matches_config(monkeypatch, tmp_path):
         assert "crypto_cfd" not in by_label
 
         # Percentage-points -> fraction conversion.
-        assert by_label["fx_major"].margin_pct == pytest.approx(0.0333, rel=1e-6)
+        assert by_label["fx_major"].margin_pct == pytest.approx(0.0288, rel=1e-6)
         assert by_label["commodity_other"].margin_pct == pytest.approx(0.10)
         assert by_label["crypto_spot"].margin_pct == pytest.approx(1.0)
 
@@ -1139,11 +1142,12 @@ def test_sync_margin_classes_matches_config(monkeypatch, tmp_path):
         # margin_pct_for() actually resolves a Kairos ticker now (pre-fix this
         # always fell through to default_margin_pct=0.25 regardless of class).
         assert profile.margin.margin_pct_for("BTC-USD") == pytest.approx(1.0)
-        # GC=F is an explicit symbol in index_gold_major (5%), not
-        # commodity_other's =F$ regex fallback (10%) -- explicit symbols win.
-        assert profile.margin.margin_pct_for("GC=F") == pytest.approx(0.05)
+        # GC=F is an explicit symbol in index_gold_major (8.78%, measured
+        # 2026-09-02), not commodity_other's =F$ regex fallback (10%) --
+        # explicit symbols win.
+        assert profile.margin.margin_pct_for("GC=F") == pytest.approx(0.0878)
         assert profile.margin.margin_pct_for("CL=F") == pytest.approx(0.10)
-        assert profile.margin.margin_pct_for("EURUSD=X") == pytest.approx(0.0333, rel=1e-6)
+        assert profile.margin.margin_pct_for("EURUSD=X") == pytest.approx(0.0288, rel=1e-6)
 
         # Idempotency: a second call with the same config must not touch the
         # DB row (same broker profile `id`, byte-identical config_json).
@@ -1151,6 +1155,73 @@ def test_sync_margin_classes_matches_config(monkeypatch, tmp_path):
             "SELECT id, config_json FROM broker_profiles WHERE name = ?", ("IBKR",)
         ).fetchone()
         kairos_papertrade._sync_margin_classes(client, "IBKR", margin_config)
+        row_after = client._conn.execute(
+            "SELECT id, config_json FROM broker_profiles WHERE name = ?", ("IBKR",)
+        ).fetchone()
+        assert row_after["id"] == row_before["id"]
+        assert row_after["config_json"] == row_before["config_json"]
+    finally:
+        client._conn.close()
+
+
+# =============================================================================
+# Test 7b: _ensure_broker_profile heals a stale profile, not just a missing one
+# =============================================================================
+
+def test_ensure_broker_profile_heals_stale_commission_schema(monkeypatch, tmp_path):
+    """`_ensure_broker_profile` used to return as soon as ANY profile named
+    "IBKR" existed, so a profile persisted before a bundled-JSON fix (e.g. a
+    commission schema change) stayed on the stale config_json forever in a
+    reused `phantom_data_dir` -- found 2026-09-02 via a live IBKR probe: a
+    real DB had an IBKR profile on an old "tiered" schema whose tier dicts
+    used "min_volume"/"max_volume"/"per_share" keys that
+    `CommissionModel.calculate()`'s tiered branch doesn't read, silently
+    pricing every simulated trade at 0.0 commission. Confirms the fixed
+    function detects and heals that drift (and stays a no-op once healed).
+    """
+    day0 = datetime(2024, 1, 1)
+    dated_rows = _dated_rows([(day0, []), (datetime(2024, 1, 2), [])])
+
+    _metrics, _meta, client = _run_main(
+        monkeypatch, tmp_path, dated_rows, {},
+        argv_extra=["--capital", "10000", "--top-n", "3", "--max-leverage", "1.0"],
+        account_name="ensure_broker_profile_heal_test",
+    )
+    try:
+        # Simulate a profile persisted under the old, wrong tier schema --
+        # same direct-SQL technique this module used before
+        # `client.brokers.update()` existed (see `_sync_margin_classes`
+        # docstring), needed here to plant stale data in the first place.
+        import json
+        row = client._conn.execute(
+            "SELECT id, config_json FROM broker_profiles WHERE name = ?", ("IBKR",)
+        ).fetchone()
+        stale = json.loads(row["config_json"])
+        stale["commission"] = {
+            "model_type": "tiered",
+            "tiers": [{"min_volume": 0.0, "max_volume": 100000.0, "per_share": 0.005}],
+        }
+        client._conn.execute(
+            "UPDATE broker_profiles SET config_json = ? WHERE id = ?",
+            (json.dumps(stale), row["id"]),
+        )
+        client._conn.commit()
+
+        healed_commission = client.brokers.get("IBKR").commission
+        assert healed_commission.model_type == "tiered"  # sanity: plant took
+
+        kairos_papertrade._ensure_broker_profile(client, "IBKR")
+
+        profile = client.brokers.get("IBKR")
+        assert profile.commission.model_type == "per_share"
+        assert profile.commission.calculate(quantity=10, price=100.0, monthly_volume=0) > 0.0
+
+        # Idempotent: a second call with the profile already healed must not
+        # touch the row (same id, byte-identical config_json).
+        row_before = client._conn.execute(
+            "SELECT id, config_json FROM broker_profiles WHERE name = ?", ("IBKR",)
+        ).fetchone()
+        kairos_papertrade._ensure_broker_profile(client, "IBKR")
         row_after = client._conn.execute(
             "SELECT id, config_json FROM broker_profiles WHERE name = ?", ("IBKR",)
         ).fetchone()
@@ -1189,11 +1260,12 @@ def test_first_batch_is_admission_gated_not_skipped():
     margin_config = load_margin_config(MARGIN_CONFIG_PATH)
     alloc_config = AllocationConfig(max_leverage=5.0, margin_utilization_cap=0.8)
 
-    # 3 plain-ticker (equity_cfd class, 20% margin) orders of notional=300
-    # each: margin_needed = 300*0.20 = 60 per order. Against equity=200 and
-    # an 80% cap (max_margin=160), orders 1+2 fit (60+60=120<=160) but order
-    # 3 doesn't (120+60=180>160) -- IF the batch is actually gated.
-    order_requests = [(f"order-{i}", f"TICK{i}", 300.0) for i in range(3)]
+    # 3 plain-ticker (equity_cfd class, 30.71% margin, measured 2026-09-02)
+    # orders of notional=250 each: margin_needed = 250*0.3071 = 76.775 per
+    # order. Against equity=200 and an 80% cap (max_margin=160), orders 1+2
+    # fit (76.775+76.775=153.55<=160) but order 3 doesn't
+    # (153.55+76.775=230.325>160) -- IF the batch is actually gated.
+    order_requests = [(f"order-{i}", f"TICK{i}", 250.0) for i in range(3)]
 
     # Pre-fix behavior: snapshot=None skips the check entirely -- all 3
     # admitted regardless of how far over the cap they'd push margin usage.

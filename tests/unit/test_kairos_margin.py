@@ -30,8 +30,8 @@ def test_load_margin_config_populates_top_level_fields(cfg: MarginConfig) -> Non
 def test_margin_class_exposes_required_fields(cfg: MarginConfig) -> None:
     fx = cfg.classes["fx_major"]
     assert fx.name == "fx_major"
-    assert fx.initial_margin_pct == pytest.approx(3.33)
-    assert fx.maintenance_margin_pct == pytest.approx(1.67)
+    assert fx.initial_margin_pct == pytest.approx(2.88)
+    assert fx.maintenance_margin_pct == pytest.approx(1.44)
     assert fx.financing_spread_pct == pytest.approx(1.5)
 
 
@@ -39,14 +39,14 @@ def test_margin_class_exposes_required_fields(cfg: MarginConfig) -> None:
 def test_fx_major_pairs_classified(symbol: str, cfg: MarginConfig) -> None:
     cls = classify_symbol(symbol, cfg)
     assert cls.name == "fx_major"
-    assert cls.initial_margin_pct == pytest.approx(3.33)
+    assert cls.initial_margin_pct == pytest.approx(2.88)
 
 
 @pytest.mark.parametrize("symbol", ["GC=F", "^GSPC", "SPY", "QQQ"])
 def test_index_gold_major_classified(symbol: str, cfg: MarginConfig) -> None:
     cls = classify_symbol(symbol, cfg)
     assert cls.name == "index_gold_major"
-    assert cls.initial_margin_pct == pytest.approx(5.0)
+    assert cls.initial_margin_pct == pytest.approx(8.78)
 
 
 def test_commodity_other_futures_classified(cfg: MarginConfig) -> None:
@@ -66,7 +66,7 @@ def test_crypto_spot_when_cfd_disabled(cfg: MarginConfig) -> None:
 def test_equity_cfd_default_for_plain_ticker(cfg: MarginConfig) -> None:
     cls = classify_symbol("AAPL", cfg)
     assert cls.name == "equity_cfd"
-    assert cls.initial_margin_pct == pytest.approx(20.0)
+    assert cls.initial_margin_pct == pytest.approx(30.71)
 
 
 def test_per_symbol_override_wins(cfg: MarginConfig) -> None:
@@ -82,7 +82,7 @@ def test_per_symbol_override_wins(cfg: MarginConfig) -> None:
     cls = classify_symbol("AAPL", cfg)
     assert cls.name == "equity_cfd"
     assert cls.initial_margin_pct == pytest.approx(50.0)
-    assert cls.maintenance_margin_pct == pytest.approx(10.0)
+    assert cls.maintenance_margin_pct == pytest.approx(15.36)
 
 
 def test_disabled_crypto_cfd_fallthrough_to_spot(cfg: MarginConfig) -> None:

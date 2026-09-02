@@ -1212,16 +1212,17 @@ class TestPlaceBatchOrders:
         )
 
     def test_second_order_in_batch_rejected_once_first_consumes_headroom(self, margin_cfg):
-        # AAPL -> default equity_cfd class, initial_margin_pct=20.
-        # equity=1000, cap=0.8 -> initial_margin_used may not exceed 800.
-        # Each order alone locks 3000*0.20=600, which is <=800 in isolation
-        # (i.e. checked against the static start-of-day snapshot ALONE, both
-        # would incorrectly pass) -- but the two together lock 1200 > 800.
+        # AAPL -> default equity_cfd class, initial_margin_pct=30.71
+        # (measured 2026-09-02). equity=1000, cap=0.8 -> initial_margin_used
+        # may not exceed 800. Each order alone locks 2000*0.3071=614.2,
+        # which is <=800 in isolation (i.e. checked against the static
+        # start-of-day snapshot ALONE, both would incorrectly pass) -- but
+        # the two together lock 1228.4 > 800.
         client = MagicMock()
         alloc_config = AllocationConfig(max_leverage=2.0, margin_utilization_cap=0.8)
         snapshot = self._snapshot(equity=1000.0, initial_margin_used=0.0)
         order1, order2 = MagicMock(), MagicMock()
-        order_requests = [(order1, "AAPL", 3000.0), (order2, "AAPL", 3000.0)]
+        order_requests = [(order1, "AAPL", 2000.0), (order2, "AAPL", 2000.0)]
 
         rejected = _place_batch_orders(
             client, "acct1", order_requests, datetime(2026, 8, 7),

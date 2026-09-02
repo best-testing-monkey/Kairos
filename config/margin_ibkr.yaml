@@ -2,11 +2,17 @@ base_currency: EUR
 benchmark_annual_pct: 3.15          # configurable; verify current EUR benchmark
 negative_balance_protection: true
 closeout_fraction: 0.5              # ESMA: liquidate at 50% of initial margin
+# initial_margin_pct values below marked "measured 2026-09-02" come from
+# live ib_async whatIfOrder() calls against a real IB Gateway paper account
+# (base currency EUR, NetLiq ~EUR1M), found via kairos-07's cost/financing
+# probe. maintenance_margin_pct keeps this file's existing initial/2
+# convention (no maintenance-side whatIf data was collected) -- rescale it
+# if real maintenance figures ever get measured.
 classes:
   fx_major:
     symbols: ["EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X", "USDCAD=X", "NZDUSD=X", "USDCHF=X"]
-    initial_margin_pct: 3.33
-    maintenance_margin_pct: 1.67
+    initial_margin_pct: 2.88        # measured 2026-09-02: EUR.USD CFD initMarginChange=2.88% (was 3.33 estimate)
+    maintenance_margin_pct: 1.44
     financing_spread_pct: 1.5
   fx_minor:
     match: "=X$"                    # regex fallback for any other FX pair
@@ -15,12 +21,17 @@ classes:
     financing_spread_pct: 1.5
   index_gold_major:
     symbols: ["GC=F", "^GSPC", "^IXIC", "^DJI", "SPY", "QQQ"]
-    initial_margin_pct: 5.0
-    maintenance_margin_pct: 2.5
+    # measured 2026-09-02: IBUS500 (index CFD) 7.29%, XAUUSD (gold CFD) 8.78%
+    # -- this bucket lumps index and gold together but they measure
+    # differently; using the higher (gold) figure for both rather than
+    # splitting the class. Revisit if index vs. gold margin needs to be
+    # distinguished.
+    initial_margin_pct: 8.78        # was 5.0 estimate
+    maintenance_margin_pct: 4.39
     financing_spread_pct: 1.5
   commodity_other:
     match: "=F$"                    # other futures proxies after index_gold_major
-    initial_margin_pct: 10.0
+    initial_margin_pct: 10.0        # unverified estimate -- no oil/silver whatIf data collected (gold's 8.78% lives in index_gold_major above, not this bucket)
     maintenance_margin_pct: 5.0
     financing_spread_pct: 1.5
   crypto_cfd:
@@ -35,8 +46,13 @@ classes:
     financing_spread_pct: 0.0
   equity_cfd:
     match: null                     # default for anything unmatched (plain tickers)
-    initial_margin_pct: 20.0
-    maintenance_margin_pct: 10.0
+    # measured 2026-09-02: AAPL CFD initMarginChange=28.49% long / 30.71%
+    # short (this schema has no long/short split -- using the more
+    # conservative short figure). Also: AAPL cash stock measured at 28.50%,
+    # essentially identical to the CFD figure -- US stock CFDs are NOT
+    # leveraged relative to cash stock on this account, despite the name.
+    initial_margin_pct: 30.71       # was 20.0 estimate -- previously under-margined by ~10pp
+    maintenance_margin_pct: 15.36
     financing_spread_pct: 1.5
 # Per-symbol house-margin overrides example:
 # "LDO-USD": {initial_margin_pct: 100.0}

@@ -1147,21 +1147,27 @@ def selected_rows(allocation_result):
 
 def _ensure_broker_profile(client, broker_name):
     """Load `broker_name`'s profile from phantom_ledger's own bundled
-    profiles/ directory into this Phantom instance's DB, if not already
-    loaded there.
+    profiles/ directory into this Phantom instance's DB, refreshing it to
+    match the bundled JSON if it's already loaded but stale.
 
     A fresh Phantom(data_dir=...) DB ships with NO broker profiles seeded
     (verified from source: BrokerRepo starts empty; phantom_ledger's own CLI
     requires an explicit one-time `phantom broker load <path>` per DB). This
     mirrors that: idempotent, safe to call every run.
+
+    The refresh half exists because a persistent `phantom_data_dir` never
+    self-heals otherwise: an early version of this function returned as soon
+    as `client.brokers.get()` found ANY row, so a profile loaded before an
+    upstream bundled-JSON fix (e.g. a commission schema change) stayed on the
+    old, wrong config_json forever -- caught 2026-09-02 via a live IBKR probe
+    that found the DB's IBKR profile still on a stale "tiered" schema whose
+    tier keys didn't match `CommissionModel.calculate()`, silently pricing
+    every simulated trade at 0.0 commission. `_sync_margin_classes()` (called
+    right after this, every run) re-applies Kairos's own margin rates
+    unconditionally, so overwriting the whole profile here -- margin field
+    included -- is safe; it doesn't need special-casing.
     """
     from phantom.errors import NotFoundError as PhNotFoundError
-
-    try:
-        client.brokers.get(broker_name)
-        return
-    except PhNotFoundError:
-        pass
 
     import phantom.profiles as _profiles_pkg
     profile_path = os.path.join(
@@ -1172,7 +1178,17 @@ def _ensure_broker_profile(client, broker_name):
             f"No bundled Phantom Ledger broker profile for {broker_name!r} "
             f"at {profile_path}; load one manually via client.brokers.load(...)."
         )
-    client.brokers.load(profile_path)
+
+    try:
+        existing = client.brokers.get(broker_name)
+    except PhNotFoundError:
+        client.brokers.load(profile_path)
+        return
+
+    bundled = client.brokers.validate(profile_path)
+    if existing.model_copy(update={"margin": bundled.margin}) == bundled:
+        return
+    client.brokers.update(broker_name, bundled)
 
 
 def _sync_margin_classes(client, broker_name, margin_config):
