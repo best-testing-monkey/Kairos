@@ -143,6 +143,15 @@ query) or candidate lists probed by name, which is what
 
 ## Measured figures
 
+> **The margin percentages below are being re-measured (2026-09-02).** They were
+> computed by dividing `initMarginChange`, which IBKR denominates in the
+> **account base currency** (EUR), by a notional in the **contract's** currency
+> — a 1.16x understatement for every USD instrument. AAPL's real figures are
+> 33.04% long / 35.62% short, not the 28.49% / 30.71% shown. EUR-denominated
+> rows (IBDE40 at 9.34%) were always correct. Fixed in `8668d27`; this section
+> is rewritten once the forced re-sweep completes. **Commission figures are
+> unaffected** — they are absolute amounts and were never divided by notional.
+
 Commission round-trip as a share of notional, US stocks — the $1 minimum is the
 whole story at small size:
 
