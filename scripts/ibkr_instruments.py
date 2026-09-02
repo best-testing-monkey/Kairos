@@ -103,7 +103,12 @@ FUTURES_MAP = {
 }
 
 # Instruments IBKR offers that CANDIDATE_UNIVERSE never names. Probed by
-# --discover. (label, secType, symbol, exchange, currency, instrument_class)
+# --discover.
+#   (secType, symbol, exchange, currency, instrument_class, price_hint)
+# price_hint is a yfinance ticker used only to price the probe order from the
+# local mirror. Index CFDs price fine off a delayed snapshot, but FX CFDs have
+# no market-data entitlement here and no mirror row of their own, so without a
+# hint they fail as no_price.
 DISCOVER_TARGETS = [
     # Index CFDs -- the leveraged route to an index, since IND is data-only.
     ("CFD", "IBUS500", "SMART", "USD", "cfd_index"),
@@ -120,15 +125,15 @@ DISCOVER_TARGETS = [
     ("CFD", "IBNL25", "SMART", "EUR", "cfd_index"),
     ("CFD", "IBHK50", "SMART", "HKD", "cfd_index"),
     # Metal CFDs / spot metals.
-    ("CFD", "XAUUSD", "SMART", "USD", "cfd_metal"),
-    ("CFD", "XAGUSD", "SMART", "USD", "cfd_metal"),
-    ("CMDTY", "XAUUSD", "SMART", "USD", "metal"),
-    ("CMDTY", "XAGUSD", "SMART", "USD", "metal"),
+    ("CFD", "XAUUSD", "SMART", "USD", "cfd_metal", "GC=F"),
+    ("CFD", "XAGUSD", "SMART", "USD", "cfd_metal", "SI=F"),
+    ("CMDTY", "XAUUSD", "SMART", "USD", "metal", "GC=F"),
+    ("CMDTY", "XAGUSD", "SMART", "USD", "metal", "SI=F"),
     # FX CFDs (distinct from IDEALPRO spot -- different margin).
-    ("CFD", "EUR", "SMART", "USD", "cfd_fx"),
-    ("CFD", "GBP", "SMART", "USD", "cfd_fx"),
-    ("CFD", "AUD", "SMART", "USD", "cfd_fx"),
-    ("CFD", "USD", "SMART", "JPY", "cfd_fx"),
+    ("CFD", "EUR", "SMART", "USD", "cfd_fx", "EURUSD=X"),
+    ("CFD", "GBP", "SMART", "USD", "cfd_fx", "GBPUSD=X"),
+    ("CFD", "AUD", "SMART", "USD", "cfd_fx", "AUDUSD=X"),
+    ("CFD", "USD", "SMART", "JPY", "cfd_fx", "USDJPY=X"),
 ]
 
 # Spot FX pairs on IDEALPRO beyond whatever the universe already lists.
@@ -553,18 +558,25 @@ def run_discover(ib, conn, prices, args):
 
     done = already_done(conn)
     targets = []
-    for sec, sym, exch, cur, cls in DISCOVER_TARGETS:
+    # (contract, class, tif, yf_symbol, price_hint). yf_symbol is a genuine
+    # equivalent and is stored; price_hint is only a proxy to size the probe
+    # order and is NOT stored as identity -- an XAUUSD CFD priced off GC=F is
+    # not GC=F.
+    for entry in DISCOVER_TARGETS:
+        sec, sym, exch, cur, cls = entry[:5]
+        hint = entry[5] if len(entry) > 5 else None
         targets.append((Contract(secType=sec, symbol=sym, exchange=exch,
-                                 currency=cur), cls, "DAY", None))
+                                 currency=cur), cls, "DAY", None, hint))
     for pair in DISCOVER_FX:
-        targets.append((Forex(pair), "fx", "DAY", f"{pair}=X"))
+        targets.append((Forex(pair), "fx", "DAY", f"{pair}=X", f"{pair}=X"))
     for sym in DISCOVER_CRYPTO:
-        targets.append((Crypto(sym, "PAXOS", "USD"), "crypto", "IOC", f"{sym}-USD"))
+        targets.append((Crypto(sym, "PAXOS", "USD"), "crypto", "IOC",
+                        f"{sym}-USD", f"{sym}-USD"))
     if args.limit:
         targets = targets[: args.limit]
 
     print(f"[discover] {len(targets)} targets", flush=True)
-    for i, (contract, cls, tif, yf_sym) in enumerate(targets, 1):
+    for i, (contract, cls, tif, yf_sym, hint) in enumerate(targets, 1):
         key = (contract.symbol, contract.secType, contract.exchange or "",
                contract.currency or "")
         if key in done:
@@ -572,7 +584,9 @@ def run_discover(ib, conn, prices, args):
         # No pre-snapshot here: sweep_one already takes a delayed snapshot off
         # the qualified contract and falls back to this mirror price, so
         # fetching one first just doubles the market-data calls.
-        price, pdate = (prices.get(yf_sym, (None, None)) if yf_sym else (None, None))
+        price, pdate = (prices.get(hint, (None, None)) if hint else (None, None))
+        if price is not None and hint != yf_sym:
+            pdate = f"proxy:{hint}@{pdate}"
         row = sweep_one(ib, contract, cls, tif, yf_sym, price, pdate,
                         False, args.pace)
         upsert(conn, row, force=args.force)
