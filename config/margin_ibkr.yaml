@@ -28,15 +28,20 @@ classes:
     # rather than splitting the class. Revisit if index vs. gold margin
     # needs to be distinguished.
     #
-    # ACCOUNT CONSTRAINT (kairos-07, 2026-09-02): SPY whatIf rejects with IB
-    # error 201 "No Trading Permission ... This product does not have a KID
-    # in English" -- EU PRIIPs/KID regime blocking US-domiciled retail ETFs
-    # on this account. Expected to also hit QQQ and every other
-    # US-domiciled ETF in CANDIDATE_UNIVERSE (GLD/SLV/USO/UNG/DBC/GDX/PDBC/
-    # CPER/COPX/REMX) -- full sweep pending, exact list TBD. These margin
-    # rates aren't wrong, some of the symbols they're attached to may simply
-    # be untradeable on this account; this is a trading-permission gap, not
-    # a margin-math one, so it's flagged here rather than changed.
+    # ACCOUNT CONSTRAINT (kairos-07, 2026-09-02): some US ETFs are
+    # unavailable to EU retail under PRIIPs/KID (IB error 201, "This
+    # product does not have a KID in English or in a language approved for
+    # your country"). This is PER-PRODUCT, not per-domicile/asset-class --
+    # SPY and DIA are both US-listed ARCA/USD ETFs, but SPY is blocked and
+    # DIA trades fine (10.36% initial margin) -- so availability must be
+    # checked per symbol, never inferred from domicile. SPY and QQQ, both
+    # named in this bucket's symbols above, are CONFIRMED blocked (equity
+    # sweep as of 2026-09-02, still in progress: also blocked --
+    # IWM/XLB/XLC/XLE/XLF/XLI/XLK/XLP/XLU/XLV/XLY; confirmed tradeable --
+    # DIA). These margin rates aren't wrong, some of the symbols they're
+    # attached to may simply be unorderable on this account; this is a
+    # trading-permission gap, not a margin-math one, so it's flagged here
+    # rather than changed.
     initial_margin_pct: 8.78        # was 5.0 estimate
     maintenance_margin_pct: 4.39
     financing_spread_pct: 1.5
@@ -45,9 +50,11 @@ classes:
     # measured 2026-09-02: GC=F (gold) 8.85%, CL=F (oil) 16.26% -- oil and
     # gold differ by ~2x, so a single rate can't represent both; left at the
     # unverified 10% estimate rather than guessing which one to match.
-    # Same PRIIPs/KID account constraint as index_gold_major above likely
-    # applies to this bucket's ETF proxies (USO/UNG/DBC/PDBC/GDX/CPER/COPX/
-    # REMX) -- pending kairos-07's full sweep.
+    # The PRIIPs/KID account constraint noted on index_gold_major above is
+    # per-product, not per-category -- this bucket's ETF proxies
+    # (USO/UNG/DBC/PDBC/GDX/CPER/COPX/REMX) haven't been swept yet (equity
+    # sweep ran first), so don't assume any of them are blocked without
+    # checking; kairos-07's fx/commodity sweep will confirm per-symbol.
     initial_margin_pct: 10.0        # unverified estimate
     maintenance_margin_pct: 5.0
     financing_spread_pct: 1.5
@@ -71,6 +78,10 @@ classes:
     initial_margin_pct: 30.71       # was 20.0 estimate -- previously under-margined by ~10pp
     maintenance_margin_pct: 15.36
     financing_spread_pct: 1.5
+    # kairos-07 (2026-09-02): ETFs get materially better margin than single
+    # stocks on this account (DIA 10.36% vs AAPL 28.52%) -- this one rate
+    # covers both populations. Not changed; worth a per-class split later
+    # if it matters.
 # Per-symbol house-margin overrides example:
 # "LDO-USD": {initial_margin_pct: 100.0}
 overrides: {}
