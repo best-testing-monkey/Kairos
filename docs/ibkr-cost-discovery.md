@@ -109,9 +109,17 @@ works with market orders. Contract metadata still records fine. IBKR's Paxos
 list is also far smaller than Kairos's 62-symbol crypto universe — XRP, DOGE,
 ADA and AVAX have no contract at all.
 
-**US-domiciled ETFs are untradeable.** EU PRIIPs/KID: *"This product does not
-have a KID in English or in a language approved for your country."* Affects
-SPY, QQQ, GLD, SLV, USO, UNG, DBC, GDX, PDBC, CPER, COPX, REMX.
+**Some US ETFs are untradeable, per product.** EU PRIIPs/KID: *"This product
+does not have a KID in English or in a language approved for your country."*
+This is **not** predictable from domicile, venue or currency — SPY and DIA are
+both US-listed ARCA ETFs in USD, and SPY is blocked while DIA trades fine.
+Whether the issuer filed an approved-language KID for that specific product is
+the discriminator, so availability has to be measured per symbol. Blocked in
+the 2026-09-02 sweep: IWM, QQQ, SPY, XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLU,
+XLV, XLY.
+
+ETFs also get materially better margin than single stocks — DIA 10.36% vs
+AAPL 28.52% — which a single equity margin rate does not capture.
 
 **Spot FX only prices in one direction.** The account holds EUR only, so buying
 any pair shorts the quote currency and rejects with *"FX trade would expose
