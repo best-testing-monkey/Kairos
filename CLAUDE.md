@@ -839,7 +839,7 @@ produced it.
 is where the change should bite hardest: a model's predicted brackets are not
 derived from the realised bar, so they miss on bar 1 far more often than
 oracle's do, which is exactly the case the old rule force-closed. One equity
-group is also not a corpus claim — crypto's wider ranges will resolve
+group is also not a pooled claim — crypto's wider ranges will resolve
 differently.
 
 **Six independent TP/SL-checking implementations exist in this codebase**
@@ -1015,7 +1015,7 @@ default, so every gate condition is false and each filter degrades to an
 unmodified pass-through, differing only in the name stamped on the signal.
 Confirmed in code, not inferred from the numbers.
 
-**Consequence for any corpus-wide statistic: one behaviour votes eight
+**Consequence for any pooled statistic: one behaviour votes eight
 times.** Collapsing the aliases moved the whitepaper's oracle median from
 +0.32 to +2.20, because seven redundant copies of an unprofitable strategy
 sat near the middle of the distribution. Counts of *profitable* strategies
