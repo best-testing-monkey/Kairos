@@ -8,6 +8,22 @@ closeout_fraction: 0.5              # ESMA: liquidate at 50% of initial margin
 # probe. maintenance_margin_pct keeps this file's existing initial/2
 # convention (no maintenance-side whatIf data was collected) -- rescale it
 # if real maintenance figures ever get measured.
+#
+# ACCOUNT CONSTRAINT -- PRIIPs/KID (kairos-07, full 153-symbol universe
+# sweep, 2026-09-02): 26 of CANDIDATE_UNIVERSE's 27 ETFs cannot be held on
+# this account -- IB error 201, "No Trading Permission, Customer
+# Ineligible ... does not have a KID in English or in a language approved
+# for your country" (EU retail PRIIPs/KID regime). This is PER-PRODUCT, not
+# per-domicile/asset-class: DIA is the same US-listed/ARCA/USD ETF type as
+# SPY, but DIA trades fine (10.36% initial margin, confirmed) while SPY is
+# blocked -- never infer availability from domicile, check per symbol.
+# Confirmed BLOCKED: COPX, CPER, DBC, GDX, GLD, HYG, IWM, PDBC, QQQ, REMX,
+# SLV, SPY, TLT, UNG, USO, XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLRE, XLU,
+# XLV, XLY. Confirmed TRADEABLE: DIA. (TLT/HYG are bond ETFs with no
+# dedicated bucket below -- they fall to equity_cfd's catch-all, also
+# blocked.) This is a trading-permission gap, not a margin-math one -- the
+# rates below aren't wrong, some of the symbols they're attached to may
+# simply be unorderable here.
 classes:
   fx_major:
     symbols: ["EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X", "USDCAD=X", "NZDUSD=X", "USDCHF=X"]
@@ -26,35 +42,26 @@ classes:
     # margined like CFDs) -- this bucket lumps index and gold together but
     # they measure differently; using the higher (gold) figure for both
     # rather than splitting the class. Revisit if index vs. gold margin
-    # needs to be distinguished.
-    #
-    # ACCOUNT CONSTRAINT (kairos-07, 2026-09-02): some US ETFs are
-    # unavailable to EU retail under PRIIPs/KID (IB error 201, "This
-    # product does not have a KID in English or in a language approved for
-    # your country"). This is PER-PRODUCT, not per-domicile/asset-class --
-    # SPY and DIA are both US-listed ARCA/USD ETFs, but SPY is blocked and
-    # DIA trades fine (10.36% initial margin) -- so availability must be
-    # checked per symbol, never inferred from domicile. SPY and QQQ, both
-    # named in this bucket's symbols above, are CONFIRMED blocked (equity
-    # sweep as of 2026-09-02, still in progress: also blocked --
-    # IWM/XLB/XLC/XLE/XLF/XLI/XLK/XLP/XLU/XLV/XLY; confirmed tradeable --
-    # DIA). These margin rates aren't wrong, some of the symbols they're
-    # attached to may simply be unorderable on this account; this is a
-    # trading-permission gap, not a margin-math one, so it's flagged here
-    # rather than changed.
+    # needs to be distinguished. SPY and QQQ, named above, are both
+    # PRIIPs/KID-blocked on this account -- see the top-of-file note.
     initial_margin_pct: 8.78        # was 5.0 estimate
     maintenance_margin_pct: 4.39
     financing_spread_pct: 1.5
   commodity_other:
     match: "=F$"                    # other futures proxies after index_gold_major
-    # measured 2026-09-02: GC=F (gold) 8.85%, CL=F (oil) 16.26% -- oil and
-    # gold differ by ~2x, so a single rate can't represent both; left at the
-    # unverified 10% estimate rather than guessing which one to match.
-    # The PRIIPs/KID account constraint noted on index_gold_major above is
-    # per-product, not per-category -- this bucket's ETF proxies
-    # (USO/UNG/DBC/PDBC/GDX/CPER/COPX/REMX) haven't been swept yet (equity
-    # sweep ran first), so don't assume any of them are blocked without
-    # checking; kairos-07's fx/commodity sweep will confirm per-symbol.
+    # All ten of this bucket's ETF proxies (GLD/SLV/USO/UNG/DBC/PDBC/CPER/
+    # COPX/REMX/GDX) are confirmed PRIIPs/KID-blocked -- see the top-of-file
+    # note -- so this class currently describes nothing this account can
+    # trade via ETF. Real commodity exposure would need futures instead,
+    # which margin very differently per-commodity (kairos-07 measured
+    # roughly a 6%-17% range across gold/oil/nat-gas/grains/metals,
+    # 2026-09-02) -- too wide for one flat rate. Not filling in a specific
+    # futures figure yet: the grain contracts' measured values had a
+    # priceMagnifier bug (pending re-sweep), and this account has no
+    # dedicated commodities segment, so even the clean figures (gold/oil/
+    # nat-gas) aren't confirmed actually tradeable here, only what IBKR
+    # would charge if they were. Left at the unverified 10% estimate
+    # pending a settled, confirmed-tradeable number.
     initial_margin_pct: 10.0        # unverified estimate
     maintenance_margin_pct: 5.0
     financing_spread_pct: 1.5
@@ -78,10 +85,13 @@ classes:
     initial_margin_pct: 30.71       # was 20.0 estimate -- previously under-margined by ~10pp
     maintenance_margin_pct: 15.36
     financing_spread_pct: 1.5
-    # kairos-07 (2026-09-02): ETFs get materially better margin than single
-    # stocks on this account (DIA 10.36% vs AAPL 28.52%) -- this one rate
-    # covers both populations. Not changed; worth a per-class split later
-    # if it matters.
+    # Confirmed representative (kairos-07, 2026-09-02, 40 US stocks swept):
+    # 28.24%-30.78% long, ~30.69% short average -- 30.71% holds.
+    # Also: ETFs get materially better margin than single stocks on this
+    # account (DIA 10.36% vs AAPL 28.52%) -- this one rate covers both
+    # populations (though DIA is the only ETF actually tradeable here, see
+    # the top-of-file PRIIPs/KID note). Not changed; worth a per-class
+    # split later if it matters.
 # Per-symbol house-margin overrides example:
 # "LDO-USD": {initial_margin_pct: 100.0}
 overrides: {}
