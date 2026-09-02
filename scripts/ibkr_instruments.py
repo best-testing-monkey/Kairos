@@ -688,20 +688,44 @@ def snapshot_price(ib, con, pace):
 
 
 def report(conn):
-    print("=== ibkr_instruments ===")
-    for line in conn.execute(
-        "SELECT instrument_class, status, COUNT(*), "
-        "ROUND(AVG(commission_min), 4), ROUND(AVG(init_margin_pct), 2) "
-        "FROM ibkr_instruments GROUP BY instrument_class, status "
-        "ORDER BY instrument_class, status"
+    """Summarise the table: what trades, what it costs, and what does not."""
+    print("=== TRADEABLE (status='ok') ===")
+    print(f"  {'class':12s} {'n':>3s}  {'min comm':>9s} {'rate %':>8s} "
+          f"{'margin long':>13s} {'margin short':>13s}")
+    for cls, n, cmin, rate, lo, hi, sh in conn.execute(
+        "SELECT instrument_class, COUNT(*), ROUND(AVG(commission_min),4), "
+        "ROUND(AVG(commission_rate_pct),5), ROUND(MIN(init_margin_pct),2), "
+        "ROUND(MAX(init_margin_pct),2), ROUND(AVG(short_init_margin_pct),2) "
+        "FROM ibkr_instruments WHERE status='ok' GROUP BY 1 ORDER BY 1"
     ):
-        cls, status, n, cmin, margin = line
-        print(f"  {cls:12s} {status:14s} n={n:<6} avg_min_comm={cmin} avg_margin={margin}")
-    total = conn.execute("SELECT COUNT(*) FROM ibkr_instruments").fetchone()[0]
-    inuni = conn.execute(
-        "SELECT COUNT(*) FROM ibkr_instruments WHERE included_in_universe=1"
+        rng = f"{lo}-{hi}%" if lo is not None and lo != hi else (f"{lo}%" if lo is not None else "-")
+        print(f"  {cls:12s} {n:>3d}  {str(cmin):>9s} {str(rate):>8s} {rng:>13s} "
+              f"{str(sh) + '%' if sh is not None else '-':>13s}")
+
+    print("=== NOT TRADEABLE ===")
+    for cls, status, n in conn.execute(
+        "SELECT instrument_class, status, COUNT(*) FROM ibkr_instruments "
+        "WHERE status!='ok' GROUP BY 1,2 ORDER BY 3 DESC"
+    ):
+        print(f"  {cls:12s} {status:18s} n={n}")
+
+    # A margin percentage computed without an FX rate is wrong by the rate
+    # itself, so flag any that slipped through rather than letting them read
+    # as measurements.
+    bad = conn.execute(
+        "SELECT COUNT(*) FROM ibkr_instruments WHERE init_margin_pct IS NOT NULL "
+        "AND fx_rate_to_base IS NULL"
     ).fetchone()[0]
-    print(f"  TOTAL {total} rows ({inuni} in universe, {total - inuni} discovered)")
+    if bad:
+        print(f"=== WARNING: {bad} rows have a margin % with no FX rate recorded "
+              f"(pre-8668d27 values, understated for non-base currencies) ===")
+
+    total, inuni = conn.execute(
+        "SELECT COUNT(*), SUM(included_in_universe) FROM ibkr_instruments"
+    ).fetchone()
+    ok = conn.execute("SELECT COUNT(*) FROM ibkr_instruments WHERE status='ok'").fetchone()[0]
+    print(f"=== {total} rows | {inuni} in universe, {total - (inuni or 0)} discovered "
+          f"| {ok} tradeable ===")
 
 
 def main():
