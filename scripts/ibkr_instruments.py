@@ -489,6 +489,25 @@ def upsert(conn, row, force=False):
     return True
 
 
+# Statuses no code change on our side can improve. Crypto is the live case:
+# the Paxos segment carries no margin, so whatIf can never price it, and
+# re-probing it makes the Gateway pop a "connect a crypto account" dialog at
+# the user. Skipped even under --force, which is meant to re-measure things
+# that could have changed, not to re-ask a settled question 62 times.
+_STRUCTURALLY_TERMINAL = ("no_contract", "no_whatif_crypto")
+
+
+def structurally_terminal(conn) -> set:
+    return {
+        (a, b, c, d)
+        for a, b, c, d in conn.execute(
+            "SELECT ib_symbol, sec_type, exchange, currency FROM ibkr_instruments "
+            f"WHERE status IN ({','.join('?' * len(_STRUCTURALLY_TERMINAL))})",
+            _STRUCTURALLY_TERMINAL,
+        )
+    }
+
+
 def already_done(conn) -> set:
     return {
         (a, b, c, d)
@@ -534,7 +553,7 @@ def run_universe(ib, conn, prices, args):
     if args.limit:
         pairs = pairs[: args.limit]
 
-    done = set() if args.force else already_done(conn)
+    done = structurally_terminal(conn) if args.force else already_done(conn)
     print(f"[universe] {len(pairs)} symbols, {len(done)} already recorded", flush=True)
     _sweep_pairs(ib, conn, prices, args, pairs, done)
 
@@ -567,7 +586,7 @@ def _sweep_pairs(ib, conn, prices, args, pairs, done):
 def run_discover(ib, conn, prices, args):
     from ib_async import Contract, Crypto, Forex
 
-    done = set() if args.force else already_done(conn)
+    done = structurally_terminal(conn) if args.force else already_done(conn)
     targets = []
     # (contract, class, tif, yf_symbol, price_hint). yf_symbol is a genuine
     # equivalent and is stored; price_hint is only a proxy to size the probe
