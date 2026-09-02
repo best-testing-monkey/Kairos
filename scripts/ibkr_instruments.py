@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS ibkr_instruments (
     size_increment       REAL,
     ref_price            REAL,
     ref_price_date       TEXT,
+    base_currency        TEXT,
+    fx_rate_to_base      REAL,
     small_qty            REAL,
     small_notional       REAL,
     small_commission     REAL,
@@ -158,9 +160,11 @@ def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(ibkr_instruments)")}
-    if "price_magnifier" not in cols:
-        conn.execute("ALTER TABLE ibkr_instruments ADD COLUMN price_magnifier REAL")
-        conn.commit()
+    for col, decl in (("price_magnifier", "REAL"), ("base_currency", "TEXT"),
+                      ("fx_rate_to_base", "REAL")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE ibkr_instruments ADD COLUMN {col} {decl}")
+    conn.commit()
     return conn
 
 
@@ -284,7 +288,7 @@ def _num(value):
 
 
 def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
-              in_universe, pace):
+              in_universe, pace, base_currency="EUR"):
     """Resolve one contract and probe it. Returns a row dict."""
     now = dt.datetime.now().isoformat(timespec="seconds")
     base = dict(
@@ -293,6 +297,7 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
         instrument_class=inst_class, broker="IBKR",
         included_in_universe=1 if in_universe else 0,
         ref_price=price, ref_price_date=price_date, measured_at=now,
+        base_currency=base_currency, fx_rate_to_base=None,
         con_id=None, local_symbol=None, primary_exchange=None, long_name=None,
         min_tick=None, price_magnifier=None, min_size=None, size_increment=None,
         small_qty=None, small_notional=None, small_commission=None,
@@ -400,17 +405,23 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
         if st.commissionCurrency:
             base["commission_currency"] = st.commissionCurrency
 
+    # Margin percentages must compare like with like: OrderState margin is in
+    # the ACCOUNT BASE currency, the notional above is in the CONTRACT's.
+    fx = rate_to_base(ib, con.currency or base_currency, base_currency, pace)
+    base["fx_rate_to_base"] = fx
+
     # Margin from whichever probe returned one; margin is linear in size so
     # either works as a percentage.
     for st, qty in ((st_large, large_qty), (st_small, small_qty)):
         if st is None:
             continue
-        notional = qty * unit
+        notional_base = qty * unit * fx if fx else None
         im, mm = _num(st.initMarginChange), _num(st.maintMarginChange)
-        if im is not None and notional > 0:
-            base["init_margin_pct"] = 100.0 * im / notional
-        if mm is not None and notional > 0:
-            base["maint_margin_pct"] = 100.0 * mm / notional
+        if notional_base and notional_base > 0:
+            if im is not None:
+                base["init_margin_pct"] = 100.0 * im / notional_base
+            if mm is not None:
+                base["maint_margin_pct"] = 100.0 * mm / notional_base
         break
 
     # Short-side initial margin: stocks are asymmetric (AAPL 28.49% long vs
@@ -419,9 +430,9 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
     ib.sleep(pace)
     if st_short is not None:
         im = _num(st_short.initMarginChange)
-        notional = large_qty * unit
-        if im is not None and notional > 0:
-            base["short_init_margin_pct"] = 100.0 * im / notional
+        notional_base = large_qty * unit * fx if fx else None
+        if im is not None and notional_base and notional_base > 0:
+            base["short_init_margin_pct"] = 100.0 * im / notional_base
 
     floor, rate_pct = infer_commission_model(
         base["small_commission"], base["small_notional"],
@@ -523,7 +534,7 @@ def run_universe(ib, conn, prices, args):
     if args.limit:
         pairs = pairs[: args.limit]
 
-    done = already_done(conn)
+    done = set() if args.force else already_done(conn)
     print(f"[universe] {len(pairs)} symbols, {len(done)} already recorded", flush=True)
     _sweep_pairs(ib, conn, prices, args, pairs, done)
 
@@ -542,7 +553,7 @@ def _sweep_pairs(ib, conn, prices, args, pairs, done):
             continue
         price, pdate = prices.get(sym, (None, None))
         row = sweep_one(ib, contract, inst_class, tif, sym, price, pdate,
-                        True, args.pace)
+                        True, args.pace, args.base_currency)
         written = upsert(conn, row, force=args.force)
         c = row["small_commission"]
         print(f"  [{i}/{len(pairs)}] {sym:16s} {row['sec_type']:6s} {row['status']:16s} "
@@ -556,7 +567,7 @@ def _sweep_pairs(ib, conn, prices, args, pairs, done):
 def run_discover(ib, conn, prices, args):
     from ib_async import Contract, Crypto, Forex
 
-    done = already_done(conn)
+    done = set() if args.force else already_done(conn)
     targets = []
     # (contract, class, tif, yf_symbol, price_hint). yf_symbol is a genuine
     # equivalent and is stored; price_hint is only a proxy to size the probe
@@ -588,12 +599,54 @@ def run_discover(ib, conn, prices, args):
         if price is not None and hint != yf_sym:
             pdate = f"proxy:{hint}@{pdate}"
         row = sweep_one(ib, contract, cls, tif, yf_sym, price, pdate,
-                        False, args.pace)
+                        False, args.pace, args.base_currency)
         upsert(conn, row, force=args.force)
         print(f"  [{i}/{len(targets)}] {contract.symbol:10s} {row['sec_type']:6s} "
               f"{row['status']:14s} margin="
               f"{'-' if row['init_margin_pct'] is None else format(row['init_margin_pct'], '.2f') + '%'}",
               flush=True)
+
+
+_FX_RATES: dict = {}
+
+
+def rate_to_base(ib, currency, base, pace):
+    """Units of `base` per 1 unit of `currency`, via IDEALPRO spot.
+
+    IBKR reports OrderState margin in the ACCOUNT BASE currency while the
+    notional we compute is in the contract's currency. Dividing one by the
+    other without converting silently scales every margin percentage by the FX
+    rate -- harmless-looking for USD on a EUR account (1.16x), catastrophic for
+    a JPY-denominated contract, which read 0.02% instead of ~3%.
+
+    Returns None rather than a guess when the rate cannot be fetched; a NULL
+    margin percentage is recoverable, a wrong one is not.
+    """
+    if currency == base:
+        return 1.0
+    if currency in _FX_RATES:
+        return _FX_RATES[currency]
+    from ib_async import Forex
+
+    rate = None
+    try:
+        # BASE/CUR quotes CUR per 1 BASE, so base-per-cur is its reciprocal.
+        det = ib.reqContractDetails(Forex(f"{base}{currency}"))
+        ib.sleep(pace)
+        if det:
+            con = det[0].contract
+            t = ib.reqMktData(con, "", True, False)
+            ib.sleep(max(4.0, pace))
+            ib.cancelMktData(con)
+            for cand in (t.midpoint(), t.last, t.close, t.marketPrice()):
+                v = _num(cand)
+                if v and v > 0:
+                    rate = 1.0 / v
+                    break
+    except Exception:  # noqa: BLE001
+        rate = None
+    _FX_RATES[currency] = rate
+    return rate
 
 
 def snapshot_price(ib, con, pace):
@@ -645,9 +698,12 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pace", type=float, default=1.5,
                     help="seconds between IBKR requests (default 1.5, be civil)")
+    ap.add_argument("--base-currency", default="",
+                    help="account base currency (auto-detected from the account if unset)")
     ap.add_argument("--force", action="store_true",
-                    help="allow a retry to overwrite a more informative existing row "
-                         "(normally refused, so a transient outage cannot destroy data)")
+                    help="re-probe every symbol including already-resolved ones, and allow "
+                         "overwriting a more informative existing row (normally refused, "
+                         "so a transient outage cannot destroy data)")
     ap.add_argument("--request-timeout", type=float, default=45.0,
                     help="seconds to wait for any single IBKR request (default 45; "
                          "0 waits forever, which is ib_async's default and hangs "
@@ -678,6 +734,11 @@ def main():
     ib.connect(args.host, args.port, clientId=args.client_id, timeout=25)
     attach_error_capture(ib)
     ib.reqMarketDataType(3)   # delayed is fine for sizing; no subscriptions here
+    if not args.base_currency:
+        found = [v.value for v in ib.accountValues()
+                 if v.tag == "$LEDGER-RealCurrency" and v.currency != "BASE"]
+        args.base_currency = found[0] if found else "EUR"
+    print(f"account base currency: {args.base_currency}", flush=True)
     print(f"connected to {args.host}:{args.port} (server {ib.client.serverVersion()})",
           flush=True)
     try:
