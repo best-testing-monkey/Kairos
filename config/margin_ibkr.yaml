@@ -21,17 +21,34 @@ classes:
     financing_spread_pct: 1.5
   index_gold_major:
     symbols: ["GC=F", "^GSPC", "^IXIC", "^DJI", "SPY", "QQQ"]
-    # measured 2026-09-02: IBUS500 (index CFD) 7.29%, XAUUSD (gold CFD) 8.78%
-    # -- this bucket lumps index and gold together but they measure
-    # differently; using the higher (gold) figure for both rather than
-    # splitting the class. Revisit if index vs. gold margin needs to be
-    # distinguished.
+    # measured 2026-09-02: IBUS500 (index CFD) 7.29%, XAUUSD (gold CFD) 8.78%,
+    # GC=F future 8.85% (close to the CFD figure, though futures aren't
+    # margined like CFDs) -- this bucket lumps index and gold together but
+    # they measure differently; using the higher (gold) figure for both
+    # rather than splitting the class. Revisit if index vs. gold margin
+    # needs to be distinguished.
+    #
+    # ACCOUNT CONSTRAINT (kairos-07, 2026-09-02): SPY whatIf rejects with IB
+    # error 201 "No Trading Permission ... This product does not have a KID
+    # in English" -- EU PRIIPs/KID regime blocking US-domiciled retail ETFs
+    # on this account. Expected to also hit QQQ and every other
+    # US-domiciled ETF in CANDIDATE_UNIVERSE (GLD/SLV/USO/UNG/DBC/GDX/PDBC/
+    # CPER/COPX/REMX) -- full sweep pending, exact list TBD. These margin
+    # rates aren't wrong, some of the symbols they're attached to may simply
+    # be untradeable on this account; this is a trading-permission gap, not
+    # a margin-math one, so it's flagged here rather than changed.
     initial_margin_pct: 8.78        # was 5.0 estimate
     maintenance_margin_pct: 4.39
     financing_spread_pct: 1.5
   commodity_other:
     match: "=F$"                    # other futures proxies after index_gold_major
-    initial_margin_pct: 10.0        # unverified estimate -- no oil/silver whatIf data collected (gold's 8.78% lives in index_gold_major above, not this bucket)
+    # measured 2026-09-02: GC=F (gold) 8.85%, CL=F (oil) 16.26% -- oil and
+    # gold differ by ~2x, so a single rate can't represent both; left at the
+    # unverified 10% estimate rather than guessing which one to match.
+    # Same PRIIPs/KID account constraint as index_gold_major above likely
+    # applies to this bucket's ETF proxies (USO/UNG/DBC/PDBC/GDX/CPER/COPX/
+    # REMX) -- pending kairos-07's full sweep.
+    initial_margin_pct: 10.0        # unverified estimate
     maintenance_margin_pct: 5.0
     financing_spread_pct: 1.5
   crypto_cfd:
