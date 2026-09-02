@@ -592,6 +592,10 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--pace", type=float, default=1.5,
                     help="seconds between IBKR requests (default 1.5, be civil)")
+    ap.add_argument("--request-timeout", type=float, default=45.0,
+                    help="seconds to wait for any single IBKR request (default 45; "
+                         "0 waits forever, which is ib_async's default and hangs "
+                         "the sweep if a data farm drops)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=4002)
     ap.add_argument("--client-id", type=int, default=42)
@@ -609,6 +613,12 @@ def main():
     prices = load_prices()
     print(f"loaded {len(prices):,} local prices", flush=True)
     ib = IB()
+    # ib_async waits forever by default (RequestTimeout = 0). When IBKR's
+    # backend data farms drop -- which they did mid-sweep, alongside a
+    # "competing live session" error -- an in-flight request simply never
+    # resolves and the whole sweep parks silently. A bounded wait turns that
+    # into one recorded failure the next pass retries.
+    ib.RequestTimeout = args.request_timeout
     ib.connect(args.host, args.port, clientId=args.client_id, timeout=25)
     attach_error_capture(ib)
     ib.reqMarketDataType(3)   # delayed is fine for sizing; no subscriptions here
