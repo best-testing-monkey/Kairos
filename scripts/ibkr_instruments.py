@@ -243,6 +243,28 @@ def probe_whatif(ib, contract, qty, price, tif, action="BUY"):
     return st, ""
 
 
+def infer_commission_model(c1, n1, c2, n2):
+    """Split two (commission, notional) probes into (floor, marginal rate %).
+
+    IBKR charges `max(floor, rate * notional)`. The small probe is normally
+    floor-bound and the large one rate-bound, so the pair separates the two.
+    Returns (None, None) for whichever side the data cannot support -- a
+    guessed zero here would read as "this instrument is free".
+    """
+    if c1 is not None and c2 is not None and n1 and n2 and n2 > n1:
+        if abs(c2 - c1) < 1e-6:
+            # Both probes hit the same number: both are floor-bound, so the
+            # marginal rate is below what this size range can resolve.
+            return c1, 0.0
+        rate = (c2 - c1) / (n2 - n1)
+        return max(0.0, c1 - rate * n1), 100.0 * rate
+    if c2 is not None and n2:
+        return None, 100.0 * c2 / n2
+    if c1 is not None and n1:
+        return c1, None
+    return None, None
+
+
 def _num(value):
     try:
         f = float(value)
@@ -383,21 +405,12 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
         if im is not None and notional > 0:
             base["short_init_margin_pct"] = 100.0 * im / notional
 
-    # Separate the fixed floor from the marginal rate. c = max(floor, rate*n).
+    floor, rate_pct = infer_commission_model(
+        base["small_commission"], base["small_notional"],
+        base["large_commission"], base["large_notional"],
+    )
+    base["commission_min"], base["commission_rate_pct"] = floor, rate_pct
     c1, c2 = base["small_commission"], base["large_commission"]
-    n1v, n2v = base["small_notional"], base["large_notional"]
-    if c1 is not None and c2 is not None and n1v and n2v and n2v > n1v:
-        if abs(c2 - c1) < 1e-6:
-            base["commission_min"] = c1          # both floor-bound
-            base["commission_rate_pct"] = 0.0
-        else:
-            rate = (c2 - c1) / (n2v - n1v)
-            base["commission_rate_pct"] = 100.0 * rate
-            base["commission_min"] = max(0.0, c1 - rate * n1v)
-    elif c2 is not None and n2v:
-        base["commission_rate_pct"] = 100.0 * c2 / n2v
-    elif c1 is not None and n1v:
-        base["commission_min"] = c1
 
     if c1 is not None or c2 is not None:
         base["status"] = "ok"
