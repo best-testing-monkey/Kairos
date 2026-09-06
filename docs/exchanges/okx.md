@@ -130,6 +130,30 @@ building the real probe script rather than trusting a remembered number.
   Kraken's doc describes: an unauthenticated probe would need to fall back
   to a published base-tier number rather than the account's real rate.
 
+## Universe coverage (2026-09-06, one public call, no auth)
+
+Checked Kairos's full 62-symbol crypto universe
+(`strategy/kairos_pipeline.py`'s `CANDIDATE_UNIVERSE["crypto"]`) against
+OKX's public `GET /api/v5/public/instruments?instType=SPOT` (1,389
+instruments, 398 distinct base currencies — one call covers everything,
+no per-symbol lookup needed for a coverage check like this).
+
+- **54/62 (87%) survive with a direct EUR pair.** Every survivor also has
+  USD/USDC/USDT/TRY quotes, so there's no partial-listing edge case (0
+  symbols listed only in a non-EUR currency).
+- **8 confirmed genuinely absent** (not a symbol-mapping issue — checked
+  for near-miss tickers, found none): `VET`, `MKR`, `EOS`, `RUNE`, `KAVA`,
+  `BEAM`, `TON`, `USUAL`.
+- yfinance's numeric disambiguation suffixes (`POL28321-USD`,
+  `UNI7083-USD`, `SUI20947-USD`, `GRT6719-USD`, `PEPE24478-USD`) all
+  stripped and matched correctly against OKX's plain `POL`/`UNI`/`SUI`/
+  `GRT`/`PEPE` base tickers — worth remembering if `resolve_instrument`
+  is ever built for real: strip Kairos's `-USD` suffix and any trailing
+  4+ digit run before comparing against OKX's `baseCcy`.
+- This was a one-off coverage check, not a persisted sweep — no
+  `scripts/okx_instruments.py`/DB entries exist from it. Re-run is cheap
+  (one public API call) if the universe or OKX's listings change.
+
 ## What's been probed for real, and what's still open
 
 **Done 2026-09-06**: full signup-to-live-call cycle completed same day —
