@@ -42,6 +42,13 @@ import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "strategy"))
+sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+
+from exchange_probe import _num, infer_commission_model  # noqa: E402
+from exchange_probe import connect_db as _shared_connect_db
+from exchange_probe import upsert as _shared_upsert
+from exchange_probe import already_done as _shared_already_done
+from exchange_probe import structurally_terminal as _shared_structurally_terminal
 
 DB_PATH = os.path.join(REPO_ROOT, "data", "ibkr_instruments.db")
 PRICE_DB = os.path.join(REPO_ROOT, "data", "yfd_prices.db")
@@ -156,16 +163,11 @@ DISCOVER_CRYPTO = [
 
 
 def connect_db() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(SCHEMA)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(ibkr_instruments)")}
-    for col, decl in (("price_magnifier", "REAL"), ("base_currency", "TEXT"),
-                      ("fx_rate_to_base", "REAL")):
-        if col not in cols:
-            conn.execute(f"ALTER TABLE ibkr_instruments ADD COLUMN {col} {decl}")
-    conn.commit()
-    return conn
+    return _shared_connect_db(
+        DB_PATH, SCHEMA, "ibkr_instruments",
+        extra_columns={"price_magnifier": "REAL", "base_currency": "TEXT",
+                        "fx_rate_to_base": "REAL"},
+    )
 
 
 def load_prices() -> dict:
@@ -257,34 +259,10 @@ def probe_whatif(ib, contract, qty, price, tif, action="BUY"):
     return st, ""
 
 
-def infer_commission_model(c1, n1, c2, n2):
-    """Split two (commission, notional) probes into (floor, marginal rate %).
-
-    IBKR charges `max(floor, rate * notional)`. The small probe is normally
-    floor-bound and the large one rate-bound, so the pair separates the two.
-    Returns (None, None) for whichever side the data cannot support -- a
-    guessed zero here would read as "this instrument is free".
-    """
-    if c1 is not None and c2 is not None and n1 and n2 and n2 > n1:
-        if abs(c2 - c1) < 1e-6:
-            # Both probes hit the same number: both are floor-bound, so the
-            # marginal rate is below what this size range can resolve.
-            return c1, 0.0
-        rate = (c2 - c1) / (n2 - n1)
-        return max(0.0, c1 - rate * n1), 100.0 * rate
-    if c2 is not None and n2:
-        return None, 100.0 * c2 / n2
-    if c1 is not None and n1:
-        return c1, None
-    return None, None
-
-
-def _num(value):
-    try:
-        f = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if (f != f or abs(f) > 1e100) else f
+# infer_commission_model() and _num() now live in exchange_probe.py (shared
+# by any future whatIf/dry-run-order-style probe) and are imported above.
+# IBKR charges max(floor, rate * notional); the small probe is normally
+# floor-bound and the large one rate-bound, so the pair separates the two.
 
 
 def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
@@ -454,70 +432,28 @@ def sweep_one(ib, contract, inst_class, tif, yf_symbol, price, price_date,
     return base
 
 
-# How informative a row is. A retry that learns less than what is already
-# stored must not overwrite it: when IBKR's sec-def farm dropped mid-run,
-# reqContractDetails started timing out and rewrote fully-populated rows
-# (contract metadata plus the exact rejection reason) as bare 'error' rows,
-# destroying good data on a transient outage.
-_STATUS_RANK = {
-    "ok": 4,
-    "no_commission": 3,      # contract resolved, rejection reason captured
-    "no_whatif_crypto": 3,   # ditto, and terminal
-    "no_price": 2,           # contract resolved, price unavailable
-    "no_contract": 1,        # definitive: IBKR does not list it
-    "error": 0,              # transient or unknown
-}
+# _STATUS_RANK / _STRUCTURALLY_TERMINAL now live in exchange_probe.py
+# (imported above) -- shared vocabulary any probe can reuse. The guard they
+# drive matters here specifically because IBKR's sec-def farm dropped
+# mid-run once and rewrote fully-populated rows (contract metadata plus the
+# exact rejection reason) as bare 'error' rows; crypto's 'no_whatif_crypto'
+# is the terminal case (Paxos carries no margin, so whatIf can never price
+# it, and re-probing it pops a "connect a crypto account" dialog).
+
+_IBKR_KEY_COLS = ("ib_symbol", "sec_type", "exchange", "currency")
 
 
 def upsert(conn, row, force=False):
     """Write a row unless it would replace a strictly more informative one."""
-    if not force:
-        prev = conn.execute(
-            "SELECT status FROM ibkr_instruments WHERE ib_symbol=? AND sec_type=? "
-            "AND exchange=? AND currency=?",
-            (row["ib_symbol"], row["sec_type"], row["exchange"], row["currency"]),
-        ).fetchone()
-        if prev and _STATUS_RANK.get(row["status"], 0) < _STATUS_RANK.get(prev[0], 0):
-            return False
-    cols = list(row)
-    conn.execute(
-        f"INSERT OR REPLACE INTO ibkr_instruments ({','.join(cols)}) "
-        f"VALUES ({','.join('?' * len(cols))})",
-        [row[c] for c in cols],
-    )
-    conn.commit()
-    return True
-
-
-# Statuses no code change on our side can improve. Crypto is the live case:
-# the Paxos segment carries no margin, so whatIf can never price it, and
-# re-probing it makes the Gateway pop a "connect a crypto account" dialog at
-# the user. Skipped even under --force, which is meant to re-measure things
-# that could have changed, not to re-ask a settled question 62 times.
-_STRUCTURALLY_TERMINAL = ("no_contract", "no_whatif_crypto")
+    return _shared_upsert(conn, row, "ibkr_instruments", _IBKR_KEY_COLS, force=force)
 
 
 def structurally_terminal(conn) -> set:
-    return {
-        (a, b, c, d)
-        for a, b, c, d in conn.execute(
-            "SELECT ib_symbol, sec_type, exchange, currency FROM ibkr_instruments "
-            f"WHERE status IN ({','.join('?' * len(_STRUCTURALLY_TERMINAL))})",
-            _STRUCTURALLY_TERMINAL,
-        )
-    }
+    return _shared_structurally_terminal(conn, "ibkr_instruments", _IBKR_KEY_COLS)
 
 
 def already_done(conn) -> set:
-    return {
-        (a, b, c, d)
-        for a, b, c, d in conn.execute(
-            # no_whatif_crypto and no_contract are terminal, not transient --
-            # retrying them just burns API calls for the same answer.
-            "SELECT ib_symbol, sec_type, exchange, currency FROM ibkr_instruments "
-            "WHERE status IN ('ok','no_contract','no_whatif_crypto')"
-        )
-    }
+    return _shared_already_done(conn, "ibkr_instruments", _IBKR_KEY_COLS)
 
 
 def _hand_curated_universe() -> dict:

@@ -8,11 +8,30 @@
 
 ### 5.1 Broker abstraction + crypto first
 - `kairos/broker.py` interface: `place_order`, `close`, `get_positions`,
-  `get_balance`.
-- First implementation: crypto exchange via `ccxt` (Binance / Kraken / Bybit) —
-  cleanest APIs, 24/7 markets, and matches the best-performing asset class.
-- Equities later via Alpaca or IBKR. Avoid the automated-browser route unless a
-  broker truly has no API; it is by far the most fragile option.
+  `get_balance` — this is Tier 2 in
+  [`docs/broker-api-interface.md`](../docs/broker-api-interface.md),
+  undesigned as of 2026-09-06. Tier 1 (cost/tradeability discovery, the
+  prerequisite question of whether a broker is even worth wiring up) is
+  built — see that doc and [`docs/exchanges/`](../docs/exchanges/).
+- First implementation: crypto exchange via `ccxt`. **Binance is out** —
+  it failed to secure an EU MiCA license and shut off EU users
+  2026-07-01, so it cannot serve a NL-resident account regardless of API
+  quality. Candidates measured 2026-09-06:
+  Bitvavo / Kraken / Bybit EU (all MiCA-compliant, ccxt-supported,
+  percentage-fee — not IBKR's flat-floor problem) and Finst (Dutch,
+  0.15% flat, ccxt support unconfirmed). See `docs/exchanges/*.md`.
+- Equities later via Alpaca or IBKR. **Alpaca launched a real European
+  broker in April 2026** (Alpaca Europe, MiFID II-compliant; Xetra live,
+  Euronext/LSE "expected to follow" — not confirmed for Euronext
+  Amsterdam yet) — but it turned out to be **Broker-as-a-Service, not a
+  direct trading account**: the EU product onboards Kairos as its own
+  broker-of-record (KYC-as-a-service, correspondent-set fees), not as a
+  self-directed account like IBKR. Materially heavier integration than
+  assumed when this was first flagged — see
+  `docs/exchanges/alpaca-europe.md` before committing to it. IBKR was
+  measured and ruled out for Kairos's trade size — see
+  `docs/ibkr-cost-discovery.md`. Avoid the automated-browser route unless
+  a broker truly has no API; it is by far the most fragile option.
 - Owner: 1 Sonnet subagent per broker adapter.
 
 ### 5.2 Risk guardrails (non-negotiable, before the first live order)

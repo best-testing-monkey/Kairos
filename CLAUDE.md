@@ -1218,6 +1218,26 @@ The §8 "Data provenance" section of each paper records the exact tables,
 columns, run ids and SQL behind every figure; that is the reference for
 "where does the data for phase X live," not this file.
 
+### Broker/exchange cost-discovery probes (`scripts/exchange_probe.py`)
+
+Shared machinery, extracted 2026-09-06 from `scripts/ibkr_instruments.py`
+(the IBKR sweep behind `docs/ibkr-cost-discovery.md`) so a new broker/
+exchange needs only a symbol-resolution + cost-lookup implementation, not a
+reimplementation of schema/resumability/reporting. See
+`docs/broker-api-interface.md` for what any broker API needs to expose
+(Tier 1: cost/tradeability discovery, built; Tier 2: live execution,
+undesigned — Phase 5), and `docs/playbooks/add-exchange-probe.md` for the
+concrete steps. `docs/exchanges/*.md` has implementation-ready connection
+notes for Bitvavo, Kraken, Bybit EU, Finst, and Alpaca Europe — the
+candidates found when IBKR's flat $1 commission floor turned out to be too
+large for Kairos's ~€18 average trade (`docs/ibkr-cost-discovery.md`).
+None of the five has a Kairos-owned account yet; this is scaffolding, not a
+live integration. Two findings from that pass worth knowing before picking
+one: **Finst has no public API** (institutional-only, not in ccxt) and
+**Alpaca Europe is Broker-as-a-Service**, not a self-directed account —
+Kairos would onboard as its own broker-of-record, a materially heavier
+integration than IBKR/Bitvavo/Kraken/Bybit.
+
 ## Test suite
 
 Tests live in `tests/unit/` and require no GPU or model download.
