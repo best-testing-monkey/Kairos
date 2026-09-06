@@ -81,28 +81,37 @@ Checked Kairos's full 62-symbol crypto universe against Bitstamp's public
 `GET /api/v2/trading-pairs-info/` (257 pairs total, 112 EUR-quoted — one
 call covers everything, no per-symbol lookup needed).
 
-- **48/62 (77%) have a EUR pair** — 47 directly, plus **1 via a legacy
-  ticker**: Kairos's `RENDER-USD` is listed on Bitstamp as `RNDR/EUR`
-  (`"description": "Render Token / Euro"`) — Bitstamp hasn't updated to
-  the post-rebrand ticker other exchanges use. Not a gap, just a naming
-  trap for `resolve_instrument` if this is ever wired up for real.
-- **1 has a pair, but not in EUR**: `ZEC` only has `ZEC/USD` on Bitstamp,
-  no `ZEC/EUR`.
+- **49/62 (79%) are tradeable against EUR, directly or via free
+  conversion** — 47 have a direct EUR pair; 1 via a legacy ticker
+  (`RENDER-USD` is listed on Bitstamp as `RNDR/EUR`,
+  `"description": "Render Token / Euro"` — Bitstamp hasn't updated to the
+  post-rebrand ticker other exchanges use, a naming trap for
+  `resolve_instrument`, not a real gap); 1 via fiat conversion (`ZEC`
+  only has `ZEC/USD` on Bitstamp, no `ZEC/EUR` — but `EUR/USD` is itself
+  a liquid Bitstamp pair, so EUR→USD→ZEC is a free two-hop route, same
+  logic Baz flagged for stablecoin conversion generally).
 - **13 confirmed genuinely absent** (zero listing under any of Bitstamp's
-  10 quote currencies — USD/EUR/GBP/USDT/USDC/BTC/RLUSD/EURC/EURCV/ETH —
-  not a EUR-quoting artifact, checked the same way as OKX's 8): `FIL`,
-  `VET`, `EOS`, `THETA`, `RUNE`, `ENJ`, `DASH`, `KAVA`, `1INCH`, `BEAM`,
-  `GALA`, `TIA`, `USUAL`.
+  10 quote currencies — USD/EUR/GBP/USDT/USDC/BTC/RLUSD/EURC/EURCV/ETH,
+  so no fiat/stablecoin conversion route exists either — not a
+  EUR-quoting artifact, checked the same way as OKX's 8): `FIL`, `VET`,
+  `EOS`, `THETA`, `RUNE`, `ENJ`, `DASH`, `KAVA`, `1INCH`, `BEAM`, `GALA`,
+  `TIA`, `USUAL`.
 - This is meaningfully **narrower coverage than OKX (87%)** — Bitstamp is
   the older, smaller exchange of the two.
 
-**New candidates**: of Bitstamp's 59 non-universe EUR-quoted assets
-(excluding fiat/stablecoin quotes and the RNDR/RENDER alias above), most
-have **zero 24h trading volume** on Bitstamp specifically (checked via
-live `ticker` calls, not assumed — e.g. `EGLD/EUR`, `SEI/EUR`, `APE/EUR`
-all returned `"volume":"0.00000"`, genuinely dead pairs, not a data
-error). Using the same JTO-EUR ~8,139 EUR/24h floor as OKX, only **4
-clear it**:
+**New candidates**: checked both EUR-quoted assets AND assets with only a
+non-EUR quote (USD/USDT/USDC/GBP/BTC/ETH), since those are equally
+reachable via Bitstamp's own EUR/USD and stablecoin pairs. The
+non-EUR-only search turned up only 4 bases beyond the EUR-quoted set —
+`ETH2` (a staking derivative), `SGD`/`XSGD` (Singapore-dollar/tokenized
+fiat), `USDG` (a stablecoin) — none are directional-prediction
+candidates, so the EUR-quoted search already covered everything real. Of
+Bitstamp's 59 non-universe EUR-quoted assets (excluding fiat/stablecoin
+quotes and the RNDR/RENDER alias above), most have **zero 24h trading
+volume** on Bitstamp specifically (checked via live `ticker` calls, not
+assumed — e.g. `EGLD/EUR`, `SEI/EUR`, `APE/EUR` all returned
+`"volume":"0.00000"`, genuinely dead pairs, not a data error). Using the
+same JTO-EUR ~8,139 EUR/24h floor as OKX, only **4 clear it**:
 
 | Symbol | 24h EUR volume | Notes |
 |---|---|---|
