@@ -143,7 +143,12 @@ no per-symbol lookup needed for a coverage check like this).
   symbols listed only in a non-EUR currency).
 - **8 confirmed genuinely absent** (not a symbol-mapping issue — checked
   for near-miss tickers, found none): `VET`, `MKR`, `EOS`, `RUNE`, `KAVA`,
-  `BEAM`, `TON`, `USUAL`.
+  `BEAM`, `TON`, `USUAL`. **Not a EUR-quoting limitation either** — checked
+  and confirmed these 8 have zero listing under any quote currency (USD/
+  USDT/USDC/TRY) and don't appear in any instrument type at all (SPOT,
+  MARGIN, SWAP, FUTURES) on the EEA entity. Converting EUR to another
+  currency first would not unlock any of them; they simply aren't carried
+  on this entity, full stop.
 - yfinance's numeric disambiguation suffixes (`POL28321-USD`,
   `UNI7083-USD`, `SUI20947-USD`, `GRT6719-USD`, `PEPE24478-USD`) all
   stripped and matched correctly against OKX's plain `POL`/`UNI`/`SUI`/
