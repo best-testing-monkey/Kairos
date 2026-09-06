@@ -7,25 +7,60 @@ entity — crypto derivatives fall under MiFID II, not MiCA, and Bybit EU
 hasn't launched them. Do not assume derivatives endpoints work here even
 though they exist in the shared API surface.
 
-**Spot margin is real leverage, not just a label — worth its own
-attention.** Bybit EU's "Fullstock" spot margin product (launched ~August
-2025, still active in 2026 per multiple sources) offers **up to 10x
-leverage on spot pairs**, MiCA-compliant, via the **Unified Trading Account
-(UTA)** mode — UTA is what lets an EU retail account combine plain spot
-holdings with margin borrowing in one account instead of a separate
-derivatives account. This is the one candidate in this directory where
-Kairos's `CostModel.init_margin_pct`/`maint_margin_pct` fields would
-actually get populated with something real for a crypto exchange — every
-other crypto candidate surveyed (Bitvavo, Kraken, OKX, Bitstamp) is
-cash/spot only with no margin concept at all.
-**Not independently verified against Bybit's own announcement page** — it
-returned nothing to either `WebFetch` (HTTP 429 / repeated timeout) or a
-Playwright headless-browser fetch (HTTP2 protocol error, then a full
-30-60s timeout even with HTTP2 disabled) across 4 attempts; this looks
-like real bot-blocking, not a transient fluke. The paragraph above is
-built from 5+ independent secondary sources instead (Sources below) —
-consistent across all of them, but confirm against the account UI or a
-real API response before treating the 10x figure as exact.
+**Spot margin is real, and now confirmed directly (Baz pasted the actual
+page content 2026-09-06 after every automated fetch attempt failed — see
+below) — and it's not a flat "leverage multiplier" the way the secondary
+coverage framed it.** Bybit EU's UTA margin is a **collateralized-borrowing
+system**: each of 42 supported coins has its own **borrow interest rate**
+(quoted hourly and annualized, and separately as a "next" rate — these
+update live) and its own **collateral ratio** — the haircut applied to that
+asset's value when used as margin collateral, tiered *down* as your holding
+size grows (a risk cap, not a single number). "Up to 10x leverage" in the
+press coverage is a simplified headline over this mechanism, not a toggle
+you set — effective leverage depends on which assets you hold/borrow and
+how much.
+
+Representative rates from the confirmed data (VIP0, all subject to
+change — this is live data, not a static rate card):
+
+| Coin | Borrowable | Annual borrow rate | Collateral ratio |
+|---|---|---|---|
+| USDT | Yes | ~2.28% | 100% (flat) |
+| USDC | Yes | ~6.20% | 100% (flat) |
+| BTC | Yes | ~1.25% | 98% (flat) |
+| ETH | Yes | ~1.99% | 95% (flat) |
+| SOL | Yes | ~1.34% | 90% (flat) |
+| EUR | **No** | 0% (not borrowable) | 95% down to 0%, tiered by holding size (8 tiers, largest starting ~€4.3M) |
+
+**EUR is margin-*eligible* (usable as collateral) but not
+*borrowable*** — makes sense as the account's own base currency, and means
+it's the natural collateral asset for an EUR-funded Kairos account rather
+than something to borrow. Most collateral ratios are flat for major coins
+(BTC/ETH/USDT/USDC/SOL/majors) but tier down in steps for higher-risk/
+lower-liquidity coins as position size grows — e.g. a newer/smaller-cap
+token might start at 80-85% collateral value and step down to 0% above a
+specific quantity threshold, capping how much of a large holding can
+actually back a margin position.
+
+This confirms the speculative endpoint guess below (a genuine borrow-rate
+lookup, separate from trading commission) was structurally right — the
+real page is presenting exactly the two data points `init_margin_pct`/
+a borrow-cost field would need: a per-coin rate and a per-coin (tiered)
+ratio. Exact native endpoint path still unconfirmed (see below).
+
+This is the one candidate in this directory where Kairos's
+`CostModel.init_margin_pct`/`maint_margin_pct` fields would actually get
+populated with something real for a crypto exchange — every other crypto
+candidate surveyed (Bitvavo, Kraken, OKX, Bitstamp) is cash/spot only with
+no margin concept at all.
+
+**The announcement page itself could not be fetched by any automated
+method** — `WebFetch` (HTTP 429, then repeated timeout) and a Playwright
+headless-browser fetch (HTTP2 protocol error, then a full 30-60s timeout
+even with HTTP2 disabled) both failed across 4 attempts, consistent with
+active bot-blocking. Baz pasted the actual rendered content directly
+instead, which is what the table and figures above are built from — this
+is now first-party data, not secondary-source inference.
 
 **USDT is not usable as a quote currency.** Tether never sought MiCA
 authorization, and a MiCA-licensed platform cannot offer non-authorized
@@ -63,13 +98,17 @@ mapping symbols**, verify the actual quote currency via `load_markets()`.
 
 **If spot margin ever matters for `init_margin_pct`/`maint_margin_pct`**:
 `fetch_trading_fee`/`fee-rate` above only covers *trading commission*, not
-margin borrowing — that's a genuinely separate lookup (a borrow/interest
-rate, not a commission rate), likely native `GET /v5/spot-margin-trade/
-interest-rate-history` or the UTA-specific risk-limit endpoints. Not
-mapped in detail here — this session's probe scope never needed margin
-math (every other crypto candidate has none), so `get_cost_model`'s
-current mapping above is trading-fee-only; extending it to cover spot
-margin borrow cost is unstarted work, not a confirmed gap.
+margin borrowing — confirmed now as a genuinely separate lookup (see the
+real borrow-rate/collateral-ratio data above). Two calls would be needed,
+not one: a per-coin borrow interest rate (likely native `GET /v5/
+spot-margin-trade/interest-rate-history` or similar — exact path still
+unconfirmed, the page itself couldn't be fetched to check the network
+calls behind it) and a per-coin collateral-ratio/tier lookup (UTA
+risk-limit endpoints). Not mapped to exact endpoints here — this session's
+probe scope never needed margin math (every other crypto candidate has
+none), so `get_cost_model`'s current mapping above stays trading-fee-only;
+extending it to cover spot margin borrow cost is unstarted work with a
+confirmed data shape, not a confirmed endpoint.
 
 ## The one real gotcha: EU endpoint vs. ccxt's default
 
@@ -132,14 +171,19 @@ it's the cheapest of the four to revisit first if that changes.
 - [Bybit Trading Fee Structure - Help Center](https://www.bybit.com/en/help-center/article/Trading-Fee-Structure)
 - [Bybit limits EEA access as MiCA deadline closes in](https://crypto.news/bybit-limits-eea-access-as-mica-deadline-closes-in/)
 - [Does Bybit have a MiCA (CASP) license? Yes, licensed in Austria](https://casptracker.eu/exchange/bybit/)
-- Bybit EU's own announcement page (`bybit.eu/en-EU/announcement-info/fullstock-leverage-uta/`,
-  flagged by Baz 2026-09-06) — **could not be fetched** (WebFetch: HTTP 429
-  then repeated timeout; Playwright headless: HTTP2 protocol error, then
-  timeout even with HTTP2 disabled — 4 attempts total, looks like active
-  bot-blocking). Spot-margin/UTA paragraph above is sourced from the
-  secondary coverage below instead.
-- [Bybit EU Launches Spot Margin Trading with Leverage Up to 10x — Cointribune](https://www.cointribune.com/en/bybit-eu-launches-spot-margin-trading-with-leverage-up-to-10x/)
-- [Bybit EU Empowers European Traders with Spot Margin: Up to 10x Leverage — PRNewswire](https://www.prnewswire.com/news-releases/bybit-eu-empowers-european-traders-with-spot-margin-up-to-10x-leverage-full-transparency-and-built-in-risk-controls-302532221.html)
-- [Bybit Rolls Out Spot Margin Trading With 10x Leverage Under MiCA Rules — FinanceFeeds](https://financefeeds.com/bybit-rolls-out-spot-margin-trading-with-10x-leverage-under-mica-rules/)
-- [Crypto Exchange Bybit Introduces 10x Spot Margin Trading in Europe — CoinDesk](https://www.coindesk.com/business/2025/08/18/crypto-exchange-bybit-introduces-10x-spot-margin-trading-in-europe)
+- Bybit EU's own margin-data page (`bybit.eu/en-EU/announcement-info/fullstock-leverage-uta/`,
+  flagged by Baz 2026-09-06) — **could not be fetched by any automated
+  method** (WebFetch: HTTP 429 then repeated timeout; Playwright headless:
+  HTTP2 protocol error, then timeout even with HTTP2 disabled — 4 attempts
+  total, looks like active bot-blocking). **Baz pasted the actual rendered
+  page content directly** (42-coin margin/collateral-ratio table, VIP0) —
+  the borrow-rate and collateral-ratio figures above are built from that
+  first-party data, not inference. Rates are live/dynamic; re-pull before
+  trusting exact numbers on reuse.
+- Secondary coverage (framed it as "up to 10x leverage" — directionally
+  right as a headline, but the mechanism above is the accurate one):
+  [Cointribune](https://www.cointribune.com/en/bybit-eu-launches-spot-margin-trading-with-leverage-up-to-10x/),
+  [PRNewswire](https://www.prnewswire.com/news-releases/bybit-eu-empowers-european-traders-with-spot-margin-up-to-10x-leverage-full-transparency-and-built-in-risk-controls-302532221.html),
+  [FinanceFeeds](https://financefeeds.com/bybit-rolls-out-spot-margin-trading-with-10x-leverage-under-mica-rules/),
+  [CoinDesk](https://www.coindesk.com/business/2025/08/18/crypto-exchange-bybit-introduces-10x-spot-margin-trading-in-europe)
 - [FAQ — Unified Trading Account (UTA), Bybit EU Help Center](https://www.bybit.eu/en-EU/help-center/article/FAQ-Unified-Trading-Account./)
