@@ -16,17 +16,36 @@ forward-looking, based on public docs only.
    Application in the Developer Portal, get an Application Key/Secret,
    pull a 24h OpenAPI access token, and the full OpenAPI surface (market
    data, cost precheck, order simulation) is usable immediately.
-2. **Likely a real flat-floor problem, same shape as IBKR's.** Sources
-   disagree on the exact number (see Fees below — this is the "sources
-   disagree" case the exchange-docs README asks to flag rather than paper
-   over), but every figure found has a **minimum commission per trade**,
-   not pure percentage. On Kairos's ~€18 average trade, even the lowest
-   found minimum (~€2 on Euronext ETFs) is over 10% round-trip; the
-   higher stock-side figures (€10-12) would be worse than IBKR's $1 floor
-   in percentage terms. **This needs a real `precheck` call against actual
-   Kairos-sized orders before trusting either import, and it needs
-   answering before assuming Saxo solves the problem IBKR had — it may
-   not.**
+2. **CONFIRMED (2026-09-06, live SIM `precheck` calls, not research):
+   Saxo has a real flat-per-trade commission floor, and it is *worse* than
+   IBKR's, not better.** Baz signed up for the free SIM account, generated
+   a 24h token, and two live `POST /trade/v2/orders/precheck` calls were
+   run against it:
+   - 1 share of AAPL (Uic 211, NASDAQ): **Commission $15.00 / €12.92**
+     (`CostInAccountCurrency`, `PreCheckResult: "Ok"`).
+   - 1 unit of IWDA (Uic 50629, iShares Core MSCI World UCITS ETF,
+     Euronext Amsterdam, EUR-denominated): **Commission €12.00**
+     (`PreCheckResult: "Ok"`).
+
+   Both land in the same ~€12-13 range regardless of asset type (stock vs.
+   ETF) or order size (1 share/unit in both cases) — this reads as Saxo's
+   Classic-tier **minimum commission per trade**, not a percentage that
+   happened to be small. On Kairos's ~€18 average trade, a ~€12-13 flat
+   commission is **65-70% of the trade's entire value round-trip on one
+   leg alone** — categorically worse than IBKR's $1 floor (which was
+   "only" ~0.6-0.7% at a placeable size). **Saxo does not solve the
+   problem IBKR had. It is currently the single worst-fee candidate
+   surveyed across all 8 exchanges/brokers**, worse even than Bitpanda's
+   1.00-1.49% (deprioritized crypto candidate, see
+   `docs/exchanges/README.md`).
+
+   This was 2 data points, not a full sweep (no `scripts/saxo_instruments.py`
+   exists yet — see `docs/playbooks/add-exchange-probe.md`), but both
+   landed in the same tight range on different asset classes, which is
+   fairly strong evidence this is a real floor, not noise. The earlier
+   "€2-3 Euronext ETF" secondary-source figure did not hold up against a
+   real order — either it applies only above some higher notional this
+   1-unit order didn't reach, or it was simply wrong; not disambiguated.
 
 ## Auth & account setup
 
@@ -59,23 +78,33 @@ floor/rate inference needed, since Saxo's published schedule already tells
 you the structure (percentage + minimum), you're just confirming the exact
 number for one order. `infer_commission_model()` is not needed here.
 
-## Fees — the critical check, and where sources disagree
+## Fees — CONFIRMED 2026-09-06 via live SIM `precheck` calls
 
-No single authoritative public number was found; different sources (and
-possibly different instrument sub-classes) give different minimums:
+| Instrument | Order | Commission (account currency) | `PreCheckResult` |
+|---|---|---|---|
+| AAPL (Uic 211, NASDAQ) | 1 share, market buy | **€12.92** ($15.00 instrument ccy) | Ok |
+| IWDA (Uic 50629, Euronext Amsterdam ETF) | 1 unit, market buy | **€12.00** | Ok |
 
-| Source/context | Rate | Minimum |
+Both land in the same ~€12-13 range — reads as a **flat minimum commission
+per trade**, not a percentage. The pre-session research table below is
+kept for context but **should not be trusted over the measured numbers
+above** — none of the researched figures (a $10 US-stock minimum, a €2-3
+Euronext-ETF minimum) held up against a real order:
+
+| Source/context (pre-measurement research, unreliable) | Rate | Minimum |
 |---|---|---|
 | US stocks, Classic tier | $0.02/share | $10 |
 | European equities, Classic tier (one source) | 0.10% | €12 |
 | European ETFs, Classic tier (another source) | 0.08% | €2 (Euronext) – €3 (Xetra), only above €2,500/trade |
 
-Take none of these as settled — **run a real `/precheck` against a SIM
-account for Kairos-sized ETF and equity orders before trusting any number
-here.** Separately, Classic accounts also carry a **custody fee: 0.15%
-p.a., minimum €5/month**, on stock/ETF/bond holdings — an ongoing holding
-cost with no equivalent in any crypto exchange surveyed so far, worth
-factoring in separately from per-trade commission.
+Only 2 data points measured (not a full sweep — no `scripts/saxo_instruments.py`
+exists yet), but landing in the same tight range across two different
+asset classes (stock vs. ETF) is fairly strong evidence this is real, not
+noise. Separately, Classic accounts also carry a **custody fee: 0.15%
+p.a., minimum €5/month** (unmeasured, from research only), on stock/ETF/
+bond holdings — an ongoing holding cost with no equivalent in any crypto
+exchange surveyed so far, worth factoring in separately from per-trade
+commission if Saxo is ever reconsidered despite the commission finding.
 
 ## Order size / precision
 
@@ -93,6 +122,16 @@ relevant to Tier 1 discovery, which never places a real order).
 
 ## Gotchas
 
+- **`get_reference_price` (`/trade/v1/infoprices`) returned `200 Ok` but
+  empty `Bid`/`Ask` fields** on a fresh SIM account, confirmed 2026-09-06.
+  The `/port/v1/users/me` response includes
+  `"MarketDataViaOpenApiTermsAccepted": false` — almost certainly the
+  cause (an explicit terms-acceptance step, gating live/delayed quotes,
+  separate from the account/API being otherwise fully functional — auth,
+  instrument search, and cost `precheck` all worked cleanly). Not yet
+  confirmed where that acceptance happens (likely somewhere in the
+  Developer Portal or a dedicated endpoint) — flagged for whoever picks
+  this up next rather than guessed at.
 - The Classic/Platinum/VIP tiering means the fee schedule genuinely
   changes with account balance — a number pulled from a SIM account may
   not represent what a real funded Classic account would see; confirm
@@ -106,14 +145,25 @@ relevant to Tier 1 discovery, which never places a real order).
   commission) — decide which one `CostModel.commission_min`/
   `commission_rate_pct` should actually track before implementing.
 
-## What's needed before this can be probed for real
+## What's been probed for real, and what's still open
 
-Nothing blocking except the decision to do it — per the free-SIM finding
-above, this is genuinely one of the cheapest candidates to smoke-test:
-sign up at `developer.saxo/accounts/sim/signup`, create a Simulation
-Application, pull a token, and run real `/precheck` calls against
-Kairos-representative order sizes to resolve the fee-figure disagreement
-above. Not done this session (docs-only pass, 2026-09-06).
+**Done 2026-09-06**: signup, Simulation Application, 24h token, and 3 live
+calls — `/port/v1/users/me` (auth check, Ok), `/ref/v1/instruments`
+(symbol search, Ok), and 2× `/trade/v2/orders/precheck` (the critical fee
+check, both confirmed a ~€12-13 flat commission — see Fees above). This
+was enough to settle the headline question (does Saxo solve IBKR's
+flat-floor problem — no) without building a full probe script.
+
+**Still open**: no `scripts/saxo_instruments.py` exists (would formalize
+this into the shared `ExchangeProbe` framework per
+`docs/playbooks/add-exchange-probe.md`, useful mainly if Saxo gets
+reconsidered later despite the fee finding); the market-data terms gotcha
+above is unresolved; only 2 instruments were checked, both landing in the
+same range but not a full sweep; custody fee (0.15% p.a.) unmeasured.
+Given the confirmed fee finding, further Saxo work is probably lower
+priority than the other 7 candidates unless something changes that
+picture (e.g. a higher account tier with a materially different
+commission schedule).
 
 ## Sources
 

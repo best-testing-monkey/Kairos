@@ -20,15 +20,23 @@ exchange's entry should move toward `docs/ibkr-cost-discovery.md`'s style
 | [bybit-eu.md](bybit-eu.md) | crypto | Vienna, MiCA CASP | 0.10%/0.10% VIP0 trading fee; **plus** UTA margin — real per-coin borrow rates (BTC ~1.25%/yr, ETH ~1.99%/yr) + tiered collateral ratios, confirmed first-party | No (trading fee) | B | Free public testnet — cheapest to smoke-test |
 | [finst.md](finst.md) | crypto | Dutch, AFM | advertised 0.15%, unverified | Unknown | — | **No public API** — institutional-only, deprioritized |
 | [alpaca-europe.md](alpaca-europe.md) | equities | Spain (CNMV), MiFID II | not externally set | N/A | — | **Broker-as-a-Service**, not a direct account — see doc |
-| [saxo.md](saxo.md) | equities | Amsterdam-based (DK parent), MiFID II | disputed, €2-€12 min/trade (sources disagree — see doc) | **Likely yes**, same shape as IBKR | A (hybrid) | Free self-service SIM account, no KYC — best sandbox found |
+| [saxo.md](saxo.md) | equities | Amsterdam-based (DK parent), MiFID II | **CONFIRMED ~€12-13 flat** (live `precheck`, both a stock and an ETF) | **Yes — confirmed, worse than IBKR's $1** | A (hybrid) | Free self-service SIM account, no KYC — best sandbox found, but ruled out on fees |
 | [okx.md](okx.md) | crypto | Malta, MFSA MiCA | 0.08%/0.10% | No | B | Free demo trading API, no funded account |
 | [bitstamp.md](bitstamp.md) | crypto | Luxembourg, CSSF | 0.30%/0.40% | No (but €10 min order size) | B | Free sandbox, no funded account |
 
 **Cheapest to actually smoke-test** (no *funded* account needed): Bybit EU
-/ OKX / Bitstamp (free demo/sandbox) > Saxo (free SIM, equities not crypto)
-> Kraken/Bitvavo (need a real funded account, no self-service sandbox
+/ OKX / Bitstamp (free demo/sandbox) > Saxo (free SIM, equities not
+crypto — **but already probed and ruled out on fees, see below**) >
+Kraken/Bitvavo (need a real funded account, no self-service sandbox
 found). **This is not the same as fastest to actually get access** — see
 below, confirmed against real signup attempts 2026-09-06.
+
+**Saxo is the first candidate actually probed for real, and it's a
+no.** Live `precheck` calls (2026-09-06, SIM account) confirmed a flat
+~€12-13 commission per trade regardless of instrument type — worse than
+IBKR's $1 floor, not an improvement on it. See `docs/exchanges/saxo.md`.
+No longer a live equities candidate unless something changes this
+picture (e.g. a materially different tier).
 
 **Real signup latency, first-hand (Baz, 2026-09-06):**
 - **Bybit EU**: real ID verification gates even the testnet path, reported
