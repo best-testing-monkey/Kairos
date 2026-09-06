@@ -17,7 +17,7 @@ exchange's entry should move toward `docs/ibkr-cost-discovery.md`'s style
 |---|---|---|---|---|---|---|
 | [bitvavo.md](bitvavo.md) | crypto | Dutch, DNB | 0.15%/0.25% | No | B | Public data open; fee-lookup likely needs a key |
 | [kraken.md](kraken.md) | crypto | MiCA (Irish entity) | disputed, 0.16-0.80% (schedule changed Jul 2026 — verify live) | No | B | Public data open; real fee tier needs auth |
-| [bybit-eu.md](bybit-eu.md) | crypto | Vienna, MiCA CASP | 0.10%/0.10% VIP0, spot only | No | B | Free public testnet — cheapest to smoke-test |
+| [bybit-eu.md](bybit-eu.md) | crypto | Vienna, MiCA CASP | 0.10%/0.10% VIP0 trading fee; spot margin up to 10x via UTA (unconfirmed, see doc) | No | B | Free public testnet — cheapest to smoke-test |
 | [finst.md](finst.md) | crypto | Dutch, AFM | advertised 0.15%, unverified | Unknown | — | **No public API** — institutional-only, deprioritized |
 | [alpaca-europe.md](alpaca-europe.md) | equities | Spain (CNMV), MiFID II | not externally set | N/A | — | **Broker-as-a-Service**, not a direct account — see doc |
 | [saxo.md](saxo.md) | equities | Amsterdam-based (DK parent), MiFID II | disputed, €2-€12 min/trade (sources disagree — see doc) | **Likely yes**, same shape as IBKR | A (hybrid) | Free self-service SIM account, no KYC — best sandbox found |
