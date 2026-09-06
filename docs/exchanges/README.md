@@ -21,7 +21,7 @@ exchange's entry should move toward `docs/ibkr-cost-discovery.md`'s style
 | [finst.md](finst.md) | crypto | Dutch, AFM | advertised 0.15%, unverified | Unknown | — | **No public API** — institutional-only, deprioritized |
 | [alpaca-europe.md](alpaca-europe.md) | equities | Spain (CNMV), MiFID II | not externally set | N/A | — | **Broker-as-a-Service**, not a direct account — see doc |
 | [saxo.md](saxo.md) | equities | Amsterdam-based (DK parent), MiFID II | **CONFIRMED ~€12-13 flat** (live `precheck`, both a stock and an ETF) | **Yes — confirmed, worse than IBKR's $1** | A (hybrid) | Free self-service SIM account, no KYC — best sandbox found, but ruled out on fees |
-| [okx.md](okx.md) | crypto | Malta, MFSA MiCA | 0.08%/0.10% | No | B | Free demo trading API, no funded account |
+| [okx.md](okx.md) | crypto | Malta, MFSA MiCA | **CONFIRMED 0.20%/0.35%** (EEA entity, live-tested — higher than global OKX's 0.08%/0.10%) | No | B | Free demo trading API — **live-tested and confirmed environment-locked (safe even with Trade/Withdraw perms)**. Needs `eea.okx.com`, not `www.okx.com` |
 | [bitstamp.md](bitstamp.md) | crypto | Luxembourg, CSSF | 0.30%/0.40% | No (but €10 min order size) | B | Free sandbox, no funded account |
 
 **Cheapest to actually smoke-test** (no *funded* account needed): Bybit EU

@@ -28,8 +28,26 @@ involved), but worth knowing if this ever goes beyond spot.
   competitors' testnets) — genuinely usable for a real Tier 1 smoke test
   with zero funded account. One header requirement: every demo request
   needs `x-simulated-trading: 1` alongside the normal
-  `OK-ACCESS-KEY`/`SIGN`/`PASSPHRASE`/`TIMESTAMP` headers.
+  `OK-ACCESS-KEY`/`SIGN`/`PASSPHRASE`/`TIMESTAMP` headers. **Confirmed
+  environment-locked** (2026-09-06 live test): the same key + demo header
+  returns a fake balance (1 BTC, 5000 USDT, ~98.8k total simulated equity);
+  the identical request *without* the header is flatly rejected —
+  `401 {"code":"50101","msg":"APIKey does not match current environment."}`.
+  A demo key cannot touch real funds no matter what permissions it's
+  granted (Trade/Withdraw included) — it simply isn't accepted outside the
+  simulated environment.
 - Live account (beyond demo) needs standard KYC.
+- **EEA-critical gotcha, confirmed 2026-09-06, cost real debugging time**:
+  an EEA-registered account (Netherlands included) only works against
+  **`eea.okx.com`**, not `www.okx.com`. Hitting the wrong host doesn't
+  produce an obviously-domain-related error — it returns `401
+  {"code":"50119","msg":"API key doesn't exist"}` on *every* authenticated
+  call, identically regardless of the demo header, which reads exactly
+  like a bad/expired key. Public (no-auth) endpoints work fine on either
+  host, which makes the failure mode more confusing, not less — the
+  break only shows up once you try an authenticated call. If `50119` shows
+  up and the key was just created and definitely pasted correctly, check
+  the host before anything else.
 
 ## Tier 1 interface mapping (Pattern B — direct fee-schedule lookup)
 
@@ -46,21 +64,43 @@ same mechanism as Bitvavo/Kraken/Bybit EU. No dry-run order needed.
 ## Fee schedule (the critical check)
 
 **No flat minimum commission per order** — pure percentage, VIP-tiered.
-Base (Regular) spot tier confirmed as of mid-2026: **0.080% maker / 0.100%
-taker** — matches the figure from earlier broader research, and among the
-cheapest base-tier rates found across all candidates so far (only Bybit EU's
-0.10%/0.10% is close; Bitvavo/Kraken are higher at base tier). Fee framework
-was restructured April 2026 (8→9 VIP levels, lower entry thresholds); rates
-drop further with volume (VIP3 taker ~0.028%) and top tiers see negative
-(rebate) maker fees. On Kairos's ~€18 average trade, base-tier taker cost is
-under 2 cents — not remotely close to IBKR's flat-$1 problem.
+**CONFIRMED 2026-09-06 via a live `GET /api/v5/account/trade-fee` call
+(demo account, Lv1/base tier, `eea.okx.com`): 0.20% maker / 0.35% taker
+for BTC-EUR spot.** This is meaningfully **higher** than the 0.08%/0.10%
+figure the earlier research pass found — that figure was for global OKX;
+**OKX Europe (the MiCA-licensed EEA entity) runs its own, higher fee
+schedule**, the same pattern already seen with Bybit EU's separate legal
+entity potentially differing from global Bybit. Trust the measured EEA
+number over the pre-measurement research figure below it in this doc.
+
+Still **no flat floor** — on Kairos's ~€18 average trade, 0.35% taker is
+~6 cents, not remotely close to IBKR's or Saxo's problem, just not as
+cheap as first assumed. Fee framework was restructured April 2026 (8→9 VIP
+levels globally); whether OKX EEA's tiers scale the same way with volume
+is unconfirmed — only the Lv1/base rate was measured.
+
+**Sign-convention gotcha, worth getting right in `get_cost_model`**: the
+API returns fees as **negative for a commission you pay, positive for a
+rebate** — the opposite of the naive reading. `"maker": "-0.002"` means
+you pay 0.2%, not that OKX pays you. Take the absolute value when mapping
+into `CostModel.commission_rate_pct`, and watch for a sign-confused
+mis-mapping if a maker fee ever comes back positive (a real rebate, not a
+bug) at a higher VIP tier.
+
+*(Pre-measurement research, kept for context, less reliable than the
+number above): "Regular"/global spot tier was reported at 0.080% maker /
+0.100% taker; rates reportedly drop further with volume (VIP3 taker
+~0.028%) with negative (rebate) maker fees at top tiers — unconfirmed
+whether this applies to the EEA entity's own schedule.*
 
 ## Order size / precision
 
-Not found in this pass — no minimum-order-size figure surfaced in the
-research done here. Pull per-pair via `load_markets()`'s `precision`/
-`limits` fields (same `InstrumentMeta.min_tick`/`size_increment`/`min_size`
-mapping as every other Pattern B exchange) once actually probing.
+Confirmed shape 2026-09-06 (`GET /api/v5/public/instruments`, BTC-EUR
+only — not a sweep): the response carries `tickSz` (price tick),
+`lotSz` (size increment), and `minSz` (minimum order size) directly,
+mapping cleanly to `InstrumentMeta.min_tick`/`size_increment`/`min_size`.
+BTC-EUR's own values weren't recorded at the time; re-pull per-pair when
+building the real probe script rather than trusting a remembered number.
 
 ## Rate limits
 
@@ -90,22 +130,42 @@ mapping as every other Pattern B exchange) once actually probing.
   Kraken's doc describes: an unauthenticated probe would need to fall back
   to a published base-tier number rather than the account's real rate.
 
-## What's needed before this can be probed for real
+## What's been probed for real, and what's still open
 
-Signup in progress (Baz, 2026-09-06). Real first-hand data point so far:
-OKX reported **"5 minutes to prepare your account for identity
-verification"** — sounds meaningfully faster to at least get started on
-than Bybit EU, which gates on up to 3 days of ID verification plus a
-separate 48h API-key wait (see `docs/exchanges/bybit-eu.md` and
-`docs/exchanges/README.md`'s "Real signup latency" note). Full end-to-end
-verification time for OKX not yet confirmed — only the initial prep-step
-duration is known so far. Next step per
-`docs/playbooks/add-exchange-probe.md` once verification clears: register
-demo trading, generate a demo API key, implement `scripts/okx_instruments.py`
-against the mapping above, run it.
+**Done 2026-09-06**: full signup-to-live-call cycle completed same day —
+faster end-to-end than Bybit EU's multi-day path. Baz created a demo API
+key ("kairos" label, Trade/Withdraw/Read permissions — broader than
+needed, but confirmed harmless on a demo-locked key, see Auth above), and
+4 live calls succeeded once the EEA-host gotcha above was found and
+fixed: `GET /api/v5/public/instruments` (resolve_instrument, Ok),
+`GET /api/v5/market/ticker` (get_reference_price, Ok),
+`GET /api/v5/account/config` (auth check, Ok), and
+`GET /api/v5/account/trade-fee` (get_cost_model, Ok — the confirmed
+0.20%/0.35% figure above). This settled the fee question without
+building a full probe script.
+
+**Still open**: no `scripts/okx_instruments.py` exists yet (would
+formalize this into the shared `ExchangeProbe` framework per
+`docs/playbooks/add-exchange-probe.md`); only one instrument (BTC-EUR)
+checked, not a sweep; order size/precision was returned by the
+instruments call (`tickSz`/`lotSz`/`minSz` fields exist) but not yet
+extracted into this doc; whether OKX EEA's fee tiers drop with volume the
+same way global OKX's do is unconfirmed.
 
 ## Sources
 
+- **Live SIM/demo API calls, 2026-09-06** (Baz's own OKX demo account,
+  `eea.okx.com`) — `/api/v5/public/instruments`, `/api/v5/market/ticker`,
+  `/api/v5/account/config`, `/api/v5/account/trade-fee`,
+  `/api/v5/account/balance` (with and without the demo header, to confirm
+  environment-locking). Primary source for the EEA-host gotcha, the
+  confirmed 0.20%/0.35% fee figures, and the sign-convention finding.
+  Credentials used only in-memory for these calls, never written to any
+  file.
+- [50119 "API key doesn't exist" — freqtrade#10967](https://github.com/freqtrade/freqtrade/issues/10967),
+  [ccxt#24601](https://github.com/ccxt/ccxt/issues/24601) — background on
+  the error before the EEA-host cause was identified.
+- [OKX now offers its services in the EEA through my.okx.com](https://www.okx.com/en-eu/help/okx-offers-its-services-in-the-eea-through-new-subdomain)
 - [OKX Fees Guide 2026: Spot, Futures, Withdrawals](https://tradersunion.com/brokers/crypto/view/okex/fees/)
 - [OKX fees: 0.020% maker, 0.050% taker (2026)](https://feeedge.com/exchanges/okx)
 - [OKX API guide | OKX technical support](https://www.okx.com/docs-v5/en/)
