@@ -154,11 +154,16 @@ live remaining quota if it ever matters.
 
 ## What's needed before this can be probed for real
 
-Nothing blocking except the decision to do it — this is the one candidate
-where a real smoke test costs nothing: testnet signup, wait 48h for API-key
-unblock, request test coins, probe away. Not done this session per Baz's
-2026-09-06 scope call (scaffolding + playbook only); flagged here since
-it's the cheapest of the four to revisit first if that changes.
+Signup is in progress (Baz, 2026-09-06): **real ID verification, reported
+as up to 3 days**, gates the account — *in addition to* the
+already-documented 48h API-key-unblock wait, so realistically up to ~5 days
+from signup to a usable API key, not the "free and instant" impression the
+"no funded account needed" framing earlier in this doc might give. Costs
+nothing (no funds required), but is **not the fastest** of the 4 crypto
+candidates to actually start probing against — see
+`docs/exchanges/README.md`'s "Real signup latency" note, and compare
+against OKX (reported much faster to at least begin) once that path is
+also confirmed end-to-end.
 
 ## Sources
 

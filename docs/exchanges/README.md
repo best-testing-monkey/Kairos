@@ -24,10 +24,23 @@ exchange's entry should move toward `docs/ibkr-cost-discovery.md`'s style
 | [okx.md](okx.md) | crypto | Malta, MFSA MiCA | 0.08%/0.10% | No | B | Free demo trading API, no funded account |
 | [bitstamp.md](bitstamp.md) | crypto | Luxembourg, CSSF | 0.30%/0.40% | No (but €10 min order size) | B | Free sandbox, no funded account |
 
-**Cheapest to actually smoke-test, ranked** (no funded account needed):
-Bybit EU / OKX / Bitstamp (all free demo/sandbox, no wait) > Saxo (free SIM,
-no wait, but equities not crypto) > Kraken/Bitvavo (need a real funded
-account, no self-service sandbox found).
+**Cheapest to actually smoke-test** (no *funded* account needed): Bybit EU
+/ OKX / Bitstamp (free demo/sandbox) > Saxo (free SIM, equities not crypto)
+> Kraken/Bitvavo (need a real funded account, no self-service sandbox
+found). **This is not the same as fastest to actually get access** — see
+below, confirmed against real signup attempts 2026-09-06.
+
+**Real signup latency, first-hand (Baz, 2026-09-06):**
+- **Bybit EU**: real ID verification gates even the testnet path, reported
+  as up to **3 days**, *plus* the already-documented 48h API-key-unblock
+  wait — up to ~5 days total before the API is actually usable. Contradicts
+  this doc's earlier "free demo/sandbox, no wait" framing; that was about
+  not needing a *funded* account, not about verification speed.
+- **OKX**: reported as "5 minutes to prepare your account for identity
+  verification" — sounds much faster to get moving on, though the full
+  verification completion time (after that 5-minute prep step) isn't
+  confirmed yet.
+- Bitstamp and Saxo's real signup latency: not yet reported back, unknown.
 
 Every exchange in this table still needs a real probe run before any
 number here is trustworthy — this index summarizes each doc's own

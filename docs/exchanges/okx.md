@@ -92,15 +92,17 @@ mapping as every other Pattern B exchange) once actually probing.
 
 ## What's needed before this can be probed for real
 
-No Kairos-owned OKX account or API key exists. Per Baz's 2026-09-06
-decision, this pass is documentation only. **OKX is a strong second
-candidate for "cheapest to actually smoke-test first" after Bybit EU** —
-the demo trading API needs no funded account and mirrors live data, closer
-in spirit to a real integration test than Bitvavo (no sandbox found) or
-Kraken (no self-service spot sandbox). Next step per
-`docs/playbooks/add-exchange-probe.md`: register demo trading, generate a
-demo API key, implement `scripts/okx_instruments.py` against the mapping
-above, run it.
+Signup in progress (Baz, 2026-09-06). Real first-hand data point so far:
+OKX reported **"5 minutes to prepare your account for identity
+verification"** — sounds meaningfully faster to at least get started on
+than Bybit EU, which gates on up to 3 days of ID verification plus a
+separate 48h API-key wait (see `docs/exchanges/bybit-eu.md` and
+`docs/exchanges/README.md`'s "Real signup latency" note). Full end-to-end
+verification time for OKX not yet confirmed — only the initial prep-step
+duration is known so far. Next step per
+`docs/playbooks/add-exchange-probe.md` once verification clears: register
+demo trading, generate a demo API key, implement `scripts/okx_instruments.py`
+against the mapping above, run it.
 
 ## Sources
 
