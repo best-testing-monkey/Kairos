@@ -75,10 +75,51 @@ universe at all; **38 clear the floor**:
 Excluded as stablecoins (not directional-prediction candidates):
 USDC-EUR (3.5M vol), USDT-EUR (2.5M vol), USDG-EUR (29.9k vol).
 
-## Bitstamp — pending
+## Bitstamp (2026-09-06)
 
-Not yet checked; do this once Bitstamp is connected (Baz's stated next
-signup target).
+Checked Kairos's full 62-symbol crypto universe against Bitstamp's public
+`GET /api/v2/trading-pairs-info/` (257 pairs total, 112 EUR-quoted — one
+call covers everything, no per-symbol lookup needed).
+
+- **48/62 (77%) have a EUR pair** — 47 directly, plus **1 via a legacy
+  ticker**: Kairos's `RENDER-USD` is listed on Bitstamp as `RNDR/EUR`
+  (`"description": "Render Token / Euro"`) — Bitstamp hasn't updated to
+  the post-rebrand ticker other exchanges use. Not a gap, just a naming
+  trap for `resolve_instrument` if this is ever wired up for real.
+- **1 has a pair, but not in EUR**: `ZEC` only has `ZEC/USD` on Bitstamp,
+  no `ZEC/EUR`.
+- **13 confirmed genuinely absent** (zero listing under any of Bitstamp's
+  10 quote currencies — USD/EUR/GBP/USDT/USDC/BTC/RLUSD/EURC/EURCV/ETH —
+  not a EUR-quoting artifact, checked the same way as OKX's 8): `FIL`,
+  `VET`, `EOS`, `THETA`, `RUNE`, `ENJ`, `DASH`, `KAVA`, `1INCH`, `BEAM`,
+  `GALA`, `TIA`, `USUAL`.
+- This is meaningfully **narrower coverage than OKX (87%)** — Bitstamp is
+  the older, smaller exchange of the two.
+
+**New candidates**: of Bitstamp's 59 non-universe EUR-quoted assets
+(excluding fiat/stablecoin quotes and the RNDR/RENDER alias above), most
+have **zero 24h trading volume** on Bitstamp specifically (checked via
+live `ticker` calls, not assumed — e.g. `EGLD/EUR`, `SEI/EUR`, `APE/EUR`
+all returned `"volume":"0.00000"`, genuinely dead pairs, not a data
+error). Using the same JTO-EUR ~8,139 EUR/24h floor as OKX, only **4
+clear it**:
+
+| Symbol | 24h EUR volume | Notes |
+|---|---|---|
+| CASHCAT | 258,950 | Very high volume for an unfamiliar name — worth a sanity check before trusting, possible thin/manipulated order book on a low-cap meme coin |
+| ZORA | 37,473 | Zora Network |
+| FET | 27,292 | Fetch.ai — **also an OKX candidate** (20,013 there), same asset found independently on two exchanges |
+| HYPE | 9,656 | Hyperliquid — **also an OKX candidate** (829,297 there, far more liquid there) |
+
+`VIRTUAL` (6,693 EUR/24h) is the closest miss, just under the floor.
+Everything else in the 59 was either a dead pair (0 volume) or below
+6,693.
+
+**Practical implication for exchange selection, not just universe
+coverage**: if Bitstamp is chosen as Kairos's actual execution venue, its
+narrower listing (77% vs. OKX's 87%) and mostly-illiquid long tail matter
+independently of its fee schedule — the fee comparison in
+`docs/exchanges/README.md` doesn't capture this.
 
 ## Bybit EU — pending
 
