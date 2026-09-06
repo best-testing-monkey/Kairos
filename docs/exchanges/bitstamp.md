@@ -94,13 +94,16 @@ cited 8,000 requests/10 minutes. Trust the official page's 400/s +
 
 ## What's needed before this can be probed for real
 
-No Kairos-owned Bitstamp account or API key exists — scaffolding + this
-connection doc only, per Baz's 2026-09-06 scope decision (see
-`docs/playbooks/add-exchange-probe.md`). Unlike Kraken (no self-service
-spot sandbox) and similar to Bybit EU, **Bitstamp's sandbox needs no
-funded account at all** — this is genuinely cheap to smoke-test whenever
-that's picked back up: register, generate a sandbox key, implement
-`scripts/bitstamp_instruments.py` against the mapping above, run it
+Signup in progress (Baz, 2026-09-06): **ID verification underway,
+reported as up to 3 days** — same latency class as Bybit EU, despite
+costing nothing (no funded account needed either way; "free" and "fast"
+turned out to be different things for both of these, see
+`docs/exchanges/README.md`'s "Real signup latency" note). No Kairos-owned
+Bitstamp account or API key exists yet. Unlike Kraken (no self-service
+spot sandbox), **Bitstamp's sandbox needs no funded account at all** —
+this is genuinely cheap to smoke-test once verification clears: generate
+a sandbox key, implement `scripts/bitstamp_instruments.py` against the
+mapping above, run it
 against `sandbox.bitstamp.net` first.
 
 ## Sources

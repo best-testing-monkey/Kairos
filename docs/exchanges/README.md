@@ -48,7 +48,12 @@ picture (e.g. a materially different tier).
   verification" — sounds much faster to get moving on, though the full
   verification completion time (after that 5-minute prep step) isn't
   confirmed yet.
-- Bitstamp and Saxo's real signup latency: not yet reported back, unknown.
+- **Bitstamp**: ID verification in progress, reported as up to 3 days —
+  same latency class as Bybit EU, despite Bitstamp's "free sandbox, no
+  funded account" framing above being about cost, not speed, same
+  distinction already made for Bybit EU.
+- **Saxo**: fast — same-day signup to live `precheck` calls (see
+  `docs/exchanges/saxo.md`), no multi-day ID wait reported.
 
 Every exchange in this table still needs a real probe run before any
 number here is trustworthy — this index summarizes each doc's own
