@@ -16,22 +16,27 @@
 - First implementation: crypto exchange via `ccxt`. **Binance is out** —
   it failed to secure an EU MiCA license and shut off EU users
   2026-07-01, so it cannot serve a NL-resident account regardless of API
-  quality. Candidates measured 2026-09-06:
-  Bitvavo / Kraken / Bybit EU (all MiCA-compliant, ccxt-supported,
-  percentage-fee — not IBKR's flat-floor problem) and Finst (Dutch,
-  0.15% flat, ccxt support unconfirmed). See `docs/exchanges/*.md`.
-- Equities later via Alpaca or IBKR. **Alpaca launched a real European
-  broker in April 2026** (Alpaca Europe, MiFID II-compliant; Xetra live,
-  Euronext/LSE "expected to follow" — not confirmed for Euronext
-  Amsterdam yet) — but it turned out to be **Broker-as-a-Service, not a
-  direct trading account**: the EU product onboards Kairos as its own
-  broker-of-record (KYC-as-a-service, correspondent-set fees), not as a
-  self-directed account like IBKR. Materially heavier integration than
-  assumed when this was first flagged — see
-  `docs/exchanges/alpaca-europe.md` before committing to it. IBKR was
-  measured and ruled out for Kairos's trade size — see
-  `docs/ibkr-cost-discovery.md`. Avoid the automated-browser route unless
-  a broker truly has no API; it is by far the most fragile option.
+  quality. 5 candidates surveyed 2026-09-06, all MiCA-compliant and
+  ccxt-supported except Finst: **OKX** (0.08%/0.10%, cheapest found, free
+  demo API) and **Bitstamp** (0.30%/0.40%, free sandbox, €10 min order
+  size) join **Bitvavo**/**Kraken**/**Bybit EU** — all percentage-fee, not
+  IBKR's flat-floor problem. **Finst** has no public API at all
+  (institutional-only) — deprioritized. See `docs/exchanges/*.md` and that
+  directory's `README.md` for the full comparison table.
+- Equities later via Alpaca, Saxo, or IBKR. **Alpaca launched a real
+  European broker in April 2026** (Alpaca Europe) — but it turned out to be
+  **Broker-as-a-Service, not a direct trading account**: the EU product
+  onboards Kairos as its own broker-of-record, not as a self-directed
+  account like IBKR. **Saxo Bank** (Amsterdam-based, surveyed 2026-09-06)
+  is the more conventional shape — a normal retail account, real public
+  API, and the best sandbox found across every candidate (free, self-service,
+  no KYC) — **but likely shares IBKR's flat-commission-floor problem**
+  (sources disagree, €2-€12 minimum per trade depending on instrument/tier,
+  unconfirmed against a real order). Check `docs/exchanges/saxo.md` before
+  assuming Saxo solves what IBKR couldn't. IBKR itself was measured and
+  ruled out for Kairos's trade size — see `docs/ibkr-cost-discovery.md`.
+  Avoid the automated-browser route unless a broker truly has no API; it is
+  by far the most fragile option.
 - Owner: 1 Sonnet subagent per broker adapter.
 
 ### 5.2 Risk guardrails (non-negotiable, before the first live order)

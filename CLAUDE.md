@@ -1227,16 +1227,22 @@ reimplementation of schema/resumability/reporting. See
 `docs/broker-api-interface.md` for what any broker API needs to expose
 (Tier 1: cost/tradeability discovery, built; Tier 2: live execution,
 undesigned — Phase 5), and `docs/playbooks/add-exchange-probe.md` for the
-concrete steps. `docs/exchanges/*.md` has implementation-ready connection
-notes for Bitvavo, Kraken, Bybit EU, Finst, and Alpaca Europe — the
-candidates found when IBKR's flat $1 commission floor turned out to be too
-large for Kairos's ~€18 average trade (`docs/ibkr-cost-discovery.md`).
-None of the five has a Kairos-owned account yet; this is scaffolding, not a
-live integration. Two findings from that pass worth knowing before picking
-one: **Finst has no public API** (institutional-only, not in ccxt) and
-**Alpaca Europe is Broker-as-a-Service**, not a self-directed account —
-Kairos would onboard as its own broker-of-record, a materially heavier
-integration than IBKR/Bitvavo/Kraken/Bybit.
+concrete steps. `docs/exchanges/*.md` (see that directory's `README.md`
+for the index/comparison table and the template every doc follows) has
+implementation-ready connection notes for 8 candidates — Bitvavo, Kraken,
+Bybit EU, OKX, Bitstamp (crypto), Finst (crypto), Alpaca Europe and Saxo
+Bank (equities) — found after IBKR's flat $1 commission floor turned out
+to be too large for Kairos's ~€18 average trade
+(`docs/ibkr-cost-discovery.md`). None of the eight has a Kairos-owned
+account yet; this is scaffolding, not a live integration. Findings worth
+knowing before picking one: **Finst has no public API** (institutional-only,
+not in ccxt); **Alpaca Europe is Broker-as-a-Service**, not a self-directed
+account (Kairos would onboard as its own broker-of-record); **Saxo likely
+shares IBKR's flat-floor problem** (sources disagree, €2-€12/trade,
+unconfirmed) despite otherwise being the most conventional equities option
+and having the best sandbox of any candidate surveyed (free, self-service,
+no KYC). Cheapest to actually smoke-test with no funded account: Bybit EU,
+OKX, Bitstamp, and Saxo (all have a real free demo/sandbox).
 
 ## Test suite
 

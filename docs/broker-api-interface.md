@@ -43,14 +43,20 @@ structure to force into one mechanism:
   end-to-end generically; see `FakeExchangeProbe` in
   `tests/unit/test_exchange_probe.py` for the minimal shape that proves it.
 
-Three of the four crypto candidates from the broker survey (Bitvavo,
-Kraken, Bybit EU) are Pattern B — see `docs/exchanges/*.md` for the
-per-exchange mapping. IBKR is the only Pattern A example so far. **Finst
-turned out to have no public API at all** (institutional-only, not in
-ccxt) — neither pattern applies until that changes; see
-`docs/exchanges/finst.md`. **Alpaca Europe doesn't fit either pattern**:
-it's Broker-as-a-Service, not an account with an externally-set fee to
-discover — see `docs/exchanges/alpaca-europe.md`.
+Five of the eight candidates surveyed (Bitvavo, Kraken, Bybit EU, OKX,
+Bitstamp — every crypto exchange except Finst) are clean Pattern B — see
+`docs/exchanges/*.md` for the per-exchange mapping. **Saxo Bank is the
+second Pattern A example, and it's a hybrid**: it publishes a rate card
+like a Pattern B exchange, but getting the exact number for one order
+needs a non-transmitting order simulation (`POST /trade/v2/orders/precheck`)
+the same way IBKR's `whatIfOrder` does — unlike IBKR, one `precheck` call
+returns the commission directly, so `infer_commission_model()`'s two-probe
+dance isn't needed even though the underlying mechanism (a dry-run order)
+is the same shape. See `docs/exchanges/saxo.md`. **Finst turned out to have
+no public API at all** (institutional-only, not in ccxt) — neither pattern
+applies until that changes; see `docs/exchanges/finst.md`. **Alpaca Europe
+doesn't fit either pattern**: it's Broker-as-a-Service, not an account with
+an externally-set fee to discover — see `docs/exchanges/alpaca-europe.md`.
 
 ## Tier 2 — live execution (not implemented)
 
@@ -76,5 +82,6 @@ account at all, since market data and fee schedules are usually public.
   — the concrete steps to add a Tier 1 probe for a new exchange.
 - [`docs/ibkr-cost-discovery.md`](ibkr-cost-discovery.md) — IBKR's own
   probe, API gotchas, and measured figures (Pattern A reference).
-- [`docs/exchanges/`](exchanges/) — per-exchange connection notes for the
-  4 crypto candidates + Alpaca Europe, written with this interface in mind.
+- [`docs/exchanges/`](exchanges/) — per-exchange connection notes for all 8
+  candidates surveyed so far (see that directory's `README.md` for the
+  index and the template every doc there follows).
