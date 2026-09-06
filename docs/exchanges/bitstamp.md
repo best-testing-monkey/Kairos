@@ -24,7 +24,14 @@ precedent this doc sets up but doesn't duplicate).
   self-service signup, no sales conversation.
 - **Real sandbox exists**: `https://sandbox.bitstamp.net/api/v2/` mirrors
   the full production API surface. Confirmed from Bitstamp's own API docs,
-  not inferred.
+  not inferred — and confirmed live 2026-09-06 (see below).
+- **Confirmed environment-locked (2026-09-06 live test)**: the sandbox key
+  works against `sandbox.bitstamp.net` (returns a fake balance: 0.5 BTC,
+  10 ETH, 40000 USD) but the identical signed request against
+  `www.bitstamp.net` (production) is flatly rejected —
+  `403 {"status":"error","reason":"API key not found","code":"API0001"}`.
+  Same property OKX's demo key had — a sandbox key cannot touch real funds
+  regardless of what permissions it's granted.
 
 ## Tier 1 interface mapping (Pattern B — direct fee-schedule lookup)
 
@@ -40,36 +47,41 @@ Confirmed Pattern B — one `fetch_trading_fee` call, no dry-run/whatIf probing.
 ## Fee schedule (the critical check)
 
 **No flat commission floor per order** — same property that ruled IBKR out
-for Kairos's trade size. Base tier (< $10,000 30-day USD-equivalent
-volume): **0.30% maker / 0.40% taker**, scaling down to ~0.00%/0.03% past
-$1B volume. FX/stablecoin pairs get an 80% fee reduction. Sources converge
-on this figure (tradingfinder.com and a second independent search both
-landed on 0.30%/0.40%), unlike Kraken's conflicting numbers — reasonably
-confident here, but still pull it live before trusting it for real, same
-discipline as every other doc in this directory.
+for Kairos's trade size. **CONFIRMED 2026-09-06 via live
+`POST /api/v2/fees/trading/` calls (sandbox key, all pairs and BTC/EUR
+individually): 0.30% maker / 0.40% taker at base tier**, matching the
+pre-measurement research figure exactly. Scales down to ~0.00%/0.03% past
+$1B 30-day volume per the published schedule (not re-measured — sandbox
+account is fixed at base tier). FX/stablecoin pairs reportedly get an 80%
+fee reduction (unmeasured).
+
+**This also settles the Advanced-vs-Instant-Buy/Sell ambiguity below**:
+`/api/v2/fees/trading/` is the actual API-returned rate, not a UI quote —
+the API genuinely uses the 0.30%/0.40% Advanced schedule.
 
 **Real constraint, different in kind from IBKR's floor: minimum order size
-is €10 / $10 / £10 (or 0.0002 BTC / 0.002 ETH directly)**, confirmed from
-Bitstamp's own API docs. Not a commission problem — a notional-size gate.
+is €10.00 EUR for BTC/EUR and XRP/EUR**, confirmed live 2026-09-06 via the
+public `GET /api/v2/trading-pairs-info/` endpoint (no auth needed).
 Kairos's ~€18 average trade clears it, but not by much; a smaller signal
 could be blocked outright rather than just taxed. Worth checking against
 the actual signal-size distribution before assuming every Kairos order
 would clear this floor.
 
-One unconfirmed wrinkle: Bitstamp's consumer UI has historically offered a
-separate "Instant Buy/Sell" flow with a spread-based fee (materially
-higher than the Advanced/API trading fee schedule above) — not found
-re-confirmed for 2026 in this pass. The API almost certainly routes
-through the Advanced trading engine (the 0.30%/0.40% schedule), not the
-consumer instant-buy flow, but this wasn't independently verified against
-API-specific fee docs — flag for confirmation once a real key exists.
+~~One unconfirmed wrinkle: Bitstamp's consumer UI has historically offered
+a separate "Instant Buy/Sell" flow with a spread-based fee... flag for
+confirmation once a real key exists.~~ Resolved above — the API uses the
+Advanced schedule.
 
 ## Order size / precision
 
-Minimum order size above (€10/$10/£10 or crypto-equivalent) is the one
-hard figure found. Per-pair tick/lot precision not measured — pull via
-ccxt `market['precision']`/`market['limits']` same as every other
-exchange in this directory.
+Confirmed live 2026-09-06 via `GET /api/v2/trading-pairs-info/` (public,
+no auth): returns `minimum_order`, `base_decimals`, `counter_decimals`
+directly per pair (e.g. BTC/EUR: `minimum_order: "10.00 EUR"`,
+`base_decimals: 8`, `counter_decimals: 2`) — maps cleanly to
+`InstrumentMeta.min_size`/`min_tick`. Only BTC/EUR and XRP/EUR pulled so
+far, not a full sweep. Note some pairs report `trading: "Disabled"` in
+this same response (e.g. ETH/BTC in the sandbox) — `resolve_instrument`
+should check this field, not assume every listed pair is tradeable.
 
 ## Rate limits
 
@@ -92,22 +104,40 @@ cited 8,000 requests/10 minutes. Trust the official page's 400/s +
   weren't fully disambiguated this pass — confirm the API genuinely uses
   the 0.30%/0.40% schedule, not something spread-based, on first real use.
 
-## What's needed before this can be probed for real
+## What's been probed for real, and what's still open
 
-Signup in progress (Baz, 2026-09-06): **ID verification underway,
-reported as up to 3 days** — same latency class as Bybit EU, despite
-costing nothing (no funded account needed either way; "free" and "fast"
-turned out to be different things for both of these, see
-`docs/exchanges/README.md`'s "Real signup latency" note). No Kairos-owned
-Bitstamp account or API key exists yet. Unlike Kraken (no self-service
-spot sandbox), **Bitstamp's sandbox needs no funded account at all** —
-this is genuinely cheap to smoke-test once verification clears: generate
-a sandbox key, implement `scripts/bitstamp_instruments.py` against the
-mapping above, run it
-against `sandbox.bitstamp.net` first.
+**Done 2026-09-06**: ID verification cleared, Baz generated a sandbox API
+key same day. 5 live calls succeeded against `sandbox.bitstamp.net`:
+`GET /api/v2/ticker/btceur/` (get_reference_price, Ok),
+`POST /api/v2/account_balances/` (auth check, Ok),
+`POST /api/v2/fees/trading/` and `.../btceur/` (get_cost_model, Ok — the
+confirmed 0.30%/0.40% figure above), and
+`GET /api/v2/trading-pairs-info/` (resolve_instrument sizing, Ok — the
+confirmed €10 minimum). Also confirmed the sandbox key is
+environment-locked against production (see Auth above). This settled the
+fee and minimum-order questions without building a full probe script,
+same as OKX's approach.
+
+**Still open**: no `scripts/bitstamp_instruments.py` exists yet (would
+formalize this into the shared `ExchangeProbe` framework per
+`docs/playbooks/add-exchange-probe.md`); only BTC/EUR and XRP/EUR checked
+for order size, not a full sweep; rate-limit figures still disagree
+(above) and weren't tested live; fee scaling at higher volume tiers is
+unmeasured (sandbox account is fixed at base tier); no production
+(non-sandbox) Kairos-owned account or key exists yet — this was a
+sandbox-only smoke test.
 
 ## Sources
 
+- **Live sandbox API calls, 2026-09-06** (Baz's own Bitstamp sandbox
+  account, `sandbox.bitstamp.net`) — `/api/v2/ticker/btceur/`,
+  `/api/v2/account_balances/`, `/api/v2/fees/trading/` (all pairs and
+  BTC/EUR), `/api/v2/trading-pairs-info/`, plus the same signed call
+  repeated against `www.bitstamp.net` to confirm environment-locking.
+  Primary source for the confirmed 0.30%/0.40% fees, the confirmed €10
+  minimum order, and the Advanced-vs-Instant-Buy/Sell resolution.
+  Credentials used only as environment variables to a throwaway
+  scratchpad script, never written to any repo file.
 - [Bitstamp API](https://www.bitstamp.net/api/)
 - [Fee schedule – Bitstamp by Robinhood](https://www.bitstamp.net/fee-schedule/)
 - [Bitstamp 2026; Fees [From 0.30%] & User Levels — TradingFinder](https://tradingfinder.com/exchanges/bitstamp/)

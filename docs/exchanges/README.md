@@ -22,7 +22,7 @@ exchange's entry should move toward `docs/ibkr-cost-discovery.md`'s style
 | [alpaca-europe.md](alpaca-europe.md) | equities | Spain (CNMV), MiFID II | not externally set | N/A | — | **Broker-as-a-Service**, not a direct account — see doc |
 | [saxo.md](saxo.md) | equities | Amsterdam-based (DK parent), MiFID II | **CONFIRMED ~€12-13 flat** (live `precheck`, both a stock and an ETF) | **Yes — confirmed, worse than IBKR's $1** | A (hybrid) | Free self-service SIM account, no KYC — best sandbox found, but ruled out on fees |
 | [okx.md](okx.md) | crypto | Malta, MFSA MiCA | **CONFIRMED 0.20%/0.35%** (EEA entity, live-tested — higher than global OKX's 0.08%/0.10%) | No | B | Free demo trading API — **live-tested and confirmed environment-locked (safe even with Trade/Withdraw perms)**. Needs `eea.okx.com`, not `www.okx.com` |
-| [bitstamp.md](bitstamp.md) | crypto | Luxembourg, CSSF | 0.30%/0.40% | No (but €10 min order size) | B | Free sandbox, no funded account |
+| [bitstamp.md](bitstamp.md) | crypto | Luxembourg, CSSF | **CONFIRMED 0.30%/0.40%** (live-tested, matches pre-measurement figure exactly) | No (but confirmed €10 min order size, live) | B | Free sandbox — **live-tested and confirmed environment-locked** (sandbox key rejected on production, `403 API key not found`) |
 
 **Cheapest to actually smoke-test** (no *funded* account needed): Bybit EU
 / OKX / Bitstamp (free demo/sandbox) > Saxo (free SIM, equities not
@@ -38,6 +38,12 @@ IBKR's $1 floor, not an improvement on it. See `docs/exchanges/saxo.md`.
 No longer a live equities candidate unless something changes this
 picture (e.g. a materially different tier).
 
+**Bitstamp is the third candidate live-tested, and it's a pass on fees.**
+Live sandbox calls (2026-09-06) confirmed 0.30%/0.40% fees (matching the
+pre-measurement research exactly) and a €10 minimum order size — no flat
+floor, same "percentage only" property as OKX. See
+`docs/exchanges/bitstamp.md`.
+
 **Real signup latency, first-hand (Baz, 2026-09-06):**
 - **Bybit EU**: real ID verification gates even the testnet path, reported
   as up to **3 days**, *plus* the already-documented 48h API-key-unblock
@@ -48,10 +54,11 @@ picture (e.g. a materially different tier).
   verification" — sounds much faster to get moving on, though the full
   verification completion time (after that 5-minute prep step) isn't
   confirmed yet.
-- **Bitstamp**: ID verification in progress, reported as up to 3 days —
-  same latency class as Bybit EU, despite Bitstamp's "free sandbox, no
-  funded account" framing above being about cost, not speed, same
-  distinction already made for Bybit EU.
+- **Bitstamp**: ID verification took up to 3 days — same latency class as
+  Bybit EU, despite Bitstamp's "free sandbox, no funded account" framing
+  above being about cost, not speed, same distinction already made for
+  Bybit EU. Once cleared, sandbox key generation to live calls was
+  same-day (like OKX/Saxo) — see `docs/exchanges/bitstamp.md`.
 - **Saxo**: fast — same-day signup to live `precheck` calls (see
   `docs/exchanges/saxo.md`), no multi-day ID wait reported.
 
