@@ -105,6 +105,28 @@ near the **top** of the doc, before auth/fees/anything else — a reader
 skimming should hit it first, not find it buried in a gotchas list six
 sections down.
 
+## Origin check (Israeli-ownership screen)
+
+Baz excludes Israeli companies (Plus500 was ruled out on this basis, see
+`project_broker_exchange_candidates` memory). Checked founder/origin for
+all 8 candidates 2026-09-06 — **none are Israeli**:
+
+| Exchange | Founders | Origin |
+|---|---|---|
+| Bitvavo | Tim Baardse, Jelle de Boer, Mark Nuvelstijn | Dutch |
+| Kraken | Jesse Powell | American |
+| Bybit EU | Ben Zhou | Chinese-born, HQ Singapore→Dubai |
+| Finst | Julien Vallet, Marcel Putina, Maria Gallo (ex-DEGIRO team) | Dutch/European |
+| Alpaca Europe | Yoshi Yokokawa, Hitoshi Harada | Japanese, HQ California |
+| Saxo Bank | Kim Fournais, Lars Seier Christensen | Danish (2018: partial stake sold to Geely/China, Sampo/Finland) |
+| OKX | Star Xu | Chinese, HQ now San Jose |
+| Bitstamp | Nejc Kodrič, Damijan Merlak | Slovenian (now owned by Robinhood, US) |
+
+Founder nationality is a reasonable proxy but not a legal ownership audit
+— re-check if this criterion ever needs to be airtight rather than a
+sanity check. Any *future* exchange added to this directory should get
+the same check before being treated as a live candidate.
+
 ## Tone and rigor
 
 - Dev-focused, not marketing copy. State uncertainty explicitly ("not
