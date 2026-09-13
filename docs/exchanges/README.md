@@ -17,7 +17,7 @@ exchange's entry should move toward `docs/ibkr-cost-discovery.md`'s style
 |---|---|---|---|---|---|---|
 | [bitvavo.md](bitvavo.md) | crypto | Dutch, DNB | 0.15%/0.25% | No | B | Public data open; fee-lookup likely needs a key |
 | [kraken.md](kraken.md) | crypto | MiCA (Irish entity) | disputed, 0.16-0.80% (schedule changed Jul 2026 — verify live) | No | B | Public data open; real fee tier needs auth |
-| [bybit-eu.md](bybit-eu.md) | crypto | Vienna, MiCA CASP | 0.10%/0.10% VIP0 trading fee; **plus** UTA margin — real per-coin borrow rates (BTC ~1.25%/yr, ETH ~1.99%/yr) + tiered collateral ratios, confirmed first-party | No (trading fee) | B | Free public testnet — cheapest to smoke-test |
+| [bybit-eu.md](bybit-eu.md) | crypto | Vienna, MiCA CASP | **CONFIRMED 0.10%/0.25%** (live-tested — VIP0 taker is higher than the pre-validation flat-0.10% guess); **plus** UTA margin — real per-coin borrow rates (BTC ~1.25%/yr, ETH ~1.99%/yr) + tiered collateral ratios, confirmed first-party | No (trading fee) | B | Free public testnet — **live-tested and confirmed environment-locked** (EU key rejected on `api.bybit.com`, `retCode 10003`) |
 | [finst.md](finst.md) | crypto | Dutch, AFM | advertised 0.15%, unverified | Unknown | — | **No public API** — institutional-only, deprioritized |
 | [alpaca-europe.md](alpaca-europe.md) | equities | Spain (CNMV), MiFID II | not externally set | N/A | — | **Broker-as-a-Service**, not a direct account — see doc |
 | [saxo.md](saxo.md) | equities | Amsterdam-based (DK parent), MiFID II | **CONFIRMED ~€12-13 flat** (live `precheck`, both a stock and an ETF) | **Yes — confirmed, worse than IBKR's $1** | A (hybrid) | Free self-service SIM account, no KYC — best sandbox found, but ruled out on fees |
@@ -44,12 +44,23 @@ pre-measurement research exactly) and a €10 minimum order size — no flat
 floor, same "percentage only" property as OKX. See
 `docs/exchanges/bitstamp.md`.
 
+**Bybit EU is the fourth candidate live-tested, and it's also a pass on
+fees — but the narrowest listing of the three crypto exchanges probed.**
+Live calls against the real (non-testnet) account (2026-09-13) confirmed
+0.10%/0.25% fees, no flat floor, and genuine EU/global environment-locking
+(the EU key is rejected outright on `api.bybit.com`). Universe coverage is
+the catch: only 66% of Kairos's crypto universe vs. OKX's 87% and
+Bitstamp's 79% — see `docs/exchanges/bybit-eu.md` and
+`docs/universe-expansion-candidates.md`.
+
 **Real signup latency, first-hand (Baz, 2026-09-06):**
-- **Bybit EU**: real ID verification gates even the testnet path, reported
-  as up to **3 days**, *plus* the already-documented 48h API-key-unblock
-  wait — up to ~5 days total before the API is actually usable. Contradicts
-  this doc's earlier "free demo/sandbox, no wait" framing; that was about
-  not needing a *funded* account, not about verification speed.
+- **Bybit EU**: reported as up to **3 days** at signup, but actually
+  cleared same-day — signed up 2026-09-06 10:07 UTC, standard ID
+  verification approved 23:32 UTC the same day (~13.5h), confirmed via the
+  approval email. Key creation and live validation followed same-day too
+  (2026-09-13, once Baz set up 2FA). Worth remembering as a case where the
+  platform's own worst-case estimate overshot reality, not a pattern to
+  extrapolate to other exchanges.
 - **OKX**: reported as "5 minutes to prepare your account for identity
   verification" — sounds much faster to get moving on, though the full
   verification completion time (after that 5-minute prep step) isn't

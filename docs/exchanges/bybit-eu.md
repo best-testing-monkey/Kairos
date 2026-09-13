@@ -123,26 +123,33 @@ exchange.urls['api']['public'] = 'https://api.bybit.eu'
 exchange.urls['api']['private'] = 'https://api.bybit.eu'
 ```
 
-Untested by this doc (no account yet) — verify this override actually
-routes correctly before trusting any data pulled through it; the two
-domains may diverge in listed markets, not just legal entity.
+**CONFIRMED live (2026-09-13, plain HMAC-signed REST, no ccxt) — the two
+domains are genuinely separate, not just a routing alias.** Public
+`BTCEUR` tickers differ between them (66,497.6 on `.eu` vs. 66,328.9 on
+`.com` at the same instant — separate order books/liquidity). More
+importantly: **the EU-issued key is environment-locked** — authenticated
+calls (`wallet-balance`, `fee-rate`) succeed on `api.bybit.eu`
+(`retCode: 0`) and fail on `api.bybit.com` with `retCode: 10003, "API key
+is invalid"`. Same safety property OKX/Bitstamp confirmed for their own
+sandbox-vs-production splits: a key scoped to the compliant EU entity
+cannot accidentally touch the wrong venue, even with Trade permissions.
 
 ## Fees
 
-VIP0 (no volume) spot: **0.10% maker, 0.10% taker** — flat percentage,
-no evidence of an IBKR-style flat-dollar floor (crypto exchanges generally
-don't have one; confirm via a real `get_cost_model` probe rather than
-trusting this doc). Fee drops with 30-day volume (e.g. VIP3 quoted at
-0.0625%/0.0750% on global Bybit) — Bybit EU's own schedule may differ
-slightly as a separate legal entity; the authoritative source is the
-authenticated `/v5/account/fee-rate` call, not the public help-center page.
+**CONFIRMED live (2026-09-13, real account, authenticated `/v5/account/
+fee-rate` call for `BTCEUR`): 0.10% maker / 0.25% taker.** The pre-validation
+guess of a flat 0.10%/0.10% below was wrong on the taker side — like every
+other crypto candidate surveyed, maker/taker are asymmetric, not flat. No
+IBKR-style flat-dollar floor (percentage only, confirmed not assumed). Fee
+drops with 30-day volume (e.g. VIP3 quoted at 0.0625%/0.0750% on global
+Bybit) — not reverified for the EU entity at higher tiers.
 
 ## Order size / precision
 
-Not measured — `load_markets()`'s `precision`/`limits` fields
-(`InstrumentMeta.min_tick`/`size_increment`/`min_size` in our schema) give
-this per-symbol once probed. No global minimum-notional figure found in
-research; check per-pair.
+**CONFIRMED live (2026-09-13, public `/v5/market/instruments-info`,
+`BTCEUR`)**: tick size 0.1 EUR, `minOrderQty` 0.00001 BTC, `minOrderAmt`
+1 EUR (minimum notional). Per-symbol, not a global figure — reprobe for
+other pairs before trusting these numbers elsewhere.
 
 ## Rate limits
 
@@ -154,16 +161,17 @@ live remaining quota if it ever matters.
 
 ## What's needed before this can be probed for real
 
-Signup is in progress (Baz, 2026-09-06): **real ID verification, reported
-as up to 3 days**, gates the account — *in addition to* the
-already-documented 48h API-key-unblock wait, so realistically up to ~5 days
-from signup to a usable API key, not the "free and instant" impression the
-"no funded account needed" framing earlier in this doc might give. Costs
-nothing (no funds required), but is **not the fastest** of the 4 crypto
-candidates to actually start probing against — see
-`docs/exchanges/README.md`'s "Real signup latency" note, and compare
-against OKX (reported much faster to at least begin) once that path is
-also confirmed end-to-end.
+**Done — live-tested 2026-09-13.** ID verification (standard) approved
+2026-09-06 23:32 UTC, same day as signup — much faster than the "up to 3
+days" estimate reported at signup time. A system-generated (HMAC) API key
+with Unified Trading/SPOT Trade + Convert permissions was created on the
+real (non-testnet) account and validated with real read-only calls
+(ticker, wallet-balance, fee-rate, instruments-info) — see "Fees", "Order
+size / precision", and the endpoint-gotcha section above for the confirmed
+figures. No order was placed despite the key being write-scoped (Trade
+permission is for later live execution, not this Tier-1 discovery pass).
+See `docs/universe-expansion-candidates.md`'s Bybit EU section for the
+crypto-universe coverage measurement done in the same pass.
 
 ## Sources
 
