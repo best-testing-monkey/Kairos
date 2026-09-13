@@ -130,10 +130,57 @@ narrower listing (77% vs. OKX's 87%) and mostly-illiquid long tail matter
 independently of its fee schedule — the fee comparison in
 `docs/exchanges/README.md` doesn't capture this.
 
-## Bybit EU — pending
+## Bybit EU (2026-09-13)
 
-Not yet checked; Bybit EU is also crypto, verification still pending as
-of 2026-09-06.
+Checked Kairos's full 62-symbol crypto universe against Bybit EU's public
+`GET /v5/market/instruments-info` (131 spot pairs total, quoted only in
+EUR/USDC/PLN — one call covers everything, no per-symbol lookup needed).
+
+- **41/62 (66%) are tradeable against EUR, directly or via free
+  conversion** — 12 have a direct EUR pair; the other 29 are USDC-quoted
+  only, but Bybit EU lists a genuine `USDC/EUR` spot pair (confirmed live,
+  not assumed), so USDC is itself a free EUR-conversion hop. Applied
+  `feedback_exchange_coverage_indirect_routes.md`'s rule from the start
+  this time, not as a correction afterward like Bitstamp's ZEC case.
+- **21 confirmed genuinely absent** (no pair under any of Bybit EU's 3
+  quote currencies): `ETC`, `VET`, `MKR`, `GRT`, `AXS`, `EOS`, `XTZ`,
+  `THETA`, `RUNE`, `SNX`, `ENJ`, `CHZ`, `ZEC`, `DASH`, `KAVA`, `1INCH`,
+  `LDO`, `BEAM`, `JTO`, `TON`, `USUAL`.
+- This is **narrower than both OKX (87%) and Bitstamp (79%)** — Bybit EU's
+  131-pair spot listing is much smaller than either, consistent with it
+  being the newest MiCA entity of the three and carved out of a much
+  larger global listing that EU/EEA customers can't reach.
+
+**New candidates**: checked all EUR/USDC-quoted bases outside the universe
+against live 24h turnover, same ~8,139 EUR/24h floor used for OKX/Bitstamp.
+16 cleared it; excluding `EURC` (a stablecoin, not a directional-prediction
+candidate), **15 real candidates** — 5 overlap with OKX's own candidate
+list (noted below), 10 are new-to-either-list:
+
+| Symbol | 24h EUR volume | Notes |
+|---|---|---|
+| PUMP | 320,785 | pump.fun — **also an OKX candidate** (633,421 there, more liquid there) |
+| KII | 263,664 | |
+| GROVE | 76,614 | |
+| APT | 52,422 | Aptos |
+| AERO | 44,365 | Aerodrome Finance |
+| LIT | 41,779 | Litentry |
+| GOAT | 30,787 | |
+| MNT | 29,829 | Mantle |
+| VIRTUAL | 27,291 | Virtuals Protocol — **also an OKX candidate** (17,518 there) — more liquid here |
+| TRUMP | 19,821 | political meme coin — **also an OKX candidate** (74,253 there, more liquid there) |
+| TRIA | 19,748 | |
+| SEI | 17,080 | |
+| PENGU | 15,634 | Pudgy Penguins — **also an OKX candidate** (44,500 there, more liquid there) |
+| XPL | 10,055 | **also an OKX candidate** (26,290 there, more liquid there) |
+| SPX | 9,004 | |
+
+None overlap with Bitstamp's 4 (`CASHCAT`/`ZORA`/`FET`/`HYPE`).
+
+**Practical implication**: if execution-venue selection weighs listing
+breadth, Bybit EU's spot market is the smallest of the three live-tested
+crypto exchanges so far — its case (if any) would need to rest on cost or
+API quality, not universe coverage.
 
 ## Kraken / Bitvavo — pending
 
