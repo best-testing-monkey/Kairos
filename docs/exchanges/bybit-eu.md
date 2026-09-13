@@ -62,12 +62,21 @@ active bot-blocking. Baz pasted the actual rendered content directly
 instead, which is what the table and figures above are built from — this
 is now first-party data, not secondary-source inference.
 
-**USDT is not usable as a quote currency.** Tether never sought MiCA
+**USDT is not usable as a quote currency — CONFIRMED live (2026-09-13),
+not just inferred from the MiCA rule.** Tether never sought MiCA
 authorization, and a MiCA-licensed platform cannot offer non-authorized
 stablecoins to EEA customers — so Bybit EU cannot run the USDT-quoted
-markets that dominate global Bybit. Expect EUR- or MiCA-compliant-
-stablecoin-quoted pairs instead; **don't hardcode a `/USDT` suffix when
-mapping symbols**, verify the actual quote currency via `load_markets()`.
+markets that dominate global Bybit. A full `/v5/market/instruments-info`
+sweep of all 131 spot pairs found **zero appearances of USDT anywhere**
+(base or quote) — this is a hard regulatory absence, not a coverage gap
+in how the universe/candidate checks were run. Bybit EU's only 3 quote
+currencies are **EUR, PLN, USDC**; don't hardcode a `/USDT` suffix when
+mapping symbols, verify the actual quote currency via `load_markets()`.
+**PLN adds nothing beyond EUR/USDC**: every PLN-quoted base also has a
+direct EUR and/or USDC pair (0 bases are PLN-only), and no `PLN/EUR`
+pair exists on Bybit EU anyway, so there's no conversion route through
+PLN even in principle — safe to ignore PLN entirely for coverage/candidate
+purposes.
 
 ## Auth & account setup
 
