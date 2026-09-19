@@ -152,7 +152,7 @@ this repo's existing dependency-free `GradientBoostedStumps` (`kairos_ml.py`) â€
 
 ## Epic 19 â€” Pluggable prediction-usage modes (architecture)
 
-- [ ] E19-S01 Add `prediction_usage_mode` to `OrchestratorConfig` (docs/tickets/E19-S01-prediction-usage-mode-config.md)
+- [x] E19-S01 Add `prediction_usage_mode` to `OrchestratorConfig` (docs/tickets/E19-S01-prediction-usage-mode-config.md)
 - [ ] E19-S02 `PREDICTION_USAGE_MODES` registry + `_run_day()` hook (docs/tickets/E19-S02-prediction-usage-registry-wiring.md)
 - [ ] E19-S03 Default-mode parity regression test (docs/tickets/E19-S03-prediction-usage-default-parity-test.md)
 
