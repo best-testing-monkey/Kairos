@@ -75,3 +75,17 @@ class TestOrchestratorConfigForInterval:
         """Verify explicit overrides still work alongside presets."""
         config = OrchestratorConfig.for_interval("1d", disabled_strategies={"foo"})
         assert config.disabled_strategies == {"foo"}
+
+
+class TestOrchestratorConfigPredictionUsageMode:
+    """Test OrchestratorConfig.prediction_usage_mode field."""
+
+    def test_prediction_usage_mode_default_value(self):
+        """Verify that prediction_usage_mode defaults to 'last_real_bar'."""
+        config = OrchestratorConfig()
+        assert config.prediction_usage_mode == "last_real_bar"
+
+    def test_prediction_usage_mode_constructor_kwarg(self):
+        """Verify that prediction_usage_mode can be set via constructor kwarg."""
+        config = OrchestratorConfig(prediction_usage_mode="distribution_as_bar")
+        assert config.prediction_usage_mode == "distribution_as_bar"

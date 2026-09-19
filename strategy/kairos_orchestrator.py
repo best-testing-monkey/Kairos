@@ -410,6 +410,11 @@ class OrchestratorConfig:
     # without ever touching a bar that wasn't genuinely knowable at the
     # point the trade could exist.
     naive_baseline: bool = False
+    # Prediction usage mode: controls how the predicted distribution is
+    # converted to OHLCV bars for entry/stop/target computation. Registered
+    # modes are dispatched in E19-S02; this field alone (E19-S01) is pure
+    # plumbing with no behavior change.
+    prediction_usage_mode: str = "last_real_bar"
 
     # Disabled strategies (shadow-tested and found unprofitable even with perfect predictions)
     disabled_strategies: Set[str] = field(default_factory=lambda: {
