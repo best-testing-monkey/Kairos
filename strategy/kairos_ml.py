@@ -26,13 +26,20 @@ Module 3: LPPLS Bubble Detection
   params profiled out via least squares.
 - Detects bubbles: 0.1<m<0.9, 6<ω<13, tc within (T, T+60], B<0 (super-exponential).
 - LPPLSGuardStrategy wrapper: vetoes LONG entries during bubbles, boosts SHORT.
+
+Module 4: ML Bracket Strategy (E18-S04)
+- Wrapper that selects optimal stop/target from trained per-candidate
+  GradientBoostedStumps classifiers (E18-S03).
 """
+
+import json
+import os
+import pickle
 
 import numpy as np
 import pandas as pd
 from collections import deque
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 from scipy.optimize import minimize
 
 from kairos_backtest import Strategy, Signal, Direction
@@ -1167,3 +1174,234 @@ class LPPLSGuardStrategy(Strategy):
         # Fit LPPLS
         self.last_fit = fit_lppls(log_prices, n_starts=self.n_starts, seed=self.seed)
         self.fit_count += 1
+
+
+# =============================================================================
+# ML Bracket Strategy (E18-S04)
+# =============================================================================
+
+class MLBracketStrategy(Strategy):
+    """Per-candidate stop/target selector using trained GBM classifiers.
+
+    Wraps a base strategy and, when the base emits a signal, evaluates the
+    expected value (EV) of each trained TP/SL candidate ({stop_pct, target_pct}
+    pair) via its corresponding GradientBoostedStumps classifier. Selects the
+    argmax-EV candidate and returns a new Signal with overridden stop/target.
+
+    Requires trained classifiers saved by E18-S03's `train_tpsl_model.py` at
+    `model_dir`. Raises a clear error at construction if no models are found.
+
+    Args:
+        base_strategy: Strategy instance to wrap.
+        model_dir: Path to directory containing trained models (default
+                   `data/tpsl_models/`).
+
+    Raises:
+        FileNotFoundError: If model_dir does not exist or contains no trained
+                          classifiers.
+    """
+
+    name = "ml_bracket"
+
+    def __init__(self, base_strategy: Strategy, model_dir: str = "data/tpsl_models/"):
+        self.base_strategy = base_strategy
+        self.model_dir = model_dir
+
+        # Load feature metadata
+        metadata_path = os.path.join(model_dir, "feature_metadata.json")
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(
+                f"No trained classifiers found at {model_dir}: "
+                f"missing {metadata_path}. Run train_tpsl_model.py first."
+            )
+
+        with open(metadata_path, "r") as fh:
+            metadata = json.load(fh)
+
+        self.feature_columns = metadata["feature_columns"]
+        self.asset_classes = metadata["asset_classes"]
+        self.interval_vocab = metadata["interval_vocab"]
+        self.candidates_meta = metadata["candidates"]
+
+        # Load trained classifiers
+        self.models: Dict[str, GradientBoostedStumps] = {}
+        for key in self.candidates_meta.keys():
+            model_path = os.path.join(model_dir, f"{key}.pkl")
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(
+                    f"Trained classifier not found at {model_path}. "
+                    f"Run train_tpsl_model.py first."
+                )
+            with open(model_path, "rb") as fh:
+                self.models[key] = pickle.load(fh)
+
+        if not self.models:
+            raise FileNotFoundError(
+                f"No trained classifiers found at {model_dir}. "
+                f"Run train_tpsl_model.py first."
+            )
+
+    def generate_signal(self, dist, current_price: float, history: pd.DataFrame,
+                        context: Dict[str, Any], **kwargs) -> Optional[Signal]:
+        """Generate signal via base strategy, override stop/target via ML classifiers.
+
+        Args:
+            dist: KairosDistribution (unused, available for future features)
+            current_price: Current price (entry point)
+            history: Historical OHLCV data
+            context: Context dict (must contain 'ticker' and 'interval')
+
+        Returns:
+            Signal with ML-selected stop/target, or None if base returns None or
+            feature extraction fails.
+        """
+        # Import here to avoid circular dependency (kairos_ml -> kairos_tpsl_features
+        # -> kairos_strategies -> kairos_orchestrator -> kairos_ml)
+        from kairos_tpsl_features import extract_features  # noqa: E402
+
+        # Call base strategy
+        base_sig = self.base_strategy.generate_signal(dist, current_price,
+                                                      history, context, **kwargs)
+        if base_sig is None:
+            return None
+
+        # Extract ticker and interval from context (required for extract_features)
+        ticker = context.get("ticker")
+        interval = context.get("interval")
+        if ticker is None or interval is None:
+            # Missing required context, pass through unchanged
+            return base_sig
+
+        # Extract the most recent bar's date from history
+        as_of_date = history.index[-1].date().isoformat()
+
+        # Extract features (price-history only, matching training)
+        try:
+            features = extract_features(
+                ticker=ticker,
+                as_of=as_of_date,
+                interval=interval,
+                entry=base_sig.entry,
+                history=history,
+            )
+        except ValueError:
+            # Insufficient history or other extraction failure, pass through
+            return base_sig
+
+        # Vectorize features in exact order from feature_metadata.json
+        X = self._vectorize_features(features)
+
+        # Evaluate all candidates
+        best_ev = float("-inf")
+        best_key = None
+        best_stop = None
+        best_target = None
+        best_p_win = 0.0
+
+        for key, model in self.models.items():
+            # Get stop_pct, target_pct from metadata
+            meta = self.candidates_meta[key]
+            stop_pct = meta["stop_pct"]
+            target_pct = meta["target_pct"]
+
+            # Compute absolute stop/target from base signal's entry
+            if base_sig.direction == Direction.LONG:
+                candidate_stop = base_sig.entry * (1.0 - stop_pct / 100.0)
+                candidate_target = base_sig.entry * (1.0 + target_pct / 100.0)
+            else:  # SHORT
+                candidate_stop = base_sig.entry * (1.0 + stop_pct / 100.0)
+                candidate_target = base_sig.entry * (1.0 - target_pct / 100.0)
+
+            # Predict P(win) for this candidate
+            try:
+                p_win = float(model.predict_proba(X.reshape(1, -1))[0])
+            except Exception:
+                # Model evaluation failed, skip this candidate
+                continue
+
+            # Compute EV: p_win * reward_pct - (1 - p_win) * risk_pct
+            risk_pct = abs(candidate_stop - base_sig.entry) / base_sig.entry * 100
+            reward_pct = abs(candidate_target - base_sig.entry) / base_sig.entry * 100
+            ev = p_win * reward_pct - (1.0 - p_win) * risk_pct
+
+            # Track best EV
+            if ev > best_ev:
+                best_ev = ev
+                best_key = key
+                best_stop = candidate_stop
+                best_target = candidate_target
+                best_p_win = p_win
+
+        # If no valid candidate was found, pass through unchanged
+        if best_key is None or best_stop is None or best_target is None:
+            return base_sig
+
+        # Get original stop/target for auditability
+        original_stop = base_sig.stop
+        original_target = base_sig.target
+
+        # Get original risk/reward percentages
+        orig_risk_pct = abs(original_stop - base_sig.entry) / base_sig.entry * 100
+        orig_reward_pct = abs(original_target - base_sig.entry) / base_sig.entry * 100
+
+        # Build new Signal with ML-selected brackets
+        best_risk_pct = abs(best_stop - base_sig.entry) / base_sig.entry * 100
+        best_reward_pct = abs(best_target - base_sig.entry) / base_sig.entry * 100
+
+        return Signal(
+            direction=base_sig.direction,
+            size=base_sig.size,
+            entry=base_sig.entry,
+            stop=best_stop,
+            target=best_target,
+            strategy_name=self.name,
+            confidence=base_sig.confidence,
+            expected_value=base_sig.expected_value,
+            metadata={
+                **base_sig.metadata,
+                "ml_bracket": {
+                    "original_stop": original_stop,
+                    "original_target": original_target,
+                    "original_stop_pct": orig_risk_pct,
+                    "original_target_pct": orig_reward_pct,
+                    "chosen_stop": best_stop,
+                    "chosen_target": best_target,
+                    "chosen_stop_pct": best_risk_pct,
+                    "chosen_target_pct": best_reward_pct,
+                    "predicted_p_win": best_p_win,
+                    "predicted_ev": best_ev,
+                    "candidate_key": best_key,
+                }
+            }
+        )
+
+    def _vectorize_features(self, features: Dict[str, Any]) -> np.ndarray:
+        """Convert extracted feature dict to numeric vector in feature column order.
+
+        Args:
+            features: Dict from extract_features() with keys:
+                     atr, realized_vol, asset_class, interval, trend_10, range_position
+
+        Returns:
+            1D numpy array of length len(self.feature_columns), one-hot encoded
+            for categorical features.
+        """
+        X = np.zeros(len(self.feature_columns), dtype=float)
+
+        # Map feature name -> column index
+        for col_idx, col_name in enumerate(self.feature_columns):
+            if "=" in col_name:
+                # Categorical one-hot column (e.g., "asset_class=equity")
+                category, value = col_name.split("=", 1)
+                if category == "asset_class":
+                    if features["asset_class"] == value:
+                        X[col_idx] = 1.0
+                elif category == "interval":
+                    if features["interval"] == value:
+                        X[col_idx] = 1.0
+            else:
+                # Numeric feature
+                if col_name in features:
+                    X[col_idx] = features[col_name]
+
+        return X

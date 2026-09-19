@@ -2,6 +2,8 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
 import pytest
+import json
+import pickle
 import numpy as np
 import pandas as pd
 from kairos_backtest import Direction, Signal, Strategy
@@ -712,3 +714,61 @@ class TestLPPLSGuardStrategy:
             sig = guard.generate_signal(FakeDist(), 100.0, history, {})
             assert sig is None or isinstance(sig, Signal)
             assert not isinstance(sig, dict)
+
+
+# ============================================================================
+# ML Bracket Strategy Tests
+# ============================================================================
+
+class TestMLBracketStrategy:
+
+    def test_ml_bracket_construction_missing_models_raises(self, tmp_path):
+        """Construction raises FileNotFoundError if model_dir has no trained models."""
+        from kairos_ml import MLBracketStrategy
+
+        # Empty model directory
+        (tmp_path / "empty_models").mkdir()
+
+        with pytest.raises(FileNotFoundError, match="No trained classifiers found"):
+            MLBracketStrategy(
+                base_strategy=StubStrategy(),
+                model_dir=str(tmp_path / "empty_models")
+            )
+
+    def test_ml_bracket_base_none_passthrough(self, tmp_path):
+        """Base strategy returning None passes through as None."""
+        from kairos_ml import MLBracketStrategy
+
+        # Create minimal fixture with trained models
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+
+        # Create feature metadata
+        metadata = {
+            "feature_columns": ["atr", "realized_vol", "trend_10", "range_position",
+                               "asset_class=equity", "asset_class=crypto",
+                               "asset_class=fx", "asset_class=commodity",
+                               "asset_class=mixed", "interval=1d"],
+            "asset_classes": ["equity", "crypto", "fx", "commodity", "mixed"],
+            "interval_vocab": ["1d"],
+            "candidates": {"candidate_1": {"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"}}
+        }
+        with open(model_dir / "feature_metadata.json", "w") as fh:
+            json.dump(metadata, fh)
+
+        # Create a mock classifier
+        gbm = GradientBoostedStumps(n_trees=1, lr=0.1, seed=0)
+        X_dummy = np.array([[100.0, 0.02, 0.01, 0.5, 1, 0, 0, 0, 0, 1]])
+        y_dummy = np.array([1.0])
+        gbm.fit(X_dummy, y_dummy)
+
+        with open(model_dir / "candidate_1.pkl", "wb") as fh:
+            pickle.dump(gbm, fh)
+
+        # Test with base strategy that returns None
+        strat = MLBracketStrategy(
+            base_strategy=StubStrategy(emit=False),
+            model_dir=str(model_dir)
+        )
+        sig = strat.generate_signal(FakeDist(), 100.0, make_history(), {})
+        assert sig is None
