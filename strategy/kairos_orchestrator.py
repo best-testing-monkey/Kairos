@@ -134,6 +134,11 @@ except ImportError as e:
     raise ImportError(f"Failed to import kairos_meta: {e}")
 
 try:
+    from kairos_prediction_usage import distribution_as_bar
+except ImportError as e:
+    raise ImportError(f"Failed to import kairos_prediction_usage: {e}")
+
+try:
     from kairos_crypto import (
         FundingRateArbitrage, BasisTrade, StablecoinDepeg,
         ExchangeSpreadArbitrage, LiquidationFrontRun, FundingRatePrediction,
@@ -360,6 +365,7 @@ PredictionUsageFn = Callable[["AssetPrediction"], "AssetPrediction"]
 # identity mode ("last_real_bar") returns an unchanged copy via dataclasses.replace().
 PREDICTION_USAGE_MODES: Dict[str, PredictionUsageFn] = {
     "last_real_bar": lambda pred: replace(pred),
+    "distribution_as_bar": distribution_as_bar,
 }
 
 

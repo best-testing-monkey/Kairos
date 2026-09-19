@@ -294,6 +294,43 @@ class TestRegistryLookupAndDispatch:
         assert "last_real_bar" in PREDICTION_USAGE_MODES
         assert callable(PREDICTION_USAGE_MODES["last_real_bar"])
 
+    def test_distribution_as_bar_is_registered(self):
+        """The distribution_as_bar mode must be registered in PREDICTION_USAGE_MODES."""
+        assert "distribution_as_bar" in PREDICTION_USAGE_MODES
+        assert callable(PREDICTION_USAGE_MODES["distribution_as_bar"])
+
+    def test_distribution_as_bar_via_dispatch(self):
+        """
+        Verify that distribution_as_bar mode works correctly through OrchestratorConfig
+        dispatch when the mode function is looked up and called.
+
+        Build a known AssetPrediction, apply the distribution_as_bar mode,
+        and verify that the result has the synthetic bar appended while all
+        other fields remain unchanged.
+        """
+        # Build known input prediction.
+        pred1 = make_asset_prediction("BTC-USD", current_price=100.0, seed=1)
+        original_history_len = len(pred1.history)
+        original_dist = pred1.dist
+        original_current_price = pred1.current_price
+        original_symbol = pred1.symbol
+
+        # Get the mode function from the registry.
+        mode_fn = PREDICTION_USAGE_MODES["distribution_as_bar"]
+        result = mode_fn(pred1)
+
+        # Verify the result has one more row in history.
+        assert len(result.history) == original_history_len + 1
+
+        # Verify current_price is unchanged (value equality).
+        assert result.current_price == original_current_price
+
+        # Verify dist is unchanged (same object).
+        assert result.dist is original_dist
+
+        # Verify symbol is unchanged.
+        assert result.symbol == original_symbol
+
 
 class TestBothEvaluationBranches:
     """

@@ -10,15 +10,17 @@ into the dispatcher in kairos_orchestrator.py via the PREDICTION_USAGE_MODES
 registry.
 
 Usage:
-    from kairos_prediction_usage import _build_synthetic_bar
+    from kairos_prediction_usage import _build_synthetic_bar, distribution_as_bar
 
     pred = AssetPrediction(symbol="BTC-USD", dist=dist_obj, ...)
     synth_bar = _build_synthetic_bar(pred, interval="1d")
+    pred_with_bar = distribution_as_bar(pred, interval="1d")
 """
 
 import pandas as pd
 import re
 from datetime import timedelta
+from dataclasses import replace
 
 
 def _interval_to_timedelta(interval: str) -> timedelta:
@@ -107,3 +109,36 @@ def _build_synthetic_bar(
         },
         name=next_ts,
     )
+
+
+def distribution_as_bar(pred, interval: str = "1d"):
+    """Build a synthetic bar from the distribution and append it to history.
+
+    This prediction-usage mode creates a synthetic OHLCV bar representing the
+    KairosDistribution forecast and appends it to the historical data. This
+    allows indicator-based strategies (RSI, MACD, etc.) to incorporate the
+    forecast into their calculations without strategy-level changes.
+
+    The synthetic bar represents one step into the forecast (one interval ahead
+    of the last real bar). Volume is carried forward from the last real bar
+    unchanged (v1 simplification).
+
+    Args:
+        pred: AssetPrediction object containing:
+            - dist: KairosDistribution with .stats["open"/"high"/"low"/"close"]
+            - current_price: float, unchanged on return
+            - history: pd.DataFrame with OHLCV data
+            - symbol: str, unchanged on return
+        interval: str, interval string (e.g., "1d", "1h") passed to
+                 _build_synthetic_bar. Default "1d".
+
+    Returns:
+        A new AssetPrediction with:
+        - history: original history + one synthetic bar row appended
+        - current_price: unchanged from input
+        - dist: unchanged from input
+        - symbol: unchanged from input
+    """
+    bar = _build_synthetic_bar(pred, interval)
+    new_history = pd.concat([pred.history, bar.to_frame().T])
+    return replace(pred, history=new_history)

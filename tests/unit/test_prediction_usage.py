@@ -17,7 +17,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 
-from kairos_prediction_usage import _build_synthetic_bar, _interval_to_timedelta
+from kairos_prediction_usage import _build_synthetic_bar, _interval_to_timedelta, distribution_as_bar
 
 
 @dataclass
@@ -312,3 +312,136 @@ class TestBuildSyntheticBar:
         # 1d should be 24 hours later than 1h
         time_diff = bar_1d.name - bar_1h.name
         assert time_diff == timedelta(days=1) - timedelta(hours=1)
+
+
+class TestDistributionAsBar:
+    """Tests for distribution_as_bar function."""
+
+    def _make_history_df(self, base_ts, num_rows=10):
+        """Create a mock history DataFrame."""
+        dates = pd.date_range(base_ts, periods=num_rows, freq="D")
+        return pd.DataFrame(
+            {
+                "open": np.arange(100.0, 100.0 + num_rows),
+                "high": np.arange(101.0, 101.0 + num_rows),
+                "low": np.arange(99.0, 99.0 + num_rows),
+                "close": np.arange(100.5, 100.5 + num_rows),
+                "volume": np.full(num_rows, 1000000.0),
+            },
+            index=dates,
+        )
+
+    def _make_prediction(
+        self, base_ts="2026-01-01", current_price=50000.0,
+        open_pct=50000.0, high_pct=51000.0, low_pct=49000.0, close_pct=50500.0
+    ):
+        """Helper to create a mock AssetPrediction with controlled stats."""
+        history = self._make_history_df(base_ts)
+
+        dist = MockDistribution(
+            stats={
+                "open": {"pct_50": open_pct},
+                "high": {"pct_50": high_pct},
+                "low": {"pct_50": low_pct},
+                "close": {"pct_50": close_pct},
+            },
+            df=pd.DataFrame(),
+        )
+
+        return MockAssetPrediction(
+            symbol="BTC-USD",
+            dist=dist,
+            current_price=current_price,
+            history=history,
+        )
+
+    def test_current_price_unchanged(self):
+        """distribution_as_bar should not modify current_price."""
+        pred = self._make_prediction(current_price=50000.0)
+        result = distribution_as_bar(pred, interval="1d")
+        assert result.current_price == pred.current_price
+        assert result.current_price == 50000.0
+
+    def test_dist_unchanged(self):
+        """distribution_as_bar should not modify dist."""
+        pred = self._make_prediction()
+        result = distribution_as_bar(pred, interval="1d")
+        assert result.dist is pred.dist
+
+    def test_symbol_unchanged(self):
+        """distribution_as_bar should not modify symbol."""
+        pred = self._make_prediction()
+        result = distribution_as_bar(pred, interval="1d")
+        assert result.symbol == pred.symbol
+        assert result.symbol == "BTC-USD"
+
+    def test_history_one_row_added(self):
+        """Returned history should have exactly one more row than input."""
+        pred = self._make_prediction()
+        original_len = len(pred.history)
+        result = distribution_as_bar(pred, interval="1d")
+        assert len(result.history) == original_len + 1
+
+    def test_original_history_rows_unchanged(self):
+        """All original history rows should be identical in result."""
+        pred = self._make_prediction()
+        original_history = pred.history.copy()
+        result = distribution_as_bar(pred, interval="1d")
+
+        # Check first n-1 rows match
+        for i in range(len(original_history)):
+            pd.testing.assert_series_equal(
+                result.history.iloc[i],
+                original_history.iloc[i],
+                check_names=False
+            )
+
+    def test_new_row_is_synthetic_bar(self):
+        """The appended row should be the synthetic bar."""
+        pred = self._make_prediction(
+            high_pct=51000.0, low_pct=49000.0,
+            close_pct=50500.0, current_price=50000.0
+        )
+        result = distribution_as_bar(pred, interval="1d")
+
+        new_row = result.history.iloc[-1]
+        assert new_row["open"] == 50000.0
+        assert new_row["high"] == 51000.0
+        assert new_row["low"] == 49000.0
+        assert new_row["close"] == 50500.0
+
+    def test_input_not_mutated(self):
+        """Input AssetPrediction should not be mutated."""
+        pred = self._make_prediction()
+        original_history = pred.history.copy()
+        original_len = len(pred.history)
+
+        distribution_as_bar(pred, interval="1d")
+
+        assert len(pred.history) == original_len
+        pd.testing.assert_frame_equal(pred.history, original_history)
+
+    def test_returned_is_asset_prediction(self):
+        """Return value should be an AssetPrediction (or compatible)."""
+        pred = self._make_prediction()
+        result = distribution_as_bar(pred, interval="1d")
+        assert hasattr(result, "symbol")
+        assert hasattr(result, "dist")
+        assert hasattr(result, "current_price")
+        assert hasattr(result, "history")
+
+    def test_different_intervals(self):
+        """Should work with different interval strings."""
+        pred = self._make_prediction()
+
+        result_1d = distribution_as_bar(pred, interval="1d")
+        result_1h = distribution_as_bar(pred, interval="1h")
+
+        # Both should add exactly one row
+        assert len(result_1d.history) == len(pred.history) + 1
+        assert len(result_1h.history) == len(pred.history) + 1
+
+        # But timestamps should be different
+        new_ts_1d = result_1d.history.index[-1]
+        new_ts_1h = result_1h.history.index[-1]
+        assert new_ts_1d != new_ts_1h
