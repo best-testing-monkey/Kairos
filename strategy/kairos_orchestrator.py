@@ -42,7 +42,7 @@ Usage:
 
 import pandas as pd
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Dict, Callable, Tuple, Any, Set
 from collections import defaultdict, deque
 import warnings
@@ -346,6 +346,21 @@ def _compound_equity_stats(pnl_list: List[float], initial_capital: float,
         "avg_loss": float(np.mean(losses)) if losses else 0.0,
         "final_capital": float(eq[-1]) if len(eq) > 1 else initial_capital,
     }
+
+
+# =============================================================================
+# PREDICTION USAGE MODE REGISTRY
+# =============================================================================
+
+# Type alias for prediction usage transform functions
+PredictionUsageFn = Callable[["AssetPrediction"], "AssetPrediction"]
+
+# Registry mapping mode name -> transform function. Each function takes an
+# AssetPrediction and returns a (possibly modified) AssetPrediction. The
+# identity mode ("last_real_bar") returns an unchanged copy via dataclasses.replace().
+PREDICTION_USAGE_MODES: Dict[str, PredictionUsageFn] = {
+    "last_real_bar": lambda pred: replace(pred),
+}
 
 
 @dataclass
@@ -1100,6 +1115,10 @@ class KairosOrchestrator:
                 date, histories, naive=self.config.naive_baseline)
         else:
             multi_preds = self.multi_predictor.predict_all(histories)
+
+        # 1a. Apply prediction usage mode transform
+        usage_fn = PREDICTION_USAGE_MODES[self.config.prediction_usage_mode]
+        multi_preds = {sym: usage_fn(pred) for sym, pred in multi_preds.items()}
 
         # 1b. Context enrichment computed once per day for the active universe:
         # trailing daily returns panel and per-symbol realized vol. Cheap
