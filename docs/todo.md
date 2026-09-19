@@ -130,4 +130,40 @@ supervision; everything else is safe for normal cheap-model automation.
 
 ---
 
+# Kairos ML-Conditioned TP/SL + Pluggable Prediction-Usage Modes — Implementation Todo
+
+Ordered by dependency. Check off an item only in the same commit that completes it.
+Source designs: `docs/tickets/DESIGN_DOC_ml_tpsl_optimization.md`,
+`docs/tickets/DESIGN_DOC_prediction_usage_modes_architecture.md`,
+`docs/tickets/DESIGN_DOC_prediction_usage_mode_distribution_as_bar.md`. Epic 18 (TP/SL) and
+Epics 19-20 (prediction usage modes) are independent axes and can run in parallel with each
+other — only Epic 20 depends on Epic 19 (it registers into the hook Epic 19 builds). The
+ml_tpsl_optimization design doc's model choice was corrected during breakdown from LightGBM to
+this repo's existing dependency-free `GradientBoostedStumps` (`kairos_ml.py`) — see that doc's
+§4 note dated 2026-09-19 before implementing E18.
+
+## Epic 18 — ML-conditioned stop/target placement
+
+- [ ] E18-S01 Grid-candidate hindsight labels for historical signals (docs/tickets/E18-S01-tpsl-label-grid.md)
+- [ ] E18-S02 Price-history-derived feature extraction (docs/tickets/E18-S02-tpsl-feature-extraction.md)
+- [ ] E18-S03 Train per-candidate GBM classifiers with purged CV (docs/tickets/E18-S03-tpsl-gbm-training.md)
+- [ ] E18-S04 `MLBracketStrategy` wrapper (docs/tickets/E18-S04-ml-bracket-strategy.md)
+- [ ] E18-S05 Offline comparison vs. static-percentile baseline (docs/tickets/E18-S05-tpsl-offline-validation.md)
+
+## Epic 19 — Pluggable prediction-usage modes (architecture)
+
+- [ ] E19-S01 Add `prediction_usage_mode` to `OrchestratorConfig` (docs/tickets/E19-S01-prediction-usage-mode-config.md)
+- [ ] E19-S02 `PREDICTION_USAGE_MODES` registry + `_run_day()` hook (docs/tickets/E19-S02-prediction-usage-registry-wiring.md)
+- [ ] E19-S03 Default-mode parity regression test (docs/tickets/E19-S03-prediction-usage-default-parity-test.md)
+
+## Epic 20 — `distribution_as_bar` prediction usage mode
+
+- [ ] E20-S01 `_build_synthetic_bar()` construction function (docs/tickets/E20-S01-synthetic-bar-builder.md)
+- [ ] E20-S02 `distribution_as_bar` mode function + registration (docs/tickets/E20-S02-distribution-as-bar-mode.md)
+- [ ] E20-S03 No-lookahead test (docs/tickets/E20-S03-distribution-as-bar-no-lookahead-test.md)
+- [ ] E20-S04 Indicator sensitivity + no-effect tests (docs/tickets/E20-S04-distribution-as-bar-indicator-sensitivity-test.md)
+- [ ] E20-S05 Offline comparison vs. `last_real_bar` mode (docs/tickets/E20-S05-distribution-as-bar-offline-comparison.md)
+
+---
+
 See `docs/tickets/APPENDIX-A-standards.md` for code style, test conventions, and commit rules that apply to every story.
