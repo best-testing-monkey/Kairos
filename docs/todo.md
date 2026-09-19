@@ -146,7 +146,7 @@ this repo's existing dependency-free `GradientBoostedStumps` (`kairos_ml.py`) â€
 
 - [x] E18-S01 Grid-candidate hindsight labels for historical signals (docs/tickets/E18-S01-tpsl-label-grid.md)
 - [x] E18-S02 Price-history-derived feature extraction (docs/tickets/E18-S02-tpsl-feature-extraction.md)
-- [ ] E18-S03 Train per-candidate GBM classifiers with purged CV (docs/tickets/E18-S03-tpsl-gbm-training.md)
+- [x] E18-S03 Train per-candidate GBM classifiers with purged CV (docs/tickets/E18-S03-tpsl-gbm-training.md)
 - [ ] E18-S04 `MLBracketStrategy` wrapper (docs/tickets/E18-S04-ml-bracket-strategy.md)
 - [ ] E18-S05 Offline comparison vs. static-percentile baseline (docs/tickets/E18-S05-tpsl-offline-validation.md)
 
