@@ -158,7 +158,7 @@ this repo's existing dependency-free `GradientBoostedStumps` (`kairos_ml.py`) â€
 
 ## Epic 20 â€” `distribution_as_bar` prediction usage mode
 
-- [ ] E20-S01 `_build_synthetic_bar()` construction function (docs/tickets/E20-S01-synthetic-bar-builder.md)
+- [x] E20-S01 `_build_synthetic_bar()` construction function (docs/tickets/E20-S01-synthetic-bar-builder.md)
 - [ ] E20-S02 `distribution_as_bar` mode function + registration (docs/tickets/E20-S02-distribution-as-bar-mode.md)
 - [ ] E20-S03 No-lookahead test (docs/tickets/E20-S03-distribution-as-bar-no-lookahead-test.md)
 - [ ] E20-S04 Indicator sensitivity + no-effect tests (docs/tickets/E20-S04-distribution-as-bar-indicator-sensitivity-test.md)
