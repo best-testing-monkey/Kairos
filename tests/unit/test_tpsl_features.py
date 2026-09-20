@@ -8,6 +8,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
+import math
 import numpy as np
 import pandas as pd
 import pytest
@@ -388,6 +389,156 @@ class TestReturnDictShape:
 
         assert isinstance(features["asset_class"], str)
         assert isinstance(features["interval"], str)
+
+
+class TestTimezoneHandling:
+    """E21-S04: Timezone-aware history handling (no crash on tz-aware index)."""
+
+    def test_tz_aware_history_no_crash(self):
+        """History with tz-aware index does not crash on comparison."""
+        history_naive = _historical_prices()
+        # Convert to tz-aware (America/New_York)
+        history_aware = history_naive.copy()
+        history_aware.index = history_aware.index.tz_localize("America/New_York")
+
+        date = history_aware.index[30]
+        as_of_str = date.strftime("%Y-%m-%d")
+
+        # Should not raise TypeError on tz-aware comparison
+        features = extract_features(
+            ticker="AAPL",
+            as_of=as_of_str,
+            interval="1d",
+            entry=100.0,
+            history=history_aware,
+        )
+
+        assert "atr" in features
+        assert "realized_vol" in features
+
+    def test_tz_aware_no_lookahead_invariant(self):
+        """No-lookahead invariant preserved for tz-aware history."""
+        history_naive = _historical_prices()
+        # Convert to tz-aware (UTC)
+        history_aware = history_naive.copy()
+        history_aware.index = history_aware.index.tz_localize("UTC")
+
+        date_aware = history_aware.index[30]
+        as_of_str = date_aware.strftime("%Y-%m-%d")
+
+        # Truncate at position 30
+        history_truncated = history_aware[history_aware.index <= date_aware]
+
+        # Extended version with extra bars
+        history_extended = history_aware.copy()
+
+        features_truncated = extract_features(
+            ticker="AAPL",
+            as_of=as_of_str,
+            interval="1d",
+            entry=100.0,
+            history=history_truncated,
+        )
+
+        features_extended = extract_features(
+            ticker="AAPL",
+            as_of=as_of_str,
+            interval="1d",
+            entry=100.0,
+            history=history_extended,
+        )
+
+        # All numeric values must be byte-identical
+        for key in ["atr", "realized_vol", "trend_10", "range_position"]:
+            assert features_truncated[key] == features_extended[key], (
+                f"Lookahead leak on tz-aware with {key}: "
+                f"truncated={features_truncated[key]}, "
+                f"extended={features_extended[key]}"
+            )
+
+
+class TestFlatRangeGuard:
+    """E21-S04: Division-by-zero guard for flat 20-bar range."""
+
+    def test_flat_range_returns_sentinel(self):
+        """Flat range (high==low) returns 0.5, not NaN or inf."""
+        # Create 25 bars with truly identical OHLC (high == low == close)
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        flat_history = pd.DataFrame(
+            {
+                "open": [100.0] * 25,
+                "high": [100.0] * 25,
+                "low": [100.0] * 25,
+                "close": [100.0] * 25,
+                "volume": [1000.0] * 25,
+            },
+            index=idx,
+        )
+        date = flat_history.index[-1]
+
+        features = extract_features(
+            ticker="TEST",
+            as_of=date.strftime("%Y-%m-%d"),
+            interval="1d",
+            entry=100.0,
+            history=flat_history,
+        )
+
+        # Should return 0.5 (sentinel for degenerate range)
+        assert features["range_position"] == 0.5
+        # Verify it's not NaN or inf
+        assert not math.isnan(features["range_position"])
+        assert not math.isinf(features["range_position"])
+
+    def test_near_flat_range_defined_value(self):
+        """Near-flat range (diff < epsilon) returns 0.5."""
+        # Create history with near-identical OHLC (within epsilon of zero range)
+        idx = pd.date_range("2024-01-01", periods=25, freq="D")
+        # Create values where high - low is smaller than epsilon
+        near_flat_history = pd.DataFrame(
+            {
+                "open": [100.0 + 1e-10] * 25,
+                "high": [100.0 + 2e-10] * 25,  # Difference of 1e-10 from open
+                "low": [100.0] * 25,  # Difference of 1e-10 from open
+                "close": [100.0 + 1e-10] * 25,
+                "volume": [1000.0] * 25,
+            },
+            index=idx,
+        )
+        date = near_flat_history.index[-1]
+
+        features = extract_features(
+            ticker="TEST",
+            as_of=date.strftime("%Y-%m-%d"),
+            interval="1d",
+            entry=100.0,
+            history=near_flat_history,
+        )
+
+        # Should return 0.5 (degenerate range)
+        assert features["range_position"] == 0.5
+        assert not math.isnan(features["range_position"])
+        assert not math.isinf(features["range_position"])
+
+    def test_normal_range_unchanged(self):
+        """Normal (non-flat) range still computes correctly."""
+        history = _historical_prices()
+        date = history.index[-1]
+
+        features = extract_features(
+            ticker="TEST",
+            as_of=date.strftime("%Y-%m-%d"),
+            interval="1d",
+            entry=100.0,
+            history=history,
+        )
+
+        # Normal range should be in [0, 1]
+        assert 0.0 <= features["range_position"] <= 1.0
+        # And should NOT be the sentinel value 0.5 (extremely unlikely to be exact)
+        # (only checking it's not obviously pathological)
+        assert not math.isnan(features["range_position"])
+        assert not math.isinf(features["range_position"])
 
 
 if __name__ == "__main__":

@@ -47,7 +47,17 @@ def extract_features(
         ValueError: if history has fewer bars than required for largest lookback window.
     """
     # Truncate history to as_of to ensure no lookahead (no-lookahead guarantee)
+    # Normalize as_of's tz-awareness to match history.index to avoid comparison crash
     as_of_date = pd.Timestamp(as_of)
+    if isinstance(history.index, pd.DatetimeIndex) and history.index.tz is not None:
+        # history.index is tz-aware: localize/convert as_of to match
+        if as_of_date.tz is None:
+            # Assume UTC if as_of is naive; convert to match history's tz
+            as_of_date = as_of_date.tz_localize("UTC").tz_convert(history.index.tz)
+        else:
+            # as_of is already aware; convert to match history's tz
+            as_of_date = as_of_date.tz_convert(history.index.tz)
+    # else: both are naive, comparison is safe
     history_truncated = history[history.index <= as_of_date]
 
     if len(history_truncated) < 21:  # Need 21 bars: 20 for realized_vol + 1 base
@@ -82,9 +92,14 @@ def extract_features(
 
     # ===== Position within 20-bar range =====
     # (close[-1] - low[-20:]) / (high[-20:] - low[-20:])
+    # Guard against zero denominator: if high==low (flat/halted instrument), return 0.5
     recent_high = np.max(highs[-20:])
     recent_low = np.min(lows[-20:])
-    range_position = (closes[-1] - recent_low) / (recent_high - recent_low)
+    range_diff = recent_high - recent_low
+    if range_diff < 1e-9:  # Effectively zero (covers floating-point precision)
+        range_position = 0.5  # Sentinel: middle of degenerate range
+    else:
+        range_position = (closes[-1] - recent_low) / range_diff
 
     return {
         "atr": float(atr_val),
