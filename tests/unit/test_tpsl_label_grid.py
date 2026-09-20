@@ -524,3 +524,151 @@ class TestPriceCacheConfiguration:
             tpsl_module.price_cache.configure = original_configure
             tpsl_module.price_cache.get_price_data = original_get_price
             conn.close()
+
+
+class TestResumeLogic:
+    """Test that the resume query correctly handles partial coverage."""
+
+    def test_partial_coverage_resumed(self):
+        """Resume should re-process a signal with only 2 of 9 candidates written.
+
+        Simulates an interrupted run: signal has 2 of 9 candidate rows already
+        persisted for the current engine_version. The resume query should
+        include this signal in uncovered_signals, so remaining 7 candidates
+        get computed.
+        """
+        db_path, conn = _setup_test_db()
+
+        # Create a signal
+        signal_id = "partial_coverage"
+        ticker = "TEST"
+        entry = 100.0
+        as_of = "2026-01-01T09:30:00"
+        _insert_signal(conn, signal_id, ticker, "long", "1d", as_of, entry, 90.0, 175.0)
+
+        # Pre-populate 2 of 9 candidates (simulating interrupted run)
+        import scripts.tpsl_label_grid as tpsl_module
+        engine_version = tpsl_module.ENGINE_VERSION
+        computed_at = datetime.now(timezone.utc).isoformat()
+
+        conn.execute(
+            """
+            INSERT INTO tpsl_label_candidates (
+                signal_id, stop_pct, target_pct, resolved, hit_target_first,
+                interval_used, engine_version, computed_at
+            ) VALUES (?, ?, ?, 1, 1, '1d', ?, ?)
+            """,
+            (signal_id, 10.0, 75.0, engine_version, computed_at)
+        )
+        conn.execute(
+            """
+            INSERT INTO tpsl_label_candidates (
+                signal_id, stop_pct, target_pct, resolved, hit_target_first,
+                interval_used, engine_version, computed_at
+            ) VALUES (?, ?, ?, 1, 0, '1d', ?, ?)
+            """,
+            (signal_id, 15.0, 85.0, engine_version, computed_at)
+        )
+        conn.commit()
+
+        # Verify only 2 rows exist for this signal
+        count_before = conn.execute(
+            "SELECT COUNT(*) FROM tpsl_label_candidates WHERE signal_id=?",
+            (signal_id,)
+        ).fetchone()[0]
+        assert count_before == 2, f"Expected 2 initial rows, got {count_before}"
+
+        # Test the resume query
+        expected_grid_size = len(tpsl_module.STOP_PCT_GRID) * len(tpsl_module.TARGET_PCT_GRID)
+        cursor = conn.execute(
+            """
+            SELECT DISTINCT s.signal_id, s.ticker, s.direction, s.entry, s.as_of
+            FROM papertrade_signals s
+            LEFT JOIN (
+                SELECT signal_id
+                FROM tpsl_label_candidates
+                WHERE engine_version = ?
+                GROUP BY signal_id
+                HAVING COUNT(*) = ?
+            ) c ON s.signal_id = c.signal_id
+            WHERE c.signal_id IS NULL
+            ORDER BY s.as_of
+            """,
+            (engine_version, expected_grid_size)
+        )
+        uncovered = cursor.fetchall()
+
+        # Signal with only 2 of 9 rows should be in uncovered list
+        signal_ids = [row[0] for row in uncovered]
+        assert signal_id in signal_ids, \
+            f"Signal {signal_id} should be in uncovered list (only 2 of {expected_grid_size} rows)"
+
+        conn.close()
+
+    def test_full_coverage_skipped(self):
+        """Resume should skip a signal with all 9 candidates already written.
+
+        Verifies that a fully-covered signal is NOT included in uncovered_signals,
+        confirming no wasted recomputation.
+        """
+        db_path, conn = _setup_test_db()
+
+        # Create a signal
+        signal_id = "full_coverage"
+        ticker = "TEST"
+        entry = 100.0
+        as_of = "2026-01-01T09:30:00"
+        _insert_signal(conn, signal_id, ticker, "long", "1d", as_of, entry, 90.0, 175.0)
+
+        # Pre-populate ALL 9 candidates
+        import scripts.tpsl_label_grid as tpsl_module
+        engine_version = tpsl_module.ENGINE_VERSION
+        computed_at = datetime.now(timezone.utc).isoformat()
+
+        for stop_pct in tpsl_module.STOP_PCT_GRID:
+            for target_pct in tpsl_module.TARGET_PCT_GRID:
+                conn.execute(
+                    """
+                    INSERT INTO tpsl_label_candidates (
+                        signal_id, stop_pct, target_pct, resolved, hit_target_first,
+                        interval_used, engine_version, computed_at
+                    ) VALUES (?, ?, ?, 1, 1, '1d', ?, ?)
+                    """,
+                    (signal_id, stop_pct, target_pct, engine_version, computed_at)
+                )
+        conn.commit()
+
+        # Verify all 9 rows exist for this signal
+        count_before = conn.execute(
+            "SELECT COUNT(*) FROM tpsl_label_candidates WHERE signal_id=?",
+            (signal_id,)
+        ).fetchone()[0]
+        expected_grid_size = len(tpsl_module.STOP_PCT_GRID) * len(tpsl_module.TARGET_PCT_GRID)
+        assert count_before == expected_grid_size, \
+            f"Expected {expected_grid_size} rows, got {count_before}"
+
+        # Test the resume query
+        cursor = conn.execute(
+            """
+            SELECT DISTINCT s.signal_id, s.ticker, s.direction, s.entry, s.as_of
+            FROM papertrade_signals s
+            LEFT JOIN (
+                SELECT signal_id
+                FROM tpsl_label_candidates
+                WHERE engine_version = ?
+                GROUP BY signal_id
+                HAVING COUNT(*) = ?
+            ) c ON s.signal_id = c.signal_id
+            WHERE c.signal_id IS NULL
+            ORDER BY s.as_of
+            """,
+            (engine_version, expected_grid_size)
+        )
+        uncovered = cursor.fetchall()
+
+        # Signal with full coverage should NOT be in uncovered list
+        signal_ids = [row[0] for row in uncovered]
+        assert signal_id not in signal_ids, \
+            f"Fully-covered signal {signal_id} should NOT be in uncovered list"
+
+        conn.close()

@@ -266,17 +266,24 @@ def main():
     # Configure price_cache
     _ensure_configured_db(args.db)
 
-    # Query signals not yet fully covered for current engine_version
+    # Query signals not yet fully covered for current engine_version.
+    # Only treat a signal as covered when it has a row for EVERY grid candidate.
+    expected_grid_size = len(STOP_PCT_GRID) * len(TARGET_PCT_GRID)
     cursor = conn.execute(
         """
         SELECT DISTINCT s.signal_id, s.ticker, s.direction, s.entry, s.as_of
         FROM papertrade_signals s
-        LEFT JOIN tpsl_label_candidates c
-            ON s.signal_id = c.signal_id AND c.engine_version = ?
+        LEFT JOIN (
+            SELECT signal_id
+            FROM tpsl_label_candidates
+            WHERE engine_version = ?
+            GROUP BY signal_id
+            HAVING COUNT(*) = ?
+        ) c ON s.signal_id = c.signal_id
         WHERE c.signal_id IS NULL
         ORDER BY s.as_of
         """,
-        (ENGINE_VERSION,)
+        (ENGINE_VERSION, expected_grid_size)
     )
 
     uncovered_signals = cursor.fetchall()
