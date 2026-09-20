@@ -99,12 +99,33 @@ def _build_synthetic_bar(
     step = _interval_to_timedelta(interval)
     next_ts = last_ts + step
 
+    # Compute OHLC from independent per-column percentiles.
+    # Each of high, low, close is a marginal percentile, not a jointly sampled
+    # value from one simulated path. Given high-kurtosis sample noise in token
+    # sampling (see CLAUDE.md "Kurtosis filter threshold"), independent
+    # percentiles can yield high < low or close outside [low, high].
+    # Reconcile by taking max(all OHLC) for high and min(all OHLC) for low,
+    # then clamp close into [low, high]. This is a deliberate approximation
+    # that preserves the independent percentile values when they're already
+    # consistent (a no-op on well-formed input).
+    open_val = pred.current_price
+    high_val = s["high"]["pct_50"]
+    low_val = s["low"]["pct_50"]
+    close_val = s["close"]["pct_50"]
+
+    # Reconcile high and low to ensure valid OHLC bar structure.
+    high_val = max(open_val, high_val, low_val, close_val)
+    low_val = min(open_val, high_val, low_val, close_val)
+
+    # Clamp close into the valid range [low, high].
+    close_val = max(low_val, min(close_val, high_val))
+
     return pd.Series(
         {
-            "open": pred.current_price,
-            "high": s["high"]["pct_50"],
-            "low": s["low"]["pct_50"],
-            "close": s["close"]["pct_50"],
+            "open": open_val,
+            "high": high_val,
+            "low": low_val,
+            "close": close_val,
             "volume": pred.history.iloc[-1]["volume"],
         },
         name=next_ts,

@@ -313,6 +313,138 @@ class TestBuildSyntheticBar:
         time_diff = bar_1d.name - bar_1h.name
         assert time_diff == timedelta(days=1) - timedelta(hours=1)
 
+    def test_adversarial_high_less_than_low(self):
+        """Test with adversarial stats where high < low before reconciliation.
+
+        This tests the case where independent per-column percentiles violate
+        the OHLC invariant: high_pct_50 < low_pct_50. The reconciliation
+        should ensure the returned bar satisfies low <= high.
+        """
+        history = self._make_history_df("2026-01-01")
+        dist = MockDistribution(
+            stats={
+                "open": {"pct_50": 100.0},
+                "high": {"pct_50": 95.0},   # Adversarial: high < low
+                "low": {"pct_50": 105.0},   # Adversarial: low > high
+                "close": {"pct_50": 100.0},
+            },
+            df=pd.DataFrame(),
+        )
+        pred = MockAssetPrediction(
+            symbol="BTC-USD",
+            dist=dist,
+            current_price=100.0,
+            history=history,
+        )
+
+        bar = _build_synthetic_bar(pred, interval="1d")
+
+        # After reconciliation, high should be >= low.
+        assert bar["high"] >= bar["low"], \
+            f"Invariant violated: high={bar['high']} < low={bar['low']}"
+        # Close should be within [low, high].
+        assert bar["low"] <= bar["close"] <= bar["high"], \
+            f"Close {bar['close']} outside [{bar['low']}, {bar['high']}]"
+
+    def test_adversarial_close_outside_range(self):
+        """Test with adversarial stats where close falls outside [low, high].
+
+        This tests the case where the independent close percentile falls
+        outside the range [low_pct_50, high_pct_50]. The reconciliation
+        should clamp close into the valid range.
+        """
+        history = self._make_history_df("2026-01-01")
+        dist = MockDistribution(
+            stats={
+                "open": {"pct_50": 100.0},
+                "high": {"pct_50": 110.0},
+                "low": {"pct_50": 90.0},
+                "close": {"pct_50": 120.0},  # Adversarial: close > high
+            },
+            df=pd.DataFrame(),
+        )
+        pred = MockAssetPrediction(
+            symbol="BTC-USD",
+            dist=dist,
+            current_price=100.0,
+            history=history,
+        )
+
+        bar = _build_synthetic_bar(pred, interval="1d")
+
+        # Close should be clamped into [low, high].
+        assert bar["low"] <= bar["close"] <= bar["high"], \
+            f"Close {bar['close']} outside [{bar['low']}, {bar['high']}]"
+        # High should remain at least 110.0 from the original high percentile.
+        assert bar["high"] >= 110.0
+
+    def test_adversarial_all_inverted(self):
+        """Test with all percentiles inverted: high < low < close.
+
+        This tests the extreme case where the independent percentiles are
+        completely out of order. The reconciliation should still produce
+        a valid OHLC bar.
+        """
+        history = self._make_history_df("2026-01-01")
+        dist = MockDistribution(
+            stats={
+                "open": {"pct_50": 100.0},
+                "high": {"pct_50": 80.0},   # Inverted
+                "low": {"pct_50": 120.0},  # Inverted
+                "close": {"pct_50": 90.0},
+            },
+            df=pd.DataFrame(),
+        )
+        pred = MockAssetPrediction(
+            symbol="BTC-USD",
+            dist=dist,
+            current_price=100.0,
+            history=history,
+        )
+
+        bar = _build_synthetic_bar(pred, interval="1d")
+
+        # All invariants must hold after reconciliation.
+        assert bar["low"] <= bar["open"] <= bar["high"], \
+            f"Open {bar['open']} not in [{bar['low']}, {bar['high']}]"
+        assert bar["low"] <= bar["close"] <= bar["high"], \
+            f"Close {bar['close']} not in [{bar['low']}, {bar['high']}]"
+        assert bar["low"] <= bar["high"], \
+            f"Invariant violated: low={bar['low']} > high={bar['high']}"
+
+    def test_well_formed_input_unchanged(self):
+        """Test that well-formed input (already consistent percentiles) is unaffected.
+
+        This verifies the reconciliation is a no-op when high > low and
+        close is within [low, high]. The returned bar should have exactly
+        the same values as the input percentiles.
+        """
+        history = self._make_history_df("2026-01-01")
+        # Use values that are already consistent.
+        dist = MockDistribution(
+            stats={
+                "open": {"pct_50": 100.0},
+                "high": {"pct_50": 110.0},
+                "low": {"pct_50": 90.0},
+                "close": {"pct_50": 105.0},
+            },
+            df=pd.DataFrame(),
+        )
+        pred = MockAssetPrediction(
+            symbol="BTC-USD",
+            dist=dist,
+            current_price=100.0,
+            history=history,
+        )
+
+        bar = _build_synthetic_bar(pred, interval="1d")
+
+        # Verify no change: values should match input percentiles exactly.
+        assert bar["open"] == 100.0
+        assert bar["high"] == 110.0
+        assert bar["low"] == 90.0
+        assert bar["close"] == 105.0
+
 
 class TestDistributionAsBar:
     """Tests for distribution_as_bar function."""
