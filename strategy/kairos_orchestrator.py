@@ -52,6 +52,8 @@ from datetime import datetime
 
 from tqdm import tqdm
 
+from kairos.errors import ConfigError
+
 warnings.filterwarnings("ignore")
 
 # =============================================================================
@@ -357,14 +359,33 @@ def _compound_equity_stats(pnl_list: List[float], initial_capital: float,
 # PREDICTION USAGE MODE REGISTRY
 # =============================================================================
 
-# Type alias for prediction usage transform functions
-PredictionUsageFn = Callable[["AssetPrediction"], "AssetPrediction"]
+# Type alias for prediction usage transform functions. The second argument is
+# the orchestrator's real bar interval (e.g. "1d", "1h") -- E21-S01: dispatch
+# must pass this through so a mode like distribution_as_bar can advance its
+# synthetic bar's timestamp by one real interval-step instead of silently
+# defaulting to "1d" on every non-daily backtest.
+PredictionUsageFn = Callable[["AssetPrediction", str], "AssetPrediction"]
+
+
+def _last_real_bar(pred: "AssetPrediction", interval: str = "1d") -> "AssetPrediction":
+    """Identity prediction-usage mode: returns an unchanged copy of `pred`.
+
+    Ignores `interval` -- it has nothing to advance a timestamp by, unlike
+    distribution_as_bar. The default keeps pre-E21-S01 single-arg callers
+    (`_last_real_bar(pred)`) working unchanged. A plain function rather than
+    a lambda because mypy cannot infer a lambda's parameter types when it has
+    a default value assigned into a Dict[str, PredictionUsageFn] context.
+    """
+    return replace(pred)
+
 
 # Registry mapping mode name -> transform function. Each function takes an
-# AssetPrediction and returns a (possibly modified) AssetPrediction. The
-# identity mode ("last_real_bar") returns an unchanged copy via dataclasses.replace().
+# AssetPrediction and the active interval string, and returns a (possibly
+# modified) AssetPrediction. The identity mode ("last_real_bar") ignores the
+# interval and returns an unchanged copy via dataclasses.replace(); its
+# `interval` param has a default so existing single-arg callers still work.
 PREDICTION_USAGE_MODES: Dict[str, PredictionUsageFn] = {
-    "last_real_bar": lambda pred: replace(pred),
+    "last_real_bar": _last_real_bar,
     "distribution_as_bar": distribution_as_bar,
 }
 
@@ -446,6 +467,35 @@ class OrchestratorConfig:
         "cross_asset_momentum_transfer", "momentum_continuation",
         "trend_following", "open_gap",
     })
+
+    def __post_init__(self) -> None:
+        """E21-S01: reject naive_baseline + a non-identity prediction_usage_mode.
+
+        naive_baseline exists to prove a strategy needs no future information:
+        _make_realized_predictions(naive=True) withholds the real last bar and
+        _run_day excludes it from context_histories/returns_window/realized_vol
+        for exactly that reason (see CLAUDE.md's "Oracle vs. naive-baseline
+        modes"). A non-identity prediction_usage_mode like distribution_as_bar
+        re-appends an approximation of that same withheld bar into
+        pred.history *before* context_histories is computed, so it leaks right
+        back in through a second, uncomposed path -- reopening the exact
+        lookahead bug this project has already fixed twice. The combination
+        isn't meaningful in the first place (re-injecting a guess at the bar
+        naive is supposed to be blind to defeats the point of naive mode by
+        construction), so it's rejected here, at construction, rather than
+        silently computed wrong.
+        """
+        if self.naive_baseline and self.prediction_usage_mode != "last_real_bar":
+            raise ConfigError(
+                "OrchestratorConfig(naive_baseline=True) is incompatible with "
+                f"prediction_usage_mode={self.prediction_usage_mode!r}. naive_baseline "
+                "withholds the real last bar specifically so a strategy can't see it; "
+                "a non-identity prediction_usage_mode (e.g. distribution_as_bar) "
+                "re-appends an approximation of that same withheld bar into history, "
+                "leaking it back into context_histories/returns_window/realized_vol. "
+                "Use prediction_usage_mode='last_real_bar' (the default) with "
+                "naive_baseline=True, or set naive_baseline=False."
+            )
 
     @classmethod
     def for_interval(cls, interval: str, **overrides) -> "OrchestratorConfig":
@@ -1122,9 +1172,14 @@ class KairosOrchestrator:
         else:
             multi_preds = self.multi_predictor.predict_all(histories)
 
-        # 1a. Apply prediction usage mode transform
+        # 1a. Apply prediction usage mode transform. Pass the orchestrator's
+        # real bar interval (E21-S01) -- without it, distribution_as_bar's
+        # interval="1d" default silently applied on every backtest, corrupting
+        # bar spacing (RSI/MACD/ATR) on any non-daily interval. KairosSettings.interval
+        # is the same source of truth __init__/_compute_shadow_performance/
+        # _build_results already use for "the real interval" in this class.
         usage_fn = PREDICTION_USAGE_MODES[self.config.prediction_usage_mode]
-        multi_preds = {sym: usage_fn(pred) for sym, pred in multi_preds.items()}
+        multi_preds = {sym: usage_fn(pred, KairosSettings.interval) for sym, pred in multi_preds.items()}
 
         # 1b. Context enrichment computed once per day for the active universe:
         # trailing daily returns panel and per-symbol realized vol. Cheap
