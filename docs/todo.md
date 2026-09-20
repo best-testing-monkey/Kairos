@@ -181,7 +181,7 @@ E21-S01 and E21-S06 involve real design judgment (not mechanical fixes) and are 
 - [x] E21-S03 Fix `tpsl_label_grid.py`'s partial-coverage resume bug (docs/tickets/E21-S03-fix-tpsl-label-grid-resume-logic.md)
 - [x] E21-S04 Fix `kairos_tpsl_features.py`: timezone crash + division-by-zero (docs/tickets/E21-S04-fix-tpsl-features-tz-and-zero-guard.md)
 - [x] E21-S05 Fix `_build_synthetic_bar()`'s OHLC-consistency gap (docs/tickets/E21-S05-fix-synthetic-bar-ohlc-consistency.md)
-- [ ] E21-S06 Fix `MLBracketStrategy` correctness bugs + add real test coverage (docs/tickets/E21-S06-fix-ml-bracket-strategy-correctness-and-tests.md)
+- [x] E21-S06 Fix `MLBracketStrategy` correctness bugs + add real test coverage (docs/tickets/E21-S06-fix-ml-bracket-strategy-correctness-and-tests.md)
 
 ---
 
