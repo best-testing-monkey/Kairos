@@ -1195,6 +1195,14 @@ class MLBracketStrategy(Strategy):
         base_strategy: Strategy instance to wrap.
         model_dir: Path to directory containing trained models (default
                    `data/tpsl_models/`).
+        interval: Bar interval string (e.g. "1d", "1h") this strategy instance
+                  is evaluating. Passed at construction rather than read from
+                  context -- no real context builder (kairos_orchestrator.py's
+                  `_run_day`, kairos_signals.py's `_build_context`) ever sets
+                  an "interval" key, and the interval is fixed per
+                  orchestrator run anyway (unlike ticker, which varies call to
+                  call and IS available from context -- see `current_symbol`
+                  below).
 
     Raises:
         FileNotFoundError: If model_dir does not exist or contains no trained
@@ -1203,9 +1211,11 @@ class MLBracketStrategy(Strategy):
 
     name = "ml_bracket"
 
-    def __init__(self, base_strategy: Strategy, model_dir: str = "data/tpsl_models/"):
+    def __init__(self, base_strategy: Strategy, model_dir: str = "data/tpsl_models/",
+                 interval: str = "1d"):
         self.base_strategy = base_strategy
         self.model_dir = model_dir
+        self.interval = interval
 
         # Load feature metadata
         metadata_path = os.path.join(model_dir, "feature_metadata.json")
@@ -1249,7 +1259,13 @@ class MLBracketStrategy(Strategy):
             dist: KairosDistribution (unused, available for future features)
             current_price: Current price (entry point)
             history: Historical OHLCV data
-            context: Context dict (must contain 'ticker' and 'interval')
+            context: Context dict. Must contain "current_symbol" (the ticker
+                     key every real context builder actually sets -- neither
+                     kairos_orchestrator.py's `_run_day` nor kairos_signals.py's
+                     `_build_context` ever sets a "ticker" key). "date", if
+                     present, is used as the feature-extraction as-of date
+                     (see below); interval comes from `self.interval`, not
+                     context.
 
         Returns:
             Signal with ML-selected stop/target, or None if base returns None or
@@ -1265,22 +1281,51 @@ class MLBracketStrategy(Strategy):
         if base_sig is None:
             return None
 
-        # Extract ticker and interval from context (required for extract_features)
-        ticker = context.get("ticker")
-        interval = context.get("interval")
-        if ticker is None or interval is None:
+        # Only LONG/SHORT signals have a directional bracket to optimize.
+        # Several base strategies (kairos_crypto.py, kairos_forex.py,
+        # kairos_meta.py, kairos_path.py) return an explicit Direction.FLAT
+        # Signal rather than None. Scoring FLAT with the SHORT-branch stop/
+        # target formula below would stamp a nonsensical bracket into the
+        # metadata even though direction stays FLAT -- skip ML selection
+        # entirely and pass through unchanged, same as the missing-context
+        # fallback below. This check must run before the context lookup so a
+        # FLAT signal always passes through regardless of context contents.
+        if base_sig.direction not in (Direction.LONG, Direction.SHORT):
+            return base_sig
+
+        # Ticker from context: "current_symbol" is the key every real context
+        # builder sets; "ticker" (the old key) is never set by either, so
+        # reading that would silently never fire once this strategy is
+        # registered live (context.get would always be None).
+        ticker = context.get("current_symbol")
+        if ticker is None:
             # Missing required context, pass through unchanged
             return base_sig
 
-        # Extract the most recent bar's date from history
-        as_of_date = history.index[-1].date().isoformat()
+        # "As of" date for feature extraction: the real current date, not
+        # history.index[-1]. Under prediction_usage_mode="distribution_as_bar"
+        # (kairos_prediction_usage.py), history's last row can be a synthetic
+        # forecast bar the orchestrator appended one interval past today --
+        # using it as as_of would defeat extract_features()'s own no-lookahead
+        # truncation (`history[history.index <= as_of]`) and let ATR/
+        # realized_vol/trend/range-position read the model's own forecast as
+        # if it were real history (this project has been bitten by this exact
+        # lookahead-via-synthetic-bar bug class twice before -- see
+        # CLAUDE.md's naive-baseline/oracle-peek sections). context["date"] is
+        # set by every real context builder to the actual date being
+        # processed, which is always <= the last real bar and strictly before
+        # any appended synthetic one. Falls back to history.index[-1] only
+        # when a caller doesn't supply "date" (e.g. a test), matching this
+        # strategy's pre-fix behavior in that case.
+        as_of_source = context.get("date", history.index[-1])
+        as_of_date = pd.Timestamp(as_of_source).date().isoformat()
 
         # Extract features (price-history only, matching training)
         try:
             features = extract_features(
                 ticker=ticker,
                 as_of=as_of_date,
-                interval=interval,
+                interval=self.interval,
                 entry=base_sig.entry,
                 history=history,
             )
@@ -1291,6 +1336,13 @@ class MLBracketStrategy(Strategy):
         # Vectorize features in exact order from feature_metadata.json
         X = self._vectorize_features(features)
 
+        # Evaluate only the candidates trained for (or applicable to) this
+        # signal's own asset class -- see _select_candidate_keys() for why an
+        # unfiltered loop over self.models lets an out-of-distribution
+        # classifier (e.g. a "..._crypto" model scoring an equity signal)
+        # win the argmax.
+        candidate_keys = self._select_candidate_keys(features["asset_class"])
+
         # Evaluate all candidates
         best_ev = float("-inf")
         best_key = None
@@ -1298,7 +1350,8 @@ class MLBracketStrategy(Strategy):
         best_target = None
         best_p_win = 0.0
 
-        for key, model in self.models.items():
+        for key in candidate_keys:
+            model = self.models[key]
             # Get stop_pct, target_pct from metadata
             meta = self.candidates_meta[key]
             stop_pct = meta["stop_pct"]
@@ -1308,15 +1361,21 @@ class MLBracketStrategy(Strategy):
             if base_sig.direction == Direction.LONG:
                 candidate_stop = base_sig.entry * (1.0 - stop_pct / 100.0)
                 candidate_target = base_sig.entry * (1.0 + target_pct / 100.0)
-            else:  # SHORT
+            else:  # SHORT (FLAT/other directions already returned above)
                 candidate_stop = base_sig.entry * (1.0 + stop_pct / 100.0)
                 candidate_target = base_sig.entry * (1.0 - target_pct / 100.0)
 
-            # Predict P(win) for this candidate
+            # Predict P(win) for this candidate. Only catch genuinely-expected
+            # failures here: the model not being fitted, or a feature-vector
+            # shape mismatch between this candidate's saved .pkl and the
+            # shared feature_metadata.json (e.g. a partially regenerated
+            # data/tpsl_models/) -- both surface as ValueError/IndexError from
+            # GradientBoostedStumps.predict_proba. Anything else is a real bug
+            # and must propagate rather than silently degrade to "no ML edge
+            # found", indistinguishable from a legitimate low-EV result.
             try:
                 p_win = float(model.predict_proba(X.reshape(1, -1))[0])
-            except Exception:
-                # Model evaluation failed, skip this candidate
+            except (ValueError, IndexError):
                 continue
 
             # Compute EV: p_win * reward_pct - (1 - p_win) * risk_pct
@@ -1348,6 +1407,18 @@ class MLBracketStrategy(Strategy):
         best_risk_pct = abs(best_stop - base_sig.entry) / base_sig.entry * 100
         best_reward_pct = abs(best_target - base_sig.entry) / base_sig.entry * 100
 
+        # confidence/expected_value must be recomputed from the CHOSEN
+        # candidate, not copied from base_sig -- base_sig's values describe
+        # the ORIGINAL (now-discarded) stop/target. kairos_signals.py's
+        # EV-based sort/gate (_ev_pct_value, min_ev_pct filtering) reads
+        # sig.expected_value directly, so a stale value would rank/gate a
+        # trade that no longer exists. expected_value is stored in absolute
+        # price units codebase-wide (kairos_signals._ev_pct_value recovers
+        # the percent via `expected_value / entry * 100`); best_ev above is
+        # already a percent (computed from risk_pct/reward_pct), so convert
+        # it back to price units for the Signal field.
+        recomputed_expected_value = (best_ev / 100.0) * base_sig.entry
+
         return Signal(
             direction=base_sig.direction,
             size=base_sig.size,
@@ -1355,8 +1426,8 @@ class MLBracketStrategy(Strategy):
             stop=best_stop,
             target=best_target,
             strategy_name=self.name,
-            confidence=base_sig.confidence,
-            expected_value=base_sig.expected_value,
+            confidence=best_p_win,
+            expected_value=recomputed_expected_value,
             metadata={
                 **base_sig.metadata,
                 "ml_bracket": {
@@ -1375,6 +1446,47 @@ class MLBracketStrategy(Strategy):
             }
         )
 
+    def _select_candidate_keys(self, asset_class: str) -> list[str]:
+        """Resolve one usable model key per (stop_pct, target_pct) grid combo.
+
+        `train_tpsl_model.py` trains either one pooled model per combo (key
+        `"{stop_pct}_{target_pct}"`, `meta["mode"] == "pooled"`) or, when there
+        was enough per-class training data (`check_class_sufficiency()`), one
+        model per (combo, asset class) instead (key
+        `"{stop_pct}_{target_pct}_{cls}"`, `meta["mode"] == "per_class"`,
+        `meta["asset_class"] == cls`) -- never both for the same combo.
+        Scoring a signal with a per-class model trained on a DIFFERENT class
+        (e.g. an equity signal against a "..._crypto" model) is an
+        out-of-distribution prediction that can still win the EV argmax, so
+        for each combo this picks, in order: the per-class model matching
+        `asset_class`, else the pooled model for that combo, else nothing
+        (that combo has no usable model for this signal and is skipped).
+
+        Args:
+            asset_class: This signal's own asset class (from extract_features()).
+
+        Returns:
+            List of `self.models` keys usable for this asset class, at most
+            one per (stop_pct, target_pct) combo.
+        """
+        by_combo: dict[tuple[float, float], dict[str, str]] = {}
+        for key, meta in self.candidates_meta.items():
+            combo = (meta["stop_pct"], meta["target_pct"])
+            slot = by_combo.setdefault(combo, {})
+            if meta.get("mode") == "per_class":
+                if meta.get("asset_class") == asset_class:
+                    slot["match"] = key
+            else:  # pooled
+                slot["pooled"] = key
+
+        selected: list[str] = []
+        for options in by_combo.values():
+            if "match" in options:
+                selected.append(options["match"])
+            elif "pooled" in options:
+                selected.append(options["pooled"])
+        return selected
+
     def _vectorize_features(self, features: Dict[str, Any]) -> np.ndarray:
         """Convert extracted feature dict to numeric vector in feature column order.
 
@@ -1385,7 +1497,31 @@ class MLBracketStrategy(Strategy):
         Returns:
             1D numpy array of length len(self.feature_columns), one-hot encoded
             for categorical features.
+
+        Raises:
+            ValueError: if features["asset_class"] or features["interval"] is
+                not present in the saved training vocabulary
+                (self.asset_classes / self.interval_vocab). train_tpsl_model.py's
+                own `_feature_columns()` docstring calls a silent mismatch here
+                "a silent-failure risk (wrong columns score without raising)":
+                leaving the one-hot segment all-zero produces a real
+                out-of-distribution feature vector that would be fed straight
+                into predict_proba() looking identical to a legitimate,
+                confidently-low-EV prediction.
         """
+        if features["asset_class"] not in self.asset_classes:
+            raise ValueError(
+                f"Unseen asset_class {features['asset_class']!r} not in training "
+                f"vocabulary {self.asset_classes}; refusing to score with an "
+                f"all-zero one-hot segment"
+            )
+        if features["interval"] not in self.interval_vocab:
+            raise ValueError(
+                f"Unseen interval {features['interval']!r} not in training "
+                f"vocabulary {self.interval_vocab}; refusing to score with an "
+                f"all-zero one-hot segment"
+            )
+
         X = np.zeros(len(self.feature_columns), dtype=float)
 
         # Map feature name -> column index

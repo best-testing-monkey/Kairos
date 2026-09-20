@@ -4,8 +4,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy
 import pytest
 import json
 import pickle
+import itertools
 import numpy as np
 import pandas as pd
+import kairos_tpsl_features
 from kairos_backtest import Direction, Signal, Strategy
 from kairos_ml import (
     MetaLabelStrategy, GradientBoostedStumps, GBMDirectionStrategy, LogisticRegressionIRLS,
@@ -48,6 +50,92 @@ class StubStrategy(Strategy):
             strategy_name=self.name, confidence=0.8, expected_value=1.0,
             metadata={"origin": "stub"},
         )
+
+
+class FlatStubStrategy(Strategy):
+    """Base strategy that always emits an explicit Direction.FLAT signal.
+
+    Several real strategies (kairos_crypto.py, kairos_forex.py, kairos_meta.py,
+    kairos_path.py) return an explicit FLAT Signal rather than None -- this
+    stub reproduces that shape for MLBracketStrategy's FLAT-passthrough test.
+    """
+    name = "flat_stub"
+
+    def generate_signal(self, dist, current_price, history, context, **kwargs):
+        return Signal(
+            direction=Direction.FLAT, size=0.0, entry=current_price,
+            stop=current_price * 0.95, target=current_price * 1.10,
+            strategy_name=self.name, confidence=0.5, expected_value=0.0,
+            metadata={"origin": "flat_stub"},
+        )
+
+
+class _FixedProbaModel:
+    """Duck-typed GradientBoostedStumps stand-in: predict_proba ignores X and
+    always returns a fixed probability. Module-level (not a closure) so it's
+    picklable, matching how MLBracketStrategy loads real models from disk.
+    """
+
+    def __init__(self, p):
+        self.p = p
+
+    def predict_proba(self, X):
+        return np.full(X.shape[0], self.p)
+
+
+class _RaisingModel:
+    """Duck-typed model stub whose predict_proba always raises a fixed
+    exception. exc_type_name is a string (not a live exception instance) so
+    this stays trivially picklable.
+    """
+
+    _EXC_TYPES = {"ValueError": ValueError, "IndexError": IndexError, "RuntimeError": RuntimeError}
+
+    def __init__(self, exc_type_name, msg="boom"):
+        self.exc_type_name = exc_type_name
+        self.msg = msg
+
+    def predict_proba(self, X):
+        raise self._EXC_TYPES[self.exc_type_name](self.msg)
+
+
+_ML_ASSET_CLASSES = ("equity", "crypto", "fx", "commodity", "mixed")
+_ml_model_dir_counter = itertools.count()
+
+
+def write_ml_bracket_model_dir(tmp_path, candidates, interval_vocab=("1d",)):
+    """Write a minimal data/tpsl_models/-shaped fixture directory.
+
+    Args:
+        tmp_path: pytest tmp_path fixture.
+        candidates: dict[key] -> (meta_dict, model_obj). meta_dict must
+            include "stop_pct"/"target_pct" (and "asset_class"/"mode" for
+            per-class entries), matching train_tpsl_model.py's trained_meta
+            format exactly.
+        interval_vocab: interval vocabulary to record in feature_metadata.json.
+
+    Returns:
+        Path to the model directory (unique per call).
+    """
+    model_dir = tmp_path / f"ml_models_{next(_ml_model_dir_counter)}"
+    model_dir.mkdir()
+    interval_vocab = list(interval_vocab)
+    metadata = {
+        "feature_columns": (
+            ["atr", "realized_vol", "trend_10", "range_position"]
+            + [f"asset_class={c}" for c in _ML_ASSET_CLASSES]
+            + [f"interval={iv}" for iv in interval_vocab]
+        ),
+        "asset_classes": list(_ML_ASSET_CLASSES),
+        "interval_vocab": interval_vocab,
+        "candidates": {key: meta for key, (meta, _model) in candidates.items()},
+    }
+    with open(model_dir / "feature_metadata.json", "w") as fh:
+        json.dump(metadata, fh)
+    for key, (_meta, model) in candidates.items():
+        with open(model_dir / f"{key}.pkl", "wb") as fh:
+            pickle.dump(model, fh)
+    return model_dir
 
 
 def make_history(n=50, price=100.0):
@@ -745,10 +833,12 @@ class TestMLBracketStrategy:
 
         # Create feature metadata
         metadata = {
-            "feature_columns": ["atr", "realized_vol", "trend_10", "range_position",
-                               "asset_class=equity", "asset_class=crypto",
-                               "asset_class=fx", "asset_class=commodity",
-                               "asset_class=mixed", "interval=1d"],
+            "feature_columns": [
+                "atr", "realized_vol", "trend_10", "range_position",
+                "asset_class=equity", "asset_class=crypto",
+                "asset_class=fx", "asset_class=commodity",
+                "asset_class=mixed", "interval=1d",
+            ],
             "asset_classes": ["equity", "crypto", "fx", "commodity", "mixed"],
             "interval_vocab": ["1d"],
             "candidates": {"candidate_1": {"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"}}
@@ -772,3 +862,278 @@ class TestMLBracketStrategy:
         )
         sig = strat.generate_signal(FakeDist(), 100.0, make_history(), {})
         assert sig is None
+
+    # ------------------------------------------------------------------
+    # Real end-to-end coverage (E21-S06): the two tests above never reach
+    # feature vectorization or the argmax-EV loop. Everything below does.
+    # ------------------------------------------------------------------
+
+    def test_ml_bracket_end_to_end_picks_highest_ev_candidate(self, tmp_path):
+        """Core algorithm: argmax-EV selection, and confidence/expected_value
+        are recomputed from the CHOSEN candidate (item 7), not copied from
+        base_sig (whose confidence=0.8, expected_value=1.0 -- distinct from
+        either candidate's numbers below, so a stale-copy regression would
+        fail these exact assertions).
+        """
+        from kairos_ml import MLBracketStrategy
+
+        # EV(2.0_4.0) = 0.9*4.0 - 0.1*2.0 = 3.4  <- winner
+        # EV(1.0_2.0) = 0.5*2.0 - 0.5*1.0 = 0.5
+        candidates = {
+            "2.0_4.0": ({"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"}, _FixedProbaModel(0.9)),
+            "1.0_2.0": ({"stop_pct": 1.0, "target_pct": 2.0, "mode": "pooled"}, _FixedProbaModel(0.5)),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates)
+        strat = MLBracketStrategy(base_strategy=StubStrategy(), model_dir=str(model_dir))
+
+        sig = strat.generate_signal(
+            FakeDist(), 100.0, make_history(n=25),
+            {"current_symbol": "AAPL", "date": make_history(n=25).index[-1]},
+        )
+
+        assert sig is not None
+        assert sig.direction == Direction.LONG
+        assert sig.strategy_name == "ml_bracket"
+        assert sig.entry == 100.0
+        assert sig.stop == pytest.approx(98.0)     # 100 * (1 - 0.02)
+        assert sig.target == pytest.approx(104.0)  # 100 * (1 + 0.04)
+        assert sig.size == 0.5  # unchanged from base_sig
+
+        # confidence/expected_value recomputed from the winning candidate,
+        # NOT copied from base_sig (confidence=0.8, expected_value=1.0).
+        assert sig.confidence == pytest.approx(0.9)
+        assert sig.expected_value == pytest.approx(3.4)  # (3.4 / 100) * 100 entry
+
+        meta = sig.metadata["ml_bracket"]
+        assert meta["candidate_key"] == "2.0_4.0"
+        assert meta["predicted_p_win"] == pytest.approx(0.9)
+        assert meta["predicted_ev"] == pytest.approx(3.4)
+        assert meta["original_stop"] == pytest.approx(95.0)   # base_sig's discarded bracket
+        assert meta["original_target"] == pytest.approx(110.0)
+
+    def test_ml_bracket_missing_current_symbol_passthrough(self, tmp_path):
+        """Item 1: context without 'current_symbol' passes base_sig through
+        unchanged -- 'ticker' (the old, never-set key) must not be read.
+        """
+        from kairos_ml import MLBracketStrategy
+
+        candidates = {
+            "2.0_4.0": ({"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"}, _FixedProbaModel(0.9)),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates)
+        strat = MLBracketStrategy(base_strategy=StubStrategy(), model_dir=str(model_dir))
+
+        sig = strat.generate_signal(FakeDist(), 100.0, make_history(n=25), {})
+
+        assert sig is not None
+        assert sig.strategy_name == "stub"  # base signal unchanged
+        assert sig.stop == pytest.approx(95.0)
+        assert sig.target == pytest.approx(110.0)
+
+    def test_ml_bracket_uses_context_date_not_history_last_row(self, tmp_path, monkeypatch):
+        """Item 2: as-of date for feature extraction must come from
+        context["date"], not history.index[-1] -- under
+        prediction_usage_mode="distribution_as_bar", the last history row is
+        a synthetic forecast bar appended one interval past the real current
+        date (see kairos_prediction_usage.py). Using it as as_of would defeat
+        extract_features()'s no-lookahead truncation.
+
+        Spies on kairos_tpsl_features.extract_features (monkeypatched on the
+        module, since MLBracketStrategy imports it fresh inside
+        generate_signal every call) to assert the exact as_of value passed.
+        """
+        from kairos_ml import MLBracketStrategy
+
+        history_real = make_history(n=25)
+        context_date = history_real.index[-1]
+        synthetic_bar = pd.Series(
+            {"open": 999.0, "high": 999.0, "low": 999.0, "close": 999.0, "volume": 1e6},
+            name=context_date + pd.Timedelta(days=1),
+        )
+        history_with_synthetic = pd.concat([history_real, synthetic_bar.to_frame().T])
+
+        captured = {}
+        real_extract_features = kairos_tpsl_features.extract_features
+
+        def spy_extract_features(**kwargs):
+            captured["as_of"] = kwargs["as_of"]
+            return real_extract_features(**kwargs)
+
+        monkeypatch.setattr(kairos_tpsl_features, "extract_features", spy_extract_features)
+
+        candidates = {
+            "2.0_4.0": ({"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"}, _FixedProbaModel(0.9)),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates)
+        strat = MLBracketStrategy(base_strategy=StubStrategy(), model_dir=str(model_dir))
+
+        strat.generate_signal(
+            FakeDist(), 100.0, history_with_synthetic,
+            {"current_symbol": "AAPL", "date": context_date},
+        )
+
+        assert captured["as_of"] == context_date.date().isoformat()
+        # Sanity check: the synthetic bar's own date really is different --
+        # otherwise this test wouldn't distinguish the fix from the bug.
+        assert captured["as_of"] != history_with_synthetic.index[-1].date().isoformat()
+
+    def test_ml_bracket_flat_direction_passthrough(self, tmp_path):
+        """Item 3: a base signal with Direction.FLAT (not None) must pass
+        through unchanged, not be scored with the SHORT-branch stop/target
+        formula. Also exercises item 1's context-key fix composing correctly
+        with item 3 (acceptance criterion): current_symbol IS present and
+        valid, yet FLAT still short-circuits before ML selection.
+        """
+        from kairos_ml import MLBracketStrategy
+
+        candidates = {
+            "2.0_4.0": ({"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"}, _FixedProbaModel(0.9)),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates)
+        strat = MLBracketStrategy(base_strategy=FlatStubStrategy(), model_dir=str(model_dir))
+
+        sig = strat.generate_signal(
+            FakeDist(), 100.0, make_history(n=25),
+            {"current_symbol": "AAPL", "date": make_history(n=25).index[-1]},
+        )
+
+        assert sig is not None
+        assert sig.direction == Direction.FLAT
+        assert sig.strategy_name == "flat_stub"
+        assert sig.stop == pytest.approx(95.0)
+        assert sig.target == pytest.approx(110.0)
+        assert sig.metadata == {"origin": "flat_stub"}  # untouched, no "ml_bracket" key added
+
+    def test_ml_bracket_filters_candidates_by_asset_class(self, tmp_path):
+        """Item 4: an equity signal must not be scored by a model trained
+        only on crypto data for the same (stop_pct, target_pct) combo, even
+        if that model's EV would otherwise win the argmax.
+
+        The crypto-only model always predicts p_win=1.0 (EV=4.0, the
+        objectively highest of all three candidates) -- if asset-class
+        filtering were missing, it would win and "candidate_key" would read
+        "2.0_4.0_crypto". The equity-only model for the same combo predicts
+        p_win=0.5 (EV=1.0); the pooled fallback for a different combo
+        predicts p_win=0.3 (EV=-0.5). The correctly-filtered winner is the
+        equity model, despite having a lower raw EV than the excluded
+        crypto one.
+        """
+        from kairos_ml import MLBracketStrategy
+
+        candidates = {
+            "2.0_4.0_crypto": (
+                {"stop_pct": 2.0, "target_pct": 4.0, "asset_class": "crypto", "mode": "per_class"},
+                _FixedProbaModel(1.0),
+            ),
+            "2.0_4.0_equity": (
+                {"stop_pct": 2.0, "target_pct": 4.0, "asset_class": "equity", "mode": "per_class"},
+                _FixedProbaModel(0.5),
+            ),
+            "5.0_10.0": (
+                {"stop_pct": 5.0, "target_pct": 10.0, "mode": "pooled"},
+                _FixedProbaModel(0.3),
+            ),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates)
+        strat = MLBracketStrategy(base_strategy=StubStrategy(), model_dir=str(model_dir))
+
+        sig = strat.generate_signal(
+            FakeDist(), 100.0, make_history(n=25),
+            {"current_symbol": "AAPL", "date": make_history(n=25).index[-1]},  # AAPL -> equity
+        )
+
+        assert sig is not None
+        meta = sig.metadata["ml_bracket"]
+        assert meta["candidate_key"] == "2.0_4.0_equity"
+        assert meta["predicted_p_win"] == pytest.approx(0.5)
+        assert sig.confidence == pytest.approx(0.5)
+
+    def test_ml_bracket_skips_candidate_on_expected_exception(self, tmp_path):
+        """Item 5: a ValueError/IndexError from one candidate's predict_proba
+        (model-not-fitted / feature-shape-mismatch class of failure) is
+        skipped, not fatal -- other candidates are still evaluated.
+        """
+        from kairos_ml import MLBracketStrategy
+
+        candidates = {
+            "2.0_4.0": (
+                {"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"},
+                _RaisingModel("IndexError"),
+            ),
+            "5.0_10.0": (
+                {"stop_pct": 5.0, "target_pct": 10.0, "mode": "pooled"},
+                _FixedProbaModel(0.6),
+            ),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates)
+        strat = MLBracketStrategy(base_strategy=StubStrategy(), model_dir=str(model_dir))
+
+        sig = strat.generate_signal(
+            FakeDist(), 100.0, make_history(n=25),
+            {"current_symbol": "AAPL", "date": make_history(n=25).index[-1]},
+        )
+
+        assert sig is not None
+        assert sig.metadata["ml_bracket"]["candidate_key"] == "5.0_10.0"
+
+    def test_ml_bracket_reraises_unexpected_exception(self, tmp_path):
+        """Item 5: an exception outside the genuinely-expected set (not
+        ValueError/IndexError) must propagate, not be silently swallowed
+        into a "no ML edge found" pass-through.
+        """
+        from kairos_ml import MLBracketStrategy
+
+        candidates = {
+            "2.0_4.0": (
+                {"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"},
+                _RaisingModel("RuntimeError", msg="corrupted model"),
+            ),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates)
+        strat = MLBracketStrategy(base_strategy=StubStrategy(), model_dir=str(model_dir))
+
+        with pytest.raises(RuntimeError, match="corrupted model"):
+            strat.generate_signal(
+                FakeDist(), 100.0, make_history(n=25),
+                {"current_symbol": "AAPL", "date": make_history(n=25).index[-1]},
+            )
+
+    def test_ml_bracket_vectorize_raises_on_unseen_asset_class(self, tmp_path):
+        """Item 6: an asset_class outside the saved training vocabulary
+        raises rather than silently scoring an all-zero one-hot segment.
+        """
+        from kairos_ml import MLBracketStrategy
+
+        candidates = {
+            "2.0_4.0": ({"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"}, _FixedProbaModel(0.9)),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates)
+        strat = MLBracketStrategy(base_strategy=StubStrategy(), model_dir=str(model_dir))
+
+        features = {
+            "atr": 1.0, "realized_vol": 0.01, "trend_10": 0.0, "range_position": 0.5,
+            "asset_class": "not_a_real_class", "interval": "1d",
+        }
+        with pytest.raises(ValueError, match="Unseen asset_class"):
+            strat._vectorize_features(features)
+
+    def test_ml_bracket_raises_on_unseen_interval_end_to_end(self, tmp_path):
+        """Item 6: constructing MLBracketStrategy with an interval outside
+        the saved training vocab means every signal hits the same unseen-
+        category guard, end-to-end through generate_signal (not just the
+        private helper) -- a misconfigured interval is a loud failure, not a
+        silently degraded one.
+        """
+        from kairos_ml import MLBracketStrategy
+
+        candidates = {
+            "2.0_4.0": ({"stop_pct": 2.0, "target_pct": 4.0, "mode": "pooled"}, _FixedProbaModel(0.9)),
+        }
+        model_dir = write_ml_bracket_model_dir(tmp_path, candidates, interval_vocab=("1d",))
+        strat = MLBracketStrategy(base_strategy=StubStrategy(), model_dir=str(model_dir), interval="4h")
+
+        with pytest.raises(ValueError, match="Unseen interval"):
+            strat.generate_signal(
+                FakeDist(), 100.0, make_history(n=25),
+                {"current_symbol": "AAPL", "date": make_history(n=25).index[-1]},
+            )
