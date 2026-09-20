@@ -166,4 +166,23 @@ this repo's existing dependency-free `GradientBoostedStumps` (`kairos_ml.py`) �
 
 ---
 
+# Kairos E18/E19/E20 Code Review Fixes — Implementation Todo
+
+Ordered by dependency. Check off an item only in the same commit that completes it.
+Source: `/code-review unpushed commits` run against the 26 unpushed E18/E19/E20 commits,
+2026-09-20 — 15 correctness findings, grouped into 6 tickets by file/component (avoiding
+multiple agents editing the same file). All 6 touch disjoint files and can run in parallel;
+E21-S01 and E21-S06 involve real design judgment (not mechanical fixes) and are Sonnet-tier.
+
+## Epic 21 — Correctness fixes from code review
+
+- [ ] E21-S01 Fix prediction-usage dispatch: naive-mode lookahead leak + missing interval (docs/tickets/E21-S01-fix-prediction-usage-dispatch-lookahead-and-interval.md)
+- [ ] E21-S02 Fix `compare_tpsl_model.py`'s nonexistent `c.as_of` column (docs/tickets/E21-S02-fix-compare-tpsl-model-schema-mismatch.md)
+- [ ] E21-S03 Fix `tpsl_label_grid.py`'s partial-coverage resume bug (docs/tickets/E21-S03-fix-tpsl-label-grid-resume-logic.md)
+- [ ] E21-S04 Fix `kairos_tpsl_features.py`: timezone crash + division-by-zero (docs/tickets/E21-S04-fix-tpsl-features-tz-and-zero-guard.md)
+- [ ] E21-S05 Fix `_build_synthetic_bar()`'s OHLC-consistency gap (docs/tickets/E21-S05-fix-synthetic-bar-ohlc-consistency.md)
+- [ ] E21-S06 Fix `MLBracketStrategy` correctness bugs + add real test coverage (docs/tickets/E21-S06-fix-ml-bracket-strategy-correctness-and-tests.md)
+
+---
+
 See `docs/tickets/APPENDIX-A-standards.md` for code style, test conventions, and commit rules that apply to every story.
