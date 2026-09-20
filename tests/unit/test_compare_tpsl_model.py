@@ -1,12 +1,13 @@
 """E18-S05: Unit tests for offline TPSL validation.
 
 Tests the validation window derivation and comparison report generation
-with synthetic fixtures.
+with synthetic fixtures built from real table-creation functions.
 """
 import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "strategy"))
 
 import sqlite3  # noqa: E402
 import tempfile  # noqa: E402
@@ -16,6 +17,8 @@ import pytest  # noqa: E402
 import numpy as np  # noqa: E402
 
 from compare_tpsl_model import purged_time_split, _get_validation_window  # noqa: E402
+from tpsl_label_grid import _ensure_tpsl_label_candidates_table  # noqa: E402
+from kairos_signal_replay import _ensure_signal_replay_tables  # noqa: E402
 
 
 @pytest.fixture
@@ -68,40 +71,40 @@ def test_purged_time_split_no_embargo():
 
 
 def test_get_validation_window_basic(temp_db):
-    """Test validation window derivation from database."""
+    """Test validation window derivation from database with real schemas."""
     conn = sqlite3.connect(temp_db)
     conn.row_factory = sqlite3.Row
 
-    # Create tpsl_label_candidates table with as_of column
-    conn.execute(
-        """
-        CREATE TABLE tpsl_label_candidates (
-            signal_id TEXT NOT NULL,
-            stop_pct REAL NOT NULL,
-            target_pct REAL NOT NULL,
-            resolved INTEGER NOT NULL,
-            hit_target_first INTEGER,
-            interval_used TEXT,
-            engine_version TEXT NOT NULL,
-            computed_at TEXT NOT NULL,
-            as_of TEXT,
-            PRIMARY KEY (signal_id, stop_pct, target_pct)
-        )
-        """
-    )
+    # Create tables using real table-creation functions
+    _ensure_signal_replay_tables(conn)
+    _ensure_tpsl_label_candidates_table(conn)
 
-    # Insert 10 resolved candidates with dates
+    # Insert 10 signals into papertrade_signals
     base_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
     for i in range(10):
         as_of = (base_date + timedelta(days=i)).date().isoformat()
         conn.execute(
             """
+            INSERT INTO papertrade_signals (
+                signal_id, strategy_name, ticker, direction, interval, as_of,
+                entry, stop, target, model_label, checkpoint_fingerprint, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (f"sig_{i}", "test_strategy", f"TEST_{i}", "long", "1d", as_of,
+             100.0, 90.0, 110.0, "base", "", datetime.now(timezone.utc).isoformat())
+        )
+
+    # Insert 10 resolved candidates in tpsl_label_candidates
+    for i in range(10):
+        conn.execute(
+            """
             INSERT INTO tpsl_label_candidates (
                 signal_id, stop_pct, target_pct, resolved, hit_target_first,
-                interval_used, engine_version, computed_at, as_of
-            ) VALUES (?, ?, ?, 1, 1, '1d', 'v1', ?, ?)
+                interval_used, engine_version, computed_at
+            ) VALUES (?, ?, ?, 1, 1, ?, ?, ?)
             """,
-            (f"sig_{i}", 10.0, 75.0, datetime.now(timezone.utc).isoformat(), as_of)
+            (f"sig_{i}", 10.0, 75.0, "1d", "e18_s01_v1",
+             datetime.now(timezone.utc).isoformat())
         )
     conn.commit()
 
@@ -122,19 +125,10 @@ def test_get_validation_window_no_data(temp_db):
     conn = sqlite3.connect(temp_db)
     conn.row_factory = sqlite3.Row
 
-    # Create table but don't populate
-    conn.execute(
-        """
-        CREATE TABLE tpsl_label_candidates (
-            signal_id TEXT NOT NULL,
-            stop_pct REAL NOT NULL,
-            target_pct REAL NOT NULL,
-            resolved INTEGER NOT NULL,
-            as_of TEXT
-        )
-        """
-    )
-    conn.commit()
+    # Create tables using real table-creation functions
+    _ensure_signal_replay_tables(conn)
+    _ensure_tpsl_label_candidates_table(conn)
+    # Don't populate either table
 
     with pytest.raises(ValueError, match="No resolved candidates"):
         _get_validation_window(conn)
@@ -147,30 +141,39 @@ def test_get_validation_window_unsorted_dates(temp_db):
     conn = sqlite3.connect(temp_db)
     conn.row_factory = sqlite3.Row
 
-    conn.execute(
-        """
-        CREATE TABLE tpsl_label_candidates (
-            signal_id TEXT NOT NULL,
-            stop_pct REAL NOT NULL,
-            target_pct REAL NOT NULL,
-            resolved INTEGER NOT NULL,
-            as_of TEXT
-        )
-        """
-    )
+    # Create tables using real table-creation functions
+    _ensure_signal_replay_tables(conn)
+    _ensure_tpsl_label_candidates_table(conn)
 
     # Insert in random order
     base_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
     dates_order = [5, 1, 9, 2, 7, 0, 4, 8, 3, 6]
+
+    # First insert signals into papertrade_signals (required for join)
     for idx in dates_order:
         as_of = (base_date + timedelta(days=idx)).date().isoformat()
         conn.execute(
             """
-            INSERT INTO tpsl_label_candidates (
-                signal_id, stop_pct, target_pct, resolved, as_of
-            ) VALUES (?, ?, ?, 1, ?)
+            INSERT INTO papertrade_signals (
+                signal_id, strategy_name, ticker, direction, interval, as_of,
+                entry, stop, target, model_label, checkpoint_fingerprint, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (f"sig_{idx}", 10.0, 75.0, as_of)
+            (f"sig_{idx}", "test_strategy", f"TEST_{idx}", "long", "1d", as_of,
+             100.0, 90.0, 110.0, "base", "", datetime.now(timezone.utc).isoformat())
+        )
+
+    # Then insert candidates into tpsl_label_candidates
+    for idx in dates_order:
+        conn.execute(
+            """
+            INSERT INTO tpsl_label_candidates (
+                signal_id, stop_pct, target_pct, resolved, hit_target_first,
+                interval_used, engine_version, computed_at
+            ) VALUES (?, ?, ?, 1, 1, ?, ?, ?)
+            """,
+            (f"sig_{idx}", 10.0, 75.0, "1d", "e18_s01_v1",
+             datetime.now(timezone.utc).isoformat())
         )
     conn.commit()
 

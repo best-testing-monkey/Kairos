@@ -62,15 +62,17 @@ def purged_time_split(
 def _get_validation_window(conn: sqlite3.Connection) -> tuple[str, str]:
     """Derive the exact validation window boundary from training data.
 
-    Reads all resolved tpsl_label_candidates, extracts their as_of dates,
-    runs purged_time_split to find the cutoff, and returns (cutoff_date_inclusive,
-    end_date_inclusive) for the validation window.
+    Reads all resolved tpsl_label_candidates, joins to papertrade_signals to
+    extract their as_of dates, runs purged_time_split to find the cutoff, and
+    returns (cutoff_date_inclusive, end_date_inclusive) for the validation window.
     """
     cursor = conn.execute(
         """
-        SELECT DISTINCT c.as_of FROM tpsl_label_candidates c
+        SELECT DISTINCT s.as_of
+        FROM tpsl_label_candidates c
+        JOIN papertrade_signals s ON c.signal_id = s.signal_id
         WHERE c.resolved = 1
-        ORDER BY c.as_of
+        ORDER BY s.as_of
         """
     )
     as_of_dates = [row[0] for row in cursor.fetchall()]
