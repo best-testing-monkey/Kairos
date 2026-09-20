@@ -176,7 +176,7 @@ E21-S01 and E21-S06 involve real design judgment (not mechanical fixes) and are 
 
 ## Epic 21 — Correctness fixes from code review
 
-- [ ] E21-S01 Fix prediction-usage dispatch: naive-mode lookahead leak + missing interval (docs/tickets/E21-S01-fix-prediction-usage-dispatch-lookahead-and-interval.md)
+- [x] E21-S01 Fix prediction-usage dispatch: naive-mode lookahead leak + missing interval (docs/tickets/E21-S01-fix-prediction-usage-dispatch-lookahead-and-interval.md)
 - [x] E21-S02 Fix `compare_tpsl_model.py`'s nonexistent `c.as_of` column (docs/tickets/E21-S02-fix-compare-tpsl-model-schema-mismatch.md)
 - [x] E21-S03 Fix `tpsl_label_grid.py`'s partial-coverage resume bug (docs/tickets/E21-S03-fix-tpsl-label-grid-resume-logic.md)
 - [x] E21-S04 Fix `kairos_tpsl_features.py`: timezone crash + division-by-zero (docs/tickets/E21-S04-fix-tpsl-features-tz-and-zero-guard.md)
